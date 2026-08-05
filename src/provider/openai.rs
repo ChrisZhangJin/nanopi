@@ -414,6 +414,24 @@ impl OpenAiProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::agent::loop_::Provider for OpenAiProvider {
+    fn id(&self) -> &'static str {
+        "openai"
+    }
+
+    async fn stream_turn(
+        &self,
+        ctx: &Context,
+        tx: mpsc::Sender<AgentEvent>,
+    ) -> Result<Usage, String> {
+        // Delegate to the inherent method by UFCS to avoid name collision.
+        OpenAiProvider::stream_turn(self, ctx, tx)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Default)]
 struct PendingToolCall {
     id: Option<String>,

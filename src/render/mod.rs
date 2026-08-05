@@ -4,5 +4,7 @@
 //! interactive and `-p` modes. `TuiRenderer` (crossterm alt-screen)
 //! is a v0.6+ concern.
 
+pub mod alt_screen;
+pub mod panel;
 pub mod stdout;
 pub mod tui;

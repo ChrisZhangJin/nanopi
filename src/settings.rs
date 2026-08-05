@@ -44,6 +44,8 @@ pub struct HooksSection {
     pub pre_tool_use: Vec<HookConfig>,
     #[serde(default)]
     pub post_tool_use: Vec<HookConfig>,
+    #[serde(default)]
+    pub user_prompt_submit: Vec<HookConfig>,
 }
 
 impl From<Settings> for HooksConfig {
@@ -51,6 +53,7 @@ impl From<Settings> for HooksConfig {
         HooksConfig {
             pre_tool_use: s.hooks.pre_tool_use,
             post_tool_use: s.hooks.post_tool_use,
+            user_prompt_submit: s.hooks.user_prompt_submit,
         }
     }
 }

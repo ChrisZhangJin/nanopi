@@ -4,9 +4,11 @@
 //! tool calls sequentially (one tool at a time, in LLM-returned order).
 //! v0.6 will add parallel tool execution (Pi parity).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+use futures_util::future::join_all;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -16,6 +18,19 @@ use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
 use crate::provider::openai::OpenAiProvider;
 use crate::session::{self, SessionEntry};
+
+/// Provider trait — abstracts the LLM backend so tests can inject fakes
+/// without HTTP. `OpenAiProvider` implements it; v0.6 will add
+/// `AnthropicProvider`.
+#[async_trait::async_trait]
+pub trait Provider: Send + Sync {
+    fn id(&self) -> &'static str;
+    async fn stream_turn(
+        &self,
+        ctx: &Context,
+        tx: mpsc::Sender<AgentEvent>,
+    ) -> Result<Usage, String>;
+}
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::util::{time, uuid};
 
@@ -40,12 +55,13 @@ impl From<session::SessionError> for AgentError {
 pub struct HooksConfig {
     pub pre_tool_use: Vec<HookConfig>,
     pub post_tool_use: Vec<HookConfig>,
+    pub user_prompt_submit: Vec<HookConfig>,
 }
 
 /// The agent — owns context, provider, tool registry, session, permissions.
 pub struct Agent {
     pub context: Context,
-    pub provider: OpenAiProvider,
+    pub provider: Box<dyn Provider>,
     pub registry: ToolRegistry,
     pub session_path: PathBuf,
     pub session_id: uuid::Uuid,
@@ -55,6 +71,44 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Reconstruct an Agent from an existing session JSONL file.
+    /// Replays message entries into the Context so a new turn can build
+    /// on prior history. Used by `--continue` and the v0.6 multi-turn
+    /// TUI.
+    pub fn load_session(
+        session_path: &Path,
+        cwd: &Path,
+    ) -> Result<Self, AgentError> {
+        let (header, entries) = crate::session::read_session(session_path)?;
+        let mut context = Context::default();
+        for entry in entries {
+            if let SessionEntry::Message { role, content, .. } = entry {
+                match role.as_str() {
+                    "user" => context.push_user_text(content),
+                    "assistant" => context.push_assistant_text(content),
+                    _ => {}
+                }
+            }
+        }
+        Ok(Self {
+            context,
+            provider: Box::new(OpenAiProvider::new("", "", "")),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.to_path_buf(),
+            session_id: header.id,
+            cwd: cwd.to_path_buf(),
+            permission: PermissionGate::from_cli(false, false, None),
+            hooks: HooksConfig::default(),
+        })
+    }
+
+    /// Find the most recently used session path for the given cwd.
+    /// Returns None if no session has ever been recorded for it. Used
+    /// by `--continue` and the multi-turn TUI to resume.
+    pub fn continue_last_session(cwd: &Path) -> Option<PathBuf> {
+        crate::session::active_session(cwd)
+    }
+
     /// Run a single user turn to completion. Streams events to `tx` and
     /// persists all messages, tool calls, and tool results to the session
     /// JSONL file. Returns the final concatenated assistant text.
@@ -192,114 +246,187 @@ impl Agent {
         calls: Vec<ToolCall>,
         tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
-        for call in calls {
-            // PreToolUse hooks (if enabled).
-            let mut effective_args = call.arguments.clone();
-            if self.permission.hooks_active() && !self.hooks.pre_tool_use.is_empty() {
-                let (outcome, transformed) = run_hooks(
-                    &self.hooks.pre_tool_use,
-                    HookEvent::PreToolUse,
-                    &call.name,
-                    call.arguments.clone(),
-                    &self.cwd,
-                    Some(&self.session_id.to_string()),
-                )
-                .await;
-                effective_args = transformed.unwrap_or(call.arguments.clone());
-                match outcome {
-                    HookOutcome::Block { reason } if self.permission.should_honor_pretooluse_block() => {
-                        let result_text = format!("blocked by hook: {reason}");
-                        session::append_entry(
-                            &self.session_path,
-                            &SessionEntry::ToolResult {
-                                tool_call_id: call.id.clone(),
-                                timestamp: time::now_iso8601(),
-                                content: result_text.clone(),
-                                is_error: true,
-                            },
-                        )?;
-                        self.context.push_tool_result(call.id.clone(), result_text.clone(), true);
-                        let _ = tx
-                            .send(AgentEvent::TextDelta {
-                                content_index: 0,
-                                text: format!("\n[{} blocked: {}]\n", call.name, reason),
-                            })
-                            .await;
-                        continue;
-                    }
-                    _ => {} // Allow, Transform, or Block-in-yolo (logged but not honored)
-                }
-            }
+        // Phase 1: Run all tool executions CONCURRENTLY via join_all.
+        // Each future resolves to (ToolCall, Result<ToolOutput, ToolError>).
+        // Hooks, persistence, and context mutation happen in phase 2.
+        let cwd = self.cwd.clone();
+        let registry = self.registry.clone();
+        let session_path = self.session_path.clone();
+        let session_id = self.session_id;
+        let permission = self.permission.clone();
+        let hooks = self.hooks.clone();
 
-            // Resolve tool.
-            let Some(tool) = self.registry.get(&call.name) else {
-                let msg = format!("unknown tool: {}", call.name);
-                session::append_entry(
-                    &self.session_path,
+        let futs: Vec<_> = calls
+            .into_iter()
+            .map(|call| {
+                let cwd = cwd.clone();
+                let registry = registry.clone();
+                let session_path = session_path.clone();
+                let session_id = session_id;
+                let permission = permission.clone();
+                let hooks = hooks.clone();
+                let tx = tx.clone();
+                async move {
+                    let outcome = run_one_tool(
+                        call,
+                        registry,
+                        session_path,
+                        session_id,
+                        cwd,
+                        permission,
+                        hooks,
+                        tx,
+                    )
+                    .await;
+                    outcome
+                }
+            })
+            .collect();
+
+let results = join_all(futs).await;
+
+        // Phase 2: Push ToolResult messages into context in call order
+        // so the next LLM turn sees them. Persistence already happened
+        // during phase 1 (in run_one_tool).
+        for outcome in results {
+            self.context.push_tool_result(
+                outcome.call_id,
+                outcome.content,
+                outcome.is_error,
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Result of running one tool — what `run_one_tool` returns to the
+/// caller's join_all. We carry enough info so the caller can persist
+/// and update context in any order (in our case, in call order).
+struct ToolCallOutcome {
+    call_id: String,
+    tool_name: String,
+    args: Value,
+    content: String,
+    is_error: bool,
+}
+
+/// Run a single tool call: hooks → execute → persist → render. Pure
+/// function over its arguments; safe to call concurrently from
+/// `execute_tool_calls`.
+async fn run_one_tool(
+    call: ToolCall,
+    registry: ToolRegistry,
+    session_path: PathBuf,
+    session_id: uuid::Uuid,
+    cwd: PathBuf,
+    permission: PermissionGate,
+    hooks: HooksConfig,
+    tx: mpsc::Sender<AgentEvent>,
+) -> ToolCallOutcome {
+    // PreToolUse hooks.
+    let mut effective_args = call.arguments.clone();
+    if permission.hooks_active() && !hooks.pre_tool_use.is_empty() {
+        let (outcome, transformed) = run_hooks(
+            &hooks.pre_tool_use,
+            HookEvent::PreToolUse,
+            &call.name,
+            call.arguments.clone(),
+            &cwd,
+            Some(&session_id.to_string()),
+        )
+        .await;
+        effective_args = transformed.unwrap_or(call.arguments.clone());
+        if let HookOutcome::Block { reason } = outcome {
+            if permission.should_honor_pretooluse_block() {
+                let result_text = format!("blocked by hook: {reason}");
+                let _ = session::append_entry(
+                    &session_path,
                     &SessionEntry::ToolResult {
                         tool_call_id: call.id.clone(),
                         timestamp: time::now_iso8601(),
-                        content: msg.clone(),
+                        content: result_text.clone(),
                         is_error: true,
                     },
-                )?;
-                self.context.push_tool_result(call.id.clone(), msg, true);
-                continue;
-            };
-
-            // Persist tool call.
-            session::append_entry(
-                &self.session_path,
-                &SessionEntry::ToolCall {
-                    id: call.id.clone(),
-                    timestamp: time::now_iso8601(),
-                    tool_name: call.name.clone(),
-                    arguments: effective_args.clone(),
-                },
-            )?;
-
-            // Execute.
-            let ctx = ToolContext { cwd: self.cwd.clone() };
-            let exec_result = tool.execute(effective_args, &ctx).await;
-            let (content, is_error) = match exec_result {
-                Ok(o) => (o.content, o.is_error),
-                Err(e) => (format!("tool error: {e}"), true),
-            };
-
-            // Persist result.
-            session::append_entry(
-                &self.session_path,
-                &SessionEntry::ToolResult {
-                    tool_call_id: call.id.clone(),
-                    timestamp: time::now_iso8601(),
-                    content: content.clone(),
-                    is_error,
-                },
-            )?;
-            self.context.push_tool_result(call.id.clone(), content.clone(), is_error);
-
-            // Stream to renderer (so user sees tool output live).
-            let _ = tx
-                .send(AgentEvent::TextDelta {
-                    content_index: 0,
-                    text: format!("\n[{} → {} bytes]\n", call.name, content.len()),
-                })
-                .await;
-
-            // PostToolUse hooks (informational; v0.5 ignores their output).
-            if self.permission.hooks_active() && !self.hooks.post_tool_use.is_empty() {
-                let _ = run_hooks(
-                    &self.hooks.post_tool_use,
-                    HookEvent::PostToolUse,
-                    &call.name,
-                    Value::Object(Default::default()),
-                    &self.cwd,
-                    Some(&self.session_id.to_string()),
-                )
-                .await;
+                );
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: format!("\n[{} blocked: {}]\n", call.name, reason),
+                    })
+                    .await;
+                return ToolCallOutcome {
+                    call_id: call.id,
+                    tool_name: call.name,
+                    args: effective_args,
+                    content: result_text,
+                    is_error: true,
+                };
             }
         }
-        Ok(())
+    }
+
+    // Persist tool call.
+    let _ = session::append_entry(
+        &session_path,
+        &SessionEntry::ToolCall {
+            id: call.id.clone(),
+            timestamp: time::now_iso8601(),
+            tool_name: call.name.clone(),
+            arguments: effective_args.clone(),
+        },
+    );
+
+    // Resolve and execute.
+    let (content, is_error) = match registry.get(&call.name) {
+        Some(tool) => {
+            let ctx = ToolContext { cwd: cwd.clone() };
+            match tool.execute(effective_args.clone(), &ctx).await {
+                Ok(o) => (o.content, o.is_error),
+                Err(e) => (format!("tool error: {e}"), true),
+            }
+        }
+        None => (format!("unknown tool: {}", call.name), true),
+    };
+
+    // Persist result.
+    let _ = session::append_entry(
+        &session_path,
+        &SessionEntry::ToolResult {
+            tool_call_id: call.id.clone(),
+            timestamp: time::now_iso8601(),
+            content: content.clone(),
+            is_error,
+        },
+    );
+
+    // Stream to renderer.
+    let _ = tx
+        .send(AgentEvent::TextDelta {
+            content_index: 0,
+            text: format!("\n[{} → {} bytes]\n", call.name, content.len()),
+        })
+        .await;
+
+    // PostToolUse hooks.
+    if permission.hooks_active() && !hooks.post_tool_use.is_empty() {
+        let _ = run_hooks(
+            &hooks.post_tool_use,
+            HookEvent::PostToolUse,
+            &call.name,
+            Value::Object(Default::default()),
+            &cwd,
+            Some(&session_id.to_string()),
+        )
+        .await;
+    }
+
+    ToolCallOutcome {
+        call_id: call.id,
+        tool_name: call.name,
+        args: effective_args,
+        content,
+        is_error,
     }
 }
 
@@ -337,10 +464,11 @@ mod tests {
         let hooks = HooksConfig {
             pre_tool_use: vec![pre_hook],
             post_tool_use: vec![],
+            user_prompt_submit: vec![],
         };
         let mut agent = Agent {
             context: Context::default(),
-            provider: fake_provider(),
+            provider: Box::new(fake_provider()),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
             session_id: uuid::v7(),
@@ -390,7 +518,7 @@ mod tests {
 
         let mut agent = Agent {
             context: Context::default(),
-            provider: fake_provider(),
+            provider: Box::new(fake_provider()),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
             session_id: uuid::v7(),
@@ -432,5 +560,141 @@ mod tests {
             parameters: json!({"type":"object"}),
         });
         assert_eq!(ctx.tools.len(), 1);
+    }
+
+    /// Test-only Provider that emits a fixed assistant message and
+    /// `Done(Stop)`. No HTTP, no LLM.
+    struct FakeProvider {
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FakeProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        async fn stream_turn(
+            &self,
+            _ctx: &Context,
+            tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<Usage, String> {
+            let _ = tx
+                .send(AgentEvent::Start { message_id: "m".into() })
+                .await;
+            let _ = tx
+                .send(AgentEvent::TextDelta {
+                    content_index: 0,
+                    text: self.response.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage::default(),
+                })
+                .await;
+            Ok(Usage::default())
+        }
+    }
+
+    // ─────── v0.6: --continue / continue_last_session ───────
+
+    /// No active session registered for this cwd → returns None.
+    #[test]
+    fn continue_last_session_returns_none_when_no_history() {
+        let home = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+
+        let cwd = tmp();
+        let got = Agent::continue_last_session(&cwd);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+        assert!(got.is_none(), "expected None, got {got:?}");
+    }
+
+    /// After creating a session and registering it as active, returns
+    /// that session's path.
+    #[test]
+    fn continue_last_session_returns_active_path_after_use() {
+        let home = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+
+        let cwd = tmp();
+        let (path, _header) =
+            crate::session::new_session(&cwd, "m", "http://x").expect("new");
+        crate::session::set_active_session(&cwd, &path).expect("active");
+
+        let got = Agent::continue_last_session(&cwd).expect("some");
+        assert_eq!(got, path);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ─────── v0.6: parallel tool execution ───────
+
+    /// Two bash calls that each sleep 1s — they MUST run in parallel
+    /// (total wall time < 1.8s), not sequentially (<2s). v0.5 was
+    /// sequential; this test pins the new parallel contract.
+    #[tokio::test]
+    async fn execute_tool_calls_runs_in_parallel_not_sequence() {
+        use std::time::Instant;
+
+        let dir = tmp();
+        let session_path = dir.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider { response: "ok".into() }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, false, None),
+            hooks: HooksConfig::default(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let start = Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 1; echo a"}),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 1; echo b"}),
+                    },
+                ],
+                &tx,
+            )
+            .await
+            .expect("execute");
+        // Drain events.
+        while rx.try_recv().is_ok() {}
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "expected parallel execution (<1.8s), got {elapsed:?}"
+        );
     }
 }

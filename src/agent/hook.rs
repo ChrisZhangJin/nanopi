@@ -38,6 +38,7 @@ pub enum HookError {
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    UserPromptSubmit,
 }
 
 impl HookEvent {
@@ -45,6 +46,7 @@ impl HookEvent {
         match self {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
         }
     }
 }
@@ -440,3 +442,30 @@ mod tests {
         }
     }
 }
+    /// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
+    /// Round-trip its enum variant and env_var name.
+    #[test]
+    fn user_prompt_submit_event_round_trips() {
+        let v = HookEvent::UserPromptSubmit;
+        assert_eq!(v.env_var(), "UserPromptSubmit");
+        let s = serde_json::to_string(&v).unwrap();
+        let back: HookEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, v);
+    }
+
+    /// `UserPromptSubmit` hooks don't have a tool_name, but the input
+    /// payload still has a `prompt` field carrying the user's text.
+    #[test]
+    fn user_prompt_submit_input_has_event_field() {
+        let input = HookInput {
+            event: HookEvent::UserPromptSubmit,
+            tool_name: None,
+            tool_call_id: None,
+            arguments: serde_json::Value::String("hi".into()),
+            cwd: None,
+            session_id: None,
+        };
+        let s = serde_json::to_string(&input).unwrap();
+        assert!(s.contains("\"event\":\"user_prompt_submit\""), "got {s}");
+        assert!(s.contains("\"hi\""), "got {s}");
+    }

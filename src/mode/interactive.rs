@@ -68,7 +68,7 @@ pub async fn run_interactive_mode(
             messages: Vec::new(),
             tools: registry.all_specs(),
         },
-        provider,
+        provider: Box::new(provider),
         registry,
         session_path: session_path.clone(),
         session_id: header.id,
