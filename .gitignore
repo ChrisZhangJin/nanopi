@@ -7,3 +7,16 @@
 # Editor
 .vscode/
 .idea/
+
+# Smoke test scratch (created by tests/smoke.sh)
+tests/smoke-tmp/
+tests/*.tmp
+
+# Bash tool overflow logs (under os tmpdir)
+# Already in $TMPDIR, not in this repo, but listed for clarity if anyone
+# redirects them here.
+/tmp/nanopi-bash-*.log
+
+# Local debug logs (created with NANOPI_DEBUG or verbose flags)
+*.log
+!docs/**/*.log
