@@ -47,6 +47,7 @@ echo "What is 2+2?" | ./nanopi --yolo --model deepseek-v4-flash --base-url https
 ./nanopi -p --yolo "auto-format src/"
 
 # Hooks: configure under ~/.nanopi/settings.toml
+# NOTE: TOML keys are snake_case (`pre_tool_use`, not `PreToolUse`).
 # See docs/v0.5-research.md §6 for the protocol.
 ```
 

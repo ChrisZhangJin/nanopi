@@ -17,6 +17,7 @@ use crate::event::AgentEvent;
 use crate::provider::openai::OpenAiProvider;
 use crate::render::stdout::StdoutRenderer;
 use crate::session;
+use crate::settings;
 use crate::tool::ToolRegistry;
 
 pub async fn run_interactive_mode(
@@ -51,15 +52,29 @@ pub async fn run_interactive_mode(
     let provider = OpenAiProvider::new(base_url, api_key, model);
     let permission = PermissionGate::from_cli(yolo, no_hooks, approve);
 
+    let registry = ToolRegistry::standard();
+
+    let hooks = match settings::load_settings(&cwd) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("warning: failed to load settings: {e}");
+            HooksConfig::default()
+        }
+    };
+
     let mut agent = Agent {
-        context: Context::default(),
+        context: Context {
+            system: None,
+            messages: Vec::new(),
+            tools: registry.all_specs(),
+        },
         provider,
-        registry: ToolRegistry::standard(),
+        registry,
         session_path: session_path.clone(),
         session_id: header.id,
         cwd: cwd.clone(),
         permission,
-        hooks: HooksConfig::default(),
+        hooks,
     };
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);

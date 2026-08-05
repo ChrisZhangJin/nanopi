@@ -1,0 +1,5 @@
+# Project-local cargo config.
+# Force single-threaded test execution: several tests mutate $NANOPI_HOME
+# via a shared Mutex, and parallel runs deadlock.
+[test]
+jobs = 1

@@ -17,6 +17,7 @@ use crate::event::AgentEvent;
 use crate::provider::openai::OpenAiProvider;
 use crate::render::stdout::StdoutRenderer;
 use crate::session::{self, SessionEntry};
+use crate::settings;
 use crate::tool::ToolRegistry;
 use crate::util::time;
 
@@ -61,7 +62,13 @@ pub async fn run_print_mode(
 
     // For v0.5: no hooks loaded yet (settings.toml loader is a separate
     // concern). YOLO mode means trust is implicit.
-    let hooks = HooksConfig::default();
+    let hooks = match settings::load_settings(&cwd) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("warning: failed to load settings: {e}");
+            HooksConfig::default()
+        }
+    };
 
     let registry = ToolRegistry::standard();
 

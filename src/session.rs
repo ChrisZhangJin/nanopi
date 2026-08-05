@@ -274,10 +274,10 @@ pub fn active_session(cwd: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Tests below mutate $HOME; serialize so they don't race.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn active_session_roundtrip() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock();
         // Use NANOPI_HOME to isolate from real ~/.nanopi.
         let tmp_home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn active_session_replaces_existing() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock();
         let tmp_home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", &tmp_home);
