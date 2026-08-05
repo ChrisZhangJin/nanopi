@@ -1,0 +1,37 @@
+[package]
+name = "nanopi"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal Rust port of Pi agent — v0.1 demo"
+
+[dependencies]
+# CLI parsing — clap v4 with derive macros
+clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "derive"] }
+
+# Async HTTP client. Use the stream feature for SSE responses and json for
+# RequestBuilder::json(). Keep rustls-tls (no system OpenSSL dependency).
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+
+# Stream utilities for SSE iteration
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Async runtime
+tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "net"] }
+
+# JSON serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Config directory resolution (for ~/.nanopi/sessions)
+dirs = "5.0"
+
+[profile.release]
+opt-level = "z"          # optimize for size
+lto = true               # link-time optimization
+codegen-units = 1        # single codegen unit for better optimization
+panic = "abort"          # smaller binary, no unwind tables
+strip = true             # strip symbols
+incremental = false      # no incremental compilation for release
