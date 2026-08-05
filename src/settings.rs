@@ -1,0 +1,1 @@
+//! Settings file loader (hooks, etc.). Stub for Task 0d.

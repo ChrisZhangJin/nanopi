@@ -1,32 +1,62 @@
 [package]
 name = "nanopi"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
-description = "A minimal Rust port of Pi agent — v0.1 demo"
+description = "A minimal Rust port of Pi agent — v0.5"
+
+# v0.5 builds the modular binary; v0.1 entry kept around for regression testing.
+[[bin]]
+name = "nanopi"
+path = "src/main.rs"
+
+[[bin]]
+name = "nanopi_v0_1"
+path = "src/v0.1_main.rs"
+
+[lib]
+name = "nanopi"
+path = "src/lib.rs"
 
 [dependencies]
-# CLI parsing — clap v4 with derive macros
+# --- v0.1 deps (kept) ---
 clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "derive"] }
-
-# Async HTTP client. Use the stream feature for SSE responses and json for
-# RequestBuilder::json(). Keep rustls-tls (no system OpenSSL dependency).
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
-
-# Stream utilities for SSE iteration
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-# Async runtime
-tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "net"] }
-
-# JSON serialization
+bytes = { version = "1", default-features = false }
+tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "net", "process", "time", "sync", "signal"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = "1.0"
-
-# Error handling
 anyhow = "1.0"
-
-# Config directory resolution (for ~/.nanopi/sessions)
+thiserror = "1.0"
 dirs = "5.0"
+
+# --- v0.5 NEW ---
+# TUI (alt-screen, color, cursor, events).
+# crossterm 0.29+ dropped the granular features (cursor/terminal/style);
+# defaults include events + windows, which we trim to skip Windows deps.
+crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream", "bracketed-paste"] }
+
+# UUID v7 (time-ordered). Needs `std` for now_v7() (timestamp source).
+uuid = { version = "1.10", default-features = false, features = ["v7", "std", "serde"] }
+
+# YAML frontmatter for skills
+serde_yaml = "0.9"
+
+# Config + settings files
+toml = "0.8"
+
+# async fn in trait objects
+async-trait = "0.1"
+
+# Hook matcher regex
+regex = { version = "1.10", default-features = false, features = ["std"] }
+
+# Date/time (RFC3339 for sessions)
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = "z"          # optimize for size
