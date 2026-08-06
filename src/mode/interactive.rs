@@ -233,7 +233,15 @@ pub async fn run_interactive_mode(
                 turn_cancel.cancel();
             }
         });
-        run_one_turn(Arc::clone(&agent_slot), msg, Some(turn_cancel.clone())).await?;
+        match run_one_turn(Arc::clone(&agent_slot), msg, Some(turn_cancel.clone())).await {
+            Ok(_) => {}
+            Err(e) => {
+                // Provider errors (rate limit, timeout, 5xx) should NOT
+                // kill the whole REPL. Print and prompt again — the
+                // agent slot is already restored by run_one_turn.
+                eprintln!("\n[error: {e:#}]");
+            }
+        }
         link_task.abort();
         if turn_cancel.is_cancelled() {
             eprintln!("\n[turn cancelled — type next message to continue]");

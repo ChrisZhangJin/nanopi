@@ -125,6 +125,49 @@ impl WireError {
     }
 }
 
+/// Try to extract a human-readable message from a provider error body.
+/// Accepts:
+///   - raw JSON:      {"error": {"message": "..."}} or {"error": "..."}
+///   - SSE payload:   `event: error\ndata: {"type":"error","error":{"message":"..."}}`
+/// Returns None if nothing matches (caller falls back to the raw body).
+fn extract_error_message(body: &str) -> Option<String> {
+    // Case 1: whole body is JSON.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+        if let Some(m) = json_error_message(&v) {
+            return Some(m);
+        }
+    }
+    // Case 2: SSE — find the first `data:` line that parses as JSON with
+    // an error field.
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        if let Some(m) = json_error_message(&v) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+fn json_error_message(v: &serde_json::Value) -> Option<String> {
+    let err = v.get("error")?;
+    if let Some(s) = err.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(m) = err.get("message").and_then(|x| x.as_str()) {
+        return Some(m.to_string());
+    }
+    err.get("type").and_then(|x| x.as_str()).map(String::from)
+}
+
 /// The OpenAI-compatible provider.
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -311,9 +354,12 @@ impl OpenAiProvider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            // Try to extract a clean error message. Gateways send it in
+            // several shapes; fall through to the raw body if nothing matches.
+            let clean = extract_error_message(&body).unwrap_or_else(|| body.clone());
             return Err(OpenAiError::Status {
                 status: status.as_u16(),
-                body,
+                body: clean,
             });
         }
 
@@ -490,6 +536,30 @@ mod tests {
 
     fn collect_events(events: Vec<Result<AgentEvent, ()>>) -> Vec<AgentEvent> {
         events.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn extract_error_from_plain_json() {
+        let body = r#"{"error":{"message":"boom","type":"internal"}}"#;
+        assert_eq!(extract_error_message(body).as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn extract_error_from_flat_string() {
+        let body = r#"{"error":"OAuth expired"}"#;
+        assert_eq!(extract_error_message(body).as_deref(), Some("OAuth expired"));
+    }
+
+    #[test]
+    fn extract_error_from_sse_stream() {
+        let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"queue_timeout\",\"message\":\"queue full, retry later\"}}\n\ndata: [DONE]\n";
+        assert_eq!(extract_error_message(body).as_deref(), Some("queue full, retry later"));
+    }
+
+    #[test]
+    fn extract_error_returns_none_on_html() {
+        let body = "<html><body>502 Bad Gateway</body></html>";
+        assert!(extract_error_message(body).is_none());
     }
 
     #[test]
