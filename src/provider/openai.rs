@@ -168,6 +168,25 @@ fn json_error_message(v: &serde_json::Value) -> Option<String> {
     err.get("type").and_then(|x| x.as_str()).map(String::from)
 }
 
+/// Cheap 0..1 pseudo-random from the current nanosecond of the clock.
+/// Good enough for retry jitter — we don't need cryptographic entropy.
+fn rand01() -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.subsec_nanos() as f64) / 1_000_000_000.0
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n).collect();
+        t.push('…');
+        t
+    }
+}
+
 /// The OpenAI-compatible provider.
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -343,25 +362,71 @@ impl OpenAiProvider {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = build_request(ctx, &self.model);
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+        // ── Retry the OPEN of the stream on 429 / 5xx / transient network
+        // errors. Once the stream is producing events, we stop retrying —
+        // the caller has already seen a partial response.
+        let retry = crate::provider::retry::RetryConfig::default();
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let send_res = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            // Try to extract a clean error message. Gateways send it in
-            // several shapes; fall through to the raw body if nothing matches.
-            let clean = extract_error_message(&body).unwrap_or_else(|| body.clone());
-            return Err(OpenAiError::Status {
-                status: status.as_u16(),
-                body: clean,
-            });
-        }
+            match send_res {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => {
+                    let status = resp.status();
+                    let hint = crate::provider::retry::parse_retry_after(resp.headers());
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let clean = extract_error_message(&body_text)
+                        .unwrap_or_else(|| body_text.clone());
+                    let retryable = crate::provider::retry::is_retryable_status(status.as_u16())
+                        || crate::provider::retry::is_retryable_message(&clean);
+                    if attempt >= retry.max_attempts || !retryable {
+                        return Err(OpenAiError::Status {
+                            status: status.as_u16(),
+                            body: clean,
+                        });
+                    }
+                    let delay = crate::provider::retry::compute_delay(
+                        attempt, &retry, hint, rand01(),
+                    );
+                    eprintln!(
+                        "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                        status.as_u16(),
+                        truncate(&clean, 100),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let retryable = crate::provider::retry::is_retryable_message(&msg);
+                    if attempt >= retry.max_attempts || !retryable {
+                        return Err(OpenAiError::Http(e));
+                    }
+                    let delay = crate::provider::retry::compute_delay(
+                        attempt, &retry, None, rand01(),
+                    );
+                    eprintln!(
+                        "[retrying ({}/{}) after {:.1}s: {}]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                        truncate(&msg, 100),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        };
 
         let byte_stream = resp
             .bytes_stream()
