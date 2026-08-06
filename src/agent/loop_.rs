@@ -81,15 +81,33 @@ impl Agent {
         session_path: &Path,
         cwd: &Path,
     ) -> Result<Self, AgentError> {
+        use crate::agent::context::{ContentBlock, ContextMessage};
         let (header, entries) = crate::session::read_session(session_path)?;
         let mut context = Context::default();
         for entry in entries {
-            if let SessionEntry::Message { role, content, .. } = entry {
-                match role.as_str() {
-                    "user" => context.push_user_text(content),
-                    "assistant" => context.push_assistant_text(content),
-                    _ => {}
+            match entry {
+                SessionEntry::Message { role, content, .. } => {
+                    match role.as_str() {
+                        "user" => context.push_user_text(content),
+                        "assistant" => context.push_assistant_text(content),
+                        _ => {}
+                    }
                 }
+                SessionEntry::Compaction { summary, replaced_count, .. } => {
+                    // On replay: the first N messages we've pushed so far
+                    // are the ones that were summarized. Drop them and
+                    // insert the summary at index 0 so the surviving tail
+                    // stays in order.
+                    let n = replaced_count.min(context.messages.len());
+                    context.messages.drain(0..n);
+                    let summary_msg = ContextMessage::User {
+                        content: vec![ContentBlock::Text {
+                            text: format!("[Prior conversation summary]\n\n{summary}"),
+                        }],
+                    };
+                    context.messages.insert(0, summary_msg);
+                }
+                _ => {}
             }
         }
         Ok(Self {
@@ -135,6 +153,36 @@ impl Agent {
         .await;
     }
 
+    /// Force a compaction pass regardless of threshold. Bound to `/compact`
+    /// in interactive mode. Best-effort — a provider error triggers a
+    /// placeholder fallback, no error propagates up. Records a
+    /// `Compaction` SessionEntry on success.
+    pub async fn compact_now(&mut self) {
+        use crate::agent::compact::compact;
+        let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
+            return;
+        };
+        let _ = session::append_entry(
+            &self.session_path,
+            &SessionEntry::Compaction {
+                timestamp: time::now_iso8601(),
+                summary: result.summary,
+                replaced_count: result.replaced_count,
+            },
+        );
+    }
+
+    /// Threshold-gated version of `compact_now`. Called at the top of
+    /// each turn so long conversations don't blow the model's context
+    /// window.
+    pub async fn maybe_compact(&mut self) {
+        use crate::agent::compact::MAX_CONTEXT_CHARS;
+        if self.context.estimate_chars() < MAX_CONTEXT_CHARS {
+            return;
+        }
+        self.compact_now().await;
+    }
+
     /// Run a single user turn to completion. Streams events to `tx` and
     /// persists all messages, tool calls, and tool results to the session
     /// JSONL file. Returns the final concatenated assistant text.
@@ -151,6 +199,10 @@ impl Agent {
         tx: &mpsc::Sender<AgentEvent>,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<String, AgentError> {
+        // If the accumulated context is too big, compact it before adding
+        // the new user message so the new message survives intact.
+        self.maybe_compact().await;
+
         // Append user message to context + session.
         let user_id = uuid::v7().to_string();
         self.context.push_user_text(user_msg.to_string());
@@ -686,6 +738,87 @@ mod tests {
 
         let got = Agent::continue_last_session(&cwd).expect("some");
         assert_eq!(got, path);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ─────── v0.6+: compaction replay in load_session ───────
+
+    /// A Compaction entry in the JSONL should collapse the earlier messages
+    /// into a single summary user message on load. Tail is preserved.
+    #[test]
+    fn load_session_replays_compaction() {
+        let home = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = tmp();
+
+        let (path, _hdr) =
+            crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+        // 4 messages that WILL be compacted, then a Compaction entry, then a
+        // trailing message that must survive.
+        for i in 1..=4 {
+            crate::session::append_entry(
+                &path,
+                &SessionEntry::Message {
+                    id: uuid::v7().to_string(),
+                    timestamp: time::now_iso8601(),
+                    role: (if i % 2 == 0 { "assistant" } else { "user" }).into(),
+                    content: format!("m{i}"),
+                },
+            )
+            .unwrap();
+        }
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::Compaction {
+                timestamp: time::now_iso8601(),
+                summary: "the summary".into(),
+                replaced_count: 4,
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "after".into(),
+            },
+        )
+        .unwrap();
+
+        let agent = Agent::load_session(&path, &cwd).expect("load");
+        // Expect: [summary_user, "after"] — 2 messages total.
+        assert_eq!(agent.context.messages.len(), 2);
+        match &agent.context.messages[0] {
+            crate::agent::context::ContextMessage::User { content } => {
+                let text = match &content[0] {
+                    crate::agent::context::ContentBlock::Text { text } => text,
+                    _ => panic!("expected text"),
+                };
+                assert!(text.contains("Prior conversation summary"));
+                assert!(text.contains("the summary"));
+            }
+            _ => panic!("expected summary user"),
+        }
+        match &agent.context.messages[1] {
+            crate::agent::context::ContextMessage::User { content } => {
+                let text = match &content[0] {
+                    crate::agent::context::ContentBlock::Text { text } => text,
+                    _ => panic!("expected text"),
+                };
+                assert_eq!(text, "after");
+            }
+            _ => panic!("expected trailing user"),
+        }
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);

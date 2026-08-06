@@ -190,6 +190,20 @@ pub async fn run_interactive_mode(
             // Empty line == exit (v0.6+ explicit; Ctrl-D also exits).
             break;
         }
+        // Slash commands are handled locally, never sent to the LLM.
+        if msg == "/compact" {
+            let mut guard = agent_slot.lock().await;
+            if let Some(a) = guard.as_mut() {
+                let before = a.context.estimate_chars();
+                a.compact_now().await;
+                let after = a.context.estimate_chars();
+                eprintln!("[compacted: {before} → {after} chars]");
+            }
+            continue;
+        }
+        if msg == "/quit" || msg == "/exit" {
+            break;
+        }
         // Per-turn cancel token, distinct from the global one.
         let turn_cancel = CancellationToken::new();
         let cancel_link = cancel.clone();

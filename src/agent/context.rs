@@ -103,6 +103,82 @@ impl Context {
             is_error,
         });
     }
+
+    /// Rough size of the context in characters. Used as a proxy for
+    /// tokens (chars/4 ≈ tokens for English/code) by the compaction
+    /// trigger.
+    pub fn estimate_chars(&self) -> usize {
+        let mut n = self.system.as_deref().map(|s| s.len()).unwrap_or(0);
+        for m in &self.messages {
+            match m {
+                ContextMessage::User { content } => {
+                    for b in content {
+                        if let ContentBlock::Text { text } = b {
+                            n += text.len();
+                        }
+                    }
+                }
+                ContextMessage::Assistant { content } => {
+                    for b in content {
+                        match b {
+                            AssistantBlock::Text { text } | AssistantBlock::Thinking { text } => {
+                                n += text.len();
+                            }
+                            AssistantBlock::ToolCall { call } => {
+                                n += call.name.len();
+                                n += call.arguments.to_string().len();
+                            }
+                        }
+                    }
+                }
+                ContextMessage::Tool { content, .. } => n += content.len(),
+            }
+        }
+        n
+    }
+
+    /// Flatten a message range to a plain-text transcript for the
+    /// summarization prompt. Roles are labeled; tool_calls and
+    /// tool_results are rendered inline.
+    pub fn flatten_range(&self, start: usize, end: usize) -> String {
+        let mut out = String::new();
+        for m in &self.messages[start..end] {
+            match m {
+                ContextMessage::User { content } => {
+                    out.push_str("USER: ");
+                    for b in content {
+                        if let ContentBlock::Text { text } = b {
+                            out.push_str(text);
+                        }
+                    }
+                    out.push('\n');
+                }
+                ContextMessage::Assistant { content } => {
+                    out.push_str("ASSISTANT: ");
+                    for b in content {
+                        match b {
+                            AssistantBlock::Text { text } => out.push_str(text),
+                            AssistantBlock::Thinking { .. } => {}
+                            AssistantBlock::ToolCall { call } => {
+                                out.push_str(&format!(
+                                    "[tool_call {}({})]",
+                                    call.name,
+                                    call.arguments
+                                ));
+                            }
+                        }
+                    }
+                    out.push('\n');
+                }
+                ContextMessage::Tool { content, is_error, .. } => {
+                    out.push_str(if *is_error { "TOOL_ERROR: " } else { "TOOL: " });
+                    out.push_str(content);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +214,28 @@ mod tests {
         let back: Context = serde_json::from_str(&s).unwrap();
         assert_eq!(back.system.as_deref(), Some("You are helpful."));
         assert_eq!(back.messages.len(), 3);
+    }
+
+    #[test]
+    fn estimate_chars_sums_all_content() {
+        let mut ctx = Context::default();
+        ctx.system = Some("hi".into());          // 2
+        ctx.push_user_text("hello");             // 5
+        ctx.push_assistant_text("world");        // 5
+        ctx.push_tool_result("id", "output", false); // 6
+        assert_eq!(ctx.estimate_chars(), 2 + 5 + 5 + 6);
+    }
+
+    #[test]
+    fn flatten_range_labels_roles() {
+        let mut ctx = Context::default();
+        ctx.push_user_text("hi");
+        ctx.push_assistant_text("hello");
+        ctx.push_tool_result("id", "output", false);
+        let s = ctx.flatten_range(0, 3);
+        assert!(s.contains("USER: hi"));
+        assert!(s.contains("ASSISTANT: hello"));
+        assert!(s.contains("TOOL: output"));
     }
 
     #[test]

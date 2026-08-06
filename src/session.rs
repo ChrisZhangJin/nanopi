@@ -83,6 +83,15 @@ pub enum SessionEntry {
         from: String,
         to: String,
     },
+    /// Written when the agent compacts context to save tokens. Records the
+    /// generated summary and how many messages it replaced. Replay logic
+    /// (Agent::load_session) treats the summary as a user message.
+    #[serde(rename = "compaction")]
+    Compaction {
+        timestamp: String,
+        summary: String,
+        replaced_count: usize,
+    },
 }
 
 /// Metadata extracted from the session header.
@@ -733,6 +742,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
         assert!(r.is_err());
+    }
+
+    /// SessionEntry::Compaction serializes as `type = "compaction"` and
+    /// round-trips its summary + replaced_count.
+    #[test]
+    fn compaction_entry_serde_roundtrips() {
+        let entry = SessionEntry::Compaction {
+            timestamp: "2026-08-06T00:00:00Z".into(),
+            summary: "hello world".into(),
+            replaced_count: 12,
+        };
+        let s = serde_json::to_string(&entry).unwrap();
+        assert!(s.contains("\"type\":\"compaction\""), "got {s}");
+        assert!(s.contains("\"replaced_count\":12"), "got {s}");
+        let back: SessionEntry = serde_json::from_str(&s).unwrap();
+        matches!(back, SessionEntry::Compaction { .. });
     }
 
     /// --session <id> with a missing id returns error (not New).
