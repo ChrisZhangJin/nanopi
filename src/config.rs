@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::settings::HooksSection;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
@@ -32,36 +34,35 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Default model id (used when --model is absent).
-    pub default_model: Option<String>,
+    /// Model id (used when --model is absent and OPENAI_MODEL is unset).
+    pub model: Option<String>,
 
-    /// Default base URL (OpenAI-compatible provider root).
-    pub default_base_url: Option<String>,
+    /// Base URL (OpenAI-compatible provider root).
+    pub base_url: Option<String>,
 
-    /// How to resolve API key. v0.5 supports `env` (read OPENAI_API_KEY).
-    /// v0.6+ will add `file` (read 0600 file).
-    #[serde(default = "default_api_key_source")]
-    pub api_key_source: String,
-
-    /// Optional path to API key file (0600 perms).
+    /// Optional path to API key file (chmod 600). Recommended over
+    /// inline `api_key` for anything committed to VCS.
     pub api_key_file: Option<PathBuf>,
 
+    /// Inline api_key. Convenient for local dev; a stderr warning fires
+    /// at load time so the user notices before committing.
+    pub api_key: Option<String>,
+
+    /// Tool whitelist. Empty/absent = all standard tools.
     #[serde(default)]
-    pub tools: ToolsConfig,
+    pub tools: Vec<String>,
 
     #[serde(default)]
     pub trust: TrustConfig,
 
     #[serde(default)]
     pub logging: LoggingConfig,
-}
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct ToolsConfig {
-    pub default_timeout_secs: Option<u64>,
-    pub bash_max_output_bytes: Option<usize>,
-    pub bash_max_output_lines: Option<usize>,
+    /// v0.6+: hooks live in the same config.toml so users have one file
+    /// to edit. Same shape as `~/.nanopi/settings.toml` (which is still
+    /// loaded for backward compatibility — see `settings::load_settings`).
+    #[serde(default)]
+    pub hooks: HooksSection,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -78,33 +79,18 @@ pub struct LoggingConfig {
     pub file: Option<PathBuf>,
 }
 
-fn default_api_key_source() -> String {
-    "env".to_string()
-}
-
 impl Config {
     /// Built-in defaults when no config files exist.
     pub fn builtin_defaults() -> Self {
         Self {
-            default_model: None,
-            default_base_url: None,
-            api_key_source: "env".to_string(),
+            model: None,
+            base_url: None,
             api_key_file: None,
-            tools: ToolsConfig::default(),
+            api_key: None,
+            tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
-        }
-    }
-
-    /// Resolve a config value by key, in priority order:
-    /// flag > project > global > builtin default.
-    ///
-    /// Used by `Args::resolve()` to fill in fields the user didn't pass.
-    pub fn resolve_string(&self, key: &str) -> Option<String> {
-        match key {
-            "default_model" => self.default_model.clone(),
-            "default_base_url" => self.default_base_url.clone(),
-            _ => None,
+            hooks: HooksSection::default(),
         }
     }
 }
@@ -130,8 +116,12 @@ pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
     Ok(merged)
 }
 
-/// Path to the global config file, if $HOME is available.
+/// Path to the global config file. Honors NANOPI_HOME for test
+/// isolation; otherwise falls back to `$HOME/.nanopi/config.toml`.
 pub fn global_config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("NANOPI_HOME") {
+        return Some(PathBuf::from(p).join("config.toml"));
+    }
     let home = dirs::home_dir()?;
     Some(home.join(".nanopi").join("config.toml"))
 }
@@ -152,26 +142,29 @@ fn load_one(path: &Path) -> Result<Config, ConfigError> {
 /// Both sides already have serde defaults applied, so a field present
 /// only in `a` keeps its value. `Option<String>` semantics: `None` means
 /// "unset" (don't overwrite `b`'s value), `Some` means "use this".
+/// Hook vectors are concatenated (a first, then b) — hooks are policies,
+/// not overrides.
 fn merge(a: Config, b: Config) -> Config {
+    let mut hooks = HooksSection {
+        pre_tool_use: a.hooks.pre_tool_use,
+        post_tool_use: a.hooks.post_tool_use,
+        user_prompt_submit: a.hooks.user_prompt_submit,
+        session_start: a.hooks.session_start,
+        session_end: a.hooks.session_end,
+    };
+    hooks.pre_tool_use.extend(b.hooks.pre_tool_use);
+    hooks.post_tool_use.extend(b.hooks.post_tool_use);
+    hooks.user_prompt_submit.extend(b.hooks.user_prompt_submit);
+    hooks.session_start.extend(b.hooks.session_start);
+    hooks.session_end.extend(b.hooks.session_end);
+    // tools whitelist: `b` (project) wins if it declares any; else keep `a`.
+    let tools = if b.tools.is_empty() { a.tools } else { b.tools };
     Config {
-        default_model: b.default_model.or(a.default_model),
-        default_base_url: b.default_base_url.or(a.default_base_url),
-        api_key_source: if b.api_key_source != "env" || a.api_key_source != "env" {
-            // either side set something; b wins unless b is the default
-            if b.api_key_source == "env" {
-                a.api_key_source
-            } else {
-                b.api_key_source
-            }
-        } else {
-            "env".to_string()
-        },
+        model: b.model.or(a.model),
+        base_url: b.base_url.or(a.base_url),
         api_key_file: b.api_key_file.or(a.api_key_file),
-        tools: ToolsConfig {
-            default_timeout_secs: b.tools.default_timeout_secs.or(a.tools.default_timeout_secs),
-            bash_max_output_bytes: b.tools.bash_max_output_bytes.or(a.tools.bash_max_output_bytes),
-            bash_max_output_lines: b.tools.bash_max_output_lines.or(a.tools.bash_max_output_lines),
-        },
+        api_key: b.api_key.or(a.api_key),
+        tools,
         trust: TrustConfig {
             default: b.trust.default.or(a.trust.default),
         },
@@ -179,6 +172,7 @@ fn merge(a: Config, b: Config) -> Config {
             level: b.logging.level.or(a.logging.level),
             file: b.logging.file.or(a.logging.file),
         },
+        hooks,
     }
 }
 
@@ -218,44 +212,74 @@ mod tests {
         crate::util::uuid::v7().to_string()
     }
 
+    /// Test guard: point NANOPI_HOME at an empty temp dir so tests
+    /// don't pick up the real ~/.nanopi/config.toml. Restore on drop.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _dir: TempDir,
+    }
+    impl HomeGuard {
+        fn new() -> Self {
+            let dir = TempDir::new();
+            let prev = std::env::var_os("NANOPI_HOME");
+            std::env::set_var("NANOPI_HOME", dir.path());
+            Self { prev, _dir: dir }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(p) => std::env::set_var("NANOPI_HOME", p),
+                None => std::env::remove_var("NANOPI_HOME"),
+            }
+        }
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn builtin_defaults() {
         let c = Config::builtin_defaults();
-        assert_eq!(c.default_model, None);
-        assert_eq!(c.default_base_url, None);
-        assert_eq!(c.api_key_source, "env");
+        assert_eq!(c.model, None);
+        assert_eq!(c.base_url, None);
+        assert!(c.tools.is_empty());
     }
 
     #[test]
     fn missing_files_use_defaults() {
+        let _g = lock();
+        let _h = HomeGuard::new();
         let tmp = TempDir::new();
         let c = load_config(tmp.path()).unwrap();
-        assert_eq!(c.api_key_source, "env");
-        assert_eq!(c.default_model, None);
+        assert_eq!(c.model, None);
     }
 
     #[test]
     fn project_overrides_global() {
-        // We can't easily override $HOME for the test, so simulate by
-        // creating only a project-local config and checking it's loaded.
+        let _g = lock();
+        let _h = HomeGuard::new();
         let tmp = TempDir::new();
         tmp.write(
             ".nanopi/config.toml",
             r#"
-default_model = "project-model"
-default_base_url = "https://project.example/v1"
+model = "project-model"
+base_url = "https://project.example/v1"
 "#,
         );
         let c = load_config(tmp.path()).unwrap();
-        assert_eq!(c.default_model.as_deref(), Some("project-model"));
+        assert_eq!(c.model.as_deref(), Some("project-model"));
         assert_eq!(
-            c.default_base_url.as_deref(),
+            c.base_url.as_deref(),
             Some("https://project.example/v1")
         );
     }
 
     #[test]
     fn invalid_toml_is_error() {
+        let _g = lock();
+        let _h = HomeGuard::new();
         let tmp = TempDir::new();
         tmp.write(
             ".nanopi/config.toml",
@@ -268,44 +292,109 @@ default_base_url = "https://project.example/v1"
     #[test]
     fn merge_preserves_unset_fields() {
         let a = Config {
-            default_model: Some("a-model".into()),
-            default_base_url: None,
-            api_key_source: "env".into(),
+            model: Some("a-model".into()),
+            base_url: None,
             api_key_file: Some("/tmp/key".into()),
-            tools: ToolsConfig {
-                default_timeout_secs: Some(10),
-                bash_max_output_bytes: None,
-                bash_max_output_lines: None,
-            },
+            api_key: None,
+            tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
+            hooks: HooksSection::default(),
         };
         let b = Config {
-            default_model: None,
-            default_base_url: Some("https://b".into()),
-            api_key_source: "env".into(),
+            model: None,
+            base_url: Some("https://b".into()),
             api_key_file: None,
-            tools: ToolsConfig::default(),
+            api_key: None,
+            tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
+            hooks: HooksSection::default(),
         };
         let m = merge(a, b);
-        assert_eq!(m.default_model.as_deref(), Some("a-model"));
-        assert_eq!(m.default_base_url.as_deref(), Some("https://b"));
+        assert_eq!(m.model.as_deref(), Some("a-model"));
+        assert_eq!(m.base_url.as_deref(), Some("https://b"));
         assert_eq!(m.api_key_file.as_deref(), Some(Path::new("/tmp/key")));
+    }
+
+    #[test]
+    fn config_loads_inline_api_key_and_hooks() {
+        let _g = lock();
+        let _h = HomeGuard::new();
+        let tmp = TempDir::new();
+        tmp.write(
+            ".nanopi/config.toml",
+            r#"
+model = "cfg-model"
+base_url = "https://cfg.example/v1"
+api_key = "sk-inline-secret"
+tools = ["read", "write", "grep"]
+
+[[hooks.pre_tool_use]]
+matcher = "bash"
+type = "command"
+command = "/bin/true"
+timeout = 5000
+
+[[hooks.session_start]]
+matcher = "*"
+type = "command"
+command = "/bin/true"
+"#,
+        );
+        let c = load_config(tmp.path()).unwrap();
+        assert_eq!(c.model.as_deref(), Some("cfg-model"));
+        assert_eq!(c.api_key.as_deref(), Some("sk-inline-secret"));
+        assert_eq!(c.tools, vec!["read", "write", "grep"]);
+        assert_eq!(c.hooks.pre_tool_use.len(), 1);
+        assert_eq!(c.hooks.pre_tool_use[0].matcher, "bash");
+        assert_eq!(c.hooks.session_start.len(), 1);
+    }
+
+    #[test]
+    fn merge_concatenates_hooks() {
+        use crate::agent::hook::HookConfig;
+        let a = Config {
+            hooks: HooksSection {
+                pre_tool_use: vec![HookConfig {
+                    matcher: "a".into(),
+                    kind: "command".into(),
+                    command: "x".into(),
+                    timeout: 1000,
+                }],
+                ..HooksSection::default()
+            },
+            ..Config::builtin_defaults()
+        };
+        let b = Config {
+            hooks: HooksSection {
+                pre_tool_use: vec![HookConfig {
+                    matcher: "b".into(),
+                    kind: "command".into(),
+                    command: "y".into(),
+                    timeout: 1000,
+                }],
+                ..HooksSection::default()
+            },
+            ..Config::builtin_defaults()
+        };
+        let m = merge(a, b);
+        assert_eq!(m.hooks.pre_tool_use.len(), 2);
+        assert_eq!(m.hooks.pre_tool_use[0].matcher, "a");
+        assert_eq!(m.hooks.pre_tool_use[1].matcher, "b");
     }
 
     #[test]
     fn merge_lets_b_override_a() {
         let a = Config {
-            default_model: Some("a-model".into()),
+            model: Some("a-model".into()),
             ..Config::builtin_defaults()
         };
         let b = Config {
-            default_model: Some("b-model".into()),
+            model: Some("b-model".into()),
             ..Config::builtin_defaults()
         };
         let m = merge(a, b);
-        assert_eq!(m.default_model.as_deref(), Some("b-model"));
+        assert_eq!(m.model.as_deref(), Some("b-model"));
     }
 }

@@ -264,5 +264,25 @@ pass "session file with Compaction entry replays without error"
 rm -rf "$fake_dir"
 rm -f "$fake_sess"
 
+# Test 18: config.toml supplies model/base_url/api_key when env is empty.
+echo "=== Test 18: config.toml precedence ==="
+BIN_ABS=$(realpath "$BIN")
+cfg_dir=$(mktemp -d)
+mkdir -p "$cfg_dir/.nanopi"
+cat > "$cfg_dir/.nanopi/config.toml" <<CFG
+model = "$MODEL"
+base_url = "$BASE"
+api_key = "$KEY"
+CFG
+# Clean env (no OPENAI_*), no CLI flag for model/base_url/api_key.
+# NANOPI_HOME points at a nonexistent dir so no global config leaks in.
+(
+    cd "$cfg_dir"
+    env -i HOME="$HOME" PATH="$PATH" NANOPI_HOME="$cfg_dir/.nanopi-noglobal" \
+        "$BIN_ABS" -p --yolo "what is 2+2? one digit only" 2>/dev/null | grep -q '4'
+) || fail "config.toml alone didn't drive a successful turn"
+pass "config.toml supplies model/base_url/api_key (no flags, no env)"
+rm -rf "$cfg_dir"
+
 echo
 echo "All smoke tests passed."

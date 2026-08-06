@@ -58,7 +58,11 @@ impl HookEvent {
 /// One hook definition (parsed from settings.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
-    /// Regex matched against the tool name. Empty or `*` = match all.
+    /// Regex matched against the tool name (or session_id for session_*).
+    /// Empty or `*` = match all. Default when omitted is `"*"`, which is
+    /// the useful case for session_start / session_end where there's no
+    /// tool name to match.
+    #[serde(default = "default_matcher")]
     pub matcher: String,
     /// Shell command. Supports `~`, `$HOME`, `${HOME}` expansion.
     #[serde(rename = "type", default = "default_type")]
@@ -66,6 +70,10 @@ pub struct HookConfig {
     pub command: String,
     #[serde(default = "default_timeout")]
     pub timeout: u64, // ms
+}
+
+fn default_matcher() -> String {
+    "*".to_string()
 }
 
 fn default_type() -> String {

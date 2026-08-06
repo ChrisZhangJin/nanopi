@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use nanopi::config;
 use nanopi::mode::{interactive, print, tui};
 
 /// Minimal CLI — covers the v0.5 acceptance criteria.
@@ -96,38 +97,80 @@ async fn main() -> ExitCode {
         );
     }
 
-    // Resolve API key.
-    let api_key = match args.api_key {
-        Some(k) => k,
-        None => match std::env::var("OPENAI_API_KEY") {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("error: no --api-key and OPENAI_API_KEY is unset");
-                return ExitCode::from(2);
-            }
-        },
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Load ~/.nanopi/config.toml + ./.nanopi/config.toml (both optional).
+    // Failures here (malformed TOML) are fatal — better to surface early
+    // than to silently ignore user intent.
+    let cfg = match config::load_config(&cwd) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
     };
 
-    // Resolve model: CLI flag > OPENAI_MODEL env > error.
-    let model = match args.model.clone() {
-        Some(m) => m,
-        None => match std::env::var("OPENAI_MODEL") {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("error: no --model and OPENAI_MODEL is unset");
-                return ExitCode::from(2);
-            }
-        },
+    // Resolve model: flag > OPENAI_MODEL env > config.toml `model` > error.
+    let model = args
+        .model
+        .clone()
+        .or_else(|| std::env::var("OPENAI_MODEL").ok())
+        .or_else(|| cfg.model.clone());
+    let Some(model) = model else {
+        eprintln!(
+            "error: no --model / OPENAI_MODEL / model in ~/.nanopi/config.toml"
+        );
+        return ExitCode::from(2);
     };
 
-    // Resolve base URL: CLI flag > OPENAI_BASE_URL env > OpenAI default.
+    // Resolve base URL: flag > OPENAI_BASE_URL env > config.toml `base_url`
+    // > OpenAI default.
     let base_url = args
         .base_url
         .clone()
         .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+        .or_else(|| cfg.base_url.clone())
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Resolve API key: flag > OPENAI_API_KEY env > config.api_key (with
+    // warning) > config.api_key_file (read file) > error.
+    let api_key = match args.api_key {
+        Some(k) => k,
+        None => match std::env::var("OPENAI_API_KEY") {
+            Ok(v) => v,
+            Err(_) => match &cfg.api_key {
+                Some(k) => {
+                    eprintln!(
+                        "⚠ api_key is inline in config.toml — consider api_key_file \
+                         or OPENAI_API_KEY env var to avoid accidental commits"
+                    );
+                    k.clone()
+                }
+                None => match &cfg.api_key_file {
+                    Some(p) => {
+                        let path = expand_tilde(p);
+                        match std::fs::read_to_string(&path) {
+                            Ok(s) => s.trim().to_string(),
+                            Err(e) => {
+                                eprintln!(
+                                    "error: cannot read api_key_file {}: {e}",
+                                    path.display()
+                                );
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "error: no --api-key / OPENAI_API_KEY / \
+                             api_key / api_key_file in config.toml"
+                        );
+                        return ExitCode::from(2);
+                    }
+                },
+            },
+        },
+    };
 
     let approve = if args.approve {
         Some(true)
@@ -206,4 +249,16 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Expand a leading `~/` to `$HOME/`. Best-effort — if HOME is unset,
+/// the path is returned unchanged.
+fn expand_tilde(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    p.to_path_buf()
 }

@@ -1,7 +1,14 @@
 //! Settings file loader — hooks configuration.
 //!
-//! Reads `~/.nanopi/settings.toml` (or `./.nanopi/settings.toml` for
-//! project-local overrides). Returns an empty config on missing files.
+//! v0.6+: hooks now primarily live in `config.toml` alongside CLI
+//! defaults. `settings.toml` is still read for backward compatibility;
+//! its hooks are appended to whatever `config.toml` declared.
+//!
+//! Load order for hooks (all are optional, hooks are cumulative):
+//!   1. `~/.nanopi/config.toml`   [hooks.*] section        (new primary)
+//!   2. `./.nanopi/config.toml`   [hooks.*] section        (new primary)
+//!   3. `~/.nanopi/settings.toml` [[hooks.*]]              (legacy)
+//!   4. `./.nanopi/settings.toml` [[hooks.*]]              (legacy)
 
 use std::path::{Path, PathBuf};
 
@@ -64,11 +71,29 @@ impl From<Settings> for HooksConfig {
     }
 }
 
-/// Load settings from global + project-local, merged (project wins on
-/// duplicate section names, but we append rather than merge within arrays).
+/// Load hooks from config.toml (primary, v0.6+) and settings.toml
+/// (legacy, backward-compat). Hooks are cumulative — all matching hooks
+/// from all four sources fire in the order they were declared.
 pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     let mut hooks = HooksConfig::default();
 
+    // v0.6+: hooks in config.toml (global + local) come first.
+    match crate::config::load_config(cwd) {
+        Ok(cfg) => {
+            hooks.pre_tool_use.extend(cfg.hooks.pre_tool_use);
+            hooks.post_tool_use.extend(cfg.hooks.post_tool_use);
+            hooks.user_prompt_submit.extend(cfg.hooks.user_prompt_submit);
+            hooks.session_start.extend(cfg.hooks.session_start);
+            hooks.session_end.extend(cfg.hooks.session_end);
+        }
+        Err(e) => {
+            // config.toml parse errors surface as SettingsError so mode
+            // code doesn't need a separate handler.
+            return Err(SettingsError::Matcher(format!("config.toml: {e}")));
+        }
+    }
+
+    // Legacy: settings.toml (global + local) hooks append.
     let global_path = global_settings_path();
     if let Some(p) = global_path {
         if p.exists() {
@@ -201,6 +226,59 @@ timeout = 2000
             std::env::remove_var("NANOPI_HOME");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_toml_hooks_and_legacy_settings_toml_hooks_both_load() {
+        let _guard = lock();
+        let dir = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &dir);
+
+        // Legacy settings.toml — one pre_tool_use hook.
+        std::fs::write(
+            dir.join("settings.toml"),
+            r#"
+[[hooks.pre_tool_use]]
+matcher = "legacy"
+type = "command"
+command = "/bin/true"
+timeout = 1000
+"#,
+        )
+        .unwrap();
+        // New config.toml — one pre_tool_use hook plus a session_start.
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+[[hooks.pre_tool_use]]
+matcher = "modern"
+type = "command"
+command = "/bin/true"
+timeout = 1000
+
+[[hooks.session_start]]
+matcher = "*"
+type = "command"
+command = "/bin/true"
+"#,
+        )
+        .unwrap();
+
+        let h = load_settings(&PathBuf::from("/tmp")).unwrap();
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Both hooks present, config.toml first, settings.toml appended.
+        assert_eq!(h.pre_tool_use.len(), 2);
+        assert_eq!(h.pre_tool_use[0].matcher, "modern");
+        assert_eq!(h.pre_tool_use[1].matcher, "legacy");
+        assert_eq!(h.session_start.len(), 1);
     }
 
     #[test]

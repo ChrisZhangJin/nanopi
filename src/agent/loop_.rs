@@ -703,9 +703,14 @@ mod tests {
 
     // ─────── v0.6: --continue / continue_last_session ───────
 
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// No active session registered for this cwd → returns None.
     #[test]
     fn continue_last_session_returns_none_when_no_history() {
+        let _g = lock();
         let home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", &home);
@@ -727,6 +732,7 @@ mod tests {
     /// that session's path.
     #[test]
     fn continue_last_session_returns_active_path_after_use() {
+        let _g = lock();
         let home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", &home);
@@ -754,6 +760,7 @@ mod tests {
     /// into a single summary user message on load. Tail is preserved.
     #[test]
     fn load_session_replays_compaction() {
+        let _g = lock();
         let home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", &home);
