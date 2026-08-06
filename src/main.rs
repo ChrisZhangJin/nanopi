@@ -13,13 +13,15 @@ use nanopi::mode::{interactive, print, tui};
 #[derive(Parser, Debug)]
 #[command(name = "nanopi", version, about = "minimal Pi port in Rust (v0.5)")]
 struct Args {
-    /// OpenAI-compatible API base URL.
-    #[arg(long, default_value = "https://api.openai.com/v1")]
-    base_url: String,
-
-    /// Model identifier (provider-specific).
+    /// OpenAI-compatible API base URL. Falls back to OPENAI_BASE_URL
+    /// env var, then to https://api.openai.com/v1.
     #[arg(long)]
-    model: String,
+    base_url: Option<String>,
+
+    /// Model identifier (provider-specific). Falls back to OPENAI_MODEL
+    /// env var.
+    #[arg(long)]
+    model: Option<String>,
 
     /// API key. Falls back to OPENAI_API_KEY env var.
     #[arg(long)]
@@ -106,6 +108,25 @@ async fn main() -> ExitCode {
         },
     };
 
+    // Resolve model: CLI flag > OPENAI_MODEL env > error.
+    let model = match args.model.clone() {
+        Some(m) => m,
+        None => match std::env::var("OPENAI_MODEL") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("error: no --model and OPENAI_MODEL is unset");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    // Resolve base URL: CLI flag > OPENAI_BASE_URL env > OpenAI default.
+    let base_url = args
+        .base_url
+        .clone()
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let approve = if args.approve {
@@ -132,8 +153,8 @@ async fn main() -> ExitCode {
             }
         };
         print::run_print_mode(
-            &args.base_url,
-            &args.model,
+            &base_url,
+            &model,
             &api_key,
             message,
             output_format,
@@ -148,8 +169,8 @@ async fn main() -> ExitCode {
         .await
     } else if args.tui {
         tui::run_tui_mode(
-            &args.base_url,
-            &args.model,
+            &base_url,
+            &model,
             &api_key,
             cwd,
             args.yolo,
@@ -163,8 +184,8 @@ async fn main() -> ExitCode {
     } else {
         let message = args.message.clone().or(args.positional_message.clone());
         interactive::run_interactive_mode(
-            &args.base_url,
-            &args.model,
+            &base_url,
+            &model,
             &api_key,
             message,
             cwd,
