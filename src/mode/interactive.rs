@@ -312,9 +312,36 @@ async fn run_one_turn(
     drop(tx); // close the main sender; task has its own clone
 
     let mut renderer = StdoutRenderer::new();
+    let mut spinner = Some(crate::render::spinner::Spinner::start("thinking"));
     while let Some(ev) = rx.recv().await {
+        // First user-visible event (text, tool, or error) → stop spinner
+        // and let the renderer take over.
+        if let Some(mut s) = spinner.take() {
+            if is_visible_event(&ev) {
+                s.stop().await;
+            } else {
+                // Not visible yet (e.g. Start / ThinkingDelta) — keep
+                // the spinner alive.
+                spinner = Some(s);
+            }
+        }
         let _ = renderer.render(&ev);
+    }
+    if let Some(mut s) = spinner.take() {
+        s.stop().await;
     }
     let result = task.await?;
     result.map(|_| 0).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// An event that produces terminal output the user can see. The
+/// spinner steps aside when one of these arrives; other events (Start,
+/// bare ThinkingDelta, etc.) leave it running.
+fn is_visible_event(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::TextDelta { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::Error { .. }
+    )
 }

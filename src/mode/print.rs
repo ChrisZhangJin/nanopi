@@ -141,11 +141,33 @@ let (session_path, header) = match &choice {
     };
 
     let mut renderer = StdoutRenderer::new();
+    // Spinner only in text mode. JSON mode buffers everything and dumps at
+    // the end, so no user-facing terminal chatter to keep alive.
+    let mut spinner = if output == OutputFormat::Text {
+        Some(crate::render::spinner::Spinner::start("thinking"))
+    } else {
+        None
+    };
     while let Some(ev) = rx.recv().await {
         if output == OutputFormat::Text {
+            if let Some(mut s) = spinner.take() {
+                if matches!(
+                    ev,
+                    AgentEvent::TextDelta { .. }
+                        | AgentEvent::ToolCall { .. }
+                        | AgentEvent::Error { .. }
+                ) {
+                    s.stop().await;
+                } else {
+                    spinner = Some(s);
+                }
+            }
             let _ = renderer.render(&ev);
         }
         // JSON mode: ignore events (we'll build envelope at the end).
+    }
+    if let Some(mut s) = spinner.take() {
+        s.stop().await;
     }
     let final_text = agent_task.await??;
 
