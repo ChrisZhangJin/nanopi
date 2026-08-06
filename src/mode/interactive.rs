@@ -359,18 +359,50 @@ async fn run_one_turn(
     drop(tx); // close the main sender; task has its own clone
 
     let mut renderer = StdoutRenderer::new();
-    let mut spinner = Some(crate::render::spinner::Spinner::start("thinking"));
+    // Spinner lives for the full turn, with labels that follow the
+    // state machine:
+    //   idle           → "thinking"          (waiting for first token)
+    //   assistant text → hidden              (real output flowing)
+    //   tool_call      → "running <name>"    (tool about to execute)
+    //   tool result    → "thinking"          (waiting for next LLM iter)
+    // Done events do NOT stop the spinner because Done(ToolCalls) is
+    // followed by silent tool execution + another stream_turn; the
+    // spinner should carry through. Final teardown happens after the
+    // outer channel closes.
+    let mut spinner: Option<crate::render::spinner::Spinner> =
+        Some(crate::render::spinner::Spinner::start("thinking"));
     while let Some(ev) = rx.recv().await {
-        // First user-visible event (text, tool, or error) → stop spinner
-        // and let the renderer take over.
-        if let Some(mut s) = spinner.take() {
-            if is_visible_event(&ev) {
-                s.stop().await;
-            } else {
-                // Not visible yet (e.g. Start / ThinkingDelta) — keep
-                // the spinner alive.
-                spinner = Some(s);
+        match &ev {
+            AgentEvent::TextDelta { text, .. } => {
+                // Distinguish the synthetic tool-result marker
+                // (`\n[<tool> → <N> bytes]\n`) from real assistant
+                // text so we can restart the spinner for the next
+                // LLM round.
+                if is_tool_result_marker(text) {
+                    if let Some(mut s) = spinner.take() {
+                        s.stop().await;
+                    }
+                    spinner = Some(crate::render::spinner::Spinner::start("thinking"));
+                } else {
+                    if let Some(mut s) = spinner.take() {
+                        s.stop().await;
+                    }
+                }
             }
+            AgentEvent::ToolCall { call, .. } => {
+                if let Some(mut s) = spinner.take() {
+                    s.stop().await;
+                }
+                let label = tool_spinner_label(&call.name, &call.arguments);
+                spinner = Some(crate::render::spinner::Spinner::start(label));
+            }
+            AgentEvent::Error { .. } => {
+                if let Some(mut s) = spinner.take() {
+                    s.stop().await;
+                }
+            }
+            // Done / Start / ThinkingDelta: leave spinner alone.
+            _ => {}
         }
         let _ = renderer.render(&ev);
     }
@@ -381,9 +413,51 @@ async fn run_one_turn(
     result.map(|_| 0).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// An event that produces terminal output the user can see. The
-/// spinner steps aside when one of these arrives; other events (Start,
-/// bare ThinkingDelta, etc.) leave it running.
+/// Does this TextDelta match the synthetic marker emitted by
+/// `Agent::execute_tool_calls` after a tool completes? Format is
+/// `\n[<tool_name> → <N> bytes]\n`. Used by the spinner to know when
+/// tool execution finished and it's now waiting on the LLM again.
+fn is_tool_result_marker(text: &str) -> bool {
+    text.starts_with("\n[") && text.contains(" → ") && text.ends_with(" bytes]\n")
+}
+
+/// Build a spinner label for a specific tool call, so the user sees
+/// what's actually running. Falls back to `running <tool>` for
+/// unknown tools. Normalizes gateway-mangled names (`Bash_tool` →
+/// `bash`) so labels stay canonical even when the upstream is buggy.
+fn tool_spinner_label(name: &str, args: &serde_json::Value) -> String {
+    let lower = name.to_ascii_lowercase();
+    let canonical = lower.strip_suffix("_tool").unwrap_or(&lower);
+    let arg_preview = match canonical {
+        "bash" => args.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        "read" | "write" | "edit" | "ls" => args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        "grep" | "find" => args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        _ => None,
+    };
+    let verb = match canonical {
+        "bash" => "running bash",
+        "read" => "reading",
+        "write" => "writing",
+        "edit" => "editing",
+        "grep" => "grepping for",
+        "find" => "finding",
+        "ls" => "listing",
+        other => return format!("running {other}"),
+    };
+    match arg_preview {
+        Some(s) => {
+            let clipped: String = s.chars().take(60).collect();
+            let ellip = if s.chars().count() > 60 { "…" } else { "" };
+            format!("{verb} {clipped}{ellip}")
+        }
+        None => format!("running {canonical}"),
+    }
+}
+
+/// (Kept for backward-compat with earlier code paths; no longer used
+/// by the primary spinner loop.) An event that produces terminal
+/// output the user can see.
+#[allow(dead_code)]
 fn is_visible_event(ev: &AgentEvent) -> bool {
     matches!(
         ev,
