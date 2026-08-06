@@ -40,6 +40,9 @@ dirs = "5.0"
 # defaults include events + windows, which we trim to skip Windows deps.
 crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream", "bracketed-paste"] }
 
+# v0.6+: ratatui full TUI (opt-in via --tui). Layered on crossterm.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+
 # UUID v7 (time-ordered). Needs `std` for now_v7() (timestamp source).
 uuid = { version = "1.10", default-features = false, features = ["v7", "std", "serde"] }
 

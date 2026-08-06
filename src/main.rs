@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use nanopi::mode::{interactive, print};
+use nanopi::mode::{interactive, print, tui};
 
 /// Minimal CLI — covers the v0.5 acceptance criteria.
 #[derive(Parser, Debug)]
@@ -72,6 +72,11 @@ struct Args {
     #[arg(long = "fork", value_name = "SESSION_ID", conflicts_with_all = ["continue_session"])]
     fork_id: Option<String>,
 
+    /// Full ratatui-based TUI (alt-screen, layout, scrollback). Default is
+    /// the streaming stdout interactive mode.
+    #[arg(long)]
+    tui: bool,
+
     /// Tool whitelist (comma-separated names). Default: all standard tools.
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
@@ -132,6 +137,20 @@ async fn main() -> ExitCode {
             &api_key,
             message,
             output_format,
+            cwd,
+            args.yolo,
+            args.no_hooks,
+            approve,
+            args.continue_session,
+            args.session_id.clone(),
+            args.fork_id.clone(),
+        )
+        .await
+    } else if args.tui {
+        tui::run_tui_mode(
+            &args.base_url,
+            &args.model,
+            &api_key,
             cwd,
             args.yolo,
             args.no_hooks,
