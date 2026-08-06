@@ -75,10 +75,17 @@ struct Args {
     #[arg(long = "fork", value_name = "SESSION_ID", conflicts_with_all = ["continue_session"])]
     fork_id: Option<String>,
 
-    /// Full ratatui-based TUI (alt-screen, layout, scrollback). Default is
-    /// the streaming stdout interactive mode.
-    #[arg(long)]
+    /// Force the full ratatui TUI (alt-screen) even if stdin isn't a
+    /// TTY. Without this or `--no-tui`, the mode is auto-selected:
+    /// TTY → TUI, pipe/non-TTY → rustyline classic mode.
+    #[arg(long, conflicts_with = "no_tui")]
     tui: bool,
+
+    /// Force the rustyline classic mode (line-oriented, pipe-friendly)
+    /// even in a TTY. Useful for scripts, CI, and users who prefer to
+    /// keep terminal scrollback.
+    #[arg(long = "no-tui")]
+    no_tui: bool,
 
     /// Tool whitelist (comma-separated names). Default: all standard tools.
     #[arg(long, value_delimiter = ',')]
@@ -134,7 +141,7 @@ async fn main() -> ExitCode {
 
     // Resolve API key: flag > OPENAI_API_KEY env > config.api_key (with
     // warning) > config.api_key_file (read file) > error.
-    let api_key = match args.api_key {
+    let api_key = match args.api_key.clone() {
         Some(k) => k,
         None => match std::env::var("OPENAI_API_KEY") {
             Ok(v) => v,
@@ -210,7 +217,7 @@ async fn main() -> ExitCode {
             args.fork_id.clone(),
         )
         .await
-    } else if args.tui {
+    } else if should_use_tui(&args) {
         tui::run_tui_mode(
             &base_url,
             &model,
@@ -249,6 +256,26 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Decide whether to enter the full ratatui TUI. Priority:
+///   --tui explicit    →  TUI
+///   --no-tui explicit →  rustyline (classic)
+///   stdin is a TTY    →  TUI  (nanopi's PI-style default)
+///   otherwise         →  rustyline (pipe/CI-friendly, single-shot)
+///
+/// The `-p` (print) branch is decided elsewhere in main and never
+/// reaches this function, so we don't need to handle it here.
+fn should_use_tui(args: &Args) -> bool {
+    if args.tui {
+        return true;
+    }
+    if args.no_tui {
+        return false;
+    }
+    // Auto: TTY on stdin means an interactive user session.
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 /// Expand a leading `~/` to `$HOME/`. Best-effort — if HOME is unset,
