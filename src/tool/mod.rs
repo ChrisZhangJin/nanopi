@@ -10,6 +10,9 @@
 
 pub mod bash;
 pub mod edit;
+pub mod find;
+pub mod grep;
+pub mod ls;
 pub mod read;
 pub mod write;
 
@@ -88,19 +91,23 @@ impl ToolRegistry {
         n
     }
 
-    /// Build the standard 4-tool registry (read, write, edit, bash).
+    /// Build the standard tool registry (read, write, edit, bash + grep, find, ls).
     pub fn standard() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(read::ReadTool));
         r.register(Arc::new(write::WriteTool));
         r.register(Arc::new(edit::EditTool));
         r.register(Arc::new(bash::BashTool::new()));
+        r.register(Arc::new(grep::GrepTool));
+        r.register(Arc::new(find::FindTool));
+        r.register(Arc::new(ls::LsTool));
         r
     }
 }
 
 /// Names of all standard tools. Useful for the `--tools` whitelist filter.
-pub const STANDARD_TOOL_NAMES: &[&str] = &["read", "write", "edit", "bash"];
+pub const STANDARD_TOOL_NAMES: &[&str] =
+    &["read", "write", "edit", "bash", "grep", "find", "ls"];
 
 /// Parse the `--tools` comma-separated whitelist and return the set of
 /// tool names the agent is allowed to invoke. Unknown names are an error.
@@ -194,10 +201,11 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_has_four_tools() {
+    fn standard_registry_has_all_tools() {
         let r = ToolRegistry::standard();
         for n in STANDARD_TOOL_NAMES {
             assert!(r.get(n).is_some(), "missing standard tool: {n}");
         }
+        assert_eq!(r.names().len(), STANDARD_TOOL_NAMES.len());
     }
 }
