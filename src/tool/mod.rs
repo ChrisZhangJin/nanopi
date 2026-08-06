@@ -78,7 +78,26 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        // Fast path: exact match. Normal case, zero overhead.
+        if let Some(t) = self.tools.get(name) {
+            return Some(t.clone());
+        }
+        // Fallback: some OpenAI-compat gateways mangle Anthropic tool_use
+        // names when translating streaming SSE (e.g. `read` → `Read_tool`).
+        // Lowercase, strip trailing `_tool`, look up again. If it lands,
+        // warn once per call so the underlying issue stays visible.
+        let normalized = name.to_ascii_lowercase();
+        let normalized = normalized.strip_suffix("_tool").unwrap_or(&normalized);
+        if normalized != name {
+            if let Some(t) = self.tools.get(normalized) {
+                eprintln!(
+                    "warning: tool name {name:?} normalized to {normalized:?} \
+                     (upstream provider/gateway may be mangling names)"
+                );
+                return Some(t.clone());
+            }
+        }
+        None
     }
 
     pub fn all_specs(&self) -> Vec<ToolSpec> {
@@ -157,6 +176,22 @@ mod tests {
         r.register(t);
         assert!(r.get("echo").is_some());
         assert!(r.get("nope").is_none());
+    }
+
+    /// Gateway-mangled names should resolve via the fallback path:
+    /// lowercase + strip trailing `_tool`.
+    #[test]
+    fn registry_get_normalizes_mangled_names() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(EchoTool));
+        // Various shapes the upstream gateway has been observed to emit.
+        assert!(r.get("Echo_tool").is_some(), "PascalCase + _tool");
+        assert!(r.get("ECHO_TOOL").is_some(), "all caps + _tool");
+        assert!(r.get("echo_tool").is_some(), "lowercase + _tool");
+        assert!(r.get("Echo").is_some(), "PascalCase alone");
+        // Unrelated names must still miss.
+        assert!(r.get("something_tool").is_none());
+        assert!(r.get("random").is_none());
     }
 
     #[test]
