@@ -105,9 +105,24 @@ struct WireUsage {
     cached_tokens: u32,
 }
 
+/// Gateways send errors mid-stream in one of two shapes:
+///   { "error": { "message": "..." } }   (OpenAI convention)
+///   { "error": "..." }                   (some proxies flatten it)
+/// This untagged enum accepts either.
 #[derive(Debug, Deserialize)]
-struct WireError {
-    message: String,
+#[serde(untagged)]
+enum WireError {
+    Struct { message: String },
+    Flat(String),
+}
+
+impl WireError {
+    fn message(&self) -> &str {
+        match self {
+            WireError::Struct { message } => message,
+            WireError::Flat(s) => s,
+        }
+    }
 }
 
 /// The OpenAI-compatible provider.
@@ -318,7 +333,7 @@ impl OpenAiProvider {
             let ev = event.map_err(|e| OpenAiError::Sse(e.to_string()))?;
             let chunk: WireChunk = serde_json::from_str(&ev.data)?;
             if let Some(err) = chunk.error {
-                return Err(OpenAiError::Api(err.message));
+                return Err(OpenAiError::Api(err.message().to_string()));
             }
             if !started {
                 started = true;
