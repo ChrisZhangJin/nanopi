@@ -38,7 +38,10 @@ impl StdoutRenderer {
                 out.flush()?;
             }
             AgentEvent::Done { .. } => {
-                write!(out, "\x1b[0m")?;
+                // Trailing newline ensures the next terminal write (e.g. a
+                // rustyline `> ` prompt) starts on a fresh row instead of
+                // overwriting the last chunk of assistant text.
+                write!(out, "\x1b[0m\n")?;
                 out.flush()?;
             }
             AgentEvent::Error { error } => {
