@@ -82,20 +82,35 @@ impl ToolRegistry {
         if let Some(t) = self.tools.get(name) {
             return Some(t.clone());
         }
-        // Fallback: some OpenAI-compat gateways mangle Anthropic tool_use
-        // names when translating streaming SSE (e.g. `read` → `Read_tool`).
-        // Lowercase, strip trailing `_tool`, look up again. If it lands,
-        // warn once per call so the underlying issue stays visible.
-        let normalized = name.to_ascii_lowercase();
-        let normalized = normalized.strip_suffix("_tool").unwrap_or(&normalized);
-        if normalized != name {
-            if let Some(t) = self.tools.get(normalized) {
+        // Fallback: gateway-mangled names (see `canonical_name`).
+        if let Some(canonical) = self.canonical_name(name) {
+            if canonical != name {
                 eprintln!(
-                    "warning: tool name {name:?} normalized to {normalized:?} \
+                    "warning: tool name {name:?} normalized to {canonical:?} \
                      (upstream provider/gateway may be mangling names)"
                 );
-                return Some(t.clone());
             }
+            return self.tools.get(&canonical).cloned();
+        }
+        None
+    }
+
+    /// Resolve a (possibly mangled) tool name to its canonical registered
+    /// form. Used both by `get()` for dispatch and by the agent loop to
+    /// normalize names before writing them into the assistant's tool_call
+    /// history — otherwise the LLM sees a name in its own history that
+    /// doesn't match the tools spec and thrashes with self-corrections.
+    ///
+    /// Rule: lowercase, strip trailing `_tool`. If the result matches a
+    /// registered tool, return it; else None.
+    pub fn canonical_name(&self, name: &str) -> Option<String> {
+        if self.tools.contains_key(name) {
+            return Some(name.to_string());
+        }
+        let normalized = name.to_ascii_lowercase();
+        let normalized = normalized.strip_suffix("_tool").unwrap_or(&normalized);
+        if self.tools.contains_key(normalized) {
+            return Some(normalized.to_string());
         }
         None
     }

@@ -259,7 +259,7 @@ impl Agent {
                 return Err(AgentError::Provider(e.to_string()));
             }
 
-            let (calls, done, assistant_text) = if let Some(ct) = cancel.as_ref() {
+            let (mut calls, done, assistant_text) = if let Some(ct) = cancel.as_ref() {
                 tokio::select! {
                     _ = ct.cancelled() => {
                         // Cancellation: drop any partial result and return
@@ -272,6 +272,18 @@ impl Agent {
             } else {
                 collect_task.await.map_err(|e| AgentError::Provider(format!("collect task: {e}")))?
             };
+
+            // Normalize gateway-mangled tool names (e.g. `Bash_tool` → `bash`)
+            // BEFORE anything downstream sees them. Otherwise:
+            //   - the assistant's own tool_call history in context ends up
+            //     with a name that doesn't match `tools`, so the next LLM
+            //     turn thinks it made a typo and retries in a loop;
+            //   - session JSONL persists the mangled name.
+            for c in calls.iter_mut() {
+                if let Some(canonical) = self.registry.canonical_name(&c.name) {
+                    c.name = canonical;
+                }
+            }
 
             // Persist assistant text + push assistant message to context.
             // CRITICAL: must include ToolCall blocks so the provider knows
