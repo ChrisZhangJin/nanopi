@@ -59,8 +59,12 @@ impl Tool for GrepTool {
             .ok_or_else(|| ToolError::InvalidArgs("pattern must be a string".into()))?;
         let ci = args["case_insensitive"].as_bool().unwrap_or(false);
         let all = args["all"].as_bool().unwrap_or(false);
+        // `unicode(false)` uses ASCII case-folding, which is enough for
+        // our line-oriented use case and doesn't require the `regex`
+        // crate's optional `unicode-case` feature.
         let re = RegexBuilder::new(pattern)
             .case_insensitive(ci)
+            .unicode(false)
             .build()
             .map_err(|e| ToolError::InvalidArgs(format!("invalid regex: {e}")))?;
         let base_str = args["path"].as_str().unwrap_or(".");

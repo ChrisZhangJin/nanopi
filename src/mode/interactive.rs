@@ -157,26 +157,42 @@ pub async fn run_interactive_mode(
         // task so we never have two simultaneous `&mut editor` borrows.
         let history_path_for_task = history_path.clone();
         let editor_for_task = Arc::clone(&editor);
-        let readline = tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
+        // ReadOutcome preserves EOF vs Interrupted vs Other so we can exit
+        // cleanly on piped stdin (rustyline returns Eof immediately when
+        // stdin isn't a TTY).
+        enum ReadOutcome {
+            Line(String),
+            Eof,
+            Interrupted,
+            Other(String),
+        }
+        let readline = tokio::task::spawn_blocking(move || -> ReadOutcome {
             let mut editor = editor_for_task
                 .lock()
                 .expect("editor lock poisoned");
-            let prompt = "> ";
-            let result = editor.readline(&prompt);
-            // Re-save history after every read so ↑↓ works across crashes.
+            let result = editor.readline("> ");
             if let Some(p) = &history_path_for_task {
                 let _ = editor.append_history(p);
             }
-            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))
+            match result {
+                Ok(s) => ReadOutcome::Line(s),
+                Err(rustyline::error::ReadlineError::Eof) => ReadOutcome::Eof,
+                Err(rustyline::error::ReadlineError::Interrupted) => ReadOutcome::Interrupted,
+                Err(e) => ReadOutcome::Other(format!("{e}")),
+            }
         })
         .await;
         let line = match readline {
-            Ok(Ok(line)) => line,
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+            Ok(ReadOutcome::Line(s)) => s,
+            Ok(ReadOutcome::Eof) => {
+                // Ctrl-D or piped-stdin exhausted → clean exit.
+                break;
+            }
+            Ok(ReadOutcome::Interrupted) => {
                 // Ctrl-C during readline: ignore the line, loop again.
                 continue;
             }
-            Ok(Err(e)) => {
+            Ok(ReadOutcome::Other(e)) => {
                 eprintln!("\n[input error: {e}]");
                 continue;
             }
