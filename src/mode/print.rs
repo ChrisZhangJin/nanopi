@@ -106,6 +106,7 @@ let (session_path, header) = match &choice {
         a.registry = registry;
         a.permission = permission_for_resume;
         a.hooks = hooks;
+        a.model = model.to_string();
         a
     } else {
         Agent {
@@ -121,6 +122,9 @@ let (session_path, header) = match &choice {
             cwd: cwd.clone(),
             permission,
             hooks,
+            model: model.to_string(),
+            usage_total: crate::event::Usage::default(),
+            turn_count: 0,
         }
     };
 

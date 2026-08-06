@@ -3,6 +3,7 @@
 //! `main.rs` is a thin shim that dispatches to `mode::*`. All real logic lives here.
 
 pub mod config;
+pub mod pricing;
 pub mod session;
 pub mod settings;
 pub mod trust;

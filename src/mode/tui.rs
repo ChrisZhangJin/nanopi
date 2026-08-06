@@ -98,6 +98,7 @@ pub async fn run_tui_mode(
         a.registry = registry;
         a.permission = permission;
         a.hooks = hooks;
+        a.model = model.to_string();
         a
     } else {
         Agent {
@@ -113,6 +114,9 @@ pub async fn run_tui_mode(
             cwd: cwd.clone(),
             permission,
             hooks,
+            model: model.to_string(),
+            usage_total: crate::event::Usage::default(),
+            turn_count: 0,
         }
     };
 
@@ -127,7 +131,7 @@ pub async fn run_tui_mode(
     }
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(header.id.to_string(), model.to_string());
+    let mut app = App::new(header.id.to_string(), model.to_string(), cwd.clone());
     let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
 
     // Restore terminal even on error.
@@ -196,10 +200,20 @@ struct App {
     session_id: String,
     model: String,
     should_exit: bool,
+    /// Snapshot of the Agent's cwd (used by the status footer for
+    /// the pwd + git-branch line). Updated whenever we can lock the
+    /// slot.
+    cwd: PathBuf,
+    /// Cumulative usage across all turns in this session.
+    usage: crate::event::Usage,
+    /// Current context size in characters (rough proxy for tokens).
+    context_chars: usize,
+    /// How many turns have completed. Displayed in the status line.
+    turn_count: u32,
 }
 
 impl App {
-    fn new(session_id: String, model: String) -> Self {
+    fn new(session_id: String, model: String, cwd: PathBuf) -> Self {
         let mut app = Self {
             lines: Vec::new(),
             last_line_is_assistant: false,
@@ -209,6 +223,10 @@ impl App {
             session_id,
             model,
             should_exit: false,
+            cwd,
+            usage: crate::event::Usage::default(),
+            context_chars: 0,
+            turn_count: 0,
         };
         app.push_system_line("nanopi TUI. Enter to submit, Ctrl-C cancels a turn, Ctrl-D exits.");
         app
@@ -332,6 +350,9 @@ async fn run_app(
                                     app.push_system_line(format!(
                                         "[compacted: {before} → {after} chars]"
                                     ));
+                                    app.context_chars = after;
+                                    app.usage = a.usage_total.clone();
+                                    app.turn_count = a.turn_count;
                                 }
                             }
                             KeyAction::StartTurn(msg) => {
@@ -381,6 +402,9 @@ async fn run_app(
                         ag_rx = None;
                         cancel = None;
                         app.status = Status::Idle;
+                        // Snapshot fresh Agent metrics into App for status
+                        // footer rendering.
+                        refresh_status(app, &agent_slot).await;
                         if let Some(t) = turn_task.take() {
                             match t.await {
                                 Ok(Ok(_final_text)) => {}
@@ -405,6 +429,18 @@ async fn recv_optional(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<Ag
     match rx.as_mut() {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Copy the Agent's live metrics into App fields so the status footer
+/// can render without holding the agent lock during draw.
+async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
+    let g = agent.lock().await;
+    if let Some(a) = g.as_ref() {
+        app.usage = a.usage_total.clone();
+        app.context_chars = a.context.estimate_chars();
+        app.turn_count = a.turn_count;
+        app.cwd = a.cwd.clone();
     }
 }
 
@@ -502,17 +538,20 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title
-            Constraint::Min(3),    // body
-            Constraint::Length(1), // status
+            Constraint::Min(3),    // body (grows)
+            Constraint::Length(3), // status footer (3 lines, PI-style)
             Constraint::Length(3), // input (bordered)
         ])
         .split(f.area());
 
-    // Title.
+    // Title — session id + turn count.
     let sid_short = &app.session_id[..8.min(app.session_id.len())];
     let title = Paragraph::new(Line::from(vec![
         Span::styled("nanopi ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!("session {} · model {}", sid_short, app.model)),
+        Span::raw(format!(
+            "session {} · turn {}",
+            sid_short, app.turn_count
+        )),
     ]))
     .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(title, chunks[0]);
@@ -524,14 +563,67 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         .scroll((app.scroll, 0));
     f.render_widget(body, chunks[1]);
 
-    // Status.
-    let status_text = match &app.status {
-        Status::Idle => "idle · Ctrl-C cancel · Ctrl-D exit · PgUp/PgDn scroll · /compact",
+    // ── Status footer (3 lines, PI-style) ──────────────────────────
+    let footer_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1); 3])
+        .split(chunks[2]);
+    let footer_style = Style::default().bg(Color::Reset).fg(Color::DarkGray);
+
+    // Line 1: cwd + git branch + short session id (right-aligned)
+    let cwd_str = crate::render::status_line::cwd_display(&app.cwd);
+    let branch = crate::render::status_line::git_branch(&app.cwd);
+    let mut left = vec![Span::styled(cwd_str, Style::default().fg(Color::Cyan))];
+    if !branch.is_empty() {
+        left.push(Span::raw(" ("));
+        left.push(Span::styled(branch, Style::default().fg(Color::Magenta)));
+        left.push(Span::raw(")"));
+    }
+    let l1 = Paragraph::new(Line::from(left)).style(footer_style);
+    f.render_widget(l1, footer_chunks[0]);
+
+    // Line 2: tokens + cost + model
+    let tokens_str = crate::render::status_line::tokens_summary(&app.usage);
+    let cost_str = crate::render::status_line::cost_string(&app.model, &app.usage);
+    let mut mid = vec![
+        Span::styled(tokens_str, Style::default().fg(Color::White)),
+    ];
+    if !cost_str.is_empty() {
+        mid.push(Span::raw("  "));
+        mid.push(Span::styled(cost_str, Style::default().fg(Color::Green)));
+    }
+    mid.push(Span::raw("  "));
+    mid.push(Span::styled(
+        app.model.clone(),
+        Style::default().fg(Color::LightBlue),
+    ));
+    let l2 = Paragraph::new(Line::from(mid)).style(footer_style);
+    f.render_widget(l2, footer_chunks[1]);
+
+    // Line 3: context% + status hint
+    let mut bottom = Vec::new();
+    if let Some(pct) = crate::render::status_line::context_percent(
+        &app.model,
+        app.context_chars,
+    ) {
+        let color = match crate::render::status_line::context_color(pct) {
+            "red" => Color::Red,
+            "yellow" => Color::Yellow,
+            _ => Color::Green,
+        };
+        bottom.push(Span::styled(
+            format!("{pct}% context"),
+            Style::default().fg(color),
+        ));
+        bottom.push(Span::raw("  "));
+    }
+    let hint = match &app.status {
+        Status::Idle => "idle · Ctrl-C exit · PgUp/PgDn scroll · /compact",
         Status::Streaming => "streaming · Ctrl-C cancel",
     };
-    let status = Paragraph::new(status_text)
-        .style(Style::default().bg(Color::Blue).fg(Color::White));
-    f.render_widget(status, chunks[2]);
+    bottom.push(Span::raw(hint));
+    let l3 = Paragraph::new(Line::from(bottom)).style(footer_style);
+    f.render_widget(l3, footer_chunks[2]);
 
     // Input.
     let input_text = format!("> {}", app.input);
@@ -546,7 +638,7 @@ mod tests {
 
     #[test]
     fn interpret_key_typing_appends() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         let k = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Nothing));
         assert_eq!(app.input, "a");
@@ -554,7 +646,7 @@ mod tests {
 
     #[test]
     fn interpret_key_backspace_pops() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         app.input = "abc".into();
         let k = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Nothing));
@@ -563,7 +655,7 @@ mod tests {
 
     #[test]
     fn interpret_key_enter_starts_turn() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         app.input = "hello".into();
         let k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         match interpret_key(&mut app, k) {
@@ -575,14 +667,14 @@ mod tests {
 
     #[test]
     fn interpret_key_enter_empty_is_noop() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         let k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Nothing));
     }
 
     #[test]
     fn interpret_key_slash_quit_exits() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         app.input = "/quit".into();
         let k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Exit));
@@ -590,7 +682,7 @@ mod tests {
 
     #[test]
     fn interpret_key_slash_compact_returns_compact() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         app.input = "/compact".into();
         let k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Compact));
@@ -598,14 +690,14 @@ mod tests {
 
     #[test]
     fn interpret_key_ctrl_d_exits() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         let k = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Exit));
     }
 
     #[test]
     fn interpret_key_ctrl_c_while_streaming_cancels() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         app.status = Status::Streaming;
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::CancelTurn));
@@ -613,14 +705,14 @@ mod tests {
 
     #[test]
     fn interpret_key_ctrl_c_while_idle_exits() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(interpret_key(&mut app, k), KeyAction::Exit));
     }
 
     #[test]
     fn push_assistant_delta_appends_to_prev() {
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         app.push_assistant_delta("hello ");
         app.push_assistant_delta("world");
         assert_eq!(app.lines.last().unwrap().spans.len(), 2);
@@ -629,7 +721,7 @@ mod tests {
     #[test]
     fn on_agent_event_tool_call_appends_line() {
         use crate::event::ToolCall;
-        let mut app = App::new("s".into(), "m".into());
+        let mut app = App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"));
         let before = app.lines.len();
         on_agent_event(&mut app, AgentEvent::ToolCall {
             content_index: 0,

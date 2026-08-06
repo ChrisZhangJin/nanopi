@@ -7,5 +7,6 @@
 pub mod alt_screen;
 pub mod panel;
 pub mod spinner;
+pub mod status_line;
 pub mod stdout;
 pub mod tui;

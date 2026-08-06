@@ -77,6 +77,7 @@ pub async fn run_interactive_mode(
             a.registry = registry;
             a.permission = permission_for_resume;
             a.hooks = hooks;
+            a.model = model.to_string();
             a
         } else {
             Agent {
@@ -92,6 +93,9 @@ pub async fn run_interactive_mode(
                 cwd: cwd.clone(),
                 permission,
                 hooks,
+                model: model.to_string(),
+                usage_total: crate::event::Usage::default(),
+                turn_count: 0,
             }
         }
     });
@@ -233,6 +237,9 @@ pub async fn run_interactive_mode(
                 turn_cancel.cancel();
             }
         });
+        // Pre-turn dim status line: model · tokens · cost · cwd · branch.
+        print_pre_turn_status(&agent_slot).await;
+        let turn_started = std::time::Instant::now();
         match run_one_turn(Arc::clone(&agent_slot), msg, Some(turn_cancel.clone())).await {
             Ok(_) => {}
             Err(e) => {
@@ -246,6 +253,8 @@ pub async fn run_interactive_mode(
         if turn_cancel.is_cancelled() {
             eprintln!("\n[turn cancelled — type next message to continue]");
         }
+        // Post-turn dim footer: ↑input ↓output · elapsed · turn #N.
+        print_post_turn_status(&agent_slot, turn_started.elapsed()).await;
     }
 
     eprintln!(
@@ -261,6 +270,44 @@ pub async fn run_interactive_mode(
     fire_lifecycle_hook(&agent_slot, false).await;
 
     Ok(0)
+}
+
+/// Print a dim-gray status line BEFORE the assistant starts streaming,
+/// so the user sees what state they're about to spend on. Format:
+///   `model · ↑1.2k ↓340 · $0.05 · ~/dir · branch`
+/// Missing pieces (unknown cost, no branch) are dropped. Best-effort:
+/// silently skips if the agent slot is locked/empty.
+async fn print_pre_turn_status(agent: &Arc<Mutex<Option<Agent>>>) {
+    let g = agent.lock().await;
+    if let Some(a) = g.as_ref() {
+        let line = crate::render::status_line::classic_status_line(
+            &a.model,
+            &a.usage_total,
+            &a.cwd,
+        );
+        // ANSI dim (2) + reset (0) — matches other stderr chatter.
+        eprintln!("\x1b[2m{line}\x1b[0m");
+    }
+}
+
+/// Print a dim-gray delta after a turn completes: token delta this
+/// turn (approximated as diff between now and pre-turn snapshot is
+/// tricky without extra state; we just show cumulative + turn count
+/// + wall time).
+async fn print_post_turn_status(
+    agent: &Arc<Mutex<Option<Agent>>>,
+    elapsed: std::time::Duration,
+) {
+    let g = agent.lock().await;
+    if let Some(a) = g.as_ref() {
+        eprintln!(
+            "\x1b[2m↑{} ↓{} · {:.1}s · turn #{}\x1b[0m",
+            crate::pricing::fmt_tokens(a.usage_total.input_tokens),
+            crate::pricing::fmt_tokens(a.usage_total.output_tokens),
+            elapsed.as_secs_f64(),
+            a.turn_count,
+        );
+    }
 }
 
 /// Fire session_start (start=true) or session_end (start=false) hooks

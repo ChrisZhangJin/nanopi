@@ -70,6 +70,17 @@ pub struct Agent {
     pub cwd: PathBuf,
     pub permission: PermissionGate,
     pub hooks: HooksConfig,
+    /// The model id string, cached here so status-line renderers can
+    /// read it without going through the Provider trait (which has
+    /// no `model()` method today).
+    pub model: String,
+    /// Cumulative token usage over the whole session — summed across
+    /// every LLM turn (including compaction summarization). Read by
+    /// the status bar; never resets except on `Agent::load_session`
+    /// (fresh Agent starts at zero).
+    pub usage_total: Usage,
+    /// Turn counter, incremented at the start of every `run_turn`.
+    pub turn_count: u32,
 }
 
 impl Agent {
@@ -119,6 +130,9 @@ impl Agent {
             cwd: cwd.to_path_buf(),
             permission: PermissionGate::from_cli(false, false, None),
             hooks: HooksConfig::default(),
+            model: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
         })
     }
 
@@ -202,6 +216,7 @@ impl Agent {
         // If the accumulated context is too big, compact it before adding
         // the new user message so the new message survives intact.
         self.maybe_compact().await;
+        self.turn_count = self.turn_count.saturating_add(1);
 
         // Append user message to context + session.
         let user_id = uuid::v7().to_string();
@@ -325,10 +340,16 @@ impl Agent {
                 );
             }
 
-            let Some((finish_reason, _usage)) = done else {
+            let Some((finish_reason, usage)) = done else {
                 // Stream ended without Done. Treat as Stop.
                 return Ok(final_text);
             };
+
+            // Accumulate tokens across every LLM iteration in the session.
+            self.usage_total.input_tokens = self.usage_total.input_tokens.saturating_add(usage.input_tokens);
+            self.usage_total.output_tokens = self.usage_total.output_tokens.saturating_add(usage.output_tokens);
+            self.usage_total.cache_read_tokens = self.usage_total.cache_read_tokens.saturating_add(usage.cache_read_tokens);
+            self.usage_total.cache_write_tokens = self.usage_total.cache_write_tokens.saturating_add(usage.cache_write_tokens);
 
             match finish_reason {
                 FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
@@ -591,6 +612,9 @@ mod tests {
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, false, None),
             hooks,
+            model: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -641,6 +665,9 @@ mod tests {
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, false, None),
             hooks: HooksConfig::default(),
+            model: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -870,6 +897,9 @@ mod tests {
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, false, None),
             hooks: HooksConfig::default(),
+            model: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
