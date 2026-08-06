@@ -189,8 +189,11 @@ pub async fn run_interactive_mode(
                 break;
             }
             Ok(ReadOutcome::Interrupted) => {
-                // Ctrl-C during readline: ignore the line, loop again.
-                continue;
+                // Ctrl-C at the prompt: exit cleanly. (Ctrl-C during a
+                // running turn is handled elsewhere — the tokio signal
+                // handler cancels that turn and control returns here.)
+                eprintln!();
+                break;
             }
             Ok(ReadOutcome::Other(e)) => {
                 eprintln!("\n[input error: {e}]");

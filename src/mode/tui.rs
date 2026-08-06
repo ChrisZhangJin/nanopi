@@ -411,12 +411,13 @@ async fn recv_optional(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<Ag
 /// Pure key → action mapping. Also mutates the input buffer for
 /// backspace/typing. Returns a top-level action for the loop to enact.
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
-    // Ctrl-C: cancel current turn (or ignore if idle).
+    // Ctrl-C: cancel current turn if one is running; otherwise exit.
+    // (Matches the default interactive-mode semantics.)
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
         return if app.status == Status::Streaming {
             KeyAction::CancelTurn
         } else {
-            KeyAction::Nothing
+            KeyAction::Exit
         };
     }
     // Ctrl-D: exit.
@@ -611,10 +612,10 @@ mod tests {
     }
 
     #[test]
-    fn interpret_key_ctrl_c_while_idle_is_noop() {
+    fn interpret_key_ctrl_c_while_idle_exits() {
         let mut app = App::new("s".into(), "m".into());
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(interpret_key(&mut app, k), KeyAction::Nothing));
+        assert!(matches!(interpret_key(&mut app, k), KeyAction::Exit));
     }
 
     #[test]
