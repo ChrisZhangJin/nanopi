@@ -1,0 +1,88 @@
+# nanopi config.toml
+#
+# Loaded from two locations (both optional, project overrides global):
+#   1. ~/.nanopi/config.toml        (global — user-wide defaults)
+#   2. <cwd>/.nanopi/config.toml    (project-local — overrides global)
+#
+# Precedence for any given value:
+#   --flag  >  OPENAI_* env var  >  project config  >  global config  >  default/error
+#
+# Every field below is optional. Copy this file to
+# ~/.nanopi/config.toml (or ./.nanopi/config.toml) and edit as needed.
+
+# ─── Model / endpoint ────────────────────────────────────────────────
+
+# Model identifier (whatever the provider expects).
+model = "gpt-5"
+
+# OpenAI-compatible endpoint. Set this when using a proxy, self-hosted
+# gateway, or non-OpenAI provider (DeepSeek, Gemini via gateway, etc.).
+base_url = "https://api.openai.com/v1"
+
+# ─── API key: pick ONE of the two below ─────────────────────────────
+
+# Option A — file (recommended). Path to a chmod-600 file containing
+# just the token. `~/` expands to $HOME.
+# api_key_file = "~/.nanopi/api_key"
+
+# Option B — inline (convenient for local dev). A stderr warning fires
+# at startup so you don't accidentally commit this file with the key.
+# api_key = "sk-..."
+
+# ─── Tool whitelist (optional) ──────────────────────────────────────
+
+# Comma-list of standard tools the agent is allowed to invoke.
+# Empty or absent = all standard tools available.
+# Valid names: read, write, edit, bash, grep, find, ls
+# tools = ["read", "grep", "find", "ls"]     # safe read-only preset
+# tools = ["read", "write", "edit", "bash"]  # full dev preset
+
+# ─── Trust default (optional) ───────────────────────────────────────
+
+# Overrides the interactive trust prompt for project-local resources.
+# One of: "trusted", "distrusted", "ask" (default).
+# [trust]
+# default = "trusted"
+
+# ─── Hooks ──────────────────────────────────────────────────────────
+#
+# Each hook is a bash command run at a lifecycle event.
+# Fields:
+#   matcher  regex against tool_name (or session_id for session_*).
+#            Defaults to "*" (match all) — required-looking blocks
+#            that omit it work fine.
+#   type     "command" (only value in v0.6+); optional.
+#   command  Path/expression run via `bash -c "..."`. Supports ~,
+#            $HOME, ${HOME}.
+#   timeout  Milliseconds. Default 5000.
+#
+# The hook receives a JSON payload on stdin describing the event.
+# Exit code 2 (or a JSON stdout {"decision":"block"}) blocks the
+# tool call; anything else allows.
+#
+# All hook vectors are cumulative — multiple hooks of the same type
+# fire in declaration order.
+
+# Ex 1: veto dangerous rm invocations before bash runs them.
+# [[hooks.pre_tool_use]]
+# matcher = "^bash$"
+# command = "~/.nanopi/hooks/check-rm-rf.sh"
+# timeout = 5000
+
+# Ex 2: log every tool result to a file for later audit.
+# [[hooks.post_tool_use]]
+# matcher = "*"
+# command = "cat >> ~/.nanopi/tool-audit.log"
+
+# Ex 3: refuse prompts that contain a specific secret pattern.
+# [[hooks.user_prompt_submit]]
+# command = "~/.nanopi/hooks/redact-secrets.sh"
+
+# Ex 4: notify on session start (matcher defaults to "*"; session_id
+# is what the matcher runs against for session_* events).
+# [[hooks.session_start]]
+# command = "echo \"[nanopi] session started at $(date)\" >> ~/.nanopi/sessions.log"
+
+# Ex 5: run cleanup on session exit.
+# [[hooks.session_end]]
+# command = "~/.nanopi/hooks/cleanup.sh"
