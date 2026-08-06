@@ -46,6 +46,10 @@ pub struct HooksSection {
     pub post_tool_use: Vec<HookConfig>,
     #[serde(default)]
     pub user_prompt_submit: Vec<HookConfig>,
+    #[serde(default)]
+    pub session_start: Vec<HookConfig>,
+    #[serde(default)]
+    pub session_end: Vec<HookConfig>,
 }
 
 impl From<Settings> for HooksConfig {
@@ -54,6 +58,8 @@ impl From<Settings> for HooksConfig {
             pre_tool_use: s.hooks.pre_tool_use,
             post_tool_use: s.hooks.post_tool_use,
             user_prompt_submit: s.hooks.user_prompt_submit,
+            session_start: s.hooks.session_start,
+            session_end: s.hooks.session_end,
         }
     }
 }
@@ -69,6 +75,9 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
             let s = load_one(&p)?;
             hooks.pre_tool_use.extend(s.hooks.pre_tool_use);
             hooks.post_tool_use.extend(s.hooks.post_tool_use);
+            hooks.user_prompt_submit.extend(s.hooks.user_prompt_submit);
+            hooks.session_start.extend(s.hooks.session_start);
+            hooks.session_end.extend(s.hooks.session_end);
         }
     }
 
@@ -77,12 +86,21 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
         let s = load_one(&local_path)?;
         hooks.pre_tool_use.extend(s.hooks.pre_tool_use);
         hooks.post_tool_use.extend(s.hooks.post_tool_use);
+        hooks.user_prompt_submit.extend(s.hooks.user_prompt_submit);
+        hooks.session_start.extend(s.hooks.session_start);
+        hooks.session_end.extend(s.hooks.session_end);
     }
 
     // Validate regex matchers up front; surface errors at startup.
     crate::agent::hook::validate_hooks(&hooks.pre_tool_use)
         .map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.post_tool_use)
+        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.user_prompt_submit)
+        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_start)
+        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_end)
         .map_err(SettingsError::Matcher)?;
 
     Ok(hooks)

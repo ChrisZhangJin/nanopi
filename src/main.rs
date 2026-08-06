@@ -58,7 +58,21 @@ struct Args {
     #[arg(short = 'N', long = "distrust")]
     no_approve: bool,
 
-    /// Tool whitelist (comma-separated names). Default: all 4 standard tools.
+    /// Resume the most recently used session for this cwd.
+    /// Falls back to a fresh session if no history exists.
+    #[arg(short = 'c', long = "continue")]
+    continue_session: bool,
+
+    /// Resume a specific session by id (full UUID or prefix).
+    #[arg(long = "session", value_name = "SESSION_ID", conflicts_with_all = ["continue_session", "fork_id"])]
+    session_id: Option<String>,
+
+    /// Fork a session: copy its history into a new session (parent_id set),
+    /// then use the new session. Original is untouched.
+    #[arg(long = "fork", value_name = "SESSION_ID", conflicts_with_all = ["continue_session"])]
+    fork_id: Option<String>,
+
+    /// Tool whitelist (comma-separated names). Default: all standard tools.
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
 }
@@ -122,6 +136,9 @@ async fn main() -> ExitCode {
             args.yolo,
             args.no_hooks,
             approve,
+            args.continue_session,
+            args.session_id.clone(),
+            args.fork_id.clone(),
         )
         .await
     } else {
@@ -135,6 +152,9 @@ async fn main() -> ExitCode {
             args.yolo,
             args.no_hooks,
             approve,
+            args.continue_session,
+            args.session_id.clone(),
+            args.fork_id.clone(),
         )
         .await
     };

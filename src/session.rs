@@ -168,6 +168,103 @@ pub fn append_entry(path: &Path, entry: &SessionEntry) -> Result<(), SessionErro
     Ok(())
 }
 
+/// Look up a session by id under the sessions dir. Returns the path
+/// if a file matching `<id>.jsonl` exists. Used by the `--session` flag.
+pub fn session_by_id(id: &str) -> Option<PathBuf> {
+    let dir = sessions_dir()?;
+    let candidate = dir.join(format!("{id}.jsonl"));
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Which session file to use for this invocation.
+#[derive(Debug)]
+pub enum SessionChoice {
+    /// Brand-new session, create one.
+    New,
+    /// Existing session, resume from this file.
+    Resume(PathBuf),
+}
+
+/// Resolve which session to use:
+///   - `--fork <id>`: copy the session with that id into a new file (with
+///     parent_id set to the source), then Resume the new file
+///   - `--session <id>`: the session with that id (must exist)
+///   - `--continue`: most recently used session for this cwd (if any)
+///   - none: create a new session
+///
+/// Fork/session/continue are expected to be mutually exclusive at the CLI
+/// layer; here we just prefer them in that order if multiple are set.
+pub fn resolve_session(
+    cwd: &Path,
+    continue_flag: bool,
+    session_id: Option<&str>,
+    fork_id: Option<&str>,
+) -> Result<SessionChoice, SessionError> {
+    if let Some(id) = fork_id {
+        let src = session_by_id(id).ok_or(SessionError::NotASession)?;
+        let (new_path, _hdr) = fork_session(cwd, &src)?;
+        return Ok(SessionChoice::Resume(new_path));
+    }
+    if let Some(id) = session_id {
+        let p = session_by_id(id).ok_or(SessionError::NotASession)?;
+        return Ok(SessionChoice::Resume(p));
+    }
+    if continue_flag {
+        if let Some(p) = active_session(cwd) {
+            return Ok(SessionChoice::Resume(p));
+        }
+        // No prior session; --continue degrades to a fresh start.
+        return Ok(SessionChoice::New);
+    }
+    Ok(SessionChoice::New)
+}
+
+/// Fork a session: copy the header + all entries of `source` into a new
+/// session file with a fresh id. The new header records `parent_id`
+/// pointing back to the source, and its `cwd` is the caller's cwd
+/// (which may differ from the source cwd — e.g. forking someone else's
+/// session into your own project).
+pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader), SessionError> {
+    let (src_hdr, entries) = read_session(source)?;
+
+    let dir = sessions_dir().ok_or_else(|| SessionError::Io {
+        path: PathBuf::from("~/.nanopi/sessions"),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir"),
+    })?;
+    std::fs::create_dir_all(&dir).map_err(|e| SessionError::Io {
+        path: dir.clone(),
+        source: e,
+    })?;
+
+    let new_id = uuid::v7();
+    let path = dir.join(format!("{new_id}.jsonl"));
+    let header = SessionHeader {
+        id: new_id,
+        parent_id: Some(src_hdr.id),
+        cwd: cwd.to_path_buf(),
+        model: src_hdr.model.clone(),
+        base_url: src_hdr.base_url.clone(),
+    };
+    let header_entry = SessionEntry::Header {
+        version: 2,
+        id: new_id.to_string(),
+        parent_id: Some(src_hdr.id.to_string()),
+        timestamp: time::now_iso8601(),
+        cwd: cwd.display().to_string(),
+        model: src_hdr.model.clone(),
+        base_url: src_hdr.base_url.clone(),
+    };
+    append_entry(&path, &header_entry)?;
+    for e in entries {
+        append_entry(&path, &e)?;
+    }
+    Ok((path, header))
+}
+
 /// Iterate over entries in a session file. Returns header + body.
 pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), SessionError> {
     if let Some(parent) = path.parent() {
@@ -430,5 +527,230 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&tmp_home);
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ─────── v0.6+: resolve_session / session_by_id ───────
+
+    // ─────── v0.6+: resolve_session / session_by_id ───────
+
+    fn home_tmp() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nanopi-sess-resolve-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// No --continue / --session → New.
+    #[test]
+    fn resolve_session_default_is_new() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let choice = resolve_session(&cwd, false, None, None).expect("resolve");
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        matches!(choice, SessionChoice::New);
+    }
+
+    /// --continue with no prior session falls back to New (not error).
+    #[test]
+    fn resolve_session_continue_without_history_falls_back_to_new() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let choice = resolve_session(&cwd, true, None, None).expect("resolve");
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        matches!(choice, SessionChoice::New);
+    }
+
+    /// --continue with a recorded active session returns Resume that path.
+    #[test]
+    fn resolve_session_continue_returns_active_path() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let (path, _h) = new_session(&cwd, "m", "http://x").unwrap();
+        set_active_session(&cwd, &path).unwrap();
+
+        let choice = resolve_session(&cwd, true, None, None).expect("resolve");
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        match choice {
+            SessionChoice::Resume(p) => assert_eq!(p, path),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// --session <id> resolves to that session file.
+    #[test]
+    fn resolve_session_by_id_returns_path() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let (path, header) = new_session(&cwd, "m", "http://x").unwrap();
+
+        let choice = resolve_session(&cwd, false, Some(&header.id.to_string()), None).expect("resolve");
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        match choice {
+            SessionChoice::Resume(p) => assert_eq!(p, path),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// fork_session copies body entries and sets parent_id on the new header.
+    #[test]
+    fn fork_session_copies_history() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        // Build a source session with two messages.
+        let (src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
+        append_entry(
+            &src_path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "hi".into(),
+            },
+        )
+        .unwrap();
+        append_entry(
+            &src_path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "assistant".into(),
+                content: "hello".into(),
+            },
+        )
+        .unwrap();
+
+        // Fork it.
+        let (fork_path, fork_hdr) = fork_session(&cwd, &src_path).unwrap();
+        assert_ne!(fork_hdr.id, src_hdr.id);
+        assert_eq!(fork_hdr.parent_id, Some(src_hdr.id));
+        // Body should be identical.
+        let (_h, entries) = read_session(&fork_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        matches!(&entries[0], SessionEntry::Message { .. });
+        matches!(&entries[1], SessionEntry::Message { .. });
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// resolve_session with --fork returns Resume(new_path) and the new file
+    /// has parent_id pointing at the source.
+    #[test]
+    fn resolve_session_fork_creates_child() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let (_src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
+        let choice = resolve_session(&cwd, false, None, Some(&src_hdr.id.to_string()))
+            .expect("resolve fork");
+        let new_path = match choice {
+            SessionChoice::Resume(p) => p,
+            other => {
+                if let Some(p) = prev {
+                    std::env::set_var("NANOPI_HOME", p);
+                } else {
+                    std::env::remove_var("NANOPI_HOME");
+                }
+                panic!("expected Resume, got {other:?}");
+            }
+        };
+        let (new_hdr, _) = read_session(&new_path).unwrap();
+        assert_eq!(new_hdr.parent_id, Some(src_hdr.id));
+        assert_ne!(new_hdr.id, src_hdr.id);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// --fork with a missing source id returns error.
+    #[test]
+    fn resolve_session_fork_missing_source_errors() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let r = resolve_session(&cwd, false, None, Some("does-not-exist"));
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+        assert!(r.is_err());
+    }
+
+    /// --session <id> with a missing id returns error (not New).
+    #[test]
+    fn resolve_session_by_id_missing_returns_error() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let r = resolve_session(&cwd, false, Some("does-not-exist"), None);
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        assert!(r.is_err(), "expected error for missing id, got {r:?}");
     }
 }

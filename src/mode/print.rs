@@ -49,12 +49,36 @@ pub async fn run_print_mode(
     yolo: bool,
     no_hooks: bool,
     approve: Option<bool>,
+    continue_session: bool,
+    session_id: Option<String>,
+    fork_id: Option<String>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
-    // Create session.
-    let (session_path, header) = session::new_session(&cwd, model, base_url)
-        .map_err(|e| anyhow::anyhow!("create session: {e}"))?;
+    // Resolve which session to use: --fork > --session > --continue > new.
+    let choice = session::resolve_session(
+        &cwd,
+        continue_session,
+        session_id.as_deref(),
+        fork_id.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?;
+
+let (session_path, header) = match &choice {
+        session::SessionChoice::Resume(p) => {
+            // Reuse the existing session. We trust its recorded model /
+            // base_url; if those are wrong the user can pass them again
+            // via flags and the next turn will pick them up.
+            let (h, _entries) = session::read_session(p)
+                .map_err(|e| anyhow::anyhow!("read resumed session: {e}"))?;
+            (p.clone(), h)
+        }
+        session::SessionChoice::New => session::new_session(&cwd, model, base_url)
+            .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
+    };
+
+    // Register this cwd's active session pointer (used by next --continue).
+    let _ = session::set_active_session(&cwd, &session_path);
 
     // Build the agent.
     let provider = OpenAiProvider::new(base_url, api_key, model);
@@ -72,26 +96,48 @@ pub async fn run_print_mode(
 
     let registry = ToolRegistry::standard();
 
-    let mut agent = Agent {
-        context: Context {
-            system: None,
-            messages: Vec::new(),
-            tools: registry.all_specs(),
-        },
-        provider: Box::new(provider),
-        registry,
-        session_path: session_path.clone(),
-        session_id: header.id,
-        cwd: cwd.clone(),
-        permission,
-        hooks,
+// If we resumed an existing session, hydrate the Agent with its
+    // history (so the model sees prior turns). Otherwise start fresh.
+    let permission_for_resume = permission.clone();
+    let mut agent = if let session::SessionChoice::Resume(_) = &choice {
+        let mut a = Agent::load_session(&session_path, &cwd)
+            .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
+        a.provider = Box::new(provider);
+        a.registry = registry;
+        a.permission = permission_for_resume;
+        a.hooks = hooks;
+        a
+    } else {
+        Agent {
+            context: Context {
+                system: None,
+                messages: Vec::new(),
+                tools: registry.all_specs(),
+            },
+            provider: Box::new(provider),
+            registry,
+            session_path: session_path.clone(),
+            session_id: header.id,
+            cwd: cwd.clone(),
+            permission,
+            hooks,
+        }
     };
+
+    // Fire session_start hooks before the first turn.
+    agent.fire_session_start().await;
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
     let message_owned = message.to_string();
     let agent_task = {
         let mut agent = agent; // move
-        tokio::spawn(async move { agent.run_turn(message_owned.as_str(), &tx).await })
+        tokio::spawn(async move {
+            let r = agent.run_turn(message_owned.as_str(), &tx, None).await;
+            // Fire session_end regardless of turn outcome so cleanup
+            // hooks (e.g. flush metrics) always run.
+            agent.fire_session_end().await;
+            r
+        })
     };
 
     let mut renderer = StdoutRenderer::new();

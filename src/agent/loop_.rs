@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::agent::context::Context;
-use crate::agent::hook::{HookConfig, HookEvent, HookOutcome, run_hooks};
+use crate::agent::hook::{HookConfig, HookEvent, HookOutcome, run_hooks, run_session_hooks};
 use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
 use crate::provider::openai::OpenAiProvider;
@@ -56,6 +56,8 @@ pub struct HooksConfig {
     pub pre_tool_use: Vec<HookConfig>,
     pub post_tool_use: Vec<HookConfig>,
     pub user_prompt_submit: Vec<HookConfig>,
+    pub session_start: Vec<HookConfig>,
+    pub session_end: Vec<HookConfig>,
 }
 
 /// The agent — owns context, provider, tool registry, session, permissions.
@@ -109,15 +111,45 @@ impl Agent {
         crate::session::active_session(cwd)
     }
 
+    /// Fire all `session_start` hooks. Advisory — outcome is not enforced.
+    /// Call once, after Agent construction, before the first turn.
+    pub async fn fire_session_start(&self) {
+        run_session_hooks(
+            &self.hooks.session_start,
+            HookEvent::SessionStart,
+            &self.session_id.to_string(),
+            &self.cwd,
+        )
+        .await;
+    }
+
+    /// Fire all `session_end` hooks. Advisory. Call before the process
+    /// exits (or before Agent is dropped in the interactive loop).
+    pub async fn fire_session_end(&self) {
+        run_session_hooks(
+            &self.hooks.session_end,
+            HookEvent::SessionEnd,
+            &self.session_id.to_string(),
+            &self.cwd,
+        )
+        .await;
+    }
+
     /// Run a single user turn to completion. Streams events to `tx` and
     /// persists all messages, tool calls, and tool results to the session
     /// JSONL file. Returns the final concatenated assistant text.
     ///
     /// Safety: caps at 16 tool-iteration rounds to prevent infinite loops.
+    ///
+    /// Honors `cancel`: if the token is cancelled, the turn returns early
+    /// with whatever was streamed so far. The session file is left in a
+    /// consistent state (last completed turns persisted; the cancelled
+    /// turn's partial assistant text is dropped).
     pub async fn run_turn(
         &mut self,
         user_msg: &str,
         tx: &mpsc::Sender<AgentEvent>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<String, AgentError> {
         // Append user message to context + session.
         let user_id = uuid::v7().to_string();
@@ -136,6 +168,14 @@ impl Agent {
         const MAX_ITERATIONS: u32 = 16;
 
         for _ in 0..MAX_ITERATIONS {
+            // If a cancel token was provided, bail before starting a new
+            // LLM turn. The user's accumulated context is preserved.
+            if let Some(ct) = cancel.as_ref() {
+                if ct.is_cancelled() {
+                    return Ok(final_text);
+                }
+            }
+
             // Set up a forward channel: provider pushes to `forward_tx`,
             // we both observe (to drive the loop) and forward to `tx`.
             let (forward_tx, mut forward_rx) = mpsc::channel::<AgentEvent>(64);
@@ -167,9 +207,19 @@ impl Agent {
                 return Err(AgentError::Provider(e.to_string()));
             }
 
-            let (calls, done, assistant_text) = collect_task
-                .await
-                .map_err(|e| AgentError::Provider(format!("collect task: {e}")))?;
+            let (calls, done, assistant_text) = if let Some(ct) = cancel.as_ref() {
+                tokio::select! {
+                    _ = ct.cancelled() => {
+                        // Cancellation: drop any partial result and return
+                        // the text we have so far. The user can send a new
+                        // message and the context is preserved.
+                        return Ok(final_text);
+                    }
+                    res = collect_task => res.map_err(|e| AgentError::Provider(format!("collect task: {e}")))?,
+                }
+            } else {
+                collect_task.await.map_err(|e| AgentError::Provider(format!("collect task: {e}")))?
+            };
 
             // Persist assistant text + push assistant message to context.
             // CRITICAL: must include ToolCall blocks so the provider knows
@@ -465,6 +515,8 @@ mod tests {
             pre_tool_use: vec![pre_hook],
             post_tool_use: vec![],
             user_prompt_submit: vec![],
+            session_start: vec![],
+            session_end: vec![],
         };
         let mut agent = Agent {
             context: Context::default(),

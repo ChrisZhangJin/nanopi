@@ -39,6 +39,8 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     UserPromptSubmit,
+    SessionStart,
+    SessionEnd,
 }
 
 impl HookEvent {
@@ -47,6 +49,8 @@ impl HookEvent {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::SessionStart => "SessionStart",
+            HookEvent::SessionEnd => "SessionEnd",
         }
     }
 }
@@ -285,6 +289,42 @@ pub async fn run_hooks(
     (HookOutcome::Allow, Some(current_args))
 }
 
+/// Run all `session_start` or `session_end` hooks. These don't have a
+/// tool_name and their outcome (allow/block) is advisory: a Block just
+/// gets logged, not enforced (a session start/end always proceeds).
+/// `matcher` on session hooks is applied against the session_id so users
+/// can scope by prefix; empty/"*" matches all.
+pub async fn run_session_hooks(
+    hooks: &[HookConfig],
+    event: HookEvent,
+    session_id: &str,
+    cwd: &std::path::Path,
+) {
+    debug_assert!(matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd));
+    for h in hooks {
+        if h.kind != "command" {
+            continue;
+        }
+        if !matcher_matches(&h.matcher, session_id) {
+            continue;
+        }
+        let input = HookInput {
+            event,
+            tool_name: None,
+            tool_call_id: None,
+            arguments: json!({}),
+            cwd: Some(cwd.display().to_string()),
+            session_id: Some(session_id.to_string()),
+        };
+        let mut env = HashMap::new();
+        env.insert("NANOPI_EVENT".into(), event.env_var().into());
+        env.insert("NANOPI_SESSION_ID".into(), session_id.into());
+        env.insert("NANOPI_CWD".into(), cwd.display().to_string());
+        // Fire and forget: outcome is advisory. Errors are swallowed.
+        let _ = run_hook(h, &input, &env).await;
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn _json_used() -> Value { json!({}) }
 
@@ -440,6 +480,66 @@ mod tests {
             HookOutcome::Block { reason } => assert_eq!(reason, "json-rule"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_events_env_var_names() {
+        assert_eq!(HookEvent::SessionStart.env_var(), "SessionStart");
+        assert_eq!(HookEvent::SessionEnd.env_var(), "SessionEnd");
+    }
+
+    #[test]
+    fn session_events_serialize_snake_case() {
+        let s = serde_json::to_string(&HookEvent::SessionStart).unwrap();
+        assert_eq!(s, "\"session_start\"");
+        let s = serde_json::to_string(&HookEvent::SessionEnd).unwrap();
+        assert_eq!(s, "\"session_end\"");
+        // Round-trip.
+        let back: HookEvent = serde_json::from_str("\"session_start\"").unwrap();
+        assert_eq!(back, HookEvent::SessionStart);
+    }
+
+    #[tokio::test]
+    async fn run_session_hooks_fires_matching_hook() {
+        // Use a temp file as a side-channel: the hook writes to it.
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("nanopi-session-hook-{}", crate::util::uuid::v7()));
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: format!("touch '{}'", marker.display()),
+            timeout: 2000,
+        };
+        run_session_hooks(
+            &[hook],
+            HookEvent::SessionStart,
+            "test-session-id",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(marker.exists(), "session_start hook should have run");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn run_session_hooks_matcher_filters_by_session_id() {
+        // Matcher "^prod-" should skip a "dev-*" session.
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("nanopi-session-nomatch-{}", crate::util::uuid::v7()));
+        let hook = HookConfig {
+            matcher: "^prod-".into(),
+            kind: "command".into(),
+            command: format!("touch '{}'", marker.display()),
+            timeout: 2000,
+        };
+        run_session_hooks(
+            &[hook],
+            HookEvent::SessionEnd,
+            "dev-1234",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(!marker.exists(), "hook should NOT fire for non-matching session id");
     }
 }
     /// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
