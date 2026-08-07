@@ -375,20 +375,10 @@ async fn run_one_turn(
         Some(crate::render::spinner::Spinner::start("thinking"));
     while let Some(ev) = rx.recv().await {
         match &ev {
-            AgentEvent::TextDelta { text, .. } => {
-                // Distinguish the synthetic tool-result marker
-                // (`\n[<tool> → <N> bytes]\n`) from real assistant
-                // text so we can restart the spinner for the next
-                // LLM round.
-                if is_tool_result_marker(text) {
-                    if let Some(mut s) = spinner.take() {
-                        s.stop().await;
-                    }
-                    spinner = Some(crate::render::spinner::Spinner::start("thinking"));
-                } else {
-                    if let Some(mut s) = spinner.take() {
-                        s.stop().await;
-                    }
+            AgentEvent::TextDelta { .. } => {
+                // Real model text arriving — stop the spinner.
+                if let Some(mut s) = spinner.take() {
+                    s.stop().await;
                 }
             }
             AgentEvent::ToolCall { call, .. } => {
@@ -397,6 +387,13 @@ async fn run_one_turn(
                 }
                 let label = tool_spinner_label(&call.name, &call.arguments);
                 spinner = Some(crate::render::spinner::Spinner::start(label));
+            }
+            AgentEvent::ToolResult { .. } => {
+                // Tool done → next iteration is LLM waiting again.
+                if let Some(mut s) = spinner.take() {
+                    s.stop().await;
+                }
+                spinner = Some(crate::render::spinner::Spinner::start("thinking"));
             }
             AgentEvent::Error { .. } => {
                 if let Some(mut s) = spinner.take() {
@@ -415,13 +412,6 @@ async fn run_one_turn(
     result.map(|_| 0).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Does this TextDelta match the synthetic marker emitted by
-/// `Agent::execute_tool_calls` after a tool completes? Format is
-/// `\n[<tool_name> → <N> bytes]\n`. Used by the spinner to know when
-/// tool execution finished and it's now waiting on the LLM again.
-fn is_tool_result_marker(text: &str) -> bool {
-    text.starts_with("\n[") && text.contains(" → ") && text.ends_with(" bytes]\n")
-}
 
 /// Build a spinner label for a specific tool call, so the user sees
 /// what's actually running. Falls back to `running <tool>` for

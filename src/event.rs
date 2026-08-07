@@ -26,6 +26,19 @@ pub enum AgentEvent {
     /// the call block is closed, then emit one `ToolCall` with parsed args.
     ToolCall { content_index: u32, call: ToolCall },
 
+    /// A tool call finished. Emitted by `Agent::execute_tool_calls`
+    /// after the local tool ran, NOT by any provider. Carries the
+    /// output content, error flag, and wall-clock duration so the
+    /// renderer can draw a single card with command + output + timing
+    /// (PI-style — see docs/img/PI_talk02.jpg).
+    ToolResult {
+        call_id: String,
+        tool_name: String,
+        content: String,
+        is_error: bool,
+        elapsed_ms: u64,
+    },
+
     /// Stream finished; carries final usage.
     Done { finish_reason: FinishReason, usage: Usage },
 
@@ -75,6 +88,7 @@ impl AgentEvent {
             AgentEvent::TextDelta { .. } => "text_delta",
             AgentEvent::ThinkingDelta { .. } => "thinking_delta",
             AgentEvent::ToolCall { .. } => "tool_call",
+            AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::Done { .. } => "done",
             AgentEvent::Error { .. } => "error",
         }

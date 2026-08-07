@@ -538,20 +538,17 @@ async fn run_one_tool(
         },
     );
 
-    // Stream to renderer. Use `→` for success, `✗` for error so the
-    // TUI can pick a matching (green / red) tool-call bar color.
-    // Format: `\n[<tool> <sep> <bytes> bytes  Took <t>s]\n`
-    let sep = if is_error { "✗" } else { "→" };
-    let took = elapsed.as_secs_f64();
-    let took_str = if took < 0.05 {
-        format!("Took {}ms", (took * 1000.0).round() as u32)
-    } else {
-        format!("Took {:.1}s", took)
-    };
+    // Stream a structured ToolResult so the TUI can render one green
+    // (or red) card containing command + output preview + timing.
+    // Rustyline mode picks the same event apart and prints a compact
+    // marker line instead.
     let _ = tx
-        .send(AgentEvent::TextDelta {
-            content_index: 0,
-            text: format!("\n[{} {} {} bytes  {}]\n", call.name, sep, content.len(), took_str),
+        .send(AgentEvent::ToolResult {
+            call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: content.clone(),
+            is_error,
+            elapsed_ms: elapsed.as_millis() as u64,
         })
         .await;
 

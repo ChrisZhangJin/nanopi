@@ -623,13 +623,6 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
 fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> {
     match ev {
         AgentEvent::TextDelta { text, .. } => {
-            // Detect the synthetic tool-result marker: `\n[tool → N bytes]\n`.
-            // Render collapsed (first N lines only) + dim italic PI-style.
-            if is_tool_result_marker(&text) {
-                flush_stream_buf(term, app)?;
-                render_tool_result_marker(term, app, &text)?;
-                return Ok(());
-            }
             // Real assistant text → flush any pending thinking, then
             // accumulate + emit full lines.
             flush_thinking_buf(term, app)?;
@@ -643,7 +636,6 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             }
         }
         AgentEvent::ThinkingDelta { text, .. } => {
-            // Buffer thinking similarly to text — flush on newlines.
             app.thinking_buf.push_str(&text);
             while let Some(nl) = app.thinking_buf.find('\n') {
                 let line: String = app.thinking_buf.drain(..=nl).collect();
@@ -663,11 +655,15 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
         AgentEvent::ToolCall { call, .. } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            // Don't draw the bar yet — we don't know if it succeeded.
-            // Stash it; the tool-result marker will trigger the draw
-            // with a green (success) or red (failure) bg.
+            // Stash bar text; we'll draw the WHOLE card on ToolResult
+            // so the entire green (or red) block appears together.
             let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
             app.pending_tool_call = Some(PendingBar { leading, body });
+        }
+        AgentEvent::ToolResult { content, is_error, elapsed_ms, .. } => {
+            flush_stream_buf(term, app)?;
+            flush_thinking_buf(term, app)?;
+            render_tool_card(term, app, &content, is_error, elapsed_ms)?;
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
@@ -679,20 +675,6 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
         AgentEvent::Done { .. } | AgentEvent::Start { .. } => {}
     }
     Ok(())
-}
-
-/// Recognize `\n[<tool> <sep> <N> bytes  Took <t>]\n` markers
-/// emitted by `Agent::execute_tool_calls`.
-fn is_tool_result_marker(text: &str) -> bool {
-    text.starts_with("\n[")
-        && (text.contains(" → ") || text.contains(" ✗ "))
-        && text.contains(" bytes")
-        && text.ends_with("]\n")
-}
-
-/// True when the marker uses the `✗` separator (error path).
-fn tool_marker_is_error(text: &str) -> bool {
-    text.contains(" ✗ ")
 }
 
 /// If any partial (no trailing newline) assistant text sits in the
@@ -763,18 +745,42 @@ fn truncate_bar_body(s: &str) -> String {
     }
 }
 
-/// Emit the whole tool block: blank line, colored bar, summary line
-/// (dim italic with duration), blank line. Bg is green on success,
-/// red on error. Matches PI's tool card layout (see img/PI_talk02.jpg).
-fn render_tool_result_marker(term: &mut Term, app: &mut App, text: &str) -> Result<()> {
-    let is_err = tool_marker_is_error(text);
-    let (bar_bg, bar_fg) = if is_err {
+/// Number of output lines to show inside a tool card. PI's screenshots
+/// show ~4-6 lines of preview.
+const TOOL_PREVIEW_LINES: usize = 6;
+
+/// Render the full tool card:
+///
+///   (blank)
+///   [green]  $ ls /tmp                              ← command
+///   [green]  file1.txt                              ← output preview
+///   [green]  file2.txt
+///   [green]  ... (K earlier lines, ctrl+o expand)   ← truncation marker
+///   [green]  (blank green row)
+///   [green]  Took 32ms                              ← duration
+///   (blank)
+///
+/// All rows share the same bg (green on success, red on error). The
+/// pending bar text was stashed by the earlier ToolCall event; if
+/// missing (shouldn't happen), we still render output + timing.
+fn render_tool_card(
+    term: &mut Term,
+    app: &mut App,
+    content: &str,
+    is_error: bool,
+    elapsed_ms: u64,
+) -> Result<()> {
+    let (bar_bg, bar_fg) = if is_error {
         (Color::Red, Color::White)
     } else {
         (Color::Green, Color::Indexed(255))
     };
     let bar_style = Style::default().bg(bar_bg).fg(bar_fg).add_modifier(Modifier::BOLD);
-    let dim_bar_style = Style::default()
+    // Dimmed foreground on the same bg — for output preview + Took.
+    let dim_style = Style::default()
+        .bg(bar_bg)
+        .fg(Color::Indexed(253));
+    let hint_style = Style::default()
         .bg(bar_bg)
         .fg(Color::Indexed(250))
         .add_modifier(Modifier::ITALIC);
@@ -782,25 +788,47 @@ fn render_tool_result_marker(term: &mut Term, app: &mut App, text: &str) -> Resu
     // Breathing room above.
     insert_line(term, Line::from(""))?;
 
-    // Draw the bar now that we know the outcome.
+    // Row 1: command bar (from stashed pending_tool_call).
     if let Some(pending) = app.pending_tool_call.take() {
         insert_line_bg(term, Line::from(vec![
             Span::styled(pending.leading, bar_style),
             Span::styled(pending.body, bar_style),
-            Span::styled("  (ctrl+o to expand)", dim_bar_style),
         ]), Some(bar_style))?;
     }
 
-    // Then the result summary line (dim italic, or dim red for errors).
-    let cleaned = text.trim();
-    let summary_style = if is_err {
-        Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC)
+    // Output preview: last N lines. If more, show a truncation marker.
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total > TOOL_PREVIEW_LINES {
+        let hidden = total - TOOL_PREVIEW_LINES;
+        insert_line_bg(term, Line::from(vec![
+            Span::styled(
+                format!("  … ({} earlier lines, ctrl+o to expand)", hidden),
+                hint_style,
+            ),
+        ]), Some(bar_style))?;
+    }
+    let start = total.saturating_sub(TOOL_PREVIEW_LINES);
+    for line in &lines[start..] {
+        // Prefix with 2 spaces for visual indent inside the card.
+        insert_line_bg(term, Line::from(vec![
+            Span::styled("  ", dim_style),
+            Span::styled(line.to_string(), dim_style),
+        ]), Some(dim_style))?;
+    }
+
+    // Empty divider row inside the card.
+    insert_line_bg(term, Line::from(vec![Span::styled("", bar_style)]), Some(bar_style))?;
+
+    // Took Xs (right-side info, italic dim on the card bg).
+    let took_str = if elapsed_ms < 50 {
+        format!("Took {}ms", elapsed_ms)
     } else {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+        format!("Took {:.1}s", elapsed_ms as f64 / 1000.0)
     };
-    insert_line(term, Line::from(vec![
-        Span::styled(cleaned.to_string(), summary_style),
-    ]))?;
+    insert_line_bg(term, Line::from(vec![
+        Span::styled(format!("  {}", took_str), hint_style),
+    ]), Some(bar_style))?;
 
     // Breathing room below.
     insert_line(term, Line::from(""))?;
@@ -1144,18 +1172,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn tool_result_marker_detection() {
-        assert!(is_tool_result_marker("\n[bash → 97 bytes  Took 0.3s]\n"));
-        assert!(is_tool_result_marker("\n[read → 12345 bytes  Took 45ms]\n"));
-        assert!(is_tool_result_marker("\n[bash ✗ 32 bytes  Took 12ms]\n"));
-        assert!(!is_tool_result_marker("bash output"));
-        assert!(!is_tool_result_marker("\n[bash starting]"));
-    }
-
-    #[test]
-    fn error_marker_flagged() {
-        assert!(tool_marker_is_error("\n[bash ✗ 32 bytes  Took 12ms]\n"));
-        assert!(!tool_marker_is_error("\n[bash → 32 bytes  Took 12ms]\n"));
-    }
 }
