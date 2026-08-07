@@ -265,9 +265,12 @@ struct App {
     /// slash palette. Payload is the target model id.
     model_picker: Option<MenuState<String>>,
     /// When Some, the fork picker (Esc double-tap) is open. Payload is
-    /// the 0-based user-message index in the current session — used to
-    /// call `session::fork_session_at` on Enter.
-    fork_picker: Option<MenuState<usize>>,
+    /// `(source_session_path, user_msg_index_in_that_session)` — used
+    /// to call `session::fork_session_at` on Enter. The source path
+    /// may point at the current session OR any ancestor along the
+    /// `parent_id` chain, so the user can revive tails that were cut
+    /// off by earlier forks.
+    fork_picker: Option<MenuState<(PathBuf, usize)>>,
     /// Timestamp of the last Esc keypress. Second Esc within 500ms on
     /// an empty editor opens the fork picker (PI's `doubleEscapeAction`
     /// = "fork"; see packages/coding-agent/src/modes/interactive/
@@ -374,9 +377,11 @@ enum KeyAction {
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
     OpenForkPicker,
-    /// User selected a user message in the fork picker — fork the
-    /// current session at that message and switch to the new one.
-    Fork(usize),
+    /// User selected a user message in the fork picker. Payload is
+    /// `(source_session_path, user_msg_index)` — the picker item that
+    /// was chosen. Fork happens against that specific session, which
+    /// may be the current one or any ancestor along the parent chain.
+    Fork(PathBuf, usize),
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -393,9 +398,10 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     if app.fork_picker.is_some() {
         let m = app.fork_picker.as_mut().unwrap();
         match m.handle_key(k) {
-            MenuAction::Chosen(idx) => {
+            MenuAction::Chosen(payload) => {
                 app.fork_picker = None;
-                return KeyAction::Fork(idx);
+                let (path, idx) = payload;
+                return KeyAction::Fork(path, idx);
             }
             MenuAction::Cancel => {
                 app.fork_picker = None;
@@ -728,11 +734,14 @@ async fn handle_action(
             }
         }
         KeyAction::OpenForkPicker => {
-            // Pull user messages from the current session file (single
-            // source of truth on disk). Context in memory would work
-            // too but the file survives compaction and is what
-            // fork_session_at reads back — using the same source
-            // guarantees indices line up.
+            // Tree-aware picker: walk the parent_id chain upward from
+            // the current session and aggregate user messages across
+            // ALL sessions in the chain. Messages a child inherited
+            // via fork are shown once (from the deepest ancestor
+            // where they first appeared), so a fork that lopped off
+            // the tail of an ancestor branch still lets the user see
+            // and pick from that tail. See session::walk_parent_chain
+            // and common_user_message_prefix.
             let session_path = {
                 let g = agent_slot.lock().await;
                 g.as_ref().map(|a| a.session_path.clone())
@@ -740,17 +749,49 @@ async fn handle_action(
             let Some(session_path) = session_path else {
                 return Ok(());
             };
-            let entries = match session::read_session(&session_path) {
-                Ok((_h, e)) => e,
-                Err(e) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(format!("[fork picker: {e}]"), Style::default().fg(Color::Red)),
-                    ]))?;
-                    return Ok(());
+
+            let mut chain = session::walk_parent_chain(&session_path);
+            if chain.is_empty() {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        "[fork: could not read current session]",
+                        Style::default().fg(Color::Red),
+                    ),
+                ]))?;
+                return Ok(());
+            }
+            // chain[0] = current, last = root. Reverse to root-first so
+            // we emit messages in chronological/tree order.
+            chain.reverse();
+
+            let mut items: Vec<MenuItem<(PathBuf, usize)>> = Vec::new();
+            let mut prev_msgs: Option<Vec<(usize, String)>> = None;
+            for (path, hdr, msgs) in &chain {
+                let start = match &prev_msgs {
+                    Some(prev) => session::common_user_message_prefix(prev, msgs),
+                    None => 0,
+                };
+                let is_current = path == &session_path;
+                let short = &hdr.id.to_string()[..8];
+                let branch_label = if is_current { "current" } else { "past branch" };
+                let total = msgs.len();
+                for (idx, text) in &msgs[start..] {
+                    let preview: String = text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    items.push(MenuItem::new(
+                        preview,
+                        format!("{} · {} · msg {}/{}", branch_label, short, idx + 1, total),
+                        (path.clone(), *idx),
+                    ));
                 }
-            };
-            let msgs = session::user_messages(&entries);
-            if msgs.is_empty() {
+                prev_msgs = Some(msgs.clone());
+            }
+            if items.is_empty() {
                 insert_line(term, Line::from(vec![
                     Span::styled(
                         "[fork: no user messages in this session yet]",
@@ -759,41 +800,21 @@ async fn handle_action(
                 ]))?;
                 return Ok(());
             }
-            let total = msgs.len();
-            let items: Vec<MenuItem<usize>> = msgs
-                .into_iter()
-                .map(|(idx, text)| {
-                    // One-line preview, collapse whitespace, truncate.
-                    let preview: String = text
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(60)
-                        .collect();
-                    MenuItem::new(
-                        preview.clone(),
-                        format!("Message {}/{}", idx + 1, total),
-                        idx,
-                    )
-                })
-                .collect();
             app.fork_picker = Some(MenuState::new(items));
         }
-        KeyAction::Fork(target_idx) => {
+        KeyAction::Fork(source_path, target_idx) => {
             // Snapshot everything the new Agent needs to inherit from
             // the current one BEFORE dropping it — provider config,
-            // permission, registry, hooks, api key. The new Agent gets
-            // loaded from the freshly-created fork file; then we
-            // transplant those non-session fields onto it.
-            let (source_path, cwd, model, base_url, api_key, permission, hooks) = {
+            // permission, registry, hooks, api key. The source session
+            // path was passed in from the picker: it may be the
+            // current session OR any ancestor along the parent chain.
+            let (cwd, model, base_url, api_key, permission, hooks) = {
                 let g = agent_slot.lock().await;
                 let a = match g.as_ref() {
                     Some(a) => a,
                     None => return Ok(()),
                 };
                 (
-                    a.session_path.clone(),
                     a.cwd.clone(),
                     a.model.clone(),
                     a.base_url.clone(),

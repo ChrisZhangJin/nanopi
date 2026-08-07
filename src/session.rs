@@ -361,6 +361,45 @@ pub fn user_messages(entries: &[SessionEntry]) -> Vec<(usize, String)> {
     out
 }
 
+/// Walk `parent_id` up from `current` toward the root. Returns
+/// `[(path, header, user_messages)]` with `current` at index 0 and
+/// the root at the last index. Stops silently on any read error
+/// (unresolvable parent id, corrupted file, etc.) — a partial chain
+/// is still useful.
+pub fn walk_parent_chain(
+    current: &Path,
+) -> Vec<(PathBuf, SessionHeader, Vec<(usize, String)>)> {
+    let mut out = Vec::new();
+    let mut cur = Some(current.to_path_buf());
+    while let Some(p) = cur.take() {
+        let (hdr, entries) = match read_session(&p) {
+            Ok(t) => t,
+            Err(_) => break,
+        };
+        let msgs = user_messages(&entries);
+        let parent_id_opt = hdr.parent_id.map(|id| id.to_string());
+        out.push((p, hdr, msgs));
+        if let Some(pid) = parent_id_opt {
+            cur = session_by_id(&pid);
+        }
+    }
+    out
+}
+
+/// Longest common prefix length between two user-message lists, by
+/// content. Used by the tree-aware fork picker to skip messages a
+/// child inherited from its parent so we don't show duplicates.
+pub fn common_user_message_prefix(
+    a: &[(usize, String)],
+    b: &[(usize, String)],
+) -> usize {
+    let mut n = 0;
+    while n < a.len() && n < b.len() && a[n].1 == b[n].1 {
+        n += 1;
+    }
+    n
+}
+
 /// Iterate over entries in a session file. Returns header + body.
 pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), SessionError> {
     if let Some(parent) = path.parent() {
@@ -831,6 +870,84 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn walk_parent_chain_returns_current_to_root() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        // Root session with one user message.
+        let (root_path, _root_hdr) = new_session(&cwd, "m", "http://x").unwrap();
+        append_entry(
+            &root_path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "root-1".into(),
+            },
+        )
+        .unwrap();
+        append_entry(
+            &root_path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "root-2".into(),
+            },
+        )
+        .unwrap();
+
+        // Fork at message 1 (keeps only "root-1").
+        let (child_path, _child_hdr, _text) =
+            fork_session_at(&cwd, &root_path, 1).unwrap();
+        // Add one more user message to the child.
+        append_entry(
+            &child_path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "child-1".into(),
+            },
+        )
+        .unwrap();
+
+        let chain = walk_parent_chain(&child_path);
+        assert_eq!(chain.len(), 2, "current + root");
+        assert_eq!(chain[0].0, child_path, "current at index 0");
+        assert_eq!(chain[1].0, root_path, "root at last");
+        // Child's user messages: root-1 (inherited) + child-1
+        let child_msgs: Vec<&str> = chain[0].2.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(child_msgs, vec!["root-1", "child-1"]);
+        // Root's: root-1, root-2
+        let root_msgs: Vec<&str> = chain[1].2.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(root_msgs, vec!["root-1", "root-2"]);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn common_user_message_prefix_finds_divergence() {
+        fn v(items: &[&str]) -> Vec<(usize, String)> {
+            items.iter().enumerate().map(|(i, s)| (i, s.to_string())).collect()
+        }
+        assert_eq!(common_user_message_prefix(&v(&["a", "b", "c"]), &v(&["a", "b", "c"])), 3);
+        assert_eq!(common_user_message_prefix(&v(&["a", "b"]), &v(&["a", "b", "c"])), 2);
+        assert_eq!(common_user_message_prefix(&v(&["a", "b"]), &v(&["a", "b'"])), 1);
+        assert_eq!(common_user_message_prefix(&v(&["x"]), &v(&["y"])), 0);
+        assert_eq!(common_user_message_prefix(&v(&[]), &v(&["a"])), 0);
     }
 
     #[test]
