@@ -527,13 +527,21 @@ async fn handle_action(
             if app.status == Status::Streaming {
                 return Ok(());
             }
-            // Echo user message into scrollback, PI-style: full-width
-            // gray background across the row.
-            let user_bg = Style::default().bg(Color::Rgb(60, 60, 60)).fg(Color::White);
-            insert_line_bg(term, Line::from(vec![
-                Span::styled("  ", user_bg),
-                Span::styled(msg.clone(), user_bg),
-            ]), Some(user_bg))?;
+            // Echo user message into scrollback, PI-style: blank line +
+            // full-width gray "card" (3 rows: pad, content, pad) + blank.
+            // Gray is bright enough to stand out against the terminal's
+            // dark bg; falls back to a plain highlight in light themes.
+            let user_bg = Style::default().bg(Color::Rgb(90, 90, 96)).fg(Color::White);
+            insert_line(term, Line::from(""))?;
+            insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
+            for line in msg.lines() {
+                insert_line_bg(term, Line::from(vec![
+                    Span::styled("  ", user_bg),
+                    Span::styled(line.to_string(), user_bg),
+                ]), Some(user_bg))?;
+            }
+            insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
+            insert_line(term, Line::from(""))?;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
             let ct = CancellationToken::new();
             let ct_task = ct.clone();
