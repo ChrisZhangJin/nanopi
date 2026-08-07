@@ -1590,9 +1590,11 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         ])
         .split(area);
 
-    // ── Palette / model picker / fork picker (dropdown menu). ────
-    // Priority: fork picker > model picker > slash palette.
-    if let Some(m) = &app.fork_picker {
+    // ── Overlay menus (dropdown). Priority matches interpret_key:
+    // summary modal > fork picker > model picker > slash palette.
+    if let Some(m) = &app.summary_prompt {
+        draw_menu(buf, chunks[0], m, "summarize branch?");
+    } else if let Some(m) = &app.fork_picker {
         draw_menu(buf, chunks[0], m, "user message");
     } else if let Some(m) = &app.model_picker {
         draw_menu(buf, chunks[0], m, "model");
