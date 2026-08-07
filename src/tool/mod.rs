@@ -39,6 +39,22 @@ pub enum ToolError {
     NotFound(String),
 }
 
+/// A base64-encoded image blob returned alongside text from a tool
+/// (typically `read` when the target file is an image). Sent to
+/// vision-capable models as a multimodal content block; stripped and
+/// replaced with a placeholder text for text-only models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// Anthropic-canonical media type ("image/png", "image/jpeg",
+    /// "image/gif", "image/webp"). Detected via magic bytes — see
+    /// `util::image_detect`.
+    pub media_type: String,
+    /// Standard base64 encoding of the raw file bytes (no data-URL
+    /// prefix). Anthropic accepts up to ~5 MB base64-encoded per
+    /// image.
+    pub data_base64: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,
@@ -46,6 +62,12 @@ pub struct ToolOutput {
     /// Optional structured metadata (e.g. unified diff for `edit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Image blobs the tool wants sent to the model as multimodal
+    /// content (e.g. `read` on a PNG). Empty for text-only results.
+    /// Serialized as an omitted field when empty for backwards
+    /// compatibility with pre-v0.8 tool outputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 /// Context passed to every tool execution. Holds the session's cwd so
@@ -179,6 +201,7 @@ mod tests {
             Ok(ToolOutput {
                 content: args["text"].as_str().unwrap_or("").to_string(),
                 is_error: false,
+                images: Vec::new(),
                 metadata: None,
             })
         }

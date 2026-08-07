@@ -72,6 +72,7 @@ impl Tool for LsTool {
         Ok(ToolOutput {
             content: if out.is_empty() { String::new() } else { out + "\n" },
             is_error: false,
+            images: Vec::new(),
             metadata: Some(json!({
                 "path": abs.display().to_string(),
                 "entries": total,

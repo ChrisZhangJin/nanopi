@@ -68,6 +68,7 @@ impl Tool for WriteTool {
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {}", content.len(), abs.display()),
             is_error: false,
+            images: Vec::new(),
             metadata: Some(json!({"path": abs.display().to_string(), "bytes": content.len()})),
         })
     }

@@ -110,15 +110,55 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> serde_json::Value 
                     messages.push(json!({"role": "assistant", "content": blocks}));
                 }
             }
-            crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error } => {
+            crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error, images } => {
                 // Anthropic tool results go inside a `user` message with a
-                // `tool_result` content block.
+                // `tool_result` content block. Text-only results use the
+                // string-content form (compact wire); multimodal results
+                // switch to the content-array form with text + image
+                // blocks so vision models see the picture. See
+                // packages/ai/src/api/anthropic-messages.ts:137-151 for
+                // the source shape.
+                let vision_ok = crate::agent::thinking::supports_vision(model);
+                let has_images = !images.is_empty();
+                let tool_result_content: serde_json::Value = if !has_images {
+                    // Text-only path — cheapest wire.
+                    serde_json::Value::String(content.clone())
+                } else if vision_ok {
+                    let mut blocks: Vec<serde_json::Value> = Vec::new();
+                    if !content.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": content }));
+                    }
+                    for img in images {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data_base64,
+                            }
+                        }));
+                    }
+                    serde_json::Value::Array(blocks)
+                } else {
+                    // Model doesn't do vision — leave a placeholder so
+                    // the model at least knows an image WAS returned.
+                    let n = images.len();
+                    let note = if content.is_empty() {
+                        format!("(image omitted — {n} image(s), model does not support vision)")
+                    } else {
+                        format!(
+                            "{}\n\n(image omitted — {n} image(s), model does not support vision)",
+                            content
+                        )
+                    };
+                    serde_json::Value::String(note)
+                };
                 messages.push(json!({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
-                        "content": content,
+                        "content": tool_result_content,
                         "is_error": is_error,
                     }]
                 }));
@@ -524,6 +564,75 @@ mod tests {
         let v = build_request(&ctx, "claude-haiku-4-5");
         // Haiku doesn't support extended thinking → block must not be sent.
         assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn tool_result_with_images_on_vision_model_emits_content_array() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result_with_images(
+            "call_1",
+            "Read image file [image/png]",
+            false,
+            vec![crate::tool::ImageAttachment {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+        );
+        let v = build_request(&ctx, "claude-opus-4-7");
+        let msgs = v["messages"].as_array().unwrap();
+        let tr = msgs.iter()
+            .flat_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["type"] == "tool_result")
+            .expect("tool_result block present");
+        let inner = tr["content"].as_array().expect("content array on multimodal");
+        assert_eq!(inner[0]["type"], "text");
+        assert_eq!(inner[0]["text"], "Read image file [image/png]");
+        assert_eq!(inner[1]["type"], "image");
+        assert_eq!(inner[1]["source"]["type"], "base64");
+        assert_eq!(inner[1]["source"]["media_type"], "image/png");
+        assert_eq!(inner[1]["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn tool_result_with_images_on_text_model_downgrades_to_placeholder() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result_with_images(
+            "call_1",
+            "Read image file [image/png]",
+            false,
+            vec![crate::tool::ImageAttachment {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+        );
+        // Made-up id nobody supports — supports_vision returns false.
+        let v = build_request(&ctx, "some-text-only-model-2100");
+        let msgs = v["messages"].as_array().unwrap();
+        let tr = msgs.iter()
+            .flat_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["type"] == "tool_result")
+            .unwrap();
+        let text = tr["content"].as_str().expect("downgraded to string");
+        assert!(text.contains("image omitted"), "got {text:?}");
+        // Original text preserved for context.
+        assert!(text.contains("image/png"), "got {text:?}");
+    }
+
+    #[test]
+    fn tool_result_without_images_still_emits_string_content() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result("call_1", "ok", false);
+        let v = build_request(&ctx, "claude-opus-4-7");
+        let msgs = v["messages"].as_array().unwrap();
+        let tr = msgs.iter()
+            .flat_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["type"] == "tool_result")
+            .unwrap();
+        // Compact string form — no unnecessary array wrapping.
+        assert_eq!(tr["content"], "ok");
     }
 
     #[test]

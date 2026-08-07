@@ -72,6 +72,7 @@ impl Tool for FindTool {
         Ok(ToolOutput {
             content: out,
             is_error: false,
+            images: Vec::new(),
             metadata: Some(json!({
                 "base": base.display().to_string(),
                 "matches": results.len(),

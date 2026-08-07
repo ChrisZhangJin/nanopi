@@ -329,10 +329,24 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                 });
             }
-            crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error } => {
+            crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error, images } => {
+                // OpenAI's tool-role message uses string content; the
+                // multimodal image-block form is user-role only.
+                // For MVP, if a tool returned images, append a text
+                // note that images were attached — the model won't
+                // see the pixels but at least learns the tool
+                // produced visual output.
+                let payload = if images.is_empty() {
+                    content.clone()
+                } else {
+                    format!(
+                        "{}\n\n({} image(s) attached — OpenAI tool-role does not carry image blocks in this adapter)",
+                        content, images.len()
+                    )
+                };
                 messages.push(WireMessage {
                     role: if *is_error { "tool".into() } else { "tool".into() },
-                    content: content.clone(),
+                    content: payload,
                     tool_call_id: Some(tool_call_id.clone()),
                     tool_calls: None,
                 });
@@ -745,6 +759,7 @@ mod tests {
             tool_call_id: "call_1".into(),
             content: "ok".into(),
             is_error: false,
+            images: Vec::new(),
         });
         let req = build_request(&ctx, "m");
         assert_eq!(req.messages.len(), 2);

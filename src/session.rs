@@ -76,6 +76,12 @@ pub enum SessionEntry {
         timestamp: String,
         content: String,
         is_error: bool,
+        /// Image attachments carried alongside the text content.
+        /// Serialized (base64) into the session file so resume + fork
+        /// reload them into context. Empty for text-only results;
+        /// omitted from JSON when empty for size and back-compat.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::tool::ImageAttachment>,
     },
     #[serde(rename = "model_change")]
     ModelChange {
@@ -648,6 +654,7 @@ mod tests {
                 timestamp: time::now_iso8601(),
                 content: "file1\nfile2".into(),
                 is_error: false,
+                images: Vec::new(),
             },
         )
         .unwrap();
@@ -1082,6 +1089,7 @@ mod tests {
             SessionEntry::ToolResult {
                 tool_call_id: "3".into(), timestamp: "".into(),
                 content: "output".into(), is_error: false,
+                images: Vec::new(),
             },
             SessionEntry::ModelChange {
                 timestamp: "".into(), from: "a".into(), to: "b".into(),

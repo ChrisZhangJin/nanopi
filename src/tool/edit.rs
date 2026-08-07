@@ -79,6 +79,7 @@ impl Tool for EditTool {
         Ok(ToolOutput {
             content: format!("edited {}: -{} +{} lines", abs.display(), old_lines.len(), new_lines.len()),
             is_error: false,
+            images: Vec::new(),
             metadata: Some(json!({
                 "path": abs.display().to_string(),
                 "removed_lines": old_lines.len(),

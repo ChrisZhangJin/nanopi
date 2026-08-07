@@ -555,10 +555,11 @@ let results = join_all(futs).await;
         // so the next LLM turn sees them. Persistence already happened
         // during phase 1 (in run_one_tool).
         for outcome in results {
-            self.context.push_tool_result(
+            self.context.push_tool_result_with_images(
                 outcome.call_id,
                 outcome.content,
                 outcome.is_error,
+                outcome.images,
             );
         }
 
@@ -575,6 +576,10 @@ struct ToolCallOutcome {
     args: Value,
     content: String,
     is_error: bool,
+    /// Multimodal image attachments from the tool (empty for text-only
+    /// tools). Forwarded into context so the next request to a vision
+    /// model can carry the image blocks.
+    images: Vec<crate::tool::ImageAttachment>,
 }
 
 /// Run a single tool call: hooks → execute → persist → render. Pure
@@ -613,6 +618,7 @@ async fn run_one_tool(
                         timestamp: time::now_iso8601(),
                         content: result_text.clone(),
                         is_error: true,
+                        images: Vec::new(),
                     },
                 );
                 let _ = tx
@@ -627,6 +633,7 @@ async fn run_one_tool(
                     args: effective_args,
                     content: result_text,
                     is_error: true,
+                    images: Vec::new(),
                 };
             }
         }
@@ -646,15 +653,15 @@ async fn run_one_tool(
     // Resolve and execute. Wall-clock timed so the TUI can show
     // "Took 0.3s" next to the marker.
     let started = std::time::Instant::now();
-    let (content, is_error) = match registry.get(&call.name) {
+    let (content, is_error, images) = match registry.get(&call.name) {
         Some(tool) => {
             let ctx = ToolContext { cwd: cwd.clone() };
             match tool.execute(effective_args.clone(), &ctx).await {
-                Ok(o) => (o.content, o.is_error),
-                Err(e) => (format!("tool error: {e}"), true),
+                Ok(o) => (o.content, o.is_error, o.images),
+                Err(e) => (format!("tool error: {e}"), true, Vec::new()),
             }
         }
-        None => (format!("unknown tool: {}", call.name), true),
+        None => (format!("unknown tool: {}", call.name), true, Vec::new()),
     };
     let elapsed = started.elapsed();
 
@@ -666,6 +673,7 @@ async fn run_one_tool(
             timestamp: time::now_iso8601(),
             content: content.clone(),
             is_error,
+            images: images.clone(),
         },
     );
 
@@ -702,6 +710,7 @@ async fn run_one_tool(
         args: effective_args,
         content,
         is_error,
+        images,
     }
 }
 

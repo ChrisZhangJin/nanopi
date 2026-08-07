@@ -83,6 +83,35 @@ impl std::str::FromStr for ThinkingLevel {
     }
 }
 
+/// Whether the given model id accepts multimodal image content.
+/// Anthropic vision has been on since Claude 3, and every 3.5+
+/// Claude ships with it. Conservative allowlist — unknown ids
+/// default to false so we don't attach 5MB base64 payloads to
+/// text-only models that would 400 on them.
+pub fn supports_vision(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    if m.starts_with("claude-opus-4") || m.starts_with("claude-sonnet-4")
+        || m.starts_with("claude-haiku-4")
+    {
+        return true;
+    }
+    if m.starts_with("claude-3-5-sonnet")
+        || m.starts_with("claude-3-5-haiku")
+        || m.starts_with("claude-3-7-sonnet")
+        || m.starts_with("claude-3-opus")
+        || m.starts_with("claude-3-sonnet")
+        || m.starts_with("claude-3-haiku")
+    {
+        return true;
+    }
+    // OpenAI vision: gpt-4o family + gpt-4.5 accept images. gpt-4
+    // (original) also does but is deprecated.
+    if m.starts_with("gpt-4o") || m.starts_with("gpt-4.5") || m == "gpt-4-vision-preview" {
+        return true;
+    }
+    false
+}
+
 /// Whether the given model id accepts Anthropic's `thinking`
 /// parameter. Conservative allowlist — Anthropic's extended thinking
 /// shipped in Claude 3.7 Sonnet, then rolled into the 4.x family.

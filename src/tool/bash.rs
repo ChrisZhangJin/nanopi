@@ -120,6 +120,7 @@ impl Tool for BashTool {
                 return Ok(ToolOutput {
                     content: format!("command timed out after {timeout:?}"),
                     is_error: true,
+                    images: Vec::new(),
                     metadata: None,
                 });
             }
@@ -168,6 +169,7 @@ impl Tool for BashTool {
         Ok(ToolOutput {
             content,
             is_error,
+            images: Vec::new(),
             metadata: Some(json!({
                 "exit_code": exit_code,
                 "stdout_bytes": out.len(),

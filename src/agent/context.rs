@@ -48,6 +48,14 @@ pub enum ContextMessage {
         content: String,
         #[serde(default)]
         is_error: bool,
+        /// Base64-encoded image blobs the tool wants sent to the
+        /// model (typically from `read` on a PNG/JPG). Empty for
+        /// text-only tool results, which is the vast majority. When
+        /// non-empty and the current model supports vision, the
+        /// Anthropic adapter emits a multimodal tool_result with
+        /// text + image content blocks.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::tool::ImageAttachment>,
     },
 }
 
@@ -97,7 +105,9 @@ impl Context {
         });
     }
 
-    /// Append a tool result message (OpenAI-style: separate role).
+    /// Append a text-only tool result message. Prefer
+    /// `push_tool_result_with_images` when the tool returned
+    /// multimodal content.
     pub fn push_tool_result(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -108,6 +118,25 @@ impl Context {
             tool_call_id: tool_call_id.into(),
             content: content.into(),
             is_error,
+            images: Vec::new(),
+        });
+    }
+
+    /// Append a tool result carrying image attachments (e.g. `read`
+    /// on a PNG). Empty `images` behaves identical to
+    /// `push_tool_result`.
+    pub fn push_tool_result_with_images(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+        images: Vec<crate::tool::ImageAttachment>,
+    ) {
+        self.messages.push(ContextMessage::Tool {
+            tool_call_id: tool_call_id.into(),
+            content: content.into(),
+            is_error,
+            images,
         });
     }
 
