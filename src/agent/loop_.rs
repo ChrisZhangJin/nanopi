@@ -349,19 +349,33 @@ impl Agent {
                 .map_err(|e| AgentError::Provider(format!("collect task: {e}")))?;
 
             if cancelled {
-                // Preserve the partial turn in context so the NEXT
-                // turn's LLM sees a coherent trace. Without this,
-                // context ends up as [user_A, user_B] with no
-                // assistant between — the model then answers both
-                // A and B, which was one of the bugs the user hit.
-                // See PI's stopReason == "aborted" path at
-                // packages/coding-agent/src/modes/interactive/
-                // interactive-mode.ts:3040-3045.
-                let marker = if assistant_text.is_empty() {
-                    "(interrupted by user before any response)".to_string()
-                } else {
-                    format!("{}\n\n(interrupted by user)", assistant_text)
-                };
+                // Push a short directive-only marker so the NEXT
+                // turn's LLM sees the turn was aborted and answers
+                // the user's new question on its own terms.
+                //
+                // Deliberately DOES NOT embed the accumulated
+                // `assistant_text`. Including the half-written
+                // response made the next turn's model "continue"
+                // that response instead of answering the new user
+                // message — a user hit this after aborting a long
+                // markdown reply about capitalism and asking "2+2"
+                // in a fresh fork, only to see the capitalism
+                // response resumed from scratch.
+                //
+                // The partial content is not lost: it was already
+                // streamed to the user's terminal via TextDelta
+                // events. The transcript keeps the visual record;
+                // the model context stays clean.
+                //
+                // Discards `assistant_text` and any pending tool
+                // calls — an aborted turn has no completed calls
+                // to reason about.
+                let _ = assistant_text;
+                let _ = calls;
+                let marker = "[Previous response was aborted by the user \
+                              before completion. Ignore this turn and \
+                              respond only to the next user message.]"
+                    .to_string();
                 session::append_entry(
                     &self.session_path,
                     &SessionEntry::Message {
@@ -892,20 +906,24 @@ mod tests {
             elapsed
         );
 
-        // Last message in context must be the synthetic (interrupted)
-        // assistant marker — this is what prevents the next turn from
-        // being interpreted as answering both the aborted and new
-        // user messages.
+        // Last message in context must be a SHORT directive-only
+        // marker. In particular it must NOT include any partial
+        // response text (that would distract the next turn's LLM
+        // into "continuing" the aborted answer instead of responding
+        // to the new user message).
         let last = agent.context.messages.last().expect("context has messages");
         match last {
             ContextMessage::Assistant { content } => {
-                let has_marker = content.iter().any(|b| match b {
-                    crate::agent::context::AssistantBlock::Text { text } => {
-                        text.contains("interrupted by user")
-                    }
-                    _ => false,
-                });
-                assert!(has_marker, "expected (interrupted by user) marker");
+                let marker_text = content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::agent::context::AssistantBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert!(marker_text.contains("aborted by the user"), "got {marker_text:?}");
+                assert!(marker_text.contains("Ignore this turn"), "got {marker_text:?}");
+                assert!(marker_text.len() < 300, "marker should be short; got {} chars", marker_text.len());
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
