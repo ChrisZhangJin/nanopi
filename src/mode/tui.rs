@@ -681,10 +681,13 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
     Ok(())
 }
 
+/// Recognize `\n[<tool> <sep> <N> bytes  Took <t>]\n` markers
+/// emitted by `Agent::execute_tool_calls`.
 fn is_tool_result_marker(text: &str) -> bool {
     text.starts_with("\n[")
         && (text.contains(" → ") || text.contains(" ✗ "))
-        && text.ends_with(" bytes]\n")
+        && text.contains(" bytes")
+        && text.ends_with("]\n")
 }
 
 /// True when the marker uses the `✗` separator (error path).
@@ -760,9 +763,9 @@ fn truncate_bar_body(s: &str) -> String {
     }
 }
 
-/// Emit both the tool-call bar (deferred until we know the outcome)
-/// and its result marker line. Bg is green on success, red on error.
-/// Falls back to yellow if there's no pending bar (shouldn't happen).
+/// Emit the whole tool block: blank line, colored bar, summary line
+/// (dim italic with duration), blank line. Bg is green on success,
+/// red on error. Matches PI's tool card layout (see img/PI_talk02.jpg).
 fn render_tool_result_marker(term: &mut Term, app: &mut App, text: &str) -> Result<()> {
     let is_err = tool_marker_is_error(text);
     let (bar_bg, bar_fg) = if is_err {
@@ -771,21 +774,24 @@ fn render_tool_result_marker(term: &mut Term, app: &mut App, text: &str) -> Resu
         (Color::Green, Color::Indexed(255))
     };
     let bar_style = Style::default().bg(bar_bg).fg(bar_fg).add_modifier(Modifier::BOLD);
-    let dim_style = Style::default()
+    let dim_bar_style = Style::default()
         .bg(bar_bg)
         .fg(Color::Indexed(250))
         .add_modifier(Modifier::ITALIC);
+
+    // Breathing room above.
+    insert_line(term, Line::from(""))?;
 
     // Draw the bar now that we know the outcome.
     if let Some(pending) = app.pending_tool_call.take() {
         insert_line_bg(term, Line::from(vec![
             Span::styled(pending.leading, bar_style),
             Span::styled(pending.body, bar_style),
-            Span::styled("  (ctrl+o to expand)", dim_style),
+            Span::styled("  (ctrl+o to expand)", dim_bar_style),
         ]), Some(bar_style))?;
     }
 
-    // Then the result summary line (dim italic).
+    // Then the result summary line (dim italic, or dim red for errors).
     let cleaned = text.trim();
     let summary_style = if is_err {
         Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC)
@@ -795,6 +801,9 @@ fn render_tool_result_marker(term: &mut Term, app: &mut App, text: &str) -> Resu
     insert_line(term, Line::from(vec![
         Span::styled(cleaned.to_string(), summary_style),
     ]))?;
+
+    // Breathing room below.
+    insert_line(term, Line::from(""))?;
     Ok(())
 }
 
@@ -1137,9 +1146,16 @@ mod tests {
 
     #[test]
     fn tool_result_marker_detection() {
-        assert!(is_tool_result_marker("\n[bash → 97 bytes]\n"));
-        assert!(is_tool_result_marker("\n[read → 12345 bytes]\n"));
+        assert!(is_tool_result_marker("\n[bash → 97 bytes  Took 0.3s]\n"));
+        assert!(is_tool_result_marker("\n[read → 12345 bytes  Took 45ms]\n"));
+        assert!(is_tool_result_marker("\n[bash ✗ 32 bytes  Took 12ms]\n"));
         assert!(!is_tool_result_marker("bash output"));
         assert!(!is_tool_result_marker("\n[bash starting]"));
+    }
+
+    #[test]
+    fn error_marker_flagged() {
+        assert!(tool_marker_is_error("\n[bash ✗ 32 bytes  Took 12ms]\n"));
+        assert!(!tool_marker_is_error("\n[bash → 32 bytes  Took 12ms]\n"));
     }
 }

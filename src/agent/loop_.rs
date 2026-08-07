@@ -512,7 +512,9 @@ async fn run_one_tool(
         },
     );
 
-    // Resolve and execute.
+    // Resolve and execute. Wall-clock timed so the TUI can show
+    // "Took 0.3s" next to the marker.
+    let started = std::time::Instant::now();
     let (content, is_error) = match registry.get(&call.name) {
         Some(tool) => {
             let ctx = ToolContext { cwd: cwd.clone() };
@@ -523,6 +525,7 @@ async fn run_one_tool(
         }
         None => (format!("unknown tool: {}", call.name), true),
     };
+    let elapsed = started.elapsed();
 
     // Persist result.
     let _ = session::append_entry(
@@ -537,11 +540,18 @@ async fn run_one_tool(
 
     // Stream to renderer. Use `→` for success, `✗` for error so the
     // TUI can pick a matching (green / red) tool-call bar color.
+    // Format: `\n[<tool> <sep> <bytes> bytes  Took <t>s]\n`
     let sep = if is_error { "✗" } else { "→" };
+    let took = elapsed.as_secs_f64();
+    let took_str = if took < 0.05 {
+        format!("Took {}ms", (took * 1000.0).round() as u32)
+    } else {
+        format!("Took {:.1}s", took)
+    };
     let _ = tx
         .send(AgentEvent::TextDelta {
             content_index: 0,
-            text: format!("\n[{} {} {} bytes]\n", call.name, sep, content.len()),
+            text: format!("\n[{} {} {} bytes  {}]\n", call.name, sep, content.len(), took_str),
         })
         .await;
 

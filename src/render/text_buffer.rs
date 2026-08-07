@@ -337,6 +337,10 @@ impl TextBuffer {
                 KeyCode::Char('w') => { self.kill_prev_word();  return Action::Nothing; }
                 KeyCode::Char('y') => { self.yank();            return self.slash_or_nothing(); }
                 KeyCode::Char('z') => { self.undo();            return Action::Nothing; }
+                // Some terminals send Backspace as Ctrl+H (0x08) instead
+                // of DEL (0x7f). Handle that here so users don't get a
+                // literal 'h' inserted when pressing Backspace.
+                KeyCode::Char('h') => { self.backspace();       return self.slash_or_nothing(); }
                 _ => {}
             }
         }
@@ -441,6 +445,16 @@ mod tests {
         let mut b = TextBuffer::new();
         type_str(&mut b, "abc");
         b.handle_key(press(KeyCode::Backspace));
+        assert_eq!(b.as_string(), "ab");
+    }
+
+    /// Some terminals send Ctrl-H (0x08) as the Backspace key. We must
+    /// treat that as a backspace, NOT insert an 'h'.
+    #[test]
+    fn ctrl_h_is_backspace() {
+        let mut b = TextBuffer::new();
+        type_str(&mut b, "abc");
+        b.handle_key(press_c(KeyCode::Char('h')));
         assert_eq!(b.as_string(), "ab");
     }
 
