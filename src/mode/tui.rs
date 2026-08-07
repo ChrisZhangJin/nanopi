@@ -60,8 +60,27 @@ use crate::provider::openai::OpenAiProvider;
 use crate::session::{self, SessionChoice};
 use crate::settings;
 use crate::tool::ToolRegistry;
+use crate::render::menu::{MenuAction, MenuItem, MenuState};
+use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 
-const DOCK_HEIGHT: u16 = 5; // 3 rows input box + 2 rows footer
+/// Slash commands available in the palette. Keep the payload
+/// `&'static str` so it's copy-able and hashable if we ever key on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCmd {
+    Compact,
+    Quit,
+    // Future: Model, Login, Settings, Export, Import.
+}
+
+fn slash_items() -> Vec<MenuItem<SlashCmd>> {
+    vec![
+        MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
+        MenuItem::new("/quit",    "Exit the session",         SlashCmd::Quit),
+        MenuItem::new("/exit",    "Exit the session",         SlashCmd::Quit),
+    ]
+}
+
+const DOCK_HEIGHT: u16 = 10; // palette(5) + input(3) + footer(2)
 
 // ─────────────────────────────────────────────────────────────────────
 // Entry
@@ -229,7 +248,10 @@ enum Status {
 }
 
 struct App {
-    input: String,
+    input: TextBuffer,
+    /// When Some, the slash-command palette is open and consumes keys
+    /// (except letters, which the TextBuffer still gets for filtering).
+    palette: Option<MenuState<SlashCmd>>,
     status: Status,
     session_id: String,
     model: String,
@@ -250,7 +272,8 @@ struct App {
 impl App {
     fn new(session_id: String, model: String, cwd: PathBuf) -> Self {
         Self {
-            input: String::new(),
+            input: TextBuffer::new(),
+            palette: None,
             status: Status::Idle,
             session_id,
             model,
@@ -269,6 +292,7 @@ impl App {
 // Key → action
 // ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 enum KeyAction {
     Nothing,
     StartTurn(String),
@@ -277,44 +301,98 @@ enum KeyAction {
     Compact,
 }
 
+/// Dispatch one key event. Palette (if open) claims navigation keys
+/// first; everything else flows through TextBuffer. After the key is
+/// handled, the palette's open/closed state is re-synced against the
+/// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-        return if app.status == Status::Streaming {
-            KeyAction::CancelTurn
-        } else {
-            KeyAction::Exit
-        };
+    // ── Palette owns navigation keys when open. ─────────────────────
+    if app.palette.is_some() {
+        let claims_nav = matches!(
+            k.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Tab
+        ) || (k.code == KeyCode::Enter && !k.modifiers.contains(KeyModifiers::SHIFT));
+        if claims_nav {
+            let m = app.palette.as_mut().unwrap();
+            match m.handle_key(k) {
+                MenuAction::Chosen(cmd) => {
+                    app.palette = None;
+                    app.input.clear();
+                    return dispatch_slash(cmd);
+                }
+                MenuAction::Cancel => {
+                    app.palette = None;
+                    app.input.clear();
+                    return KeyAction::Nothing;
+                }
+                MenuAction::Nothing => {
+                    return KeyAction::Nothing;
+                }
+            }
+        }
     }
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('d') {
-        return KeyAction::Exit;
-    }
-    match k.code {
-        KeyCode::Enter => {
+
+    // ── Otherwise route through the text buffer. ────────────────────
+    let action = app.input.handle_key(k);
+    let out = match action {
+        TbAction::Nothing => KeyAction::Nothing,
+        TbAction::SlashChanged(_) => KeyAction::Nothing, // sync below opens palette
+        TbAction::Cancel => {
+            if app.palette.is_some() {
+                app.palette = None;
+                app.input.clear();
+                KeyAction::Nothing
+            } else if app.status == Status::Streaming {
+                KeyAction::CancelTurn
+            } else {
+                KeyAction::Exit
+            }
+        }
+        TbAction::Exit => KeyAction::Exit,
+        TbAction::Submit(text) => {
             if app.status == Status::Streaming {
-                return KeyAction::Nothing;
+                // Ignore submits mid-turn.
+                KeyAction::Nothing
+            } else {
+                let t = text.trim();
+                if t.is_empty() {
+                    KeyAction::Nothing
+                } else if t == "/quit" || t == "/exit" {
+                    KeyAction::Exit
+                } else if t == "/compact" {
+                    KeyAction::Compact
+                } else {
+                    KeyAction::StartTurn(t.to_string())
+                }
             }
-            let msg = std::mem::take(&mut app.input);
-            let trimmed = msg.trim().to_string();
-            if trimmed.is_empty() {
-                return KeyAction::Nothing;
-            }
-            if trimmed == "/quit" || trimmed == "/exit" {
-                return KeyAction::Exit;
-            }
-            if trimmed == "/compact" {
-                return KeyAction::Compact;
-            }
-            KeyAction::StartTurn(trimmed)
         }
-        KeyCode::Backspace => {
-            app.input.pop();
-            KeyAction::Nothing
+    };
+    sync_palette(app);
+    out
+}
+
+/// Sync palette state with the input buffer: open if first line
+/// starts with `/`, else close. Also refreshes the filter query.
+fn sync_palette(app: &mut App) {
+    let full = app.input.as_string();
+    let first_line = full.lines().next().unwrap_or("");
+    if first_line.starts_with('/') {
+        if app.palette.is_none() {
+            app.palette = Some(MenuState::new(slash_items()));
         }
-        KeyCode::Char(c) => {
-            app.input.push(c);
-            KeyAction::Nothing
+        if let Some(m) = app.palette.as_mut() {
+            let filter = first_line.strip_prefix('/').unwrap_or("").to_string();
+            m.set_filter(filter);
         }
-        _ => KeyAction::Nothing,
+    } else if app.palette.is_some() {
+        app.palette = None;
+    }
+}
+
+fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
+    match cmd {
+        SlashCmd::Compact => KeyAction::Compact,
+        SlashCmd::Quit => KeyAction::Exit,
     }
 }
 
@@ -349,7 +427,8 @@ async fn run_app(
                                       &mut ag_rx, &mut cancel, &mut turn_task).await?;
                     }
                     Some(Ok(Event::Paste(s))) => {
-                        app.input.push_str(&s);
+                        app.input.insert_str(&s);
+                        sync_palette(app);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(_)) => {}
@@ -587,35 +666,60 @@ fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────
 
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
+    // Layout: 5 rows palette + 3 rows input + 2 rows footer = 10 total.
+    // When palette closed, the top 5 rows are blank.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(5), // palette area (blank when closed)
             Constraint::Length(3), // input box (top border + content + bottom border)
             Constraint::Length(1), // cwd + branch
             Constraint::Length(1), // stats
         ])
         .split(area);
 
-    // Input box.
-    let input_text = format!("> {}_", app.input); // trailing _ ≈ cursor
-    let mut input_line = vec![
+    // ── Palette (dropdown menu) ──────────────────────────────────
+    if let Some(m) = &app.palette {
+        draw_palette(buf, chunks[0], m);
+    }
+
+    // ── Input box ────────────────────────────────────────────────
+    // TextBuffer can be multi-line but for MVP we render only the row
+    // containing the cursor + trim overflow. The bordered block is 3
+    // rows total (top ─, content, bottom ─).
+    let cursor_row = app.input.cursor().0;
+    let cursor_col = app.input.cursor().1;
+    let display_row = app.input.lines().get(cursor_row).cloned().unwrap_or_default();
+    // Render prefix + text-so-far + cursor block + text-after.
+    let (pre, post) = split_at_col(&display_row, cursor_col);
+    let mut input_spans: Vec<Span> = vec![
         Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(app.input.clone()),
-        // Reverse-video block as cursor
-        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(pre.to_string()),
+        // Reverse-video block as cursor; either the char under it or space.
+        {
+            let cursor_char: String = post.chars().next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
+            Span::styled(cursor_char, Style::default().add_modifier(Modifier::REVERSED))
+        },
+        Span::raw(post.chars().skip(1).collect::<String>()),
     ];
-    // Show a small status note on the right if set.
     if let Some(note) = &app.status_note {
-        input_line.push(Span::raw("  "));
-        input_line.push(Span::styled(
+        input_spans.push(Span::raw("  "));
+        input_spans.push(Span::styled(
             format!("({note})"),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
         ));
     }
-    let _ = input_text; // silence unused
-    let input_para = Paragraph::new(Line::from(input_line))
+    // If multi-line, show "(+N more lines)" hint on the right.
+    if app.input.row_count() > 1 {
+        input_spans.push(Span::raw("  "));
+        input_spans.push(Span::styled(
+            format!("(line {}/{})", cursor_row + 1, app.input.row_count()),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let input_para = Paragraph::new(Line::from(input_spans))
         .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
-    input_para.render(chunks[0], buf);
+    input_para.render(chunks[1], buf);
 
     // Line 1 of footer: cwd + branch + session
     let cwd_str = crate::render::status_line::cwd_display(&app.cwd);
@@ -631,7 +735,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         format!("  · session {}", sid_short),
         Style::default().fg(Color::DarkGray),
     ));
-    Paragraph::new(Line::from(l1)).render(chunks[1], buf);
+    Paragraph::new(Line::from(l1)).render(chunks[2], buf);
 
     // Line 2: context% + tokens + cost + model  (or streaming note)
     let mut l2: Vec<Span> = Vec::new();
@@ -662,7 +766,68 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
         ));
     }
-    Paragraph::new(Line::from(l2)).render(chunks[2], buf);
+    Paragraph::new(Line::from(l2)).render(chunks[3], buf);
+}
+
+/// Split a string at the given byte position, returning (pre, post).
+fn split_at_col(s: &str, col: usize) -> (&str, &str) {
+    let clamped = col.min(s.len());
+    s.split_at(clamped)
+}
+
+/// Render the slash-command palette in the given rect. Selected item
+/// gets green `→` + bold label; others get grey.
+fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
+    let vis = m.visible();
+    let sel = m.cursor();
+    if vis.is_empty() {
+        let msg = Line::from(vec![Span::styled(
+            "  (no matches)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )]);
+        Paragraph::new(msg).render(area, buf);
+        return;
+    }
+    let max_rows = area.height as usize;
+    // Center the window around the cursor if items overflow.
+    let start = if vis.len() <= max_rows {
+        0
+    } else if sel < max_rows / 2 {
+        0
+    } else if sel >= vis.len() - (max_rows - max_rows / 2) {
+        vis.len().saturating_sub(max_rows)
+    } else {
+        sel - max_rows / 2
+    };
+    let end = (start + max_rows).min(vis.len());
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in vis[start..end].iter().enumerate() {
+        let absolute = start + i;
+        let is_sel = absolute == sel;
+        let arrow = if is_sel { "→ " } else { "  " };
+        let label_style = if is_sel {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let desc_style = Style::default().fg(Color::DarkGray);
+        lines.push(Line::from(vec![
+            Span::styled(arrow, label_style),
+            Span::styled(format!("{:<12}", item.label), label_style),
+            Span::styled(item.description.clone(), desc_style),
+        ]));
+    }
+    // Overflow indicator on last row if more items exist below.
+    if end < vis.len() {
+        let count = vis.len() - end;
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled(
+                format!("   (+{count} more)"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+    }
+    Paragraph::new(lines).render(area, buf);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -677,6 +842,11 @@ mod tests {
         App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"))
     }
 
+    fn seed_input(app: &mut App, text: &str) {
+        app.input.insert_str(text);
+        sync_palette(app);
+    }
+
     #[test]
     fn typing_appends() {
         let mut app = mkapp();
@@ -684,24 +854,24 @@ mod tests {
             interpret_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
             KeyAction::Nothing
         ));
-        assert_eq!(app.input, "a");
+        assert_eq!(app.input.as_string(), "a");
     }
 
     #[test]
     fn backspace_pops() {
         let mut app = mkapp();
-        app.input = "abc".into();
+        seed_input(&mut app, "abc");
         interpret_key(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(app.input, "ab");
+        assert_eq!(app.input.as_string(), "ab");
     }
 
     #[test]
     fn enter_submits() {
         let mut app = mkapp();
-        app.input = "hi".into();
+        seed_input(&mut app, "hi");
         match interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
             KeyAction::StartTurn(s) => assert_eq!(s, "hi"),
-            _ => panic!(),
+            other => panic!("got {other:?}"),
         }
     }
 
@@ -715,9 +885,12 @@ mod tests {
     }
 
     #[test]
-    fn slash_quit_exits() {
+    fn slash_quit_opens_palette_then_enter_exits() {
         let mut app = mkapp();
-        app.input = "/quit".into();
+        seed_input(&mut app, "/quit");
+        assert!(app.palette.is_some(), "palette should open on /");
+        // Enter picks the selected item; "quit" matches only /quit
+        // so it's the selected item.
         assert!(matches!(
             interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             KeyAction::Exit
@@ -725,13 +898,31 @@ mod tests {
     }
 
     #[test]
-    fn slash_compact() {
+    fn slash_compact_picks_command() {
         let mut app = mkapp();
-        app.input = "/compact".into();
+        seed_input(&mut app, "/compact");
         assert!(matches!(
             interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             KeyAction::Compact
         ));
+    }
+
+    #[test]
+    fn palette_esc_closes_and_clears_input() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/co");
+        assert!(app.palette.is_some());
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.palette.is_none());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn palette_filters_by_typing() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/co");
+        let m = app.palette.as_ref().unwrap();
+        assert!(m.visible().iter().any(|it| it.label == "/compact"));
     }
 
     #[test]

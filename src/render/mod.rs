@@ -5,8 +5,10 @@
 //! is a v0.6+ concern.
 
 pub mod alt_screen;
+pub mod menu;
 pub mod panel;
 pub mod spinner;
 pub mod status_line;
 pub mod stdout;
+pub mod text_buffer;
 pub mod tui;
