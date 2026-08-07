@@ -91,14 +91,29 @@ impl Context {
     }
 
     /// Append a tool result message (OpenAI-style: separate role).
+    ///
+    /// Guard: if the context already contains a Tool message with the
+    /// same `tool_call_id`, skip. Anthropic's API rejects requests where
+    /// a single `tool_use_id` has multiple `tool_result` blocks, so we
+    /// enforce that invariant at the source. This can happen if a
+    /// gateway/proxy replays a tool_use id across turns or if our
+    /// streaming parser ever misses a dedup.
     pub fn push_tool_result(
         &mut self,
         tool_call_id: impl Into<String>,
         content: impl Into<String>,
         is_error: bool,
     ) {
+        let id_str = tool_call_id.into();
+        if self.messages.iter().any(|m| {
+            matches!(m, ContextMessage::Tool { tool_call_id: existing, .. } if existing == &id_str)
+        }) {
+            // Duplicate — silently drop. Emitting a warn! would spam
+            // stderr on every reused id (some proxies do this per turn).
+            return;
+        }
         self.messages.push(ContextMessage::Tool {
-            tool_call_id: tool_call_id.into(),
+            tool_call_id: id_str,
             content: content.into(),
             is_error,
         });
@@ -200,6 +215,33 @@ mod tests {
             }
             _ => panic!("expected user message"),
         }
+    }
+
+    /// Guard rail: repeated `push_tool_result` with the same
+    /// tool_call_id must not duplicate the message. Anthropic API
+    /// rejects requests containing multiple tool_result blocks with the
+    /// same tool_use_id.
+    #[test]
+    fn push_tool_result_drops_duplicate_ids() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result("call_A", "first", false);
+        ctx.push_tool_result("call_A", "second (should be dropped)", false);
+        ctx.push_tool_result("call_B", "different id, kept", false);
+
+        let tool_msgs: Vec<_> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, content, .. } => {
+                    Some((tool_call_id.clone(), content.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "expected exactly 2 Tool messages");
+        assert_eq!(tool_msgs[0].0, "call_A");
+        assert_eq!(tool_msgs[0].1, "first", "first push wins");
+        assert_eq!(tool_msgs[1].0, "call_B");
     }
 
     #[test]

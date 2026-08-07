@@ -334,6 +334,18 @@ impl Agent {
                 }
             }
 
+            // Dedup calls by id. The Anthropic streaming parser already
+            // dedups within one stream via `emitted_call_ids`, but proxy
+            // gateways sometimes replay tool_use ids from earlier turns.
+            // Two ToolCalls with the same id would create two ToolResult
+            // blocks with the same tool_use_id in the next request, which
+            // Anthropic rejects ("each tool_use must have a single
+            // result"). Keep the first occurrence.
+            {
+                let mut seen: std::collections::HashSet<String> = Default::default();
+                calls.retain(|c| seen.insert(c.id.clone()));
+            }
+
             // Persist assistant text + push assistant message to context.
             // CRITICAL: must include ToolCall blocks so the provider knows
             // the following Tool messages are responses.
