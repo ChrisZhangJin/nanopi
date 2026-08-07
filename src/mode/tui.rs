@@ -675,7 +675,7 @@ async fn handle_action(
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let before = a.context.estimate_chars();
-                a.compact_now().await;
+                a.compact_now(None, "manual").await;
                 let after = a.context.estimate_chars();
                 insert_line(term, Line::from(vec![
                     Span::styled(
@@ -811,6 +811,31 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             insert_line(term, Line::from(vec![
                 Span::styled(format!("[error: {error}]"), Style::default().fg(Color::Red)),
             ]))?;
+        }
+        AgentEvent::CompactionStart { reason } => {
+            flush_stream_buf(term, app)?;
+            flush_thinking_buf(term, app)?;
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[compacting context ({reason})…]"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
+        }
+        AgentEvent::CompactionEnd { replaced_count, used_llm } => {
+            let via = if used_llm { "summary" } else { "truncation" };
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[compacted {replaced_count} messages via {via}]"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
+            // Refresh cached context estimate for the status footer.
+            app.context_chars = 0; // will be re-populated on next event
         }
         AgentEvent::Done { .. } | AgentEvent::Start { .. } => {}
     }

@@ -16,14 +16,44 @@ use crate::agent::context::{ContentBlock, Context, ContextMessage};
 use crate::agent::loop_::Provider;
 use crate::event::AgentEvent;
 
-/// Compact when the character count crosses this threshold. Roughly
-/// 25k tokens (chars/4). Well under the 32k window many small models
-/// still target.
+/// Fallback char-count threshold used when we don't know the model's
+/// context window (unknown model id). Roughly 25k tokens. Prefer the
+/// token-based check in `should_auto_compact` when a window is known.
 pub const MAX_CONTEXT_CHARS: usize = 100_000;
+
+/// Space (in tokens) to keep between "current context" and the model's
+/// hard window when auto-compacting. Matches PI (see
+/// `packages/coding-agent/src/core/compaction/compaction.ts:134`).
+pub const RESERVE_TOKENS: u32 = 16_384;
+
+/// Rough chars-per-token used to convert a char estimate into tokens
+/// when we haven't yet seen a real Usage number for this session.
+/// PI's tokenizer is more accurate; 4 chars ≈ 1 token is the industry
+/// rule of thumb and lands within ~30% for English + code.
+pub const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Keep at least this many trailing messages verbatim after compaction.
 /// Roughly 4 turn pairs.
 pub const KEEP_LAST_MESSAGES: usize = 8;
+
+/// Decide whether an auto-compact should fire.
+///
+/// - When `context_window` is `Some(w)`: fire if
+///   `estimated_tokens + RESERVE_TOKENS > w`. This matches PI.
+/// - When it's `None` (unknown model): fall back to
+///   `estimated_chars >= MAX_CONTEXT_CHARS`.
+pub fn should_auto_compact(
+    estimated_chars: usize,
+    context_window: Option<u32>,
+) -> bool {
+    match context_window {
+        Some(window) => {
+            let est_tokens = (estimated_chars / CHARS_PER_TOKEN_ESTIMATE) as u32;
+            est_tokens.saturating_add(RESERVE_TOKENS) > window
+        }
+        None => estimated_chars >= MAX_CONTEXT_CHARS,
+    }
+}
 
 /// System prompt used to drive the summarization LLM call.
 const SUMMARIZER_SYSTEM: &str = "You compress conversations. Given the transcript below, output a compact summary that preserves: user goals, decisions made, key facts learned, files/functions touched, and any open questions. Aim for 300-500 words. Output only the summary — no preamble, no meta-commentary.";
@@ -170,6 +200,25 @@ mod tests {
             content: content.into(),
             is_error: false,
         }
+    }
+
+    #[test]
+    fn should_auto_compact_fires_when_close_to_window() {
+        // Claude Opus window ≈ 200_000 tokens. Estimated 190k tokens ≈
+        // 760_000 chars. With 16k reserve, 190k + 16k = 206k > 200k → fire.
+        assert!(should_auto_compact(760_000, Some(200_000)));
+    }
+
+    #[test]
+    fn should_auto_compact_holds_when_below_reserve() {
+        // 150k tokens = 600k chars. 150k + 16k = 166k < 200k → hold.
+        assert!(!should_auto_compact(600_000, Some(200_000)));
+    }
+
+    #[test]
+    fn should_auto_compact_falls_back_to_char_check_for_unknown_model() {
+        assert!(!should_auto_compact(99_000, None));
+        assert!(should_auto_compact(100_001, None));
     }
 
     #[test]

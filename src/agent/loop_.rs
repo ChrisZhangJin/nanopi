@@ -179,11 +179,33 @@ impl Agent {
     /// in interactive mode. Best-effort — a provider error triggers a
     /// placeholder fallback, no error propagates up. Records a
     /// `Compaction` SessionEntry on success.
-    pub async fn compact_now(&mut self) {
+    ///
+    /// When `tx` is Some, emits `CompactionStart` + `CompactionEnd`
+    /// events so the UI can draw a scrollback marker. The manual
+    /// `/compact` path passes None and drives its own feedback via
+    /// the palette; the auto-trigger passes Some(&turn_tx).
+    pub async fn compact_now(
+        &mut self,
+        tx: Option<&mpsc::Sender<AgentEvent>>,
+        reason: &str,
+    ) {
         use crate::agent::compact::compact;
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(AgentEvent::CompactionStart { reason: reason.to_string() })
+                .await;
+        }
         let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
             return;
         };
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(AgentEvent::CompactionEnd {
+                    replaced_count: result.replaced_count,
+                    used_llm: result.used_llm,
+                })
+                .await;
+        }
         let _ = session::append_entry(
             &self.session_path,
             &SessionEntry::Compaction {
@@ -195,14 +217,18 @@ impl Agent {
     }
 
     /// Threshold-gated version of `compact_now`. Called at the top of
-    /// each turn so long conversations don't blow the model's context
-    /// window.
-    pub async fn maybe_compact(&mut self) {
-        use crate::agent::compact::MAX_CONTEXT_CHARS;
-        if self.context.estimate_chars() < MAX_CONTEXT_CHARS {
-            return;
+    /// each turn AND after each response completes (matching PI). Uses
+    /// the model's known context window when available, otherwise a
+    /// fixed char threshold. Returns true if a pass was run.
+    pub async fn maybe_compact(&mut self, tx: &mpsc::Sender<AgentEvent>) -> bool {
+        use crate::agent::compact::should_auto_compact;
+        let est_chars = self.context.estimate_chars();
+        let window = crate::pricing::context_window(&self.model);
+        if !should_auto_compact(est_chars, window) {
+            return false;
         }
-        self.compact_now().await;
+        self.compact_now(Some(tx), "threshold").await;
+        true
     }
 
     /// Run a single user turn to completion. Streams events to `tx` and
@@ -223,7 +249,7 @@ impl Agent {
     ) -> Result<String, AgentError> {
         // If the accumulated context is too big, compact it before adding
         // the new user message so the new message survives intact.
-        self.maybe_compact().await;
+        self.maybe_compact(tx).await;
         self.turn_count = self.turn_count.saturating_add(1);
 
         // Append user message to context + session.
@@ -361,23 +387,27 @@ impl Agent {
 
             match finish_reason {
                 FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
-                    return Ok(final_text);
+                    break;
                 }
                 FinishReason::ToolCalls => {
                     if calls.is_empty() {
                         // LLM said "tool calls" but emitted none — done.
-                        return Ok(final_text);
+                        break;
                     }
                     // Execute tools sequentially (v0.5).
                     self.execute_tool_calls(calls, tx).await?;
                     // Loop back to the next LLM turn.
                 }
                 FinishReason::Unknown => {
-                    return Ok(final_text);
+                    break;
                 }
             }
         }
-        // Hit MAX_ITERATIONS — give up gracefully.
+        // Post-turn compaction check. Matches PI (`agent-session.ts`
+        // `_handlePostAgentRun`). Firing here means the user sees the
+        // compaction event bundled with the just-finished response
+        // instead of at the start of the next turn.
+        self.maybe_compact(tx).await;
         Ok(final_text)
     }
 
@@ -724,6 +754,77 @@ mod tests {
             parameters: json!({"type":"object"}),
         });
         assert_eq!(ctx.tools.len(), 1);
+    }
+
+    /// Build a minimal Agent for compaction tests. Uses FakeProvider so
+    /// the summarizer call inside compact() returns synthesized text
+    /// instead of hitting the network.
+    fn agent_for_compact_test(response: &str) -> (Agent, PathBuf) {
+        let dir = tmp();
+        let session_path = dir.join("session.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider { response: response.into() }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+        };
+        (agent, dir)
+    }
+
+    #[tokio::test]
+    async fn compact_now_emits_start_and_end_when_tx_provided() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        // Populate enough messages that find_compact_boundary succeeds.
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}"));
+            agent.context.push_assistant_text(format!("a{i}"));
+        }
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        agent.compact_now(Some(&tx), "threshold").await;
+        drop(tx);
+
+        let mut got_start_reason = None;
+        let mut got_end = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                AgentEvent::CompactionStart { reason } => got_start_reason = Some(reason),
+                AgentEvent::CompactionEnd { used_llm, replaced_count } => {
+                    assert!(used_llm, "expected used_llm=true from FakeProvider");
+                    assert!(replaced_count > 0);
+                    got_end = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(got_start_reason.as_deref(), Some("threshold"));
+        assert!(got_end, "expected CompactionEnd event");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_returns_false_and_stays_silent_below_threshold() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        agent.context.push_user_text("hello");
+        agent.context.push_assistant_text("hi");
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        let fired = agent.maybe_compact(&tx).await;
+        drop(tx);
+        assert!(!fired);
+        // Channel should be empty and closed → recv returns None.
+        assert!(rx.recv().await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Test-only Provider that emits a fixed assistant message and

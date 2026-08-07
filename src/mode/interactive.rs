@@ -225,7 +225,7 @@ pub async fn run_interactive_mode(
             let mut guard = agent_slot.lock().await;
             if let Some(a) = guard.as_mut() {
                 let before = a.context.estimate_chars();
-                a.compact_now().await;
+                a.compact_now(None, "manual").await;
                 let after = a.context.estimate_chars();
                 eprintln!("[compacted: {before} → {after} chars]");
             }

@@ -66,6 +66,19 @@ impl StdoutRenderer {
                 write!(out, "\x1b[31m\n[error: {}]\x1b[0m\n", error)?;
                 out.flush()?;
             }
+            AgentEvent::CompactionStart { reason } => {
+                write!(out, "\x1b[2m\n[compacting context ({})…]\x1b[0m\n", reason)?;
+                out.flush()?;
+            }
+            AgentEvent::CompactionEnd { replaced_count, used_llm } => {
+                let via = if *used_llm { "summary" } else { "truncation" };
+                write!(
+                    out,
+                    "\x1b[2m[compacted {} messages via {}]\x1b[0m\n",
+                    replaced_count, via
+                )?;
+                out.flush()?;
+            }
         }
         Ok(())
     }

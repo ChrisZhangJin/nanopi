@@ -44,6 +44,23 @@ pub enum AgentEvent {
 
     /// Stream errored.
     Error { error: String },
+
+    /// Auto-compaction started because the context grew past the
+    /// model's window minus reserve. Emitted by Agent::compact_now
+    /// when called from maybe_compact. Manual /compact does NOT emit
+    /// these (the palette handler drives its own UI feedback).
+    CompactionStart {
+        /// Why it fired: "threshold" (approaching window) or "manual".
+        reason: String,
+    },
+
+    /// Auto-compaction finished. Renderer draws a scrollback marker.
+    CompactionEnd {
+        /// How many messages were folded into the summary.
+        replaced_count: usize,
+        /// True if the LLM actually summarized; false = placeholder fallback.
+        used_llm: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +108,8 @@ impl AgentEvent {
             AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::Done { .. } => "done",
             AgentEvent::Error { .. } => "error",
+            AgentEvent::CompactionStart { .. } => "compaction_start",
+            AgentEvent::CompactionEnd { .. } => "compaction_end",
         }
     }
 }
