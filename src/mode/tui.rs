@@ -268,6 +268,10 @@ struct App {
     /// Same, for `ThinkingDelta` events (Anthropic reasoning traces).
     /// Rendered dim italic to distinguish from the model's actual reply.
     thinking_buf: String,
+    /// A tool_call event just arrived; its bar is not yet drawn. On the
+    /// matching tool-result marker we colour it green (success) or red
+    /// (failure) using the marker's separator (`→` vs `✗`).
+    pending_tool_call: Option<PendingBar>,
     /// Optional short status shown to the right of the input box
     /// (e.g. "cancelling…", "compacting…").
     status_note: Option<String>,
@@ -288,9 +292,19 @@ impl App {
             turn_count: 0,
             stream_buf: String::new(),
             thinking_buf: String::new(),
+            pending_tool_call: None,
             status_note: None,
         }
     }
+}
+
+/// A ToolCall event we've received but not yet drawn to scrollback.
+/// We wait until the tool_result marker so we can pick the bar color
+/// (green success / red failure).
+#[derive(Debug, Clone)]
+struct PendingBar {
+    leading: String,
+    body: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -448,9 +462,26 @@ async fn run_app(
                         term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
                     }
                     None => {
-                        // Turn done. Flush both buffers, reap task.
+                        // Turn done. Flush buffers + any orphan pending bar
+                        // (tool that didn't get to emit its result marker,
+                        // e.g. turn was cancelled).
                         flush_stream_buf(term, app)?;
                         flush_thinking_buf(term, app)?;
+                        if let Some(pending) = app.pending_tool_call.take() {
+                            let yellow = Style::default()
+                                .bg(Color::Yellow)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD);
+                            let dim = Style::default()
+                                .bg(Color::Yellow)
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC);
+                            insert_line_bg(term, Line::from(vec![
+                                Span::styled(pending.leading, yellow),
+                                Span::styled(pending.body, yellow),
+                                Span::styled("  (interrupted)", dim),
+                            ]), Some(yellow))?;
+                        }
                         ag_rx = None;
                         cancel = None;
                         app.status = Status::Idle;
@@ -529,9 +560,13 @@ async fn handle_action(
             }
             // Echo user message into scrollback, PI-style: blank line +
             // full-width gray "card" (3 rows: pad, content, pad) + blank.
-            // Gray is bright enough to stand out against the terminal's
-            // dark bg; falls back to a plain highlight in light themes.
-            let user_bg = Style::default().bg(Color::Rgb(90, 90, 96)).fg(Color::White);
+            // Use 256-color palette (Indexed 238) — visible on every
+            // terminal including tmux without truecolor passthrough.
+            // Truecolor (RGB) fails silently on tmux-256color, which is
+            // the default in most setups.
+            let user_bg = Style::default()
+                .bg(Color::Indexed(238))
+                .fg(Color::Indexed(255));
             insert_line(term, Line::from(""))?;
             insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
             for line in msg.lines() {
@@ -592,7 +627,7 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             // Render collapsed (first N lines only) + dim italic PI-style.
             if is_tool_result_marker(&text) {
                 flush_stream_buf(term, app)?;
-                render_tool_result_marker(term, &text)?;
+                render_tool_result_marker(term, app, &text)?;
                 return Ok(());
             }
             // Real assistant text → flush any pending thinking, then
@@ -628,23 +663,11 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
         AgentEvent::ToolCall { call, .. } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            // Full-width green background bar — PI's "$ command" style.
-            // Bash gets the shell-prompt look; other tools get
-            // "toolname: <arg preview>".
+            // Don't draw the bar yet — we don't know if it succeeded.
+            // Stash it; the tool-result marker will trigger the draw
+            // with a green (success) or red (failure) bg.
             let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
-            let bar_style = Style::default()
-                .bg(Color::Rgb(0, 100, 0))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD);
-            let dim_style = Style::default()
-                .bg(Color::Rgb(0, 100, 0))
-                .fg(Color::Rgb(180, 220, 180))
-                .add_modifier(Modifier::ITALIC);
-            insert_line_bg(term, Line::from(vec![
-                Span::styled(leading, bar_style),
-                Span::styled(body, bar_style),
-                Span::styled("  (ctrl+o to expand)", dim_style),
-            ]), Some(bar_style))?;
+            app.pending_tool_call = Some(PendingBar { leading, body });
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
@@ -659,7 +682,14 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
 }
 
 fn is_tool_result_marker(text: &str) -> bool {
-    text.starts_with("\n[") && text.contains(" → ") && text.ends_with(" bytes]\n")
+    text.starts_with("\n[")
+        && (text.contains(" → ") || text.contains(" ✗ "))
+        && text.ends_with(" bytes]\n")
+}
+
+/// True when the marker uses the `✗` separator (error path).
+fn tool_marker_is_error(text: &str) -> bool {
+    text.contains(" ✗ ")
 }
 
 /// If any partial (no trailing newline) assistant text sits in the
@@ -730,17 +760,40 @@ fn truncate_bar_body(s: &str) -> String {
     }
 }
 
-/// Render the synthetic `\n[<tool> → N bytes]\n` marker as a dim
-/// italic single line. In v0.7 this is where "collapsed output +
-/// (K more lines, ctrl+o expand)" would land; for now we just show
-/// the marker itself.
-fn render_tool_result_marker(term: &mut Term, text: &str) -> Result<()> {
+/// Emit both the tool-call bar (deferred until we know the outcome)
+/// and its result marker line. Bg is green on success, red on error.
+/// Falls back to yellow if there's no pending bar (shouldn't happen).
+fn render_tool_result_marker(term: &mut Term, app: &mut App, text: &str) -> Result<()> {
+    let is_err = tool_marker_is_error(text);
+    let (bar_bg, bar_fg) = if is_err {
+        (Color::Red, Color::White)
+    } else {
+        (Color::Green, Color::Indexed(255))
+    };
+    let bar_style = Style::default().bg(bar_bg).fg(bar_fg).add_modifier(Modifier::BOLD);
+    let dim_style = Style::default()
+        .bg(bar_bg)
+        .fg(Color::Indexed(250))
+        .add_modifier(Modifier::ITALIC);
+
+    // Draw the bar now that we know the outcome.
+    if let Some(pending) = app.pending_tool_call.take() {
+        insert_line_bg(term, Line::from(vec![
+            Span::styled(pending.leading, bar_style),
+            Span::styled(pending.body, bar_style),
+            Span::styled("  (ctrl+o to expand)", dim_style),
+        ]), Some(bar_style))?;
+    }
+
+    // Then the result summary line (dim italic).
     let cleaned = text.trim();
+    let summary_style = if is_err {
+        Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    };
     insert_line(term, Line::from(vec![
-        Span::styled(
-            cleaned.to_string(),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        ),
+        Span::styled(cleaned.to_string(), summary_style),
     ]))?;
     Ok(())
 }

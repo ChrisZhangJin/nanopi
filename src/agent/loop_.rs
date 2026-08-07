@@ -535,11 +535,13 @@ async fn run_one_tool(
         },
     );
 
-    // Stream to renderer.
+    // Stream to renderer. Use `→` for success, `✗` for error so the
+    // TUI can pick a matching (green / red) tool-call bar color.
+    let sep = if is_error { "✗" } else { "→" };
     let _ = tx
         .send(AgentEvent::TextDelta {
             content_index: 0,
-            text: format!("\n[{} → {} bytes]\n", call.name, content.len()),
+            text: format!("\n[{} {} {} bytes]\n", call.name, sep, content.len()),
         })
         .await;
 
