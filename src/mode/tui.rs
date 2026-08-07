@@ -69,14 +69,16 @@ enum SlashCmd {
     Compact,
     Quit,
     Model,
-    Thinking,
     // Future: Login, Settings, Export, Import.
+    //
+    // Not here: /thinking. PI exposes thinking-budget control as a
+    // keybinding (Shift+Tab cycle), not a slash command — see
+    // packages/coding-agent/src/core/keybindings.ts:73-76.
 }
 
 fn slash_items() -> Vec<MenuItem<SlashCmd>> {
     vec![
         MenuItem::new("/model",    "Switch to a different model",       SlashCmd::Model),
-        MenuItem::new("/thinking", "Set extended-thinking budget",      SlashCmd::Thinking),
         MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
         MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
         MenuItem::new("/exit",     "Exit the session",                  SlashCmd::Quit),
@@ -267,9 +269,6 @@ struct App {
     /// When Some, the model picker is open — takes priority over the
     /// slash palette. Payload is the target model id.
     model_picker: Option<MenuState<String>>,
-    /// When Some, the thinking-level picker is open. Payload is
-    /// Option<ThinkingLevel> — None means "Off".
-    thinking_picker: Option<MenuState<Option<crate::agent::thinking::ThinkingLevel>>>,
     /// When Some, the fork picker (Esc double-tap) is open. Payload is
     /// `(source_session_path, entry_index_in_that_session)` — used to
     /// call `session::fork_session_at` on Enter. The source path may
@@ -339,6 +338,10 @@ struct App {
     /// Optional short status shown to the right of the input box
     /// (e.g. "cancelling…", "compacting…").
     status_note: Option<String>,
+    /// Set by CancelTurn (Esc / Ctrl+C during streaming); consumed by
+    /// the recv-None wrap-up so the transcript gets an
+    /// "[Operation aborted]" marker matching PI's UX.
+    turn_was_cancelled: bool,
 }
 
 impl App {
@@ -369,8 +372,8 @@ impl App {
             pending_fork: None,
             capture_custom_prompt: false,
             summarize_task: None,
-            thinking_picker: None,
             thinking: None,
+            turn_was_cancelled: false,
         }
     }
 }
@@ -448,8 +451,10 @@ enum KeyAction {
     Compact,
     OpenModelPicker,
     SwapModel(String),
-    OpenThinkingPicker,
-    SetThinking(Option<crate::agent::thinking::ThinkingLevel>),
+    /// Shift+Tab (PI's `app.thinking.cycle`): step through Off →
+    /// Minimal → Low → Medium → High → Xhigh → Max → Off and apply
+    /// the next level to the current Agent.
+    CycleThinking,
     ExpandLastTool,
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
@@ -518,6 +523,16 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         }
     }
 
+    // ── Esc during a streaming turn = interrupt (PI's app.interrupt,
+    // keybindings.ts:66). Cancels the current run; the turn wrap-up
+    // will insert an "[Operation aborted]" marker.
+    if k.code == KeyCode::Esc
+        && k.modifiers.is_empty()
+        && app.status == Status::Streaming
+    {
+        return KeyAction::CancelTurn;
+    }
+
     // ── Esc double-tap → open fork picker ───────────────────────────
     // Only when the editor is empty, no menu open, not streaming, and
     // the previous Esc was < 500ms ago. First-Esc-on-empty just records
@@ -543,22 +558,13 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         return KeyAction::Nothing;
     }
 
-    // ── Thinking picker (priority just below fork/summary) ──────────
-    if app.thinking_picker.is_some() {
-        let m = app.thinking_picker.as_mut().unwrap();
-        match m.handle_key(k) {
-            MenuAction::Chosen(level) => {
-                app.thinking_picker = None;
-                app.input.clear();
-                return KeyAction::SetThinking(level);
-            }
-            MenuAction::Cancel => {
-                app.thinking_picker = None;
-                app.input.clear();
-                return KeyAction::Nothing;
-            }
-            MenuAction::Nothing => return KeyAction::Nothing,
-        }
+    // ── Shift+Tab cycles thinking level (PI's app.thinking.cycle). ──
+    // Fires regardless of streaming state — advancing the setting is
+    // safe mid-turn (next turn picks it up), and PI allows the same.
+    if k.code == KeyCode::BackTab
+        || (k.code == KeyCode::Tab && k.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        return KeyAction::CycleThinking;
     }
     // ── Model picker (highest priority when open) ───────────────────
     if app.model_picker.is_some() {
@@ -678,7 +684,6 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
         SlashCmd::Compact => KeyAction::Compact,
         SlashCmd::Quit => KeyAction::Exit,
         SlashCmd::Model => KeyAction::OpenModelPicker,
-        SlashCmd::Thinking => KeyAction::OpenThinkingPicker,
     }
 }
 
@@ -801,6 +806,21 @@ async fn run_app(
                         app.turn_started_at = None;
                         app.tool_started_at = None;
                         app.status_note = None;
+                        // Esc / Ctrl+C during streaming → mark the turn
+                        // as aborted in the transcript, PI-style. See
+                        // interactive-mode.ts:3040-3045 where PI emits
+                        // "Operation aborted" for stopReason=="aborted".
+                        if app.turn_was_cancelled {
+                            app.turn_was_cancelled = false;
+                            insert_line(term, Line::from(vec![
+                                Span::styled(
+                                    "Operation aborted",
+                                    Style::default()
+                                        .fg(Color::Indexed(131))
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
+                            ]))?;
+                        }
                         refresh_status(app, &agent_slot).await;
                         if let Some(t) = turn_task.take() {
                             match t.await {
@@ -847,6 +867,7 @@ async fn handle_action(
             if let Some(ct) = cancel.as_ref() {
                 ct.cancel();
                 app.status_note = Some("cancelling…".into());
+                app.turn_was_cancelled = true;
             }
         }
         KeyAction::ExpandLastTool => {
@@ -883,7 +904,8 @@ async fn handle_action(
                 .collect();
             app.model_picker = Some(MenuState::new(items));
         }
-        KeyAction::OpenThinkingPicker => {
+        KeyAction::CycleThinking => {
+            use crate::agent::thinking::ThinkingLevel;
             let (current, model) = {
                 let g = agent_slot.lock().await;
                 match g.as_ref() {
@@ -891,45 +913,37 @@ async fn handle_action(
                     None => return Ok(()),
                 }
             };
-            let supported = crate::agent::thinking::supports_thinking(&model);
-            let mut items: Vec<MenuItem<Option<crate::agent::thinking::ThinkingLevel>>> = Vec::new();
-            let off_marker = if current.is_none() { "  (current)" } else { "" };
-            items.push(MenuItem::new(
-                "Off".to_string(),
-                format!("Disable extended thinking{off_marker}"),
-                None,
-            ));
-            for &lvl in crate::agent::thinking::ThinkingLevel::all() {
-                let marker = if current == Some(lvl) { "  (current)" } else { "" };
-                let mut desc = format!(
-                    "budget {} tokens{}",
-                    lvl.budget_tokens(),
-                    marker
-                );
-                if !supported {
-                    desc.push_str("  · not supported by this model");
+            // Cycle: None → Minimal → Low → Medium → High → Xhigh → Max → None
+            let next: Option<ThinkingLevel> = match current {
+                None => Some(ThinkingLevel::Minimal),
+                Some(ThinkingLevel::Minimal) => Some(ThinkingLevel::Low),
+                Some(ThinkingLevel::Low) => Some(ThinkingLevel::Medium),
+                Some(ThinkingLevel::Medium) => Some(ThinkingLevel::High),
+                Some(ThinkingLevel::High) => Some(ThinkingLevel::Xhigh),
+                Some(ThinkingLevel::Xhigh) => Some(ThinkingLevel::Max),
+                Some(ThinkingLevel::Max) => None,
+            };
+            {
+                let mut g = agent_slot.lock().await;
+                if let Some(a) = g.as_mut() {
+                    a.context.thinking = next;
                 }
-                items.push(MenuItem::new(
-                    lvl.to_string(),
-                    desc,
-                    Some(lvl),
-                ));
             }
-            app.thinking_picker = Some(MenuState::new(items));
-        }
-        KeyAction::SetThinking(level) => {
-            let mut g = agent_slot.lock().await;
-            if let Some(a) = g.as_mut() {
-                a.context.thinking = level;
-            }
-            app.thinking = level;
-            let label = match level {
+            app.thinking = next;
+            let label = match next {
                 None => "off".to_string(),
                 Some(l) => l.to_string(),
             };
+            let note = if !crate::agent::thinking::supports_thinking(&model)
+                && next.is_some()
+            {
+                "  (not supported by this model)"
+            } else {
+                ""
+            };
             insert_line(term, Line::from(vec![
                 Span::styled(
-                    format!("[thinking → {}]", label),
+                    format!("[thinking → {}{}]", label, note),
                     Style::default()
                         .fg(Color::Indexed(108))
                         .add_modifier(Modifier::ITALIC),
@@ -1676,13 +1690,11 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         .split(area);
 
     // ── Overlay menus (dropdown). Priority matches interpret_key:
-    // summary > fork > thinking > model > slash palette.
+    // summary > fork > model > slash palette.
     if let Some(m) = &app.summary_prompt {
         draw_menu(buf, chunks[0], m, "summarize branch?");
     } else if let Some(m) = &app.fork_picker {
         draw_menu(buf, chunks[0], m, "user message");
-    } else if let Some(m) = &app.thinking_picker {
-        draw_menu(buf, chunks[0], m, "thinking level");
     } else if let Some(m) = &app.model_picker {
         draw_menu(buf, chunks[0], m, "model");
     } else if let Some(m) = &app.palette {

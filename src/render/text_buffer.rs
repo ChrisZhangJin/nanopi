@@ -48,6 +48,11 @@ pub enum Action {
     SlashChanged(String),
 }
 
+/// Cap for the in-memory prompt history. PI uses 100 (see
+/// `packages/tui/src/components/editor.ts:403-406`); matching keeps
+/// the muscle memory identical between the two tools.
+const HISTORY_CAP: usize = 100;
+
 #[derive(Debug, Clone, Default)]
 pub struct TextBuffer {
     lines: Vec<String>,
@@ -58,6 +63,17 @@ pub struct TextBuffer {
     /// What the previous key did — drives fish-style coalescing so
     /// runs of word chars merge into one undo unit.
     last_op: LastOp,
+    /// Ring of previously-submitted prompts (oldest first, newest
+    /// last). Capped at HISTORY_CAP entries.
+    history: Vec<String>,
+    /// When `Some(i)`, the editor is currently showing `history[i]`;
+    /// Up/Down keep navigating and Enter submits that recalled text.
+    /// `None` means the user is composing a fresh prompt.
+    history_index: Option<usize>,
+    /// Snapshot of whatever was in the editor at the moment we
+    /// entered history mode, so Down past the newest entry restores
+    /// it. PI calls this `historyDraft`.
+    history_draft: String,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +105,9 @@ impl TextBuffer {
             kill_ring: String::new(),
             undo_stack: Vec::new(),
             last_op: LastOp::Other,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 
@@ -142,12 +161,107 @@ impl TextBuffer {
         self.cursor = (0, 0);
         self.undo_stack.clear();
         self.last_op = LastOp::Other;
+        // history is intentionally preserved — clearing on cancel /
+        // submit / palette-open must not wipe recall data.
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Push a submitted prompt onto the history ring. Blank text and
+    /// exact-duplicate consecutive entries are skipped (bash-style).
+    /// Older entries drop off the front once we exceed HISTORY_CAP.
+    fn push_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.last().map(|s| s == trimmed).unwrap_or(false) {
+            return;
+        }
+        self.history.push(trimmed.to_string());
+        if self.history.len() > HISTORY_CAP {
+            let excess = self.history.len() - HISTORY_CAP;
+            self.history.drain(0..excess);
+        }
+    }
+
+    /// Load `text` into the editor, replacing everything and leaving
+    /// the cursor at end-of-content. Used by history navigation.
+    fn load_from_history(&mut self, text: &str) {
+        self.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(|s| s.to_string()).collect()
+        };
+        let last_row = self.lines.len().saturating_sub(1);
+        let last_col = self.lines[last_row].len();
+        self.cursor = (last_row, last_col);
+        self.undo_stack.clear();
+        self.last_op = LastOp::Other;
+    }
+
+    /// True when the editor is fully empty (one row, no chars).
+    fn buffer_blank(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+
+    /// Should this key trigger history navigation rather than cursor
+    /// movement? PI's rule (editor.ts:824): empty buffer, already in
+    /// history mode, or cursor sitting at the very start (row 0, col 0).
+    fn history_eligible(&self) -> bool {
+        self.history_index.is_some()
+            || self.buffer_blank()
+            || self.cursor == (0, 0)
+    }
+
+    /// Called at the start of every content mutation. If the buffer
+    /// was showing a recalled history entry, the user is now editing
+    /// that text — exit history mode so a subsequent Down doesn't
+    /// clobber their edits by re-loading the recalled snapshot.
+    fn exit_history_mode(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Up-arrow: step back one entry in history (or enter it from a
+    /// fresh buffer). No-op if we're already at the oldest entry.
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let target = match self.history_index {
+            None => {
+                self.history_draft = self.as_string();
+                self.history.len() - 1
+            }
+            Some(0) => return, // already oldest
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(target);
+        let text = self.history[target].clone();
+        self.load_from_history(&text);
+    }
+
+    /// Down-arrow: step forward one entry, or restore the draft if
+    /// we've moved past the newest entry.
+    fn history_next(&mut self) {
+        let Some(i) = self.history_index else { return };
+        if i + 1 < self.history.len() {
+            self.history_index = Some(i + 1);
+            let text = self.history[i + 1].clone();
+            self.load_from_history(&text);
+        } else {
+            self.history_index = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.load_from_history(&draft);
+        }
     }
 
     /// Insert a string at the cursor. Newlines break into new lines.
     /// Used by bracketed-paste to inject clipboard content — treated as
     /// an atomic op (one snapshot, does not coalesce with typing).
     pub fn insert_str(&mut self, s: &str) {
+        self.exit_history_mode();
         self.snapshot();
         for c in s.chars() {
             if c == '\n' {
@@ -254,6 +368,7 @@ impl TextBuffer {
     // ─── Mutations ─────────────────────────────────────────────────
 
     fn insert_char(&mut self, c: char) {
+        self.exit_history_mode();
         // Fish-style coalescing:
         //   word char  → snapshot only if the previous op was Other
         //                (i.e. this starts a new typing run). Consecutive
@@ -276,6 +391,7 @@ impl TextBuffer {
     }
 
     fn insert_newline(&mut self) {
+        self.exit_history_mode();
         self.snapshot();
         self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
@@ -285,6 +401,7 @@ impl TextBuffer {
     }
 
     fn backspace(&mut self) {
+        self.exit_history_mode();
         let (row, col) = self.cursor;
         if col > 0 {
             self.snapshot();
@@ -309,6 +426,7 @@ impl TextBuffer {
     }
 
     fn delete_forward(&mut self) {
+        self.exit_history_mode();
         let (row, col) = self.cursor;
         let line_len = self.lines[row].len();
         if col < line_len {
@@ -330,6 +448,7 @@ impl TextBuffer {
     }
 
     fn kill_to_line_end(&mut self) {
+        self.exit_history_mode();
         self.snapshot();
         self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
@@ -338,6 +457,7 @@ impl TextBuffer {
     }
 
     fn kill_to_line_start(&mut self) {
+        self.exit_history_mode();
         self.snapshot();
         self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
@@ -347,6 +467,7 @@ impl TextBuffer {
     }
 
     fn kill_prev_word(&mut self) {
+        self.exit_history_mode();
         self.snapshot();
         self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
@@ -369,6 +490,7 @@ impl TextBuffer {
         if self.kill_ring.is_empty() {
             return;
         }
+        self.exit_history_mode();
         self.snapshot();
         self.last_op = LastOp::Other;
         let text = self.kill_ring.clone();
@@ -437,6 +559,7 @@ impl TextBuffer {
                     return Action::Nothing;
                 }
                 let text = self.as_string();
+                self.push_history(&text);
                 self.clear();
                 return Action::Submit(text);
             }
@@ -446,6 +569,20 @@ impl TextBuffer {
             KeyCode::Right     => { self.move_right();     return Action::Nothing; }
             KeyCode::Home      => { self.move_line_start(); return Action::Nothing; }
             KeyCode::End       => { self.move_line_end();   return Action::Nothing; }
+            KeyCode::Up => {
+                // History nav only when eligible; else no-op (multi-
+                // line row-up navigation is a future extension).
+                if self.history_eligible() {
+                    self.history_prev();
+                }
+                return Action::Nothing;
+            }
+            KeyCode::Down => {
+                if self.history_index.is_some() {
+                    self.history_next();
+                }
+                return Action::Nothing;
+            }
             KeyCode::Char(c)   => { self.insert_char(c);   return self.slash_or_nothing(); }
             _ => {}
         }
@@ -672,6 +809,88 @@ mod tests {
         // "ab" now. Undo restores "abc".
         b.handle_key(press_c(KeyCode::Char('z')));
         assert_eq!(b.as_string(), "abc");
+    }
+
+    fn submit(b: &mut TextBuffer, s: &str) {
+        type_str(b, s);
+        b.handle_key(press(KeyCode::Enter));
+    }
+
+    #[test]
+    fn history_up_on_empty_buffer_loads_last() {
+        let mut b = TextBuffer::new();
+        submit(&mut b, "hello");
+        submit(&mut b, "world");
+        // Buffer empty now — Up brings back "world".
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "world");
+        // Up again → "hello"
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "hello");
+        // Up at oldest → no-op
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "hello");
+    }
+
+    #[test]
+    fn history_down_walks_forward_and_restores_draft() {
+        let mut b = TextBuffer::new();
+        submit(&mut b, "one");
+        submit(&mut b, "two");
+        // Start typing something, then recall + go back forward.
+        type_str(&mut b, "draft");
+        b.handle_key(press(KeyCode::Up)); // enter history mode from non-empty at (0,0)? no, cursor not at 0,0.
+        // With text, cursor at (0,5), NOT eligible → no history nav.
+        assert_eq!(b.as_string(), "draft");
+        // Move to (0, 0) so Up becomes eligible.
+        b.handle_key(press_c(KeyCode::Char('a')));
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "two");
+        b.handle_key(press(KeyCode::Down));
+        // Past the newest → draft restored.
+        assert_eq!(b.as_string(), "draft");
+    }
+
+    #[test]
+    fn history_dedups_consecutive_submits() {
+        let mut b = TextBuffer::new();
+        submit(&mut b, "same");
+        submit(&mut b, "same");
+        submit(&mut b, "different");
+        // History should be ["same", "different"] — the duplicate dropped.
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "different");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "same");
+    }
+
+    #[test]
+    fn typing_while_in_history_exits_history_mode() {
+        let mut b = TextBuffer::new();
+        submit(&mut b, "first");
+        submit(&mut b, "second");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "second");
+        // Edit the recalled text — should exit history so Down doesn't
+        // wipe the edits.
+        type_str(&mut b, "-edit");
+        assert_eq!(b.as_string(), "second-edit");
+        b.handle_key(press(KeyCode::Down));
+        // No effect (history_index is None) — edits stay.
+        assert_eq!(b.as_string(), "second-edit");
+    }
+
+    #[test]
+    fn history_caps_at_100() {
+        let mut b = TextBuffer::new();
+        for i in 0..120 {
+            submit(&mut b, &format!("cmd-{i}"));
+        }
+        // History holds the newest 100. Up 100 times reaches cmd-20.
+        for _ in 0..100 {
+            b.handle_key(press(KeyCode::Up));
+        }
+        assert_eq!(b.as_string(), "cmd-20");
     }
 
     #[test]
