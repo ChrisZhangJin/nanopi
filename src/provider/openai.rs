@@ -372,12 +372,22 @@ impl OpenAiProvider {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = build_request(ctx, &self.model);
 
-        // ── Retry the OPEN of the stream on 429 / 5xx / transient network
-        // errors. Once the stream is producing events, we stop retrying —
-        // the caller has already seen a partial response.
+        // ── Retry envelope covers BOTH the HTTP open (429 / 5xx / transient
+        // network) AND mid-stream errors that arrive before we've emitted
+        // any event to `tx`. Once we've sent the Start event we stop
+        // retrying — the caller has seen the first chunk, resuming
+        // would produce duplicates.
         let retry = crate::provider::retry::RetryConfig::default();
         let mut attempt: u32 = 0;
-        let resp = loop {
+
+        // These vars are set by the loop body on success, then used
+        // AFTER the loop for the drain phase. Rust's borrow checker
+        // won't let us assign in-loop-then-use-outside; instead we
+        // finish the whole drain inside the loop and just track
+        // final_usage.
+        let final_usage;
+
+        'retry: loop {
             let send_res = self
                 .client
                 .post(&url)
@@ -386,8 +396,8 @@ impl OpenAiProvider {
                 .send()
                 .await;
 
-            match send_res {
-                Ok(resp) if resp.status().is_success() => break resp,
+            let resp = match send_res {
+                Ok(resp) if resp.status().is_success() => resp,
                 Ok(resp) => {
                     let status = resp.status();
                     let hint = crate::provider::retry::parse_retry_after(resp.headers());
@@ -407,14 +417,13 @@ impl OpenAiProvider {
                     );
                     eprintln!(
                         "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
-                        attempt + 1,
-                        retry.max_attempts,
-                        delay.as_secs_f64(),
-                        status.as_u16(),
+                        attempt + 1, retry.max_attempts,
+                        delay.as_secs_f64(), status.as_u16(),
                         truncate(&clean, 100),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
+                    continue 'retry;
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -427,35 +436,51 @@ impl OpenAiProvider {
                     );
                     eprintln!(
                         "[retrying ({}/{}) after {:.1}s: {}]",
-                        attempt + 1,
-                        retry.max_attempts,
-                        delay.as_secs_f64(),
-                        truncate(&msg, 100),
+                        attempt + 1, retry.max_attempts,
+                        delay.as_secs_f64(), truncate(&msg, 100),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
+                    continue 'retry;
                 }
-            }
-        };
+            };
 
-        let byte_stream = resp
-            .bytes_stream()
-            .map_err(|e| OpenAiError::Http(e));
-        let sse = SseStream::new(byte_stream);
+            let byte_stream = resp
+                .bytes_stream()
+                .map_err(|e| OpenAiError::Http(e));
+            let sse = SseStream::new(byte_stream);
 
-        // Accumulate per-index tool calls; OpenAI streams tool calls in pieces.
-        let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
-        let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
-        let mut started = false;
-        let mut final_usage = Usage::default();
+            let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
+            let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
+            let mut started = false;
+            let mut usage_local = Usage::default();
 
-        let mut stream = Box::pin(sse);
-        while let Some(event) = stream.next().await {
-            let ev = event.map_err(|e| OpenAiError::Sse(e.to_string()))?;
-            let chunk: WireChunk = serde_json::from_str(&ev.data)?;
-            if let Some(err) = chunk.error {
-                return Err(OpenAiError::Api(err.message().to_string()));
-            }
+            let mut stream = Box::pin(sse);
+            while let Some(event) = stream.next().await {
+                let ev = event.map_err(|e| OpenAiError::Sse(e.to_string()))?;
+                let chunk: WireChunk = serde_json::from_str(&ev.data)?;
+                if let Some(err) = chunk.error {
+                    let msg = err.message().to_string();
+                    // Retryable mid-stream error BEFORE we sent anything
+                    // to `tx` → back to the top of 'retry.
+                    if !started
+                        && attempt < retry.max_attempts
+                        && crate::provider::retry::is_retryable_message(&msg)
+                    {
+                        let delay = crate::provider::retry::compute_delay(
+                            attempt, &retry, None, rand01(),
+                        );
+                        eprintln!(
+                            "[retrying ({}/{}) after {:.1}s: {}]",
+                            attempt + 1, retry.max_attempts,
+                            delay.as_secs_f64(), truncate(&msg, 100),
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry;
+                    }
+                    return Err(OpenAiError::Api(msg));
+                }
             if !started {
                 started = true;
                 let id = chunk.id.clone().unwrap_or_else(|| "msg".into());
@@ -519,7 +544,7 @@ impl OpenAiProvider {
                         _ => FinishReason::Unknown,
                     };
                     if let Some(u) = &chunk.usage {
-                        final_usage = Usage {
+                        usage_local = Usage {
                             input_tokens: u.prompt_tokens,
                             output_tokens: u.completion_tokens,
                             cache_read_tokens: u.cached_tokens,
@@ -529,13 +554,13 @@ impl OpenAiProvider {
                     let _ = tx
                         .send(AgentEvent::Done {
                             finish_reason: finish,
-                            usage: final_usage.clone(),
+                            usage: usage_local.clone(),
                         })
                         .await;
                 }
             }
             if let Some(u) = chunk.usage {
-                final_usage = Usage {
+                usage_local = Usage {
                     input_tokens: u.prompt_tokens,
                     output_tokens: u.completion_tokens,
                     cache_read_tokens: u.cached_tokens,
@@ -546,6 +571,9 @@ impl OpenAiProvider {
 
         // Stream closed without an explicit finish_reason; emit Done with what we have.
         flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, 0).await;
+        final_usage = usage_local;
+        break 'retry;
+        }
         Ok(final_usage)
     }
 }

@@ -468,19 +468,22 @@ async fn run_app(
                         flush_stream_buf(term, app)?;
                         flush_thinking_buf(term, app)?;
                         if let Some(pending) = app.pending_tool_call.take() {
-                            let yellow = Style::default()
-                                .bg(Color::Yellow)
-                                .fg(Color::Black)
+                            // Muted amber (Indexed 137 #af875f) for
+                            // interrupted state — Morandi warm tone.
+                            let bg = Color::Indexed(137);
+                            let bold = Style::default()
+                                .bg(bg)
+                                .fg(Color::Indexed(232))
                                 .add_modifier(Modifier::BOLD);
                             let dim = Style::default()
-                                .bg(Color::Yellow)
-                                .fg(Color::DarkGray)
+                                .bg(bg)
+                                .fg(Color::Indexed(235))
                                 .add_modifier(Modifier::ITALIC);
                             insert_line_bg(term, Line::from(vec![
-                                Span::styled(pending.leading, yellow),
-                                Span::styled(pending.body, yellow),
+                                Span::styled(pending.leading, bold),
+                                Span::styled(pending.body, bold),
                                 Span::styled("  (interrupted)", dim),
-                            ]), Some(yellow))?;
+                            ]), Some(bold))?;
                         }
                         ag_rx = None;
                         cancel = None;
@@ -770,10 +773,16 @@ fn render_tool_card(
     is_error: bool,
     elapsed_ms: u64,
 ) -> Result<()> {
+    // Morandi palette (dusty, low-saturation) — reads clearly on both
+    // light and dark terminals without shouting. Use 256-color
+    // Indexed(...) so it renders identically on truecolor and
+    // 256-only terminals.
+    //   65  = #5f875f  muted sage    (success)
+    //   131 = #af5f5f  dusty rose    (error)
     let (bar_bg, bar_fg) = if is_error {
-        (Color::Red, Color::White)
+        (Color::Indexed(131), Color::Indexed(230))
     } else {
-        (Color::Green, Color::Indexed(255))
+        (Color::Indexed(65), Color::Indexed(230))
     };
     let bar_style = Style::default().bg(bar_bg).fg(bar_fg).add_modifier(Modifier::BOLD);
     // Dimmed foreground on the same bg — for output preview + Took.

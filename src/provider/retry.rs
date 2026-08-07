@@ -74,6 +74,12 @@ pub fn is_retryable_message(msg: &str) -> bool {
         "you can retry",
         "queue_timeout",
         "queue timeout",
+        // Some gateways return a transient "OAuth access token has
+        // expired. Re-authenticate to continue." on the first request
+        // after cold-start / pool churn; the SECOND request works. Try
+        // 2-3 more times with backoff before giving up.
+        "oauth access token has expired",
+        "re-authenticate to continue",
         // Stream / socket death
         "socket hang up",
         "connection reset",
@@ -176,6 +182,11 @@ mod tests {
         assert!(is_retryable_message("socket hang up"));
         assert!(is_retryable_message("ENOTFOUND api.example.com"));
         assert!(is_retryable_message("queue_timeout"));
+        // Transient gateway OAuth churn — first request fails, retry
+        // succeeds.
+        assert!(is_retryable_message(
+            "OAuth access token has expired. Re-authenticate to continue."
+        ));
         // Non-retryable trumps retryable
         assert!(!is_retryable_message("insufficient_quota: your account is out of budget"));
         // Bare unrelated
