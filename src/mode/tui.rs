@@ -265,12 +265,28 @@ struct App {
     /// slash palette. Payload is the target model id.
     model_picker: Option<MenuState<String>>,
     /// When Some, the fork picker (Esc double-tap) is open. Payload is
-    /// `(source_session_path, user_msg_index_in_that_session)` — used
-    /// to call `session::fork_session_at` on Enter. The source path
-    /// may point at the current session OR any ancestor along the
+    /// `(source_session_path, entry_index_in_that_session)` — used to
+    /// call `session::fork_session_at` on Enter. The source path may
+    /// point at the current session OR any ancestor along the
     /// `parent_id` chain, so the user can revive tails that were cut
     /// off by earlier forks.
     fork_picker: Option<MenuState<(PathBuf, usize)>>,
+    /// After picking a fork target: modal asking whether to summarize
+    /// the cut-off branch. Three options match PI's UX:
+    /// No summary / Summarize (default prompt) / Summarize with custom
+    /// prompt. On Chosen, dispatch RunSummary.
+    summary_prompt: Option<MenuState<SummaryChoice>>,
+    /// A fork the user picked that is waiting on a summary decision.
+    /// Carries the fork target and the cut-off entries so the summary
+    /// LLM call doesn't need to re-read the session file.
+    pending_fork: Option<PendingFork>,
+    /// True after user picks "Summarize with custom prompt" — the next
+    /// Enter on the input box will submit the typed text as the
+    /// custom summarize instructions, not as a chat turn.
+    capture_custom_prompt: bool,
+    /// While a branch summary is being generated, hold the join handle
+    /// so the main loop can poll for completion via `is_finished`.
+    summarize_task: Option<tokio::task::JoinHandle<SummarizeOutcome>>,
     /// Timestamp of the last Esc keypress. Second Esc within 500ms on
     /// an empty editor opens the fork picker (PI's `doubleEscapeAction`
     /// = "fork"; see packages/coding-agent/src/modes/interactive/
@@ -340,8 +356,56 @@ impl App {
             last_tool_output: None,
             fork_picker: None,
             last_esc_at: None,
+            summary_prompt: None,
+            pending_fork: None,
+            capture_custom_prompt: false,
+            summarize_task: None,
         }
     }
+}
+
+/// Three options in the post-fork "Summarize branch?" modal — mirrors
+/// PI's showBranchSummarySelector at
+/// `packages/coding-agent/src/modes/interactive/interactive-mode.ts:4736-4779`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SummaryChoice {
+    /// Fork immediately, no summary marker inserted.
+    NoSummary,
+    /// Ask the model to summarize the cut-off tail with the default
+    /// system prompt (see `agent::branch_summary::DEFAULT_SUMMARIZER_SYSTEM`).
+    DefaultSummary,
+    /// Prompt user for custom instructions, then summarize with them.
+    CustomSummary,
+}
+
+/// A fork target the user picked and confirmed but hasn't yet committed
+/// because the summary modal is open. When summary decision arrives
+/// (or capture-mode Enter fires), this is consumed by the fork
+/// execution path.
+#[derive(Debug, Clone)]
+struct PendingFork {
+    /// Which session file the picker rows point into (may be current
+    /// session or an ancestor).
+    source_path: PathBuf,
+    /// Entry index within source_path at which to fork.
+    target_entry_idx: usize,
+    /// If target was a user Message, its text (for editor prefill).
+    prefill: Option<String>,
+    /// The tail from the CURRENT session that's about to be abandoned.
+    /// Passed to `summarize_branch` when the user picks a summary
+    /// option. Empty when a summary doesn't make sense (target is on
+    /// an ancestor session — the whole current session becomes moot).
+    cut_off: Vec<crate::session::SessionEntry>,
+}
+
+/// Result the async summarize task hands back to the main loop.
+#[derive(Debug)]
+enum SummarizeOutcome {
+    /// Summarization succeeded → carry the summary text into the fork.
+    Ok { summary: Option<String>, fork: PendingFork },
+    /// Something went wrong assembling the request. Reported to user
+    /// but fork proceeds without a summary.
+    Err { error: String, fork: PendingFork },
 }
 
 /// A ToolCall event we've received but not yet drawn to scrollback.
@@ -377,11 +441,26 @@ enum KeyAction {
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
     OpenForkPicker,
-    /// User selected a user message in the fork picker. Payload is
-    /// `(source_session_path, user_msg_index)` — the picker item that
-    /// was chosen. Fork happens against that specific session, which
-    /// may be the current one or any ancestor along the parent chain.
-    Fork(PathBuf, usize),
+    /// User selected a fork target in the picker — but the fork isn't
+    /// executed yet. If the target sits inside the current session and
+    /// isn't the very last entry, we open the "Summarize branch?"
+    /// modal first (PendingFork stashed on the App). Otherwise the
+    /// fork runs immediately as if the user picked "No summary".
+    ForkChosen(PathBuf, usize),
+    /// User picked one of the 3 summary options. `Custom` transitions
+    /// into capture mode, waiting for the user to type instructions.
+    SummaryChosen(SummaryChoice),
+    /// While capture_custom_prompt is on, the input box's Enter fires
+    /// this instead of a chat turn: the typed text is the custom
+    /// summarization prompt.
+    RunCustomSummary(String),
+    /// A queued summarize task finished; commit its output to a fork.
+    /// Dispatched by the main loop's tick when `summarize_task.
+    /// is_finished()`.
+    SummaryFinished(SummarizeOutcome),
+    /// User pressed Esc in the summary modal — abandon the pending
+    /// fork, don't switch sessions.
+    CancelPendingFork,
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -394,14 +473,29 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         return KeyAction::ExpandLastTool;
     }
 
-    // ── Fork picker (highest priority when open) ────────────────────
+    // ── Summary modal (highest priority once open) ──────────────────
+    if app.summary_prompt.is_some() {
+        let m = app.summary_prompt.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(choice) => {
+                app.summary_prompt = None;
+                return KeyAction::SummaryChosen(choice);
+            }
+            MenuAction::Cancel => {
+                app.summary_prompt = None;
+                return KeyAction::CancelPendingFork;
+            }
+            MenuAction::Nothing => return KeyAction::Nothing,
+        }
+    }
+    // ── Fork picker (opens summary modal on Chosen) ─────────────────
     if app.fork_picker.is_some() {
         let m = app.fork_picker.as_mut().unwrap();
         match m.handle_key(k) {
             MenuAction::Chosen(payload) => {
                 app.fork_picker = None;
                 let (path, idx) = payload;
-                return KeyAction::Fork(path, idx);
+                return KeyAction::ForkChosen(path, idx);
             }
             MenuAction::Cancel => {
                 app.fork_picker = None;
@@ -497,7 +591,20 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         }
         TbAction::Exit => KeyAction::Exit,
         TbAction::Submit(text) => {
-            if app.status == Status::Streaming {
+            if app.capture_custom_prompt {
+                // We're in "type your custom summarize prompt" mode.
+                // Anything the user submits goes to the summarizer,
+                // NOT to the model as a chat turn. Empty text falls
+                // back to the default prompt (same as picking
+                // "Summarize" instead of "Custom").
+                app.capture_custom_prompt = false;
+                let t = text.trim().to_string();
+                if t.is_empty() {
+                    KeyAction::SummaryChosen(SummaryChoice::DefaultSummary)
+                } else {
+                    KeyAction::RunCustomSummary(t)
+                }
+            } else if app.status == Status::Streaming {
                 // Ignore submits mid-turn.
                 KeyAction::Nothing
             } else {
@@ -574,8 +681,39 @@ async fn run_app(
 
         tokio::select! {
             _ = tick.tick() => {
+                // Pick up a completed summarize task. The tick is
+                // 120ms, which matches PI's UX for "quick actions"
+                // completing without needing a fancy select! arm.
+                if let Some(task) = app.summarize_task.take() {
+                    if task.is_finished() {
+                        match task.await {
+                            Ok(outcome) => {
+                                handle_action(
+                                    KeyAction::SummaryFinished(outcome),
+                                    app, term, &agent_slot,
+                                    &mut ag_rx, &mut cancel, &mut turn_task,
+                                ).await?;
+                            }
+                            Err(_join_err) => {
+                                app.status_note = None;
+                                app.pending_fork = None;
+                                insert_line(term, Line::from(vec![
+                                    Span::styled(
+                                        "[summarize task panicked — fork aborted]",
+                                        Style::default().fg(Color::Red),
+                                    ),
+                                ]))?;
+                            }
+                        }
+                    } else {
+                        app.summarize_task = Some(task);
+                    }
+                }
                 // Redraw only when there's a live counter to update.
-                if app.turn_started_at.is_some() || app.tool_started_at.is_some() {
+                if app.turn_started_at.is_some()
+                    || app.tool_started_at.is_some()
+                    || app.status_note.is_some()
+                {
                     term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
                 }
             }
@@ -783,97 +921,122 @@ async fn handle_action(
             }
             app.fork_picker = Some(MenuState::new(items));
         }
-        KeyAction::Fork(source_path, target_idx) => {
-            // Snapshot everything the new Agent needs to inherit from
-            // the current one BEFORE dropping it — provider config,
-            // permission, registry, hooks, api key. The source session
-            // path was passed in from the picker: it may be the
-            // current session OR any ancestor along the parent chain.
-            let (cwd, model, base_url, api_key, permission, hooks) = {
+        KeyAction::ForkChosen(source_path, target_idx) => {
+            // Compute cut-off (tail of CURRENT session that this fork
+            // will abandon) and prefill (target message text if it's a
+            // user message). Only sessions where source == current
+            // have a meaningful cut-off — cross-session forks to an
+            // ancestor abandon nothing summarizable in the ancestor
+            // itself, so we skip the summary prompt in that case.
+            let current_path = {
                 let g = agent_slot.lock().await;
-                let a = match g.as_ref() {
-                    Some(a) => a,
+                match g.as_ref() {
+                    Some(a) => a.session_path.clone(),
                     None => return Ok(()),
-                };
-                (
-                    a.cwd.clone(),
-                    a.model.clone(),
-                    a.base_url.clone(),
-                    a.api_key.clone(),
-                    a.permission.clone(),
-                    a.hooks.clone(),
-                )
+                }
             };
-
-            let (new_path, new_header, selected_text) =
-                match session::fork_session_at(&cwd, &source_path, target_idx) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        insert_line(term, Line::from(vec![
-                            Span::styled(format!("[fork failed: {e}]"), Style::default().fg(Color::Red)),
-                        ]))?;
-                        return Ok(());
-                    }
-                };
-            let _ = session::set_active_session(&cwd, &new_path);
-
-            let mut new_agent = match Agent::load_session(&new_path, &cwd) {
-                Ok(a) => a,
+            let src_entries = match session::read_session(&source_path) {
+                Ok((_, e)) => e,
                 Err(e) => {
                     insert_line(term, Line::from(vec![
                         Span::styled(
-                            format!("[fork load failed: {e}]"),
+                            format!("[fork read failed: {e}]"),
                             Style::default().fg(Color::Red),
                         ),
                     ]))?;
                     return Ok(());
                 }
             };
-            new_agent.provider = Box::new(crate::provider::openai::OpenAiProvider::new(
-                &base_url, &api_key, &model,
-            ));
-            new_agent.model = model.clone();
-            new_agent.base_url = base_url;
-            new_agent.api_key = api_key;
-            new_agent.permission = permission;
-            new_agent.hooks = hooks;
-            new_agent.registry = crate::tool::ToolRegistry::standard();
-            if new_agent.context.system.is_none() {
-                new_agent.context.system = Some(
-                    crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
-                );
-            }
-            new_agent.context.tools = new_agent.registry.all_specs();
-            let new_session_id = new_header.id;
-
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
-
-            // Reset TUI turn/usage/context state so the status footer
-            // reflects the fresh fork.
-            app.session_id = new_session_id.to_string();
-            app.usage = crate::event::Usage::default();
-            app.context_chars = 0;
-            app.turn_count = 0;
-            app.input.clear();
-            if let Some(text) = selected_text.as_ref().filter(|s| !s.is_empty()) {
-                app.input.insert_str(text);
-            }
-
-            insert_line(term, Line::from(vec![
-                Span::styled(
-                    format!(
-                        "[forked at entry {} → new session {}]",
-                        target_idx,
-                        &new_session_id.to_string()[..8]
+            let prefill = src_entries.get(target_idx).and_then(|e| match e {
+                session::SessionEntry::Message { role, content, .. } if role == "user" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            });
+            let cut_off = if source_path == current_path && target_idx < src_entries.len() {
+                src_entries[target_idx..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let pending = PendingFork {
+                source_path,
+                target_entry_idx: target_idx,
+                prefill,
+                cut_off,
+            };
+            if !pending.cut_off.is_empty() {
+                app.pending_fork = Some(pending);
+                app.summary_prompt = Some(MenuState::new(vec![
+                    MenuItem::new(
+                        "No summary".to_string(),
+                        "Fork without summarizing the abandoned tail".to_string(),
+                        SummaryChoice::NoSummary,
                     ),
-                    Style::default()
-                        .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
+                    MenuItem::new(
+                        "Summarize".to_string(),
+                        "Have the model summarize the cut-off tail (default prompt)".to_string(),
+                        SummaryChoice::DefaultSummary,
+                    ),
+                    MenuItem::new(
+                        "Summarize with custom prompt".to_string(),
+                        "Type your own instructions, then Enter".to_string(),
+                        SummaryChoice::CustomSummary,
+                    ),
+                ]));
+            } else {
+                execute_fork(pending, None, app, term, agent_slot).await?;
+            }
+        }
+        KeyAction::SummaryChosen(choice) => {
+            let Some(pending) = app.pending_fork.take() else {
+                return Ok(());
+            };
+            match choice {
+                SummaryChoice::NoSummary => {
+                    execute_fork(pending, None, app, term, agent_slot).await?;
+                }
+                SummaryChoice::DefaultSummary => {
+                    spawn_summarize_task(app, agent_slot, pending, None).await;
+                }
+                SummaryChoice::CustomSummary => {
+                    // Stash again; wait for the next TextBuffer Submit
+                    // to arrive as RunCustomSummary(text).
+                    app.pending_fork = Some(pending);
+                    app.capture_custom_prompt = true;
+                    app.status_note =
+                        Some("custom summarize prompt — Enter to submit".into());
+                }
+            }
+        }
+        KeyAction::RunCustomSummary(text) => {
+            let Some(pending) = app.pending_fork.take() else {
+                app.status_note = None;
+                return Ok(());
+            };
+            app.status_note = None;
+            spawn_summarize_task(app, agent_slot, pending, Some(text)).await;
+        }
+        KeyAction::SummaryFinished(outcome) => {
+            app.status_note = None;
+            match outcome {
+                SummarizeOutcome::Ok { summary, fork } => {
+                    execute_fork(fork, summary, app, term, agent_slot).await?;
+                }
+                SummarizeOutcome::Err { error, fork } => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[summarize error: {error} — forking without summary]"),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]))?;
+                    execute_fork(fork, None, app, term, agent_slot).await?;
+                }
+            }
+        }
+        KeyAction::CancelPendingFork => {
+            app.pending_fork = None;
+            app.capture_custom_prompt = false;
+            app.status_note = None;
         }
         KeyAction::Compact => {
             app.status_note = Some("compacting…".into());
@@ -946,6 +1109,154 @@ async fn recv_optional(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<Ag
         Some(r) => r.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Finalize a fork: create the new session file, optionally append a
+/// BranchSummary entry with the LLM-generated text, load it as the
+/// active Agent (transplanting provider / permission / hooks from the
+/// old Agent), then update the App's session id + prefill.
+async fn execute_fork(
+    fork: PendingFork,
+    summary: Option<String>,
+    app: &mut App,
+    term: &mut Term,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+) -> Result<()> {
+    let (cwd, model, base_url, api_key, permission, hooks) = {
+        let g = agent_slot.lock().await;
+        let a = match g.as_ref() {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+        (
+            a.cwd.clone(),
+            a.model.clone(),
+            a.base_url.clone(),
+            a.api_key.clone(),
+            a.permission.clone(),
+            a.hooks.clone(),
+        )
+    };
+
+    let (new_path, new_header, _fresh_prefill) =
+        match session::fork_session_at(&cwd, &fork.source_path, fork.target_entry_idx) {
+            Ok(t) => t,
+            Err(e) => {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("[fork failed: {e}]"),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]))?;
+                return Ok(());
+            }
+        };
+
+    // Persist the summary as a BranchSummary session entry BEFORE
+    // loading — that way load_session replays it as part of context.
+    if let Some(text) = summary.as_ref().filter(|s| !s.is_empty()) {
+        let _ = session::append_entry(
+            &new_path,
+            &session::SessionEntry::BranchSummary {
+                timestamp: crate::util::time::now_iso8601(),
+                summary: text.clone(),
+            },
+        );
+    }
+
+    let _ = session::set_active_session(&cwd, &new_path);
+
+    let mut new_agent = match Agent::load_session(&new_path, &cwd) {
+        Ok(a) => a,
+        Err(e) => {
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[fork load failed: {e}]"),
+                    Style::default().fg(Color::Red),
+                ),
+            ]))?;
+            return Ok(());
+        }
+    };
+    new_agent.provider = Box::new(crate::provider::openai::OpenAiProvider::new(
+        &base_url, &api_key, &model,
+    ));
+    new_agent.model = model.clone();
+    new_agent.base_url = base_url;
+    new_agent.api_key = api_key;
+    new_agent.permission = permission;
+    new_agent.hooks = hooks;
+    new_agent.registry = crate::tool::ToolRegistry::standard();
+    if new_agent.context.system.is_none() {
+        new_agent.context.system = Some(
+            crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
+        );
+    }
+    new_agent.context.tools = new_agent.registry.all_specs();
+    let new_session_id = new_header.id;
+
+    {
+        let mut g = agent_slot.lock().await;
+        *g = Some(new_agent);
+    }
+
+    app.session_id = new_session_id.to_string();
+    app.usage = crate::event::Usage::default();
+    app.context_chars = 0;
+    app.turn_count = 0;
+    app.input.clear();
+    if let Some(text) = fork.prefill.as_ref().filter(|s| !s.is_empty()) {
+        app.input.insert_str(text);
+    }
+
+    let short = &new_session_id.to_string()[..8];
+    let summary_note = if summary.is_some() { " · with summary" } else { "" };
+    insert_line(term, Line::from(vec![
+        Span::styled(
+            format!(
+                "[forked at entry {} → new session {}{}]",
+                fork.target_entry_idx, short, summary_note
+            ),
+            Style::default()
+                .fg(Color::Indexed(108))
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]))?;
+    Ok(())
+}
+
+/// Spawn the async summarization task and stash its handle on `app`.
+/// The main loop's tick polls `summarize_task.is_finished()` to pick
+/// up the result and dispatch `SummaryFinished`. A fresh
+/// OpenAiProvider is built for the task (the Agent's provider is
+/// `Box<dyn Provider>` which isn't Send-safe to share out).
+async fn spawn_summarize_task(
+    app: &mut App,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    pending: PendingFork,
+    custom: Option<String>,
+) {
+    let (model, base_url, api_key) = {
+        let g = agent_slot.lock().await;
+        match g.as_ref() {
+            Some(a) => (a.model.clone(), a.base_url.clone(), a.api_key.clone()),
+            None => return,
+        }
+    };
+    let provider =
+        crate::provider::openai::OpenAiProvider::new(&base_url, &api_key, &model);
+    let cut_off = pending.cut_off.clone();
+    let task = tokio::spawn(async move {
+        let summary = crate::agent::branch_summary::summarize_branch(
+            &cut_off,
+            custom.as_deref(),
+            &provider,
+        )
+        .await;
+        SummarizeOutcome::Ok { summary, fork: pending }
+    });
+    app.status_note = Some("summarizing branch…".into());
+    app.summarize_task = Some(task);
 }
 
 async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {

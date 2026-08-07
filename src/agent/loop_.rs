@@ -124,6 +124,17 @@ impl Agent {
                     };
                     context.messages.insert(0, summary_msg);
                 }
+                SessionEntry::BranchSummary { summary, .. } => {
+                    // Written by the fork picker's "Summarize branch"
+                    // action to carry over what happened on the branch
+                    // we abandoned. Replayed at its position (in order),
+                    // NOT dropped/inserted like Compaction — it belongs
+                    // where the user placed it in the new branch.
+                    context.push_user_text(format!(
+                        "[Branch summary from the abandoned line of \
+                        history]\n\n{summary}"
+                    ));
+                }
                 _ => {}
             }
         }

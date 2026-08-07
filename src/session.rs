@@ -92,6 +92,16 @@ pub enum SessionEntry {
         summary: String,
         replaced_count: usize,
     },
+    /// Written when the user forked to a new branch AND asked the agent
+    /// to summarize the tail that got cut off. The summary carries
+    /// what happened on the abandoned branch (files touched, decisions,
+    /// open questions) so the new branch can pick up with context.
+    /// Replayed as a synthetic user message on load, like Compaction.
+    #[serde(rename = "branch_summary")]
+    BranchSummary {
+        timestamp: String,
+        summary: String,
+    },
 }
 
 /// Metadata extracted from the session header.
@@ -420,6 +430,14 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
                         replaced_count,
                         collapse_ws_truncate(summary, 50)
                     ),
+                    prefill_text: None,
+                });
+            }
+            SessionEntry::BranchSummary { summary, .. } => {
+                out.push(TreeRow {
+                    entry_index: i,
+                    role: "[branch summary]".into(),
+                    preview: collapse_ws_truncate(summary, 60),
                     prefill_text: None,
                 });
             }
@@ -1180,6 +1198,36 @@ mod tests {
         assert!(s.contains("\"replaced_count\":12"), "got {s}");
         let back: SessionEntry = serde_json::from_str(&s).unwrap();
         matches!(back, SessionEntry::Compaction { .. });
+    }
+
+    /// BranchSummary is the fork-time counterpart of Compaction —
+    /// serializes with type "branch_summary" and roundtrips its text.
+    #[test]
+    fn branch_summary_entry_serde_roundtrips() {
+        let entry = SessionEntry::BranchSummary {
+            timestamp: "2026-08-07T18:00:00Z".into(),
+            summary: "abandoned line: user tried fix X, got Y".into(),
+        };
+        let s = serde_json::to_string(&entry).unwrap();
+        assert!(s.contains("\"type\":\"branch_summary\""), "got {s}");
+        assert!(s.contains("abandoned line"), "got {s}");
+        let back: SessionEntry = serde_json::from_str(&s).unwrap();
+        matches!(back, SessionEntry::BranchSummary { .. });
+    }
+
+    /// tree_items renders BranchSummary as a "[branch summary]" row so
+    /// users can see it in the fork picker.
+    #[test]
+    fn tree_items_renders_branch_summary() {
+        let entries = vec![SessionEntry::BranchSummary {
+            timestamp: "".into(),
+            summary: "we deleted three files and reverted an edit".into(),
+        }];
+        let rows = tree_items(&entries);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "[branch summary]");
+        assert!(rows[0].preview.contains("deleted three files"));
+        assert!(rows[0].prefill_text.is_none());
     }
 
     /// --session <id> with a missing id returns error (not New).
