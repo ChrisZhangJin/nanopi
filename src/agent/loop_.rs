@@ -74,6 +74,12 @@ pub struct Agent {
     /// read it without going through the Provider trait (which has
     /// no `model()` method today).
     pub model: String,
+    /// Base URL + api key stashed so slash-command handlers (`/model`)
+    /// can rebuild `provider` with a different model without needing
+    /// to plumb config through every callsite. Not sensitive — same
+    /// values the user already put in config.toml or env vars.
+    pub base_url: String,
+    pub api_key: String,
     /// Cumulative token usage over the whole session — summed across
     /// every LLM turn (including compaction summarization). Read by
     /// the status bar; never resets except on `Agent::load_session`
@@ -131,6 +137,8 @@ impl Agent {
             permission: PermissionGate::from_cli(false, false, None),
             hooks: HooksConfig::default(),
             model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
         })
@@ -622,6 +630,8 @@ mod tests {
             permission: PermissionGate::from_cli(false, false, None),
             hooks,
             model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
         };
@@ -675,6 +685,8 @@ mod tests {
             permission: PermissionGate::from_cli(false, false, None),
             hooks: HooksConfig::default(),
             model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
         };
@@ -907,6 +919,8 @@ mod tests {
             permission: PermissionGate::from_cli(false, false, None),
             hooks: HooksConfig::default(),
             model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
         };

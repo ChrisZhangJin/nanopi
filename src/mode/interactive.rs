@@ -78,6 +78,8 @@ pub async fn run_interactive_mode(
             a.permission = permission_for_resume;
             a.hooks = hooks;
             a.model = model.to_string();
+            a.base_url = base_url.to_string();
+            a.api_key = api_key.to_string();
             if a.context.system.is_none() {
                 a.context.system = Some(crate::agent::system_prompt::build(&cwd, &a.registry.names()));
             }
@@ -97,6 +99,8 @@ pub async fn run_interactive_mode(
                 permission,
                 hooks,
                 model: model.to_string(),
+                base_url: base_url.to_string(),
+                api_key: api_key.to_string(),
                 usage_total: crate::event::Usage::default(),
                 turn_count: 0,
             }

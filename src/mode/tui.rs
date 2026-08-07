@@ -63,20 +63,21 @@ use crate::tool::ToolRegistry;
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 
-/// Slash commands available in the palette. Keep the payload
-/// `&'static str` so it's copy-able and hashable if we ever key on it.
+/// Slash commands available in the palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlashCmd {
     Compact,
     Quit,
-    // Future: Model, Login, Settings, Export, Import.
+    Model,
+    // Future: Login, Settings, Export, Import.
 }
 
 fn slash_items() -> Vec<MenuItem<SlashCmd>> {
     vec![
-        MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
-        MenuItem::new("/quit",    "Exit the session",         SlashCmd::Quit),
-        MenuItem::new("/exit",    "Exit the session",         SlashCmd::Quit),
+        MenuItem::new("/model",   "Switch to a different model", SlashCmd::Model),
+        MenuItem::new("/compact", "Force context compaction",    SlashCmd::Compact),
+        MenuItem::new("/quit",    "Exit the session",            SlashCmd::Quit),
+        MenuItem::new("/exit",    "Exit the session",            SlashCmd::Quit),
     ]
 }
 
@@ -136,6 +137,8 @@ pub async fn run_tui_mode(
         a.permission = permission;
         a.hooks = hooks;
         a.model = model.to_string();
+        a.base_url = base_url.to_string();
+        a.api_key = api_key.to_string();
         if a.context.system.is_none() {
             a.context.system = Some(crate::agent::system_prompt::build(&cwd, &a.registry.names()));
         }
@@ -155,6 +158,8 @@ pub async fn run_tui_mode(
             permission,
             hooks,
             model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
             usage_total: crate::event::Usage::default(),
             turn_count: 0,
         }
@@ -256,6 +261,9 @@ struct App {
     /// When Some, the slash-command palette is open and consumes keys
     /// (except letters, which the TextBuffer still gets for filtering).
     palette: Option<MenuState<SlashCmd>>,
+    /// When Some, the model picker is open — takes priority over the
+    /// slash palette. Payload is the target model id.
+    model_picker: Option<MenuState<String>>,
     status: Status,
     session_id: String,
     model: String,
@@ -293,6 +301,7 @@ impl App {
         Self {
             input: TextBuffer::new(),
             palette: None,
+            model_picker: None,
             status: Status::Idle,
             session_id,
             model,
@@ -331,6 +340,8 @@ enum KeyAction {
     CancelTurn,
     Exit,
     Compact,
+    OpenModelPicker,
+    SwapModel(String),
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -338,6 +349,23 @@ enum KeyAction {
 /// handled, the palette's open/closed state is re-synced against the
 /// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
+    // ── Model picker (highest priority when open) ───────────────────
+    if app.model_picker.is_some() {
+        let m = app.model_picker.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(model_id) => {
+                app.model_picker = None;
+                app.input.clear();
+                return KeyAction::SwapModel(model_id);
+            }
+            MenuAction::Cancel => {
+                app.model_picker = None;
+                app.input.clear();
+                return KeyAction::Nothing;
+            }
+            MenuAction::Nothing => return KeyAction::Nothing,
+        }
+    }
     // ── Palette owns navigation keys when open. ─────────────────────
     if app.palette.is_some() {
         let claims_nav = matches!(
@@ -425,6 +453,7 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
     match cmd {
         SlashCmd::Compact => KeyAction::Compact,
         SlashCmd::Quit => KeyAction::Exit,
+        SlashCmd::Model => KeyAction::OpenModelPicker,
     }
 }
 
@@ -562,6 +591,45 @@ async fn handle_action(
             if let Some(ct) = cancel.as_ref() {
                 ct.cancel();
                 app.status_note = Some("cancelling…".into());
+            }
+        }
+        KeyAction::OpenModelPicker => {
+            // Populate the picker with pricing-known models. Highlight
+            // the current one so users see where they're switching from.
+            let current = {
+                let g = agent_slot.lock().await;
+                g.as_ref().map(|a| a.model.clone()).unwrap_or_default()
+            };
+            let items: Vec<MenuItem<String>> = crate::pricing::known_models()
+                .into_iter()
+                .map(|prefix| {
+                    let marker = if current.starts_with(prefix) { "  (current)" } else { "" };
+                    MenuItem::new(
+                        prefix.to_string(),
+                        format!("Switch to {}{}", prefix, marker),
+                        prefix.to_string(),
+                    )
+                })
+                .collect();
+            app.model_picker = Some(MenuState::new(items));
+        }
+        KeyAction::SwapModel(new_model) => {
+            let mut g = agent_slot.lock().await;
+            if let Some(a) = g.as_mut() {
+                let new_provider = crate::provider::openai::OpenAiProvider::new(
+                    &a.base_url,
+                    &a.api_key,
+                    &new_model,
+                );
+                a.provider = Box::new(new_provider);
+                a.model = new_model.clone();
+                app.model = new_model.clone();
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("[model → {}]", new_model),
+                        Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
             }
         }
         KeyAction::Compact => {
@@ -936,8 +1004,10 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         ])
         .split(area);
 
-    // ── Palette (dropdown menu) ──────────────────────────────────
-    if let Some(m) = &app.palette {
+    // ── Palette / model picker (dropdown menu). Picker wins. ─────
+    if let Some(m) = &app.model_picker {
+        draw_string_menu(buf, chunks[0], m, "model");
+    } else if let Some(m) = &app.palette {
         draw_palette(buf, chunks[0], m);
     }
 
@@ -1108,6 +1178,60 @@ fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
 fn split_at_col(s: &str, col: usize) -> (&str, &str) {
     let clamped = col.min(s.len());
     s.split_at(clamped)
+}
+
+/// Same as draw_palette but for MenuState<String> (model picker etc).
+/// A minimal re-implementation — TODO: unify via a trait once we have
+/// a third menu type.
+fn draw_string_menu(buf: &mut Buffer, area: Rect, m: &MenuState<String>, label: &str) {
+    let vis = m.visible();
+    let sel = m.cursor();
+    if vis.is_empty() {
+        let msg = Line::from(vec![Span::styled(
+            format!("  (no {label} matches)"),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )]);
+        Paragraph::new(msg).render(area, buf);
+        return;
+    }
+    let max_rows = area.height as usize;
+    let start = if vis.len() <= max_rows {
+        0
+    } else if sel < max_rows / 2 {
+        0
+    } else if sel >= vis.len() - (max_rows - max_rows / 2) {
+        vis.len().saturating_sub(max_rows)
+    } else {
+        sel - max_rows / 2
+    };
+    let end = (start + max_rows).min(vis.len());
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in vis[start..end].iter().enumerate() {
+        let absolute = start + i;
+        let is_sel = absolute == sel;
+        let arrow = if is_sel { "→ " } else { "  " };
+        let label_style = if is_sel {
+            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let desc_style = Style::default().fg(Color::DarkGray);
+        lines.push(Line::from(vec![
+            Span::styled(arrow, label_style),
+            Span::styled(format!("{:<32}", item.label), label_style),
+            Span::styled(item.description.clone(), desc_style),
+        ]));
+    }
+    if end < vis.len() {
+        let count = vis.len() - end;
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled(
+                format!("   (+{count} more)"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+    }
+    Paragraph::new(lines).render(area, buf);
 }
 
 /// Render the slash-command palette in the given rect. Selected item

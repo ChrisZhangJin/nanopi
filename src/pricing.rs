@@ -30,6 +30,13 @@ impl ModelPricing {
     }
 }
 
+/// All model prefixes we know pricing for. Used by the `/model`
+/// palette to enumerate switchable models — the gateway may support
+/// more, but this is what the UI can *quote a price for*.
+pub fn known_models() -> Vec<&'static str> {
+    TABLE.iter().map(|(prefix, _)| *prefix).collect()
+}
+
 /// Look up pricing for a model id. Returns None if unknown.
 pub fn lookup(model_id: &str) -> Option<ModelPricing> {
     // Newest models near the top; match on prefix so date-suffixed
