@@ -91,32 +91,30 @@ impl Context {
     }
 
     /// Append a tool result message (OpenAI-style: separate role).
-    ///
-    /// Guard: if the context already contains a Tool message with the
-    /// same `tool_call_id`, skip. Anthropic's API rejects requests where
-    /// a single `tool_use_id` has multiple `tool_result` blocks, so we
-    /// enforce that invariant at the source. This can happen if a
-    /// gateway/proxy replays a tool_use id across turns or if our
-    /// streaming parser ever misses a dedup.
     pub fn push_tool_result(
         &mut self,
         tool_call_id: impl Into<String>,
         content: impl Into<String>,
         is_error: bool,
     ) {
-        let id_str = tool_call_id.into();
-        if self.messages.iter().any(|m| {
-            matches!(m, ContextMessage::Tool { tool_call_id: existing, .. } if existing == &id_str)
-        }) {
-            // Duplicate — silently drop. Emitting a warn! would spam
-            // stderr on every reused id (some proxies do this per turn).
-            return;
-        }
         self.messages.push(ContextMessage::Tool {
-            tool_call_id: id_str,
+            tool_call_id: tool_call_id.into(),
             content: content.into(),
             is_error,
         });
+    }
+
+    /// True when any prior Assistant message already contains a
+    /// ToolCall block with this id. Used by `run_turn` to detect
+    /// gateway-replayed tool_use ids and rewrite them before push.
+    pub fn has_assistant_tool_call_id(&self, id: &str) -> bool {
+        self.messages.iter().any(|m| match m {
+            ContextMessage::Assistant { content } => content.iter().any(|b| match b {
+                AssistantBlock::ToolCall { call } => call.id == id,
+                _ => false,
+            }),
+            _ => false,
+        })
     }
 
     /// Rough size of the context in characters. Used as a proxy for
@@ -217,31 +215,20 @@ mod tests {
         }
     }
 
-    /// Guard rail: repeated `push_tool_result` with the same
-    /// tool_call_id must not duplicate the message. Anthropic API
-    /// rejects requests containing multiple tool_result blocks with the
-    /// same tool_use_id.
     #[test]
-    fn push_tool_result_drops_duplicate_ids() {
+    fn has_assistant_tool_call_id_finds_prior_use() {
         let mut ctx = Context::default();
-        ctx.push_tool_result("call_A", "first", false);
-        ctx.push_tool_result("call_A", "second (should be dropped)", false);
-        ctx.push_tool_result("call_B", "different id, kept", false);
-
-        let tool_msgs: Vec<_> = ctx
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                ContextMessage::Tool { tool_call_id, content, .. } => {
-                    Some((tool_call_id.clone(), content.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(tool_msgs.len(), 2, "expected exactly 2 Tool messages");
-        assert_eq!(tool_msgs[0].0, "call_A");
-        assert_eq!(tool_msgs[0].1, "first", "first push wins");
-        assert_eq!(tool_msgs[1].0, "call_B");
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![AssistantBlock::ToolCall {
+                call: ToolCallBlock {
+                    id: "X".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                },
+            }],
+        });
+        assert!(ctx.has_assistant_tool_call_id("X"));
+        assert!(!ctx.has_assistant_tool_call_id("Y"));
     }
 
     #[test]
