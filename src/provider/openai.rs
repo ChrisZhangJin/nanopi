@@ -168,6 +168,16 @@ fn json_error_message(v: &serde_json::Value) -> Option<String> {
     err.get("type").and_then(|x| x.as_str()).map(String::from)
 }
 
+/// Undo the OpenAI-compat-gateway rewrite that turns Anthropic
+/// `tool_use.name = "bash"` into `"Bash_tool"` in the SSE
+/// `chat.completion.chunk.delta.tool_calls[].function.name` field.
+/// Lowercase + strip trailing `_tool`. Passes canonical names
+/// through unchanged.
+fn normalize_mangled_tool_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    lower.strip_suffix("_tool").map(String::from).unwrap_or(lower)
+}
+
 /// Cheap 0..1 pseudo-random from the current nanosecond of the clock.
 /// Good enough for retry jitter — we don't need cryptographic entropy.
 fn rand01() -> f64 {
@@ -583,7 +593,13 @@ async fn flush_pending_tool_calls(
         } else {
             serde_json::from_str(&p.args_buf).unwrap_or_else(|_| json!({}))
         };
-        let name = p.name.unwrap_or_else(|| "unknown".into());
+        // Normalize gateway-mangled names (e.g. `Bash_tool` → `bash`)
+        // AT THE SOURCE so every downstream consumer — spinner labels,
+        // TUI tool bar, session persistence, next-turn context — sees
+        // the canonical form. Rule matches `ToolRegistry::canonical_name`
+        // but stateless (no registry lookup needed here).
+        let raw = p.name.unwrap_or_else(|| "unknown".into());
+        let name = normalize_mangled_tool_name(&raw);
         let _ = tx
             .send(AgentEvent::ToolCall {
                 content_index,

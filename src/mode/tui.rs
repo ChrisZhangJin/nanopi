@@ -621,7 +621,9 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             // Full-width green background bar — PI's "$ command" style.
-            let cmd_preview = tool_call_preview(&call.name, &call.arguments);
+            // Bash gets the shell-prompt look; other tools get
+            // "toolname: <arg preview>".
+            let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
             let bar_style = Style::default()
                 .bg(Color::Rgb(0, 100, 0))
                 .fg(Color::White)
@@ -631,8 +633,8 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
                 .fg(Color::Rgb(180, 220, 180))
                 .add_modifier(Modifier::ITALIC);
             insert_line_bg(term, Line::from(vec![
-                Span::styled(format!(" ${} ", if call.name == "bash" { " " } else { "" }), bar_style),
-                Span::styled(cmd_preview, bar_style),
+                Span::styled(leading, bar_style),
+                Span::styled(body, bar_style),
                 Span::styled("  (ctrl+o to expand)", dim_style),
             ]), Some(bar_style))?;
         }
@@ -678,25 +680,45 @@ fn flush_thinking_buf(term: &mut Term, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Build a compact command preview for the green tool-call bar.
-fn tool_call_preview(name: &str, args: &serde_json::Value) -> String {
-    match name {
-        "bash" => args.get("command").and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| name.to_string()),
+/// Build the two parts of the tool-call bar:
+///   leading (fixed short chip like ` $ ` or ` read `)
+///   body    (the meat: command / path / pattern)
+///
+/// bash mimics a shell prompt: ` $ ls -la /tmp`.
+/// Other tools show ` <name> <arg>`: ` read /etc/hostname`.
+fn tool_call_bar_text(name: &str, args: &serde_json::Value) -> (String, String) {
+    let name_lc = name.to_ascii_lowercase();
+    match name_lc.as_str() {
+        "bash" => {
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(String::new);
+            (" $ ".to_string(), truncate_bar_body(&cmd))
+        }
         "read" | "write" | "edit" | "ls" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            format!("{name} {path}")
+            (format!(" {} ", name_lc), truncate_bar_body(path))
         }
         "grep" | "find" => {
             let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            format!("{name} '{pat}'")
+            (format!(" {} ", name_lc), truncate_bar_body(&format!("'{pat}'")))
         }
         _ => {
             let s = args.to_string();
-            let preview = if s.len() > 80 { format!("{}…", &s[..80]) } else { s };
-            format!("{name} {preview}")
+            (format!(" {} ", name_lc), truncate_bar_body(&s))
         }
+    }
+}
+
+fn truncate_bar_body(s: &str) -> String {
+    const MAX: usize = 120;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let taken: String = s.chars().take(MAX).collect();
+        format!("{taken}…")
     }
 }
 
