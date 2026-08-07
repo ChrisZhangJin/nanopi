@@ -314,24 +314,70 @@ impl Agent {
                 (calls, done, assistant_text)
             });
 
-            // Run one streaming assistant turn.
-            if let Err(e) = self.provider.stream_turn(&self.context, forward_tx).await {
-                return Err(AgentError::Provider(e.to_string()));
-            }
-
-            let (mut calls, done, assistant_text) = if let Some(ct) = cancel.as_ref() {
+            // Run one streaming assistant turn. To make Esc interrupt
+            // immediately (PI's app.interrupt), race the HTTP stream
+            // against the cancel token via tokio::select!. If cancel
+            // fires first, the select drops the stream future — that
+            // drops `forward_tx` and closes the reqwest connection,
+            // which in turn ends `collect_task` (it sees forward_rx
+            // return None). Without this the .await would block until
+            // the model naturally finished, which is what the user
+            // saw as "Esc waits a while".
+            //
+            // `biased` gives priority to the cancel branch when both
+            // are ready — otherwise tokio picks randomly and Esc can
+            // still get outraced by a single-chunk fast reply.
+            let (cancelled, stream_result) = if let Some(ct) = cancel.as_ref() {
                 tokio::select! {
-                    _ = ct.cancelled() => {
-                        // Cancellation: drop any partial result and return
-                        // the text we have so far. The user can send a new
-                        // message and the context is preserved.
-                        return Ok(final_text);
+                    biased;
+                    _ = ct.cancelled() => (true, Ok(())),
+                    r = self.provider.stream_turn(&self.context, forward_tx) => {
+                        (false, r.map(|_| ()).map_err(|e| e))
                     }
-                    res = collect_task => res.map_err(|e| AgentError::Provider(format!("collect task: {e}")))?,
                 }
             } else {
-                collect_task.await.map_err(|e| AgentError::Provider(format!("collect task: {e}")))?
+                (false, self.provider.stream_turn(&self.context, forward_tx).await.map(|_| ()))
             };
+
+            // Collect whatever the streaming parser managed to
+            // accumulate before the connection dropped. Because the
+            // forward_tx has been dropped by now (either the stream
+            // completed or its future was dropped by cancel), the
+            // channel is closed and collect_task returns promptly.
+            let (mut calls, done, assistant_text) = collect_task
+                .await
+                .map_err(|e| AgentError::Provider(format!("collect task: {e}")))?;
+
+            if cancelled {
+                // Preserve the partial turn in context so the NEXT
+                // turn's LLM sees a coherent trace. Without this,
+                // context ends up as [user_A, user_B] with no
+                // assistant between — the model then answers both
+                // A and B, which was one of the bugs the user hit.
+                // See PI's stopReason == "aborted" path at
+                // packages/coding-agent/src/modes/interactive/
+                // interactive-mode.ts:3040-3045.
+                let marker = if assistant_text.is_empty() {
+                    "(interrupted by user before any response)".to_string()
+                } else {
+                    format!("{}\n\n(interrupted by user)", assistant_text)
+                };
+                session::append_entry(
+                    &self.session_path,
+                    &SessionEntry::Message {
+                        id: uuid::v7().to_string(),
+                        timestamp: time::now_iso8601(),
+                        role: "assistant".into(),
+                        content: marker.clone(),
+                    },
+                )?;
+                self.context.push_assistant_text(marker);
+                return Ok(final_text);
+            }
+
+            if let Err(e) = stream_result {
+                return Err(AgentError::Provider(e.to_string()));
+            }
 
             // Normalize gateway-mangled tool names (e.g. `Bash_tool` → `bash`)
             // BEFORE anything downstream sees them. Otherwise:
@@ -648,7 +694,7 @@ async fn run_one_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::context::ToolSpec;
+    use crate::agent::context::{ContextMessage, ToolSpec};
     use serde_json::json;
 
     fn tmp() -> PathBuf {
@@ -773,6 +819,95 @@ mod tests {
                 assert!(content.contains("unknown tool"));
             }
             _ => panic!("expected Tool message"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Esc-during-streaming (PI's app.interrupt): the cancel token
+    /// fires while stream_turn is still running. run_turn must:
+    ///   1) drop the stream future promptly (not wait for it to
+    ///      complete naturally),
+    ///   2) preserve the aborted turn in context by pushing a
+    ///      synthetic "(interrupted by user…)" assistant message,
+    ///      so the next turn's request doesn't leave the LLM staring
+    ///      at two consecutive user messages.
+    #[tokio::test]
+    async fn run_turn_cancel_drops_stream_and_marks_context_aborted() {
+        // Provider that hangs forever — simulates a real HTTP stream
+        // that hasn't finished yet when the user hits Esc.
+        struct HangingProvider;
+        #[async_trait::async_trait]
+        impl Provider for HangingProvider {
+            fn id(&self) -> &'static str { "hanging" }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                _tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("session.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(HangingProvider),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        let ct = tokio_util::sync::CancellationToken::new();
+        let ct_clone = ct.clone();
+
+        // Trigger cancel after a short delay — long enough for run_turn
+        // to enter the streaming select but short enough to keep the
+        // test fast.
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ct_clone.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let out = agent.run_turn("do something forever", &tx, Some(ct)).await;
+        canceller.await.ok();
+        let elapsed = start.elapsed();
+
+        assert!(out.is_ok(), "run_turn should return Ok on cancel");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "cancel should be prompt; took {:?}",
+            elapsed
+        );
+
+        // Last message in context must be the synthetic (interrupted)
+        // assistant marker — this is what prevents the next turn from
+        // being interpreted as answering both the aborted and new
+        // user messages.
+        let last = agent.context.messages.last().expect("context has messages");
+        match last {
+            ContextMessage::Assistant { content } => {
+                let has_marker = content.iter().any(|b| match b {
+                    crate::agent::context::AssistantBlock::Text { text } => {
+                        text.contains("interrupted by user")
+                    }
+                    _ => false,
+                });
+                assert!(has_marker, "expected (interrupted by user) marker");
+            }
+            other => panic!("expected assistant message, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
