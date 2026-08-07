@@ -264,6 +264,15 @@ struct App {
     /// When Some, the model picker is open — takes priority over the
     /// slash palette. Payload is the target model id.
     model_picker: Option<MenuState<String>>,
+    /// When Some, the fork picker (Esc double-tap) is open. Payload is
+    /// the 0-based user-message index in the current session — used to
+    /// call `session::fork_session_at` on Enter.
+    fork_picker: Option<MenuState<usize>>,
+    /// Timestamp of the last Esc keypress. Second Esc within 500ms on
+    /// an empty editor opens the fork picker (PI's `doubleEscapeAction`
+    /// = "fork"; see packages/coding-agent/src/modes/interactive/
+    /// interactive-mode.ts:2644).
+    last_esc_at: Option<std::time::Instant>,
     status: Status,
     session_id: String,
     model: String,
@@ -326,6 +335,8 @@ impl App {
             status_note: None,
             md_state: crate::render::markdown::MdState::default(),
             last_tool_output: None,
+            fork_picker: None,
+            last_esc_at: None,
         }
     }
 }
@@ -360,6 +371,12 @@ enum KeyAction {
     OpenModelPicker,
     SwapModel(String),
     ExpandLastTool,
+    /// User double-tapped Esc on an empty editor — build the
+    /// user-message picker from the current session.
+    OpenForkPicker,
+    /// User selected a user message in the fork picker — fork the
+    /// current session at that message and switch to the new one.
+    Fork(usize),
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -370,6 +387,47 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     // Ctrl+O — expand the last tool output (PI's `app.tools.expand`).
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('o') {
         return KeyAction::ExpandLastTool;
+    }
+
+    // ── Fork picker (highest priority when open) ────────────────────
+    if app.fork_picker.is_some() {
+        let m = app.fork_picker.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(idx) => {
+                app.fork_picker = None;
+                return KeyAction::Fork(idx);
+            }
+            MenuAction::Cancel => {
+                app.fork_picker = None;
+                return KeyAction::Nothing;
+            }
+            MenuAction::Nothing => return KeyAction::Nothing,
+        }
+    }
+
+    // ── Esc double-tap → open fork picker ───────────────────────────
+    // Only when the editor is empty, no menu open, not streaming, and
+    // the previous Esc was < 500ms ago. First-Esc-on-empty just records
+    // the time (no visible effect). Matches PI's `lastEscapeTime`
+    // check (see interactive-mode.ts:2644).
+    if k.code == KeyCode::Esc
+        && k.modifiers.is_empty()
+        && app.input.is_empty()
+        && app.palette.is_none()
+        && app.model_picker.is_none()
+        && app.status != Status::Streaming
+    {
+        let now = std::time::Instant::now();
+        let is_double = app
+            .last_esc_at
+            .map(|prev| now.duration_since(prev) < std::time::Duration::from_millis(500))
+            .unwrap_or(false);
+        if is_double {
+            app.last_esc_at = None;
+            return KeyAction::OpenForkPicker;
+        }
+        app.last_esc_at = Some(now);
+        return KeyAction::Nothing;
     }
 
     // ── Model picker (highest priority when open) ───────────────────
@@ -668,6 +726,152 @@ async fn handle_action(
                     ),
                 ]))?;
             }
+        }
+        KeyAction::OpenForkPicker => {
+            // Pull user messages from the current session file (single
+            // source of truth on disk). Context in memory would work
+            // too but the file survives compaction and is what
+            // fork_session_at reads back — using the same source
+            // guarantees indices line up.
+            let session_path = {
+                let g = agent_slot.lock().await;
+                g.as_ref().map(|a| a.session_path.clone())
+            };
+            let Some(session_path) = session_path else {
+                return Ok(());
+            };
+            let entries = match session::read_session(&session_path) {
+                Ok((_h, e)) => e,
+                Err(e) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(format!("[fork picker: {e}]"), Style::default().fg(Color::Red)),
+                    ]))?;
+                    return Ok(());
+                }
+            };
+            let msgs = session::user_messages(&entries);
+            if msgs.is_empty() {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        "[fork: no user messages in this session yet]",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+                return Ok(());
+            }
+            let total = msgs.len();
+            let items: Vec<MenuItem<usize>> = msgs
+                .into_iter()
+                .map(|(idx, text)| {
+                    // One-line preview, collapse whitespace, truncate.
+                    let preview: String = text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    MenuItem::new(
+                        preview.clone(),
+                        format!("Message {}/{}", idx + 1, total),
+                        idx,
+                    )
+                })
+                .collect();
+            app.fork_picker = Some(MenuState::new(items));
+        }
+        KeyAction::Fork(target_idx) => {
+            // Snapshot everything the new Agent needs to inherit from
+            // the current one BEFORE dropping it — provider config,
+            // permission, registry, hooks, api key. The new Agent gets
+            // loaded from the freshly-created fork file; then we
+            // transplant those non-session fields onto it.
+            let (source_path, cwd, model, base_url, api_key, permission, hooks) = {
+                let g = agent_slot.lock().await;
+                let a = match g.as_ref() {
+                    Some(a) => a,
+                    None => return Ok(()),
+                };
+                (
+                    a.session_path.clone(),
+                    a.cwd.clone(),
+                    a.model.clone(),
+                    a.base_url.clone(),
+                    a.api_key.clone(),
+                    a.permission.clone(),
+                    a.hooks.clone(),
+                )
+            };
+
+            let (new_path, new_header, selected_text) =
+                match session::fork_session_at(&cwd, &source_path, target_idx) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        insert_line(term, Line::from(vec![
+                            Span::styled(format!("[fork failed: {e}]"), Style::default().fg(Color::Red)),
+                        ]))?;
+                        return Ok(());
+                    }
+                };
+            let _ = session::set_active_session(&cwd, &new_path);
+
+            let mut new_agent = match Agent::load_session(&new_path, &cwd) {
+                Ok(a) => a,
+                Err(e) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[fork load failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                    return Ok(());
+                }
+            };
+            new_agent.provider = Box::new(crate::provider::openai::OpenAiProvider::new(
+                &base_url, &api_key, &model,
+            ));
+            new_agent.model = model.clone();
+            new_agent.base_url = base_url;
+            new_agent.api_key = api_key;
+            new_agent.permission = permission;
+            new_agent.hooks = hooks;
+            new_agent.registry = crate::tool::ToolRegistry::standard();
+            if new_agent.context.system.is_none() {
+                new_agent.context.system = Some(
+                    crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
+                );
+            }
+            new_agent.context.tools = new_agent.registry.all_specs();
+            let new_session_id = new_header.id;
+
+            {
+                let mut g = agent_slot.lock().await;
+                *g = Some(new_agent);
+            }
+
+            // Reset TUI turn/usage/context state so the status footer
+            // reflects the fresh fork.
+            app.session_id = new_session_id.to_string();
+            app.usage = crate::event::Usage::default();
+            app.context_chars = 0;
+            app.turn_count = 0;
+            app.input.clear();
+            if !selected_text.is_empty() {
+                app.input.insert_str(&selected_text);
+            }
+
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!(
+                        "[forked at message {} → new session {}]",
+                        target_idx + 1,
+                        &new_session_id.to_string()[..8]
+                    ),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
         }
         KeyAction::Compact => {
             app.status_note = Some("compacting…".into());
@@ -1073,9 +1277,12 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         ])
         .split(area);
 
-    // ── Palette / model picker (dropdown menu). Picker wins. ─────
-    if let Some(m) = &app.model_picker {
-        draw_string_menu(buf, chunks[0], m, "model");
+    // ── Palette / model picker / fork picker (dropdown menu). ────
+    // Priority: fork picker > model picker > slash palette.
+    if let Some(m) = &app.fork_picker {
+        draw_menu(buf, chunks[0], m, "user message");
+    } else if let Some(m) = &app.model_picker {
+        draw_menu(buf, chunks[0], m, "model");
     } else if let Some(m) = &app.palette {
         draw_palette(buf, chunks[0], m);
     }
@@ -1299,7 +1506,7 @@ fn split_at_col(s: &str, col: usize) -> (&str, &str) {
 /// Same as draw_palette but for MenuState<String> (model picker etc).
 /// A minimal re-implementation — TODO: unify via a trait once we have
 /// a third menu type.
-fn draw_string_menu(buf: &mut Buffer, area: Rect, m: &MenuState<String>, label: &str) {
+fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &str) {
     let vis = m.visible();
     let sel = m.cursor();
     if vis.is_empty() {

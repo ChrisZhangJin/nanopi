@@ -274,6 +274,93 @@ pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader
     Ok((path, header))
 }
 
+/// Fork a session at a specific user-message boundary. The new session
+/// contains the header (with `parent_id` set to source) plus every
+/// entry BEFORE the Nth user message in the source. The Nth message
+/// itself is NOT copied — the caller is expected to pre-fill the
+/// editor with its text so the user can revise and resubmit.
+///
+/// `target_user_index` is 0-based over user Messages in the source.
+/// Passing `0` produces a fork with no messages (just the header) —
+/// equivalent to starting over from the same cwd/model context.
+/// If the index exceeds the number of user messages, everything is
+/// copied (fork == full clone in that degenerate case).
+pub fn fork_session_at(
+    cwd: &Path,
+    source: &Path,
+    target_user_index: usize,
+) -> Result<(PathBuf, SessionHeader, String), SessionError> {
+    let (src_hdr, entries) = read_session(source)?;
+
+    // Walk entries; find where the Nth user Message sits. Copy prefix
+    // ends at that index (exclusive). Also capture the message text
+    // so the caller can pre-fill the editor.
+    let mut user_count = 0usize;
+    let mut copy_until = entries.len();
+    let mut selected_text = String::new();
+    for (i, e) in entries.iter().enumerate() {
+        if let SessionEntry::Message { role, content, .. } = e {
+            if role == "user" {
+                if user_count == target_user_index {
+                    copy_until = i;
+                    selected_text = content.clone();
+                    break;
+                }
+                user_count += 1;
+            }
+        }
+    }
+
+    let dir = sessions_dir().ok_or_else(|| SessionError::Io {
+        path: PathBuf::from("~/.nanopi/sessions"),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir"),
+    })?;
+    std::fs::create_dir_all(&dir).map_err(|e| SessionError::Io {
+        path: dir.clone(),
+        source: e,
+    })?;
+
+    let new_id = uuid::v7();
+    let path = dir.join(format!("{new_id}.jsonl"));
+    let header = SessionHeader {
+        id: new_id,
+        parent_id: Some(src_hdr.id),
+        cwd: cwd.to_path_buf(),
+        model: src_hdr.model.clone(),
+        base_url: src_hdr.base_url.clone(),
+    };
+    let header_entry = SessionEntry::Header {
+        version: 2,
+        id: new_id.to_string(),
+        parent_id: Some(src_hdr.id.to_string()),
+        timestamp: time::now_iso8601(),
+        cwd: cwd.display().to_string(),
+        model: src_hdr.model.clone(),
+        base_url: src_hdr.base_url.clone(),
+    };
+    append_entry(&path, &header_entry)?;
+    for e in entries.iter().take(copy_until) {
+        append_entry(&path, e)?;
+    }
+    Ok((path, header, selected_text))
+}
+
+/// Extract user Message texts from a session, in file order. Used to
+/// populate the fork picker. Returns (index-in-user-list, content).
+pub fn user_messages(entries: &[SessionEntry]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut n = 0usize;
+    for e in entries {
+        if let SessionEntry::Message { role, content, .. } = e {
+            if role == "user" {
+                out.push((n, content.clone()));
+                n += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Iterate over entries in a session file. Returns header + body.
 pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), SessionError> {
     if let Some(parent) = path.parent() {
@@ -685,6 +772,84 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// fork_session_at truncates the prefix at the Nth user message
+    /// (0-based). Selected message text is returned alongside so the
+    /// TUI can pre-fill the editor. parent_id links back to source.
+    #[test]
+    fn fork_session_at_truncates_prefix_and_returns_selected_text() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let (src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
+        // Build 3 user messages interleaved with assistant replies.
+        for (role, text) in [
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("assistant", "a2"),
+            ("user", "u3"),
+        ] {
+            append_entry(
+                &src_path,
+                &SessionEntry::Message {
+                    id: uuid::v7().to_string(),
+                    timestamp: time::now_iso8601(),
+                    role: role.into(),
+                    content: text.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        // Fork at the SECOND user message (index 1 = "u2"). Prefix
+        // should include u1 + a1 only (2 entries). Selected text = "u2".
+        let (fork_path, fork_hdr, selected) = fork_session_at(&cwd, &src_path, 1).unwrap();
+        assert_eq!(selected, "u2");
+        assert_eq!(fork_hdr.parent_id, Some(src_hdr.id));
+        let (_h, entries) = read_session(&fork_path).unwrap();
+        assert_eq!(entries.len(), 2, "expected u1 + a1 to be copied");
+
+        // Fork at index 0 → no messages, header only.
+        let (empty_path, _, _) = fork_session_at(&cwd, &src_path, 0).unwrap();
+        let (_h, entries) = read_session(&empty_path).unwrap();
+        assert_eq!(entries.len(), 0);
+
+        // Fork past the end → everything copies (degenerate but safe).
+        let (all_path, _, _) = fork_session_at(&cwd, &src_path, 99).unwrap();
+        let (_h, entries) = read_session(&all_path).unwrap();
+        assert_eq!(entries.len(), 5);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn user_messages_picks_only_user_role() {
+        let entries = vec![
+            SessionEntry::Message {
+                id: "1".into(), timestamp: "".into(), role: "user".into(), content: "hi".into(),
+            },
+            SessionEntry::Message {
+                id: "2".into(), timestamp: "".into(), role: "assistant".into(), content: "hello".into(),
+            },
+            SessionEntry::Message {
+                id: "3".into(), timestamp: "".into(), role: "user".into(), content: "how are you".into(),
+            },
+        ];
+        let out = user_messages(&entries);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (0, "hi".into()));
+        assert_eq!(out[1], (1, "how are you".into()));
     }
 
     /// resolve_session with --fork returns Resume(new_path) and the new file
