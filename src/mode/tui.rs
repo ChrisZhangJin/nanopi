@@ -272,6 +272,14 @@ struct App {
     /// matching tool-result marker we colour it green (success) or red
     /// (failure) using the marker's separator (`→` vs `✗`).
     pending_tool_call: Option<PendingBar>,
+    /// When Some, a tool is currently executing — show a live BLUE
+    /// "$ command  Elapsed X.Xs" strip inside the dock (PI-style
+    /// working state, see img/PI_work_status.jpg). Cleared when
+    /// ToolResult arrives.
+    tool_started_at: Option<std::time::Instant>,
+    /// When the assistant is streaming (or awaiting first token), show
+    /// a `⣷ thinking (X.Xs)` strip in the dock. `None` = idle.
+    turn_started_at: Option<std::time::Instant>,
     /// Optional short status shown to the right of the input box
     /// (e.g. "cancelling…", "compacting…").
     status_note: Option<String>,
@@ -293,6 +301,8 @@ impl App {
             stream_buf: String::new(),
             thinking_buf: String::new(),
             pending_tool_call: None,
+            tool_started_at: None,
+            turn_started_at: None,
             status_note: None,
         }
     }
@@ -428,6 +438,12 @@ async fn run_app(
     let mut ag_rx: Option<mpsc::Receiver<AgentEvent>> = None;
     let mut turn_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut cancel: Option<CancellationToken> = None;
+    // 120ms ticker keeps the "Elapsed X.Xs" / spinner glyph moving
+    // while nothing else is happening. First tick fires immediately;
+    // set reset_missed so if the runtime is busy we don't queue up
+    // stale ticks.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Initial dock draw.
     term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
@@ -438,6 +454,12 @@ async fn run_app(
         }
 
         tokio::select! {
+            _ = tick.tick() => {
+                // Redraw only when there's a live counter to update.
+                if app.turn_started_at.is_some() || app.tool_started_at.is_some() {
+                    term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+                }
+            }
             key = key_events.next() => {
                 match key {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
@@ -488,6 +510,8 @@ async fn run_app(
                         ag_rx = None;
                         cancel = None;
                         app.status = Status::Idle;
+                        app.turn_started_at = None;
+                        app.tool_started_at = None;
                         app.status_note = None;
                         refresh_status(app, &agent_slot).await;
                         if let Some(t) = turn_task.take() {
@@ -597,6 +621,7 @@ async fn handle_action(
             *cancel = Some(ct);
             *turn_task = Some(task);
             app.status = Status::Streaming;
+            app.turn_started_at = Some(std::time::Instant::now());
         }
     }
     Ok(())
@@ -658,15 +683,17 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
         AgentEvent::ToolCall { call, .. } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            // Stash bar text; we'll draw the WHOLE card on ToolResult
-            // so the entire green (or red) block appears together.
             let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
             app.pending_tool_call = Some(PendingBar { leading, body });
+            // Start the live "Elapsed X.Xs" clock so the dock can
+            // render a blue running-state strip until ToolResult.
+            app.tool_started_at = Some(std::time::Instant::now());
         }
         AgentEvent::ToolResult { content, is_error, elapsed_ms, .. } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             render_tool_card(term, app, &content, is_error, elapsed_ms)?;
+            app.tool_started_at = None;
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
@@ -894,12 +921,12 @@ fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> R
 // ─────────────────────────────────────────────────────────────────────
 
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
-    // Layout: 5 rows palette + 3 rows input + 2 rows footer = 10 total.
-    // When palette closed, the top 5 rows are blank.
+    // Layout: 4 palette + 1 status/working + 3 input + 2 footer = 10.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // palette area (blank when closed)
+            Constraint::Length(4), // palette area (blank when closed)
+            Constraint::Length(1), // status strip (blue tool bar / thinking spinner / blank)
             Constraint::Length(3), // input box (top border + content + bottom border)
             Constraint::Length(1), // cwd + branch
             Constraint::Length(1), // stats
@@ -910,6 +937,10 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     if let Some(m) = &app.palette {
         draw_palette(buf, chunks[0], m);
     }
+
+    // ── Status strip ─────────────────────────────────────────────
+    // Priority: tool running (blue bar) > turn thinking > blank.
+    draw_status_strip(buf, chunks[1], app);
 
     // ── Input box ────────────────────────────────────────────────
     // TextBuffer can be multi-line but for MVP we render only the row
@@ -947,7 +978,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let input_para = Paragraph::new(Line::from(input_spans))
         .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
-    input_para.render(chunks[1], buf);
+    input_para.render(chunks[2], buf);
 
     // Line 1 of footer: cwd + branch + session
     let cwd_str = crate::render::status_line::cwd_display(&app.cwd);
@@ -963,7 +994,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         format!("  · session {}", sid_short),
         Style::default().fg(Color::DarkGray),
     ));
-    Paragraph::new(Line::from(l1)).render(chunks[2], buf);
+    Paragraph::new(Line::from(l1)).render(chunks[3], buf);
 
     // Line 2: tokens + cost + model + context ratio (PI-style)
     let mut l2: Vec<Span> = Vec::new();
@@ -1003,7 +1034,71 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
         ));
     }
-    Paragraph::new(Line::from(l2)).render(chunks[3], buf);
+    Paragraph::new(Line::from(l2)).render(chunks[4], buf);
+}
+
+/// Draw the 1-row activity strip between palette and input box.
+/// - tool running → blue `$ cmd  Elapsed X.Xs` (matches PI's blue bar
+///   in img/PI_work_status.jpg)
+/// - streaming with no active tool → `⣷ thinking (X.Xs)` dim
+/// - idle → blank row
+fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
+    const BRAILLE: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+    let frame = ((std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0) / 120) as usize) % BRAILLE.len();
+
+    // Tool running has priority.
+    if let (Some(started), Some(bar)) =
+        (app.tool_started_at, app.pending_tool_call.as_ref())
+    {
+        let elapsed = started.elapsed().as_secs_f64();
+        let blue_bg = Color::Indexed(24); // muted navy — matches Morandi
+        let bar_style = Style::default()
+            .bg(blue_bg)
+            .fg(Color::Indexed(230))
+            .add_modifier(Modifier::BOLD);
+        let dim_style = Style::default()
+            .bg(blue_bg)
+            .fg(Color::Indexed(250))
+            .add_modifier(Modifier::ITALIC);
+        // truncate command to fit
+        let width_budget = (area.width as usize).saturating_sub(30);
+        let body_short = if bar.body.chars().count() > width_budget {
+            let taken: String = bar.body.chars().take(width_budget).collect();
+            format!("{taken}…")
+        } else {
+            bar.body.clone()
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("{} ", BRAILLE[frame]), bar_style),
+            Span::styled(bar.leading.clone(), bar_style),
+            Span::styled(body_short, bar_style),
+            Span::styled(format!("  Elapsed {:.1}s", elapsed), dim_style),
+        ]);
+        // Row-fill with the bar bg so the strip extends to the edge.
+        let full = Style::default().bg(blue_bg);
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, area.y)) {
+                cell.set_char(' ').set_style(full);
+            }
+        }
+        buf.set_line(area.x, area.y, &line, area.width);
+        return;
+    }
+
+    // Assistant thinking / waiting.
+    if let Some(started) = app.turn_started_at {
+        let elapsed = started.elapsed().as_secs_f64();
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{} thinking ({:.1}s)", BRAILLE[frame], elapsed),
+                Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        buf.set_line(area.x, area.y, &line, area.width);
+    }
+    // else: leave blank
 }
 
 /// Split a string at the given byte position, returning (pre, post).
