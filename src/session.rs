@@ -274,42 +274,32 @@ pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader
     Ok((path, header))
 }
 
-/// Fork a session at a specific user-message boundary. The new session
+/// Fork a session at a specific entry boundary. The new session
 /// contains the header (with `parent_id` set to source) plus every
-/// entry BEFORE the Nth user message in the source. The Nth message
-/// itself is NOT copied — the caller is expected to pre-fill the
-/// editor with its text so the user can revise and resubmit.
+/// entry BEFORE `target_entry_index` in the source's entries Vec.
+/// The target entry itself is NOT copied.
 ///
-/// `target_user_index` is 0-based over user Messages in the source.
-/// Passing `0` produces a fork with no messages (just the header) —
-/// equivalent to starting over from the same cwd/model context.
-/// If the index exceeds the number of user messages, everything is
-/// copied (fork == full clone in that degenerate case).
+/// - If the target entry is a user Message, its text is returned as
+///   `Some(text)` so the caller can pre-fill the editor. The caller
+///   typically expects the user to edit + resubmit.
+/// - If the target is an assistant / tool / anything else, `None` is
+///   returned. The caller starts the new branch with a blank editor.
+/// - `target_entry_index == 0` yields an empty branch (header only).
+/// - Index beyond `entries.len()` copies everything (degenerate).
 pub fn fork_session_at(
     cwd: &Path,
     source: &Path,
-    target_user_index: usize,
-) -> Result<(PathBuf, SessionHeader, String), SessionError> {
+    target_entry_index: usize,
+) -> Result<(PathBuf, SessionHeader, Option<String>), SessionError> {
     let (src_hdr, entries) = read_session(source)?;
 
-    // Walk entries; find where the Nth user Message sits. Copy prefix
-    // ends at that index (exclusive). Also capture the message text
-    // so the caller can pre-fill the editor.
-    let mut user_count = 0usize;
-    let mut copy_until = entries.len();
-    let mut selected_text = String::new();
-    for (i, e) in entries.iter().enumerate() {
-        if let SessionEntry::Message { role, content, .. } = e {
-            if role == "user" {
-                if user_count == target_user_index {
-                    copy_until = i;
-                    selected_text = content.clone();
-                    break;
-                }
-                user_count += 1;
-            }
+    let copy_until = target_entry_index.min(entries.len());
+    let prefill = entries.get(target_entry_index).and_then(|e| match e {
+        SessionEntry::Message { role, content, .. } if role == "user" => {
+            Some(content.clone())
         }
-    }
+        _ => None,
+    });
 
     let dir = sessions_dir().ok_or_else(|| SessionError::Io {
         path: PathBuf::from("~/.nanopi/sessions"),
@@ -342,7 +332,7 @@ pub fn fork_session_at(
     for e in entries.iter().take(copy_until) {
         append_entry(&path, e)?;
     }
-    Ok((path, header, selected_text))
+    Ok((path, header, prefill))
 }
 
 /// Extract user Message texts from a session, in file order. Used to
@@ -361,14 +351,102 @@ pub fn user_messages(entries: &[SessionEntry]) -> Vec<(usize, String)> {
     out
 }
 
+/// One displayable row in the fork tree picker. Matches PI's
+/// default tree filter (see `tree-selector.ts:345-386`): show user,
+/// assistant, tool calls, and compaction; hide bookkeeping (model
+/// changes etc.).
+///
+/// `entry_index` is the position of this row inside the source
+/// session's entries Vec — used by fork_session_at to slice a prefix.
+/// `prefill_text` is Some(content) when the row is a user Message so
+/// the editor can be pre-filled on fork; None otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    pub entry_index: usize,
+    pub role: String,
+    pub preview: String,
+    pub prefill_text: Option<String>,
+}
+
+/// Extract displayable rows from a session's entries in file order.
+/// Skips model_change / (future) session_info / label bookkeeping
+/// entries. Tool results are folded into their preceding ToolCall's
+/// row (no separate row) so the tree stays skimmable.
+pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
+    let mut out = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        match e {
+            SessionEntry::Message { role, content, .. } => {
+                let preview = collapse_ws_truncate(content, 60);
+                out.push(TreeRow {
+                    entry_index: i,
+                    role: role.clone(),
+                    preview,
+                    prefill_text: if role == "user" {
+                        Some(content.clone())
+                    } else {
+                        None
+                    },
+                });
+            }
+            SessionEntry::ToolCall { tool_name, arguments, .. } => {
+                // For bash render the command; otherwise a compact
+                // JSON one-liner of the args. Users rarely care about
+                // full arg blob at picker time.
+                let preview = match tool_name.as_str() {
+                    "bash" => arguments
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| collapse_ws_truncate(s, 60))
+                        .unwrap_or_default(),
+                    _ => {
+                        let raw = arguments.to_string();
+                        collapse_ws_truncate(&raw, 60)
+                    }
+                };
+                out.push(TreeRow {
+                    entry_index: i,
+                    role: format!("[{}]", tool_name),
+                    preview,
+                    prefill_text: None,
+                });
+            }
+            SessionEntry::Compaction { summary, replaced_count, .. } => {
+                out.push(TreeRow {
+                    entry_index: i,
+                    role: "[compaction]".into(),
+                    preview: format!(
+                        "{} msgs → {}",
+                        replaced_count,
+                        collapse_ws_truncate(summary, 50)
+                    ),
+                    prefill_text: None,
+                });
+            }
+            // ToolResult is folded into its ToolCall row above; a
+            // separate "[result]" row would double every tool.
+            SessionEntry::ToolResult { .. } => {}
+            // Header lives once at line 0 — not user-facing content.
+            SessionEntry::Header { .. } => {}
+            SessionEntry::ModelChange { .. } => {}
+        }
+    }
+    out
+}
+
+fn collapse_ws_truncate(s: &str, max_chars: usize) -> String {
+    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    one_line.chars().take(max_chars).collect()
+}
+
 /// Walk `parent_id` up from `current` toward the root. Returns
-/// `[(path, header, user_messages)]` with `current` at index 0 and
-/// the root at the last index. Stops silently on any read error
-/// (unresolvable parent id, corrupted file, etc.) — a partial chain
-/// is still useful.
+/// `[(path, header, tree_rows)]` with `current` at index 0 and the
+/// root at the last index. Each session's tree_rows are its
+/// full displayable entry list (user + assistant + tools + compact),
+/// used by the fork picker to render a PI-style DFS tree.
 pub fn walk_parent_chain(
     current: &Path,
-) -> Vec<(PathBuf, SessionHeader, Vec<(usize, String)>)> {
+) -> Vec<(PathBuf, SessionHeader, Vec<TreeRow>)> {
     let mut out = Vec::new();
     let mut cur = Some(current.to_path_buf());
     while let Some(p) = cur.take() {
@@ -376,9 +454,9 @@ pub fn walk_parent_chain(
             Ok(t) => t,
             Err(_) => break,
         };
-        let msgs = user_messages(&entries);
+        let rows = tree_items(&entries);
         let parent_id_opt = hdr.parent_id.map(|id| id.to_string());
-        out.push((p, hdr, msgs));
+        out.push((p, hdr, rows));
         if let Some(pid) = parent_id_opt {
             cur = session_by_id(&pid);
         }
@@ -386,15 +464,12 @@ pub fn walk_parent_chain(
     out
 }
 
-/// Longest common prefix length between two user-message lists, by
-/// content. Used by the tree-aware fork picker to skip messages a
-/// child inherited from its parent so we don't show duplicates.
-pub fn common_user_message_prefix(
-    a: &[(usize, String)],
-    b: &[(usize, String)],
-) -> usize {
+/// Longest common prefix length between two TreeRow lists — compares
+/// role + preview. Used by the fork picker to skip rows a child
+/// inherited from its parent so we don't show duplicates.
+pub fn common_tree_row_prefix(a: &[TreeRow], b: &[TreeRow]) -> usize {
     let mut n = 0;
-    while n < a.len() && n < b.len() && a[n].1 == b[n].1 {
+    while n < a.len() && n < b.len() && a[n].role == b[n].role && a[n].preview == b[n].preview {
         n += 1;
     }
     n
@@ -845,23 +920,34 @@ mod tests {
             .unwrap();
         }
 
-        // Fork at the SECOND user message (index 1 = "u2"). Prefix
-        // should include u1 + a1 only (2 entries). Selected text = "u2".
-        let (fork_path, fork_hdr, selected) = fork_session_at(&cwd, &src_path, 1).unwrap();
-        assert_eq!(selected, "u2");
+        // Fork at ENTRY index 2 (which is "u2" — indices 0/1/2/3/4 =
+        // u1/a1/u2/a2/u3). Prefix should include entries[0..2] = u1+a1
+        // (2 entries). Selected text = u2 (a user Message → prefill).
+        let (fork_path, fork_hdr, prefill) = fork_session_at(&cwd, &src_path, 2).unwrap();
+        assert_eq!(prefill.as_deref(), Some("u2"));
         assert_eq!(fork_hdr.parent_id, Some(src_hdr.id));
         let (_h, entries) = read_session(&fork_path).unwrap();
         assert_eq!(entries.len(), 2, "expected u1 + a1 to be copied");
 
-        // Fork at index 0 → no messages, header only.
-        let (empty_path, _, _) = fork_session_at(&cwd, &src_path, 0).unwrap();
+        // Fork at ENTRY index 1 (an assistant message "a1"). Prefix
+        // is entries[0..1] = [u1]. Prefill = None (not a user Message).
+        let (asst_path, _, prefill) = fork_session_at(&cwd, &src_path, 1).unwrap();
+        assert_eq!(prefill, None, "assistant fork target ⇒ no prefill");
+        let (_h, entries) = read_session(&asst_path).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Fork at index 0 → no messages, prefill is u1 (target is user).
+        let (empty_path, _, prefill) = fork_session_at(&cwd, &src_path, 0).unwrap();
         let (_h, entries) = read_session(&empty_path).unwrap();
         assert_eq!(entries.len(), 0);
+        assert_eq!(prefill.as_deref(), Some("u1"));
 
-        // Fork past the end → everything copies (degenerate but safe).
-        let (all_path, _, _) = fork_session_at(&cwd, &src_path, 99).unwrap();
+        // Fork past the end → everything copies (degenerate but safe),
+        // no prefill (index out of range).
+        let (all_path, _, prefill) = fork_session_at(&cwd, &src_path, 99).unwrap();
         let (_h, entries) = read_session(&all_path).unwrap();
         assert_eq!(entries.len(), 5);
+        assert_eq!(prefill, None);
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
@@ -922,12 +1008,12 @@ mod tests {
         assert_eq!(chain.len(), 2, "current + root");
         assert_eq!(chain[0].0, child_path, "current at index 0");
         assert_eq!(chain[1].0, root_path, "root at last");
-        // Child's user messages: root-1 (inherited) + child-1
-        let child_msgs: Vec<&str> = chain[0].2.iter().map(|(_, s)| s.as_str()).collect();
-        assert_eq!(child_msgs, vec!["root-1", "child-1"]);
+        // Child's tree rows: root-1 (inherited via fork prefix) + child-1
+        let child_previews: Vec<&str> = chain[0].2.iter().map(|r| r.preview.as_str()).collect();
+        assert_eq!(child_previews, vec!["root-1", "child-1"]);
         // Root's: root-1, root-2
-        let root_msgs: Vec<&str> = chain[1].2.iter().map(|(_, s)| s.as_str()).collect();
-        assert_eq!(root_msgs, vec!["root-1", "root-2"]);
+        let root_previews: Vec<&str> = chain[1].2.iter().map(|r| r.preview.as_str()).collect();
+        assert_eq!(root_previews, vec!["root-1", "root-2"]);
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
@@ -939,15 +1025,69 @@ mod tests {
     }
 
     #[test]
-    fn common_user_message_prefix_finds_divergence() {
-        fn v(items: &[&str]) -> Vec<(usize, String)> {
-            items.iter().enumerate().map(|(i, s)| (i, s.to_string())).collect()
+    fn common_tree_row_prefix_finds_divergence() {
+        fn row(role: &str, preview: &str) -> TreeRow {
+            TreeRow {
+                entry_index: 0,
+                role: role.into(),
+                preview: preview.into(),
+                prefill_text: None,
+            }
         }
-        assert_eq!(common_user_message_prefix(&v(&["a", "b", "c"]), &v(&["a", "b", "c"])), 3);
-        assert_eq!(common_user_message_prefix(&v(&["a", "b"]), &v(&["a", "b", "c"])), 2);
-        assert_eq!(common_user_message_prefix(&v(&["a", "b"]), &v(&["a", "b'"])), 1);
-        assert_eq!(common_user_message_prefix(&v(&["x"]), &v(&["y"])), 0);
-        assert_eq!(common_user_message_prefix(&v(&[]), &v(&["a"])), 0);
+        let a = vec![row("user", "a"), row("assistant", "b"), row("user", "c")];
+        let b_same = vec![row("user", "a"), row("assistant", "b"), row("user", "c")];
+        assert_eq!(common_tree_row_prefix(&a, &b_same), 3);
+        let b_extended = vec![row("user", "a"), row("assistant", "b"), row("user", "c"), row("user", "d")];
+        assert_eq!(common_tree_row_prefix(&a, &b_extended), 3);
+        let b_diverge = vec![row("user", "a"), row("assistant", "b'")];
+        assert_eq!(common_tree_row_prefix(&a, &b_diverge), 1);
+        let b_role_mismatch = vec![row("assistant", "a")];
+        assert_eq!(common_tree_row_prefix(&a, &b_role_mismatch), 0);
+    }
+
+    #[test]
+    fn tree_items_shows_all_display_types_with_role_labels() {
+        let entries = vec![
+            SessionEntry::Message {
+                id: "1".into(), timestamp: "".into(),
+                role: "user".into(), content: "hi   there  \n friend".into(),
+            },
+            SessionEntry::Message {
+                id: "2".into(), timestamp: "".into(),
+                role: "assistant".into(), content: "hello".into(),
+            },
+            SessionEntry::ToolCall {
+                id: "3".into(), timestamp: "".into(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls -la"}),
+            },
+            SessionEntry::ToolResult {
+                tool_call_id: "3".into(), timestamp: "".into(),
+                content: "output".into(), is_error: false,
+            },
+            SessionEntry::ModelChange {
+                timestamp: "".into(), from: "a".into(), to: "b".into(),
+            },
+            SessionEntry::Compaction {
+                timestamp: "".into(), summary: "we discussed X".into(), replaced_count: 12,
+            },
+        ];
+        let rows = tree_items(&entries);
+        // user, assistant, bash tool call, compaction — 4 rows.
+        // ToolResult folded, ModelChange skipped.
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].preview, "hi there friend"); // whitespace collapsed
+        assert_eq!(rows[0].prefill_text.as_deref(), Some("hi   there  \n friend"));
+        assert_eq!(rows[0].entry_index, 0);
+        assert_eq!(rows[1].role, "assistant");
+        assert!(rows[1].prefill_text.is_none());
+        assert_eq!(rows[2].role, "[bash]");
+        assert_eq!(rows[2].preview, "ls -la");
+        assert_eq!(rows[2].entry_index, 2);
+        assert_eq!(rows[3].role, "[compaction]");
+        assert!(rows[3].preview.contains("12 msgs"));
+        assert_eq!(rows[3].entry_index, 5);
     }
 
     #[test]

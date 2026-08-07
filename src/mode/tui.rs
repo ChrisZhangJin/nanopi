@@ -858,15 +858,15 @@ async fn handle_action(
             app.context_chars = 0;
             app.turn_count = 0;
             app.input.clear();
-            if !selected_text.is_empty() {
-                app.input.insert_str(&selected_text);
+            if let Some(text) = selected_text.as_ref().filter(|s| !s.is_empty()) {
+                app.input.insert_str(text);
             }
 
             insert_line(term, Line::from(vec![
                 Span::styled(
                     format!(
-                        "[forked at message {} → new session {}]",
-                        target_idx + 1,
+                        "[forked at entry {} → new session {}]",
+                        target_idx,
                         &new_session_id.to_string()[..8]
                     ),
                     Style::default()
@@ -1515,15 +1515,15 @@ fn split_at_col(s: &str, col: usize) -> (&str, &str) {
 /// nested inline at their branch points, PI-style
 /// (see img/pi_fork_tree.jpg).
 fn render_fork_tree(
-    chain: &[(PathBuf, session::SessionHeader, Vec<(usize, String)>)],
+    chain: &[(PathBuf, session::SessionHeader, Vec<session::TreeRow>)],
     depth: usize,
     start: usize,
     current_path: &Path,
     items: &mut Vec<MenuItem<(PathBuf, usize)>>,
 ) {
-    let (path, hdr, msgs) = &chain[depth];
+    let (path, hdr, rows) = &chain[depth];
     let deeper_start = if depth + 1 < chain.len() {
-        Some(session::common_user_message_prefix(msgs, &chain[depth + 1].2))
+        Some(session::common_tree_row_prefix(rows, &chain[depth + 1].2))
     } else {
         None
     };
@@ -1531,32 +1531,27 @@ fn render_fork_tree(
     let short = &hdr.id.to_string()[..8];
     let branch_label = if is_current { "current" } else { "past branch" };
     let indent = "  ".repeat(depth);
-    let total = msgs.len();
+    let total = rows.len();
 
-    for i in start..msgs.len() {
+    for i in start..rows.len() {
         if Some(i) == deeper_start {
             render_fork_tree(chain, depth + 1, i, current_path, items);
         }
-        let text = &msgs[i].1;
-        let preview: String = text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(60)
-            .collect();
+        let row = &rows[i];
+        // Payload is the ENTRY index in the source session, not the
+        // tree-row index — that's what fork_session_at slices on.
         items.push(MenuItem::new(
-            format!("{}{}", indent, preview),
-            format!("{} · {} · msg {}/{}", branch_label, short, i + 1, total),
-            (path.clone(), i),
+            format!("{}{}: {}", indent, row.role, row.preview),
+            format!("{} · {} · row {}/{}", branch_label, short, i + 1, total),
+            (path.clone(), row.entry_index),
         ));
     }
 
     // Edge case: deeper session diverges AT OR PAST our end (it fully
-    // shares our prefix and adds new messages beyond us). Descend
-    // after the loop so those messages still appear.
+    // shares our prefix and adds new rows beyond us). Descend after
+    // the loop so those rows still appear.
     if let Some(ds) = deeper_start {
-        if ds >= msgs.len() {
+        if ds >= rows.len() {
             render_fork_tree(chain, depth + 1, ds, current_path, items);
         }
     }
