@@ -282,9 +282,11 @@ struct App {
     /// Markdown parser state (mostly: are we inside a ``` fenced block?).
     /// Kept across TextDelta lines within a single turn.
     md_state: crate::render::markdown::MdState,
-    /// Content of the most recent tool result. On Ctrl+O we insert
-    /// the full text into scrollback (once — expanded flips true).
-    last_tool_output: Option<(String, bool)>,
+    /// Most recent tool result — content, is_error flag (so the
+    /// expanded rows land in the matching green/red zone), and an
+    /// `expanded` bool that flips true on Ctrl+O so a second press
+    /// doesn't duplicate the dump.
+    last_tool_output: Option<LastTool>,
     /// A tool_call event just arrived; its bar is not yet drawn. On the
     /// matching tool-result marker we colour it green (success) or red
     /// (failure) using the marker's separator (`→` vs `✗`).
@@ -335,6 +337,13 @@ impl App {
 struct PendingBar {
     leading: String,
     body: String,
+}
+
+#[derive(Debug, Clone)]
+struct LastTool {
+    content: String,
+    is_error: bool,
+    expanded: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -609,32 +618,15 @@ async fn handle_action(
         }
         KeyAction::ExpandLastTool => {
             // Only expand once per tool result — flip the flag.
-            let content_opt = match app.last_tool_output.take() {
-                Some((c, false)) => Some(c),
+            let last = match app.last_tool_output.take() {
+                Some(l) if !l.expanded => Some(l),
                 other => {
                     app.last_tool_output = other;
                     None
                 }
             };
-            if let Some(content) = content_opt {
-                let line_count = content.lines().count();
-                insert_line(term, Line::from(vec![
-                    Span::styled(
-                        format!("── full tool output ({} lines) ──", line_count),
-                        Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
-                for line in content.lines() {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Indexed(252)),
-                        ),
-                    ]))?;
-                }
-                insert_line(term, Line::from(""))?;
-                // Mark as expanded (put back with true flag) so a second
-                // Ctrl+O doesn't dupe.
+            if let Some(l) = last {
+                render_tool_expansion(term, &l.content, l.is_error)?;
                 app.last_tool_output = None;
             }
         }
@@ -809,8 +801,9 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             flush_thinking_buf(term, app)?;
             render_tool_card(term, app, &content, is_error, elapsed_ms)?;
             app.tool_started_at = None;
-            // Stash full output so Ctrl+O can expand it later.
-            app.last_tool_output = Some((content, false));
+            // Stash full output so Ctrl+O can expand it later — with
+            // the outcome flag so expansion uses matching bg.
+            app.last_tool_output = Some(LastTool { content, is_error, expanded: false });
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
@@ -1159,6 +1152,53 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         ));
     }
     Paragraph::new(Line::from(l2)).render(chunks[4], buf);
+}
+
+/// Render the full tool output as an extension of the last tool card —
+/// same green (or red) bg, with the whole content this time (not the
+/// 6-line preview). Matches PI's behavior: the expanded output lives
+/// INSIDE the colored zone (see tool-execution.ts:265).
+fn render_tool_expansion(term: &mut Term, content: &str, is_error: bool) -> Result<()> {
+    let (bar_bg, hint_fg) = if is_error {
+        (Color::Indexed(131), Color::Indexed(250))
+    } else {
+        (Color::Indexed(65), Color::Indexed(250))
+    };
+    let bar_style = Style::default().bg(bar_bg).fg(Color::Indexed(230));
+    let hint_style = Style::default()
+        .bg(bar_bg)
+        .fg(hint_fg)
+        .add_modifier(Modifier::ITALIC);
+
+    // Header: `── expanded (N lines) ──` inside the colored zone.
+    let n = content.lines().count();
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled(
+            format!("  ── expanded output ({n} lines) ──"),
+            hint_style,
+        )]),
+        Some(bar_style),
+    )?;
+    // Every content line rendered as `  <line>` on the same bg.
+    for line in content.lines() {
+        insert_line_bg(
+            term,
+            Line::from(vec![
+                Span::styled("  ", bar_style),
+                Span::styled(line.to_string(), bar_style),
+            ]),
+            Some(bar_style),
+        )?;
+    }
+    // Trailing padding row + blank outside for breathing room.
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled("", bar_style)]),
+        Some(bar_style),
+    )?;
+    insert_line(term, Line::from(""))?;
+    Ok(())
 }
 
 /// Draw the 1-row activity strip between palette and input box.
