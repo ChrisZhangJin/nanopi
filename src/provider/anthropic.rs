@@ -237,16 +237,31 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = build_request(ctx, &self.model);
 
-        let resp = self
+        // Reqwest has no default send timeout — a gateway that accepts
+        // the TCP connection but never sends response headers would
+        // hang forever. Cap the header-wait at 60s; streaming body
+        // reads afterwards have no cap (LLM streams legitimately run
+        // for minutes). See openai.rs for the same guard.
+        let send_fut = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+            .send();
+        let resp = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            send_fut,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_elapsed) => {
+                return Err("send timeout: no response headers after 60s".into());
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {

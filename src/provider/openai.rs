@@ -388,13 +388,53 @@ impl OpenAiProvider {
         let final_usage;
 
         'retry: loop {
-            let send_res = self
+            // Reqwest's client has no built-in send timeout. If the
+            // gateway accepts the TCP connection but never sends the
+            // response headers, `.send()` blocks forever — the retry
+            // loop can't advance because it never sees a result to
+            // classify. Wrap in tokio::time::timeout so a slow/hung
+            // gateway triggers a retryable "send timeout" error
+            // instead of hanging the whole session.
+            //
+            // 60 seconds covers realistic queued-gateway waits; longer
+            // hangs are almost always a dead connection. We don't put
+            // a timeout on the body stream itself, since streaming
+            // completions legitimately last minutes.
+            let send_fut = self
                 .client
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .json(&body)
-                .send()
-                .await;
+                .send();
+            let send_res = match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                send_fut,
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    // Synthesize a retryable transport error so the
+                    // existing retry/report code path handles it.
+                    if attempt >= retry.max_attempts {
+                        return Err(OpenAiError::Api(
+                            "send timeout: no response headers after 60s".into(),
+                        ));
+                    }
+                    let delay = crate::provider::retry::compute_delay(
+                        attempt, &retry, None, rand01(),
+                    );
+                    eprintln!(
+                        "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry;
+                }
+            };
 
             let resp = match send_res {
                 Ok(resp) if resp.status().is_success() => resp,
