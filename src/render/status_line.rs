@@ -68,22 +68,37 @@ pub fn cost_string(model: &str, u: &Usage) -> String {
     }
 }
 
-/// Context usage as `NN%` of the model's window. Returns None if the
-/// window isn't known. `chars` is the current `Context::estimate_chars`
-/// value; we approximate tokens = chars/4.
-pub fn context_percent(model: &str, chars: usize) -> Option<u8> {
+/// Context usage as a fraction of the model's window. Returns None if
+/// the window isn't known. `chars` is the current
+/// `Context::estimate_chars` value; we approximate tokens = chars/4.
+/// Full precision so callers can format `.1f` — PI-style.
+pub fn context_percent(model: &str, chars: usize) -> Option<f64> {
     let window = pricing::context_window(model)? as usize;
     let est_tokens = chars / 4;
     let pct = (est_tokens as f64 / window as f64) * 100.0;
-    Some(pct.clamp(0.0, 999.0) as u8)
+    Some(pct.clamp(0.0, 999.0))
+}
+
+/// Formatted `{:.1}%/<windowStr>` string — matches PI's footer
+/// (`1.4%/205k`). Returns None if the model's window isn't in our
+/// table. `(auto)` suffix appended when auto_compact is on.
+pub fn context_ratio(model: &str, chars: usize, auto_compact: bool) -> Option<String> {
+    let pct = context_percent(model, chars)?;
+    let window = pricing::context_window(model)?;
+    let base = format!("{:.1}%/{}", pct, pricing::fmt_tokens(window));
+    if auto_compact {
+        Some(format!("{} (auto)", base))
+    } else {
+        Some(base)
+    }
 }
 
 /// Pick a color name (returned as a `&'static str` matching ratatui /
 /// ANSI conventions) for a context percentage.
-pub fn context_color(pct: u8) -> &'static str {
-    if pct >= 90 {
+pub fn context_color(pct: f64) -> &'static str {
+    if pct >= 90.0 {
         "red"
-    } else if pct >= 70 {
+    } else if pct >= 70.0 {
         "yellow"
     } else {
         "green"
@@ -186,18 +201,31 @@ mod tests {
 
     #[test]
     fn context_percent_reasonable() {
-        // 200k tokens ≈ 800k chars for claude-opus-4-7 (1M window).
-        // 400k chars → 100k tokens → 10%.
-        let p = context_percent("claude-opus-4-7", 400_000);
-        assert_eq!(p, Some(10));
+        // claude-opus-4-7 window = 1_000_000.
+        // 400k chars → 100k tokens → 10.0%.
+        let p = context_percent("claude-opus-4-7", 400_000).unwrap();
+        assert!((p - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn context_ratio_formatting() {
+        // 10.0% for opus 4.7 (1M window).
+        let s = context_ratio("claude-opus-4-7", 400_000, false).unwrap();
+        assert_eq!(s, "10.0%/1.0M");
+        // With auto suffix.
+        let s = context_ratio("claude-opus-4-7", 400_000, true).unwrap();
+        assert_eq!(s, "10.0%/1.0M (auto)");
+        // Small usage no longer rounds to 0.
+        let s = context_ratio("claude-opus-4-7", 12_000, false).unwrap();
+        assert_eq!(s, "0.3%/1.0M");
     }
 
     #[test]
     fn context_color_ranges() {
-        assert_eq!(context_color(0), "green");
-        assert_eq!(context_color(70), "yellow");
-        assert_eq!(context_color(89), "yellow");
-        assert_eq!(context_color(90), "red");
+        assert_eq!(context_color(0.0), "green");
+        assert_eq!(context_color(70.0), "yellow");
+        assert_eq!(context_color(89.9), "yellow");
+        assert_eq!(context_color(90.0), "red");
     }
 
     #[test]

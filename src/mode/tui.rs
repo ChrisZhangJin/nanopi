@@ -965,17 +965,8 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     ));
     Paragraph::new(Line::from(l1)).render(chunks[2], buf);
 
-    // Line 2: context% + tokens + cost + model  (or streaming note)
+    // Line 2: tokens + cost + model + context ratio (PI-style)
     let mut l2: Vec<Span> = Vec::new();
-    if let Some(pct) = crate::render::status_line::context_percent(&app.model, app.context_chars) {
-        let color = match crate::render::status_line::context_color(pct) {
-            "red" => Color::Red,
-            "yellow" => Color::Yellow,
-            _ => Color::Green,
-        };
-        l2.push(Span::styled(format!("{pct}% context"), Style::default().fg(color)));
-        l2.push(Span::raw(" · "));
-    }
     l2.push(Span::styled(
         crate::render::status_line::tokens_summary(&app.usage),
         Style::default().fg(Color::White),
@@ -987,6 +978,24 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     }
     l2.push(Span::raw(" · "));
     l2.push(Span::styled(app.model.clone(), Style::default().fg(Color::LightBlue)));
+    // Context ratio (`1.4%/205k (auto)`), color-coded by usage.
+    // Auto-compact is always on today; if we add a config toggle we
+    // can wire it here.
+    if let Some(ratio) = crate::render::status_line::context_ratio(
+        &app.model,
+        app.context_chars,
+        true,
+    ) {
+        let pct = crate::render::status_line::context_percent(&app.model, app.context_chars)
+            .unwrap_or(0.0);
+        let color = match crate::render::status_line::context_color(pct) {
+            "red" => Color::Red,
+            "yellow" => Color::Yellow,
+            _ => Color::Indexed(108), // muted sage — matches Morandi theme
+        };
+        l2.push(Span::raw("  "));
+        l2.push(Span::styled(ratio, Style::default().fg(color)));
+    }
     if app.status == Status::Streaming {
         l2.push(Span::raw("  · "));
         l2.push(Span::styled(
