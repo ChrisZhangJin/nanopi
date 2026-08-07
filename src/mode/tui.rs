@@ -279,6 +279,12 @@ struct App {
     /// Same, for `ThinkingDelta` events (Anthropic reasoning traces).
     /// Rendered dim italic to distinguish from the model's actual reply.
     thinking_buf: String,
+    /// Markdown parser state (mostly: are we inside a ``` fenced block?).
+    /// Kept across TextDelta lines within a single turn.
+    md_state: crate::render::markdown::MdState,
+    /// Content of the most recent tool result. On Ctrl+O we insert
+    /// the full text into scrollback (once — expanded flips true).
+    last_tool_output: Option<(String, bool)>,
     /// A tool_call event just arrived; its bar is not yet drawn. On the
     /// matching tool-result marker we colour it green (success) or red
     /// (failure) using the marker's separator (`→` vs `✗`).
@@ -316,6 +322,8 @@ impl App {
             tool_started_at: None,
             turn_started_at: None,
             status_note: None,
+            md_state: crate::render::markdown::MdState::default(),
+            last_tool_output: None,
         }
     }
 }
@@ -342,6 +350,7 @@ enum KeyAction {
     Compact,
     OpenModelPicker,
     SwapModel(String),
+    ExpandLastTool,
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -349,6 +358,11 @@ enum KeyAction {
 /// handled, the palette's open/closed state is re-synced against the
 /// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
+    // Ctrl+O — expand the last tool output (PI's `app.tools.expand`).
+    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('o') {
+        return KeyAction::ExpandLastTool;
+    }
+
     // ── Model picker (highest priority when open) ───────────────────
     if app.model_picker.is_some() {
         let m = app.model_picker.as_mut().unwrap();
@@ -593,6 +607,37 @@ async fn handle_action(
                 app.status_note = Some("cancelling…".into());
             }
         }
+        KeyAction::ExpandLastTool => {
+            // Only expand once per tool result — flip the flag.
+            let content_opt = match app.last_tool_output.take() {
+                Some((c, false)) => Some(c),
+                other => {
+                    app.last_tool_output = other;
+                    None
+                }
+            };
+            if let Some(content) = content_opt {
+                let line_count = content.lines().count();
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("── full tool output ({} lines) ──", line_count),
+                        Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+                for line in content.lines() {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::Indexed(252)),
+                        ),
+                    ]))?;
+                }
+                insert_line(term, Line::from(""))?;
+                // Mark as expanded (put back with true flag) so a second
+                // Ctrl+O doesn't dupe.
+                app.last_tool_output = None;
+            }
+        }
         KeyAction::OpenModelPicker => {
             // Populate the picker with pricing-known models. Highlight
             // the current one so users see where they're switching from.
@@ -723,15 +768,14 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
     match ev {
         AgentEvent::TextDelta { text, .. } => {
             // Real assistant text → flush any pending thinking, then
-            // accumulate + emit full lines.
+            // accumulate + emit full lines through the markdown parser.
             flush_thinking_buf(term, app)?;
             app.stream_buf.push_str(&text);
             while let Some(nl) = app.stream_buf.find('\n') {
                 let line: String = app.stream_buf.drain(..=nl).collect();
                 let trimmed = line.trim_end_matches('\n');
-                insert_line(term, Line::from(vec![
-                    Span::styled(trimmed.to_string(), Style::default().fg(Color::White)),
-                ]))?;
+                let spans = crate::render::markdown::render_line(trimmed, &mut app.md_state);
+                insert_line(term, Line::from(spans))?;
             }
         }
         AgentEvent::ThinkingDelta { text, .. } => {
@@ -765,6 +809,8 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             flush_thinking_buf(term, app)?;
             render_tool_card(term, app, &content, is_error, elapsed_ms)?;
             app.tool_started_at = None;
+            // Stash full output so Ctrl+O can expand it later.
+            app.last_tool_output = Some((content, false));
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
@@ -783,9 +829,14 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
 fn flush_stream_buf(term: &mut Term, app: &mut App) -> Result<()> {
     if !app.stream_buf.is_empty() {
         let text = std::mem::take(&mut app.stream_buf);
-        insert_line(term, Line::from(vec![
-            Span::styled(text, Style::default().fg(Color::White)),
-        ]))?;
+        let spans = crate::render::markdown::render_line(&text, &mut app.md_state);
+        // Own the strings so lifetime isn't tied to `text` which drops
+        // at end of scope.
+        let owned: Vec<Span<'static>> = spans
+            .into_iter()
+            .map(|s| Span::styled(s.content.into_owned(), s.style))
+            .collect();
+        insert_line(term, Line::from(owned))?;
     }
     Ok(())
 }
