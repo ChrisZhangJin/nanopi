@@ -32,7 +32,7 @@
 //! MVP: single-line input; multi-line + Emacs keys come in v0.7 S2.
 
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -735,13 +735,18 @@ async fn handle_action(
         }
         KeyAction::OpenForkPicker => {
             // Tree-aware picker: walk the parent_id chain upward from
-            // the current session and aggregate user messages across
-            // ALL sessions in the chain. Messages a child inherited
-            // via fork are shown once (from the deepest ancestor
-            // where they first appeared), so a fork that lopped off
-            // the tail of an ancestor branch still lets the user see
-            // and pick from that tail. See session::walk_parent_chain
-            // and common_user_message_prefix.
+            // the current session, then render as a depth-first tree
+            // (matches PI's Session Tree — see img/pi_fork_tree.jpg).
+            //
+            // Example: root [A, B, C, D] with a child fork [A, B, B1, B2]
+            // renders as
+            //     A, B, B1, B2, C, D
+            // — at the divergence point (index 2 in root, since A+B
+            // are the shared prefix), we descend into the child's
+            // "new tail" first (B1, B2), then pop back to the parent
+            // and continue with C, D. This is DFS on a nested-branch
+            // tree; each session's items are indented by depth so
+            // users see which branch a message is on.
             let session_path = {
                 let g = agent_slot.lock().await;
                 g.as_ref().map(|a| a.session_path.clone())
@@ -760,37 +765,13 @@ async fn handle_action(
                 ]))?;
                 return Ok(());
             }
-            // chain[0] = current, last = root. Reverse to root-first so
-            // we emit messages in chronological/tree order.
+            // chain[0] = current, last = root. Reverse to [root, …, current]
+            // so DFS starts at the root and dips into child branches.
             chain.reverse();
 
             let mut items: Vec<MenuItem<(PathBuf, usize)>> = Vec::new();
-            let mut prev_msgs: Option<Vec<(usize, String)>> = None;
-            for (path, hdr, msgs) in &chain {
-                let start = match &prev_msgs {
-                    Some(prev) => session::common_user_message_prefix(prev, msgs),
-                    None => 0,
-                };
-                let is_current = path == &session_path;
-                let short = &hdr.id.to_string()[..8];
-                let branch_label = if is_current { "current" } else { "past branch" };
-                let total = msgs.len();
-                for (idx, text) in &msgs[start..] {
-                    let preview: String = text
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(60)
-                        .collect();
-                    items.push(MenuItem::new(
-                        preview,
-                        format!("{} · {} · msg {}/{}", branch_label, short, idx + 1, total),
-                        (path.clone(), *idx),
-                    ));
-                }
-                prev_msgs = Some(msgs.clone());
-            }
+            render_fork_tree(&chain, 0, 0, &session_path, &mut items);
+
             if items.is_empty() {
                 insert_line(term, Line::from(vec![
                     Span::styled(
@@ -1522,6 +1503,63 @@ fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
 fn split_at_col(s: &str, col: usize) -> (&str, &str) {
     let clamped = col.min(s.len());
     s.split_at(clamped)
+}
+
+/// Recursively populate `items` with a DFS traversal of the session
+/// tree. `chain` is ordered [root, ..., parent, current]. At each
+/// level `depth`, we walk the session's user messages starting at
+/// `start`; whenever we reach the index where the next-deeper chain
+/// entry diverges (its common-prefix-length with us), we descend
+/// into that deeper session's "new tail" before emitting our own
+/// message at that index. Result: the picker shows fork branches
+/// nested inline at their branch points, PI-style
+/// (see img/pi_fork_tree.jpg).
+fn render_fork_tree(
+    chain: &[(PathBuf, session::SessionHeader, Vec<(usize, String)>)],
+    depth: usize,
+    start: usize,
+    current_path: &Path,
+    items: &mut Vec<MenuItem<(PathBuf, usize)>>,
+) {
+    let (path, hdr, msgs) = &chain[depth];
+    let deeper_start = if depth + 1 < chain.len() {
+        Some(session::common_user_message_prefix(msgs, &chain[depth + 1].2))
+    } else {
+        None
+    };
+    let is_current = path == current_path;
+    let short = &hdr.id.to_string()[..8];
+    let branch_label = if is_current { "current" } else { "past branch" };
+    let indent = "  ".repeat(depth);
+    let total = msgs.len();
+
+    for i in start..msgs.len() {
+        if Some(i) == deeper_start {
+            render_fork_tree(chain, depth + 1, i, current_path, items);
+        }
+        let text = &msgs[i].1;
+        let preview: String = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(60)
+            .collect();
+        items.push(MenuItem::new(
+            format!("{}{}", indent, preview),
+            format!("{} · {} · msg {}/{}", branch_label, short, i + 1, total),
+            (path.clone(), i),
+        ));
+    }
+
+    // Edge case: deeper session diverges AT OR PAST our end (it fully
+    // shares our prefix and adds new messages beyond us). Descend
+    // after the loop so those messages still appear.
+    if let Some(ds) = deeper_start {
+        if ds >= msgs.len() {
+            render_fork_tree(chain, depth + 1, ds, current_path, items);
+        }
+    }
 }
 
 /// Same as draw_palette but for MenuState<String> (model picker etc).
