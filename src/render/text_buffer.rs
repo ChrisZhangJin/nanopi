@@ -19,7 +19,13 @@
 //!   Ctrl-W                       kill previous word
 //!   Ctrl-Y                       yank (paste kill ring)
 //!   Alt-B / Alt-F                move by word
-//!   Ctrl-Z                       undo
+//!   Ctrl-- / Ctrl-_ / Ctrl-Z     undo (fish-style: word-coalesced)
+//!
+//! Undo model mirrors PI (see `packages/tui/src/components/editor.ts`):
+//! consecutive word chars coalesce into one undo unit; each whitespace
+//! run gets its own snapshot; every mutating non-typing op (kill, yank,
+//! paste, backspace, newline) always snapshots. Cursor motion resets
+//! the coalesce state without snapshotting. No redo.
 //!
 //! Non-goals: multi-slot kill ring, redo, search, IME.
 
@@ -49,12 +55,30 @@ pub struct TextBuffer {
     cursor: (usize, usize),
     kill_ring: String,
     undo_stack: Vec<UndoSnapshot>,
+    /// What the previous key did — drives fish-style coalescing so
+    /// runs of word chars merge into one undo unit.
+    last_op: LastOp,
 }
 
 #[derive(Debug, Clone)]
 struct UndoSnapshot {
     lines: Vec<String>,
     cursor: (usize, usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LastOp {
+    /// Fresh buffer, or the last op was a non-typing mutation / cursor
+    /// motion. Next typed char will snapshot before inserting.
+    #[default]
+    Other,
+    /// Last char was a word char in a contiguous run. Next word char
+    /// does NOT snapshot; next non-word char does.
+    TypingWord,
+    /// Last char was whitespace/punctuation. Next word char does NOT
+    /// snapshot (the space's own snapshot already covers "before this
+    /// space + everything after"). Non-word chars still snapshot.
+    TypingNonWord,
 }
 
 impl TextBuffer {
@@ -64,6 +88,7 @@ impl TextBuffer {
             cursor: (0, 0),
             kill_ring: String::new(),
             undo_stack: Vec::new(),
+            last_op: LastOp::Other,
         }
     }
 
@@ -107,16 +132,21 @@ impl TextBuffer {
             self.lines = snap.lines;
             self.cursor = snap.cursor;
         }
+        // Reset the coalesce state so the next typed char begins a fresh
+        // undo unit; otherwise "type, undo, type" would silently merge.
+        self.last_op = LastOp::Other;
     }
 
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.cursor = (0, 0);
         self.undo_stack.clear();
+        self.last_op = LastOp::Other;
     }
 
     /// Insert a string at the cursor. Newlines break into new lines.
-    /// Used by bracketed-paste to inject clipboard content.
+    /// Used by bracketed-paste to inject clipboard content — treated as
+    /// an atomic op (one snapshot, does not coalesce with typing).
     pub fn insert_str(&mut self, s: &str) {
         self.snapshot();
         for c in s.chars() {
@@ -131,6 +161,7 @@ impl TextBuffer {
                 self.cursor.1 = col + c.len_utf8();
             }
         }
+        self.last_op = LastOp::Other;
     }
 
     // ─── Cursor motion ─────────────────────────────────────────────
@@ -143,7 +174,14 @@ impl TextBuffer {
         &mut self.lines[self.cursor.0]
     }
 
+    /// True for chars that merge into contiguous undo runs. Matches
+    /// the word-motion definition used by Ctrl-W / Alt-B / Alt-F.
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
     fn move_left(&mut self) {
+        self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
         if col > 0 {
             // Move back one char boundary (UTF-8-safe).
@@ -162,6 +200,7 @@ impl TextBuffer {
     }
 
     fn move_right(&mut self) {
+        self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
         let line_len = self.lines[row].len();
         if col < line_len {
@@ -178,19 +217,22 @@ impl TextBuffer {
     }
 
     fn move_line_start(&mut self) {
+        self.last_op = LastOp::Other;
         self.cursor.1 = 0;
     }
 
     fn move_line_end(&mut self) {
+        self.last_op = LastOp::Other;
         self.cursor.1 = self.line().len();
     }
 
     fn move_word_left(&mut self) {
+        self.last_op = LastOp::Other;
         // Walk left through whitespace, then through non-whitespace.
         while self.cursor.1 > 0 {
             self.move_left();
             let ch = self.line()[self.cursor.1..].chars().next();
-            if ch.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) {
+            if ch.map(Self::is_word_char).unwrap_or(false) {
                 // Continue until we hit non-word or start of line.
             } else {
                 break;
@@ -199,10 +241,11 @@ impl TextBuffer {
     }
 
     fn move_word_right(&mut self) {
+        self.last_op = LastOp::Other;
         while self.cursor.1 < self.line().len() {
             let ch = self.line()[self.cursor.1..].chars().next();
             self.move_right();
-            if ch.map(|c| !(c.is_alphanumeric() || c == '_')).unwrap_or(false) {
+            if ch.map(|c| !Self::is_word_char(c)).unwrap_or(false) {
                 break;
             }
         }
@@ -211,7 +254,22 @@ impl TextBuffer {
     // ─── Mutations ─────────────────────────────────────────────────
 
     fn insert_char(&mut self, c: char) {
-        self.snapshot();
+        // Fish-style coalescing:
+        //   word char  → snapshot only if the previous op was Other
+        //                (i.e. this starts a new typing run). Consecutive
+        //                word chars merge; a preceding whitespace snap
+        //                already covers "before this run".
+        //   non-word   → always snapshot (each punctuation/space stands
+        //                alone; the following word run coalesces with it).
+        if Self::is_word_char(c) {
+            if self.last_op == LastOp::Other {
+                self.snapshot();
+            }
+            self.last_op = LastOp::TypingWord;
+        } else {
+            self.snapshot();
+            self.last_op = LastOp::TypingNonWord;
+        }
         let (row, col) = self.cursor;
         self.lines[row].insert(col, c);
         self.cursor.1 = col + c.len_utf8();
@@ -219,6 +277,7 @@ impl TextBuffer {
 
     fn insert_newline(&mut self) {
         self.snapshot();
+        self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
         let rest = self.lines[row].split_off(col);
         self.lines.insert(row + 1, rest);
@@ -229,6 +288,7 @@ impl TextBuffer {
         let (row, col) = self.cursor;
         if col > 0 {
             self.snapshot();
+            self.last_op = LastOp::Other;
             let line = self.lines[row].clone();
             let prev = line[..col]
                 .char_indices()
@@ -239,6 +299,7 @@ impl TextBuffer {
             self.cursor.1 = prev;
         } else if row > 0 {
             self.snapshot();
+            self.last_op = LastOp::Other;
             let removed = self.lines.remove(row);
             let prev_row = row - 1;
             let new_col = self.lines[prev_row].len();
@@ -252,6 +313,7 @@ impl TextBuffer {
         let line_len = self.lines[row].len();
         if col < line_len {
             self.snapshot();
+            self.last_op = LastOp::Other;
             let rest = &self.lines[row][col..];
             let step = rest
                 .char_indices()
@@ -261,6 +323,7 @@ impl TextBuffer {
             self.lines[row].replace_range(col..col + step, "");
         } else if row + 1 < self.lines.len() {
             self.snapshot();
+            self.last_op = LastOp::Other;
             let next = self.lines.remove(row + 1);
             self.lines[row].push_str(&next);
         }
@@ -268,6 +331,7 @@ impl TextBuffer {
 
     fn kill_to_line_end(&mut self) {
         self.snapshot();
+        self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
         let killed = self.lines[row].split_off(col);
         self.kill_ring = killed;
@@ -275,6 +339,7 @@ impl TextBuffer {
 
     fn kill_to_line_start(&mut self) {
         self.snapshot();
+        self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
         let killed = self.lines[row].drain(..col).collect();
         self.kill_ring = killed;
@@ -283,6 +348,7 @@ impl TextBuffer {
 
     fn kill_prev_word(&mut self) {
         self.snapshot();
+        self.last_op = LastOp::Other;
         let (row, col) = self.cursor;
         // Find start of previous word: skip trailing whitespace, then
         // skip word chars.
@@ -304,6 +370,7 @@ impl TextBuffer {
             return;
         }
         self.snapshot();
+        self.last_op = LastOp::Other;
         let text = self.kill_ring.clone();
         let (row, col) = self.cursor;
         self.lines[row].insert_str(col, &text);
@@ -336,7 +403,13 @@ impl TextBuffer {
                 KeyCode::Char('u') => { self.kill_to_line_start(); return Action::Nothing; }
                 KeyCode::Char('w') => { self.kill_prev_word();  return Action::Nothing; }
                 KeyCode::Char('y') => { self.yank();            return self.slash_or_nothing(); }
-                KeyCode::Char('z') => { self.undo();            return Action::Nothing; }
+                // Undo. PI uses Ctrl+- (Ctrl+Minus); Ctrl+_ is the
+                // Emacs / GNU readline convention; Ctrl+Z is muscle
+                // memory from most modern editors. Accept all three.
+                KeyCode::Char('z') | KeyCode::Char('-') | KeyCode::Char('_') => {
+                    self.undo();
+                    return Action::Nothing;
+                }
                 // Some terminals send Backspace as Ctrl+H (0x08) instead
                 // of DEL (0x7f). Handle that here so users don't get a
                 // literal 'h' inserted when pressing Backspace.
@@ -543,14 +616,62 @@ mod tests {
         ));
     }
 
+    /// Fish-style: a run of word chars is one undo unit. Typing "abc"
+    /// then undo goes straight back to empty.
     #[test]
-    fn ctrl_z_undoes() {
+    fn undo_coalesces_word_run() {
         let mut b = TextBuffer::new();
         type_str(&mut b, "abc");
         b.handle_key(press_c(KeyCode::Char('z')));
-        assert_eq!(b.as_string(), "ab");
+        assert_eq!(b.as_string(), "");
+    }
+
+    /// Typing "hello world" — 2 undo units per PI's rule (each space
+    /// snapshots before itself and the following word coalesces with it).
+    #[test]
+    fn undo_hello_world_two_units() {
+        let mut b = TextBuffer::new();
+        type_str(&mut b, "hello world");
         b.handle_key(press_c(KeyCode::Char('z')));
-        assert_eq!(b.as_string(), "a");
+        assert_eq!(b.as_string(), "hello");
+        b.handle_key(press_c(KeyCode::Char('z')));
+        assert_eq!(b.as_string(), "");
+    }
+
+    /// Ctrl+- and Ctrl+_ are aliases for undo (PI + Emacs conventions).
+    #[test]
+    fn undo_ctrl_minus_and_underscore() {
+        let mut b = TextBuffer::new();
+        type_str(&mut b, "abc def");
+        b.handle_key(press_c(KeyCode::Char('-')));
+        assert_eq!(b.as_string(), "abc");
+        b.handle_key(press_c(KeyCode::Char('_')));
+        assert_eq!(b.as_string(), "");
+    }
+
+    /// Cursor motion resets coalescing — typing after moving should
+    /// start a new undo unit, not merge with what came before.
+    #[test]
+    fn cursor_motion_breaks_coalesce() {
+        let mut b = TextBuffer::new();
+        type_str(&mut b, "abc");
+        b.handle_key(press_c(KeyCode::Char('a'))); // home
+        type_str(&mut b, "X");
+        // Now: "Xabc". Undo should remove just "X", not "Xabc".
+        b.handle_key(press_c(KeyCode::Char('z')));
+        assert_eq!(b.as_string(), "abc");
+    }
+
+    /// Backspace is always its own snapshot — undoing after backspace
+    /// restores the deleted char, not the whole preceding word run.
+    #[test]
+    fn backspace_is_own_undo_unit() {
+        let mut b = TextBuffer::new();
+        type_str(&mut b, "abc");
+        b.handle_key(press(KeyCode::Backspace));
+        // "ab" now. Undo restores "abc".
+        b.handle_key(press_c(KeyCode::Char('z')));
+        assert_eq!(b.as_string(), "abc");
     }
 
     #[test]
