@@ -6,3 +6,4 @@ pub mod compact;
 pub mod hook;
 pub mod permission;
 pub mod loop_;
+pub mod system_prompt;

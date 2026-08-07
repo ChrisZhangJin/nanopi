@@ -136,11 +136,14 @@ pub async fn run_tui_mode(
         a.permission = permission;
         a.hooks = hooks;
         a.model = model.to_string();
+        if a.context.system.is_none() {
+            a.context.system = Some(crate::agent::system_prompt::build(&cwd, &a.registry.names()));
+        }
         a
     } else {
         Agent {
             context: Context {
-                system: None,
+                system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
                 messages: Vec::new(),
                 tools: registry.all_specs(),
             },
