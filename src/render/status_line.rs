@@ -35,8 +35,9 @@ pub fn short_session_id(uuid: &uuid::Uuid) -> String {
     s.chars().take(8).collect()
 }
 
-/// Tokens summary: `↑1.2k ↓340 R89 W12`. Cache figures are omitted
-/// when zero.
+/// Tokens summary: `↑1.2k ↓340 R89 W12 CH27.4%`. Cache figures are
+/// omitted when zero; CH% (cache-hit rate) only when there's been at
+/// least one cache read.
 pub fn tokens_summary(u: &Usage) -> String {
     let mut parts = vec![
         format!("↑{}", pricing::fmt_tokens(u.input_tokens)),
@@ -47,6 +48,13 @@ pub fn tokens_summary(u: &Usage) -> String {
     }
     if u.cache_write_tokens > 0 {
         parts.push(format!("W{}", pricing::fmt_tokens(u.cache_write_tokens)));
+    }
+    // Cache-hit rate = cache_read / (cache_read + input) — proportion of
+    // tokens served from cache rather than freshly billed as input.
+    let denom = u.cache_read_tokens as u64 + u.input_tokens as u64;
+    if u.cache_read_tokens > 0 && denom > 0 {
+        let rate = (u.cache_read_tokens as f64 / denom as f64) * 100.0;
+        parts.push(format!("CH{:.1}%", rate));
     }
     parts.join(" ")
 }
@@ -155,6 +163,14 @@ mod tests {
         let s = tokens_summary(&usage);
         assert!(s.contains("R200"));
         assert!(s.contains("W30"));
+        // CH = 200 / (200 + 100) = 66.7%
+        assert!(s.contains("CH66.7%"), "got {s}");
+    }
+
+    #[test]
+    fn tokens_summary_no_ch_without_cache_read() {
+        let s = tokens_summary(&u(500, 200));
+        assert!(!s.contains("CH"));
     }
 
     #[test]

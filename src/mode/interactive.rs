@@ -257,13 +257,15 @@ pub async fn run_interactive_mode(
         print_post_turn_status(&agent_slot, turn_started.elapsed()).await;
     }
 
+    let sid = initial_session_id.to_string();
+    let sid_short: String = sid.chars().take(8).collect();
     eprintln!(
-        "\n✓ session {} saved to {}",
-        initial_session_id,
-        {
-            let g = agent_slot.lock().await;
-            g.as_ref().map(|a| a.session_path.display().to_string()).unwrap_or_default()
-        }
+        "\n\x1b[2m✓ session {} saved\x1b[0m",
+        sid_short,
+    );
+    eprintln!(
+        "\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {}\x1b[0m",
+        sid,
     );
 
     // Fire session_end hooks before returning.

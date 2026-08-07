@@ -184,11 +184,12 @@ pub async fn run_tui_mode(
         }
     }
 
-    // A closing line so the terminal doesn't feel abrupt.
-    println!(
-        "\n✓ session {} saved",
-        &header.id.to_string()[..8.min(header.id.to_string().len())]
-    );
+    // Closing lines: `✓ session saved` + resume hint so the user knows
+    // how to pick up where they left off.
+    let sid = header.id.to_string();
+    let sid_short = &sid[..8.min(sid.len())];
+    println!("\n\x1b[2m✓ session {sid_short} saved\x1b[0m");
+    println!("\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
 
     result
 }
@@ -264,6 +265,9 @@ struct App {
     /// line". Flushed to scrollback via insert_before on newline / turn
     /// end.
     stream_buf: String,
+    /// Same, for `ThinkingDelta` events (Anthropic reasoning traces).
+    /// Rendered dim italic to distinguish from the model's actual reply.
+    thinking_buf: String,
     /// Optional short status shown to the right of the input box
     /// (e.g. "cancelling…", "compacting…").
     status_note: Option<String>,
@@ -283,6 +287,7 @@ impl App {
             context_chars: 0,
             turn_count: 0,
             stream_buf: String::new(),
+            thinking_buf: String::new(),
             status_note: None,
         }
     }
@@ -443,8 +448,9 @@ async fn run_app(
                         term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
                     }
                     None => {
-                        // Turn done. Flush stream buffer, reap task.
+                        // Turn done. Flush both buffers, reap task.
                         flush_stream_buf(term, app)?;
+                        flush_thinking_buf(term, app)?;
                         ag_rx = None;
                         cancel = None;
                         app.status = Status::Idle;
@@ -521,11 +527,13 @@ async fn handle_action(
             if app.status == Status::Streaming {
                 return Ok(());
             }
-            // Echo user message into scrollback.
-            insert_line(term, Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(msg.clone()),
-            ]))?;
+            // Echo user message into scrollback, PI-style: full-width
+            // gray background across the row.
+            let user_bg = Style::default().bg(Color::Rgb(60, 60, 60)).fg(Color::White);
+            insert_line_bg(term, Line::from(vec![
+                Span::styled("  ", user_bg),
+                Span::styled(msg.clone(), user_bg),
+            ]), Some(user_bg))?;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
             let ct = CancellationToken::new();
             let ct_task = ct.clone();
@@ -572,44 +580,70 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
 fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> {
     match ev {
         AgentEvent::TextDelta { text, .. } => {
-            // Detect the synthetic tool-result marker so we can render it
-            // in dim gray instead of as regular assistant text.
+            // Detect the synthetic tool-result marker: `\n[tool → N bytes]\n`.
+            // Render collapsed (first N lines only) + dim italic PI-style.
             if is_tool_result_marker(&text) {
                 flush_stream_buf(term, app)?;
-                let cleaned = text.trim();
-                insert_line(term, Line::from(vec![
-                    Span::styled(cleaned.to_string(),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-                ]))?;
+                render_tool_result_marker(term, &text)?;
                 return Ok(());
             }
-            // Accumulate; flush completed lines to scrollback.
+            // Real assistant text → flush any pending thinking, then
+            // accumulate + emit full lines.
+            flush_thinking_buf(term, app)?;
             app.stream_buf.push_str(&text);
             while let Some(nl) = app.stream_buf.find('\n') {
                 let line: String = app.stream_buf.drain(..=nl).collect();
                 let trimmed = line.trim_end_matches('\n');
                 insert_line(term, Line::from(vec![
-                    Span::styled(trimmed.to_string(), Style::default().fg(Color::Green)),
+                    Span::styled(trimmed.to_string(), Style::default().fg(Color::White)),
                 ]))?;
+            }
+        }
+        AgentEvent::ThinkingDelta { text, .. } => {
+            // Buffer thinking similarly to text — flush on newlines.
+            app.thinking_buf.push_str(&text);
+            while let Some(nl) = app.thinking_buf.find('\n') {
+                let line: String = app.thinking_buf.drain(..=nl).collect();
+                let trimmed = line.trim_end_matches('\n');
+                if !trimmed.is_empty() {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            trimmed.to_string(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]))?;
+                }
             }
         }
         AgentEvent::ToolCall { call, .. } => {
             flush_stream_buf(term, app)?;
-            let args = call.arguments.to_string();
-            let preview = if args.len() > 60 { format!("{}…", &args[..60]) } else { args };
-            insert_line(term, Line::from(vec![
-                Span::styled(format!("[tool_call: {}] ", call.name),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(preview, Style::default().fg(Color::DarkGray)),
-            ]))?;
+            flush_thinking_buf(term, app)?;
+            // Full-width green background bar — PI's "$ command" style.
+            let cmd_preview = tool_call_preview(&call.name, &call.arguments);
+            let bar_style = Style::default()
+                .bg(Color::Rgb(0, 100, 0))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
+            let dim_style = Style::default()
+                .bg(Color::Rgb(0, 100, 0))
+                .fg(Color::Rgb(180, 220, 180))
+                .add_modifier(Modifier::ITALIC);
+            insert_line_bg(term, Line::from(vec![
+                Span::styled(format!(" ${} ", if call.name == "bash" { " " } else { "" }), bar_style),
+                Span::styled(cmd_preview, bar_style),
+                Span::styled("  (ctrl+o to expand)", dim_style),
+            ]), Some(bar_style))?;
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
+            flush_thinking_buf(term, app)?;
             insert_line(term, Line::from(vec![
                 Span::styled(format!("[error: {error}]"), Style::default().fg(Color::Red)),
             ]))?;
         }
-        AgentEvent::Done { .. } | AgentEvent::Start { .. } | AgentEvent::ThinkingDelta { .. } => {}
+        AgentEvent::Done { .. } | AgentEvent::Start { .. } => {}
     }
     Ok(())
 }
@@ -624,15 +658,72 @@ fn flush_stream_buf(term: &mut Term, app: &mut App) -> Result<()> {
     if !app.stream_buf.is_empty() {
         let text = std::mem::take(&mut app.stream_buf);
         insert_line(term, Line::from(vec![
-            Span::styled(text, Style::default().fg(Color::Green)),
+            Span::styled(text, Style::default().fg(Color::White)),
         ]))?;
     }
     Ok(())
 }
 
+/// Flush any pending thinking-buffer content as italic dim lines.
+fn flush_thinking_buf(term: &mut Term, app: &mut App) -> Result<()> {
+    if !app.thinking_buf.is_empty() {
+        let text = std::mem::take(&mut app.thinking_buf);
+        insert_line(term, Line::from(vec![
+            Span::styled(
+                text,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ),
+        ]))?;
+    }
+    Ok(())
+}
+
+/// Build a compact command preview for the green tool-call bar.
+fn tool_call_preview(name: &str, args: &serde_json::Value) -> String {
+    match name {
+        "bash" => args.get("command").and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| name.to_string()),
+        "read" | "write" | "edit" | "ls" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{name} {path}")
+        }
+        "grep" | "find" => {
+            let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{name} '{pat}'")
+        }
+        _ => {
+            let s = args.to_string();
+            let preview = if s.len() > 80 { format!("{}…", &s[..80]) } else { s };
+            format!("{name} {preview}")
+        }
+    }
+}
+
+/// Render the synthetic `\n[<tool> → N bytes]\n` marker as a dim
+/// italic single line. In v0.7 this is where "collapsed output +
+/// (K more lines, ctrl+o expand)" would land; for now we just show
+/// the marker itself.
+fn render_tool_result_marker(term: &mut Term, text: &str) -> Result<()> {
+    let cleaned = text.trim();
+    insert_line(term, Line::from(vec![
+        Span::styled(
+            cleaned.to_string(),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ),
+    ]))?;
+    Ok(())
+}
+
 /// Insert one line above the viewport into scrollback.
 fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
-    // Owned copy of spans so the closure can consume them.
+    insert_line_bg(term, line, None)
+}
+
+/// Insert one line with an optional full-row background style. If
+/// `bg_style` is Some, unset cells beyond the text get that style
+/// (PI's "user echo" gray bar effect).
+fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> Result<()> {
     let spans: Vec<(String, Style)> = line
         .spans
         .iter()
@@ -656,6 +747,14 @@ fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
                 }
             }
             col += take.chars().count() as u16;
+        }
+        // Fill the rest of the row with bg_style (space char + style).
+        if let Some(bg) = bg_style {
+            for x in col..buf.area.width {
+                if let Some(cell) = buf.cell_mut((x, row)) {
+                    cell.set_char(' ').set_style(bg);
+                }
+            }
         }
     })?;
     Ok(())
