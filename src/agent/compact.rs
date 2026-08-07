@@ -111,6 +111,7 @@ pub async fn summarize_via_provider(
             content: vec![ContentBlock::Text { text: transcript.to_string() }],
         }],
         tools: vec![],
+        thinking: None,
     };
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);

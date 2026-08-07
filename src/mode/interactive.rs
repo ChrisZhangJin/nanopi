@@ -90,6 +90,7 @@ pub async fn run_interactive_mode(
                     system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
                     messages: Vec::new(),
                     tools: registry.all_specs(),
+                    thinking: None,
                 },
                 provider: Box::new(provider),
                 registry,

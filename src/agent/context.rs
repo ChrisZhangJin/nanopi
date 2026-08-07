@@ -22,6 +22,13 @@ pub struct Context {
 
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
+
+    /// Extended-thinking budget level. `None` = off (default). Set by
+    /// the `/thinking` slash command. Only Anthropic providers on the
+    /// Claude 4.x / 3.7 Sonnet family act on this; others ignore it.
+    /// Not persisted to session files — a resume starts back at Off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::agent::thinking::ThinkingLevel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

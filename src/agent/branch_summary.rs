@@ -80,6 +80,7 @@ pub async fn summarize_branch(
         messages: vec![ContextMessage::User {
             content: vec![ContentBlock::Text { text: transcript }],
         }],
+        thinking: None,
         tools: vec![],
     };
 

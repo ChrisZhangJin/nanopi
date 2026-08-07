@@ -150,6 +150,21 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> serde_json::Value 
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    // Extended thinking: only when the user picked a level AND the
+    // model supports it. Sending `thinking` to a model that doesn't
+    // support the field would 400. See agent::thinking::supports_thinking.
+    if let Some(level) = ctx.thinking {
+        if crate::agent::thinking::supports_thinking(model) {
+            let budget = level.budget_tokens();
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+            // Anthropic requires max_tokens > budget_tokens so the
+            // model has room to write an actual answer AFTER thinking.
+            body["max_tokens"] = json!(budget + 4096);
+        }
+    }
     body
 }
 
@@ -481,6 +496,34 @@ mod tests {
         let delta = ev.delta.unwrap();
         assert_eq!(delta.kind.as_deref(), Some("input_json_delta"));
         assert!(delta.partial_json.unwrap().contains("command"));
+    }
+
+    #[test]
+    fn build_request_omits_thinking_block_when_off() {
+        let ctx = Context::default();
+        let v = build_request(&ctx, "claude-opus-4-7");
+        assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_includes_thinking_when_set_and_model_supports() {
+        let mut ctx = Context::default();
+        ctx.thinking = Some(crate::agent::thinking::ThinkingLevel::Medium);
+        let v = build_request(&ctx, "claude-opus-4-7");
+        let t = v.get("thinking").expect("thinking block should be present");
+        assert_eq!(t["type"], "enabled");
+        assert_eq!(t["budget_tokens"], 8192); // medium
+        // max_tokens must exceed the budget or Anthropic will reject.
+        assert!(v["max_tokens"].as_u64().unwrap() > 8192);
+    }
+
+    #[test]
+    fn build_request_skips_thinking_for_unsupported_model() {
+        let mut ctx = Context::default();
+        ctx.thinking = Some(crate::agent::thinking::ThinkingLevel::High);
+        let v = build_request(&ctx, "claude-haiku-4-5");
+        // Haiku doesn't support extended thinking → block must not be sent.
+        assert!(v.get("thinking").is_none());
     }
 
     #[test]

@@ -69,15 +69,17 @@ enum SlashCmd {
     Compact,
     Quit,
     Model,
+    Thinking,
     // Future: Login, Settings, Export, Import.
 }
 
 fn slash_items() -> Vec<MenuItem<SlashCmd>> {
     vec![
-        MenuItem::new("/model",   "Switch to a different model", SlashCmd::Model),
-        MenuItem::new("/compact", "Force context compaction",    SlashCmd::Compact),
-        MenuItem::new("/quit",    "Exit the session",            SlashCmd::Quit),
-        MenuItem::new("/exit",    "Exit the session",            SlashCmd::Quit),
+        MenuItem::new("/model",    "Switch to a different model",       SlashCmd::Model),
+        MenuItem::new("/thinking", "Set extended-thinking budget",      SlashCmd::Thinking),
+        MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
+        MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
+        MenuItem::new("/exit",     "Exit the session",                  SlashCmd::Quit),
     ]
 }
 
@@ -149,6 +151,7 @@ pub async fn run_tui_mode(
                 system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
                 messages: Vec::new(),
                 tools: registry.all_specs(),
+                thinking: None,
             },
             provider: Box::new(provider),
             registry,
@@ -264,6 +267,9 @@ struct App {
     /// When Some, the model picker is open — takes priority over the
     /// slash palette. Payload is the target model id.
     model_picker: Option<MenuState<String>>,
+    /// When Some, the thinking-level picker is open. Payload is
+    /// Option<ThinkingLevel> — None means "Off".
+    thinking_picker: Option<MenuState<Option<crate::agent::thinking::ThinkingLevel>>>,
     /// When Some, the fork picker (Esc double-tap) is open. Payload is
     /// `(source_session_path, entry_index_in_that_session)` — used to
     /// call `session::fork_session_at` on Enter. The source path may
@@ -300,6 +306,9 @@ struct App {
     usage: crate::event::Usage,
     context_chars: usize,
     turn_count: u32,
+    /// Cached thinking level from the current Agent, for the footer.
+    /// Synced by `refresh_status` (or immediately after SetThinking).
+    thinking: Option<crate::agent::thinking::ThinkingLevel>,
     /// Partial assistant text still being streamed on the "current
     /// line". Flushed to scrollback via insert_before on newline / turn
     /// end.
@@ -360,6 +369,8 @@ impl App {
             pending_fork: None,
             capture_custom_prompt: false,
             summarize_task: None,
+            thinking_picker: None,
+            thinking: None,
         }
     }
 }
@@ -437,6 +448,8 @@ enum KeyAction {
     Compact,
     OpenModelPicker,
     SwapModel(String),
+    OpenThinkingPicker,
+    SetThinking(Option<crate::agent::thinking::ThinkingLevel>),
     ExpandLastTool,
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
@@ -530,6 +543,23 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         return KeyAction::Nothing;
     }
 
+    // ── Thinking picker (priority just below fork/summary) ──────────
+    if app.thinking_picker.is_some() {
+        let m = app.thinking_picker.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(level) => {
+                app.thinking_picker = None;
+                app.input.clear();
+                return KeyAction::SetThinking(level);
+            }
+            MenuAction::Cancel => {
+                app.thinking_picker = None;
+                app.input.clear();
+                return KeyAction::Nothing;
+            }
+            MenuAction::Nothing => return KeyAction::Nothing,
+        }
+    }
     // ── Model picker (highest priority when open) ───────────────────
     if app.model_picker.is_some() {
         let m = app.model_picker.as_mut().unwrap();
@@ -648,6 +678,7 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
         SlashCmd::Compact => KeyAction::Compact,
         SlashCmd::Quit => KeyAction::Exit,
         SlashCmd::Model => KeyAction::OpenModelPicker,
+        SlashCmd::Thinking => KeyAction::OpenThinkingPicker,
     }
 }
 
@@ -851,6 +882,59 @@ async fn handle_action(
                 })
                 .collect();
             app.model_picker = Some(MenuState::new(items));
+        }
+        KeyAction::OpenThinkingPicker => {
+            let (current, model) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => (a.context.thinking, a.model.clone()),
+                    None => return Ok(()),
+                }
+            };
+            let supported = crate::agent::thinking::supports_thinking(&model);
+            let mut items: Vec<MenuItem<Option<crate::agent::thinking::ThinkingLevel>>> = Vec::new();
+            let off_marker = if current.is_none() { "  (current)" } else { "" };
+            items.push(MenuItem::new(
+                "Off".to_string(),
+                format!("Disable extended thinking{off_marker}"),
+                None,
+            ));
+            for &lvl in crate::agent::thinking::ThinkingLevel::all() {
+                let marker = if current == Some(lvl) { "  (current)" } else { "" };
+                let mut desc = format!(
+                    "budget {} tokens{}",
+                    lvl.budget_tokens(),
+                    marker
+                );
+                if !supported {
+                    desc.push_str("  · not supported by this model");
+                }
+                items.push(MenuItem::new(
+                    lvl.to_string(),
+                    desc,
+                    Some(lvl),
+                ));
+            }
+            app.thinking_picker = Some(MenuState::new(items));
+        }
+        KeyAction::SetThinking(level) => {
+            let mut g = agent_slot.lock().await;
+            if let Some(a) = g.as_mut() {
+                a.context.thinking = level;
+            }
+            app.thinking = level;
+            let label = match level {
+                None => "off".to_string(),
+                Some(l) => l.to_string(),
+            };
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[thinking → {}]", label),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
         }
         KeyAction::SwapModel(new_model) => {
             let mut g = agent_slot.lock().await;
@@ -1266,6 +1350,7 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.context_chars = a.context.estimate_chars();
         app.turn_count = a.turn_count;
         app.cwd = a.cwd.clone();
+        app.thinking = a.context.thinking;
     }
 }
 
@@ -1591,11 +1676,13 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         .split(area);
 
     // ── Overlay menus (dropdown). Priority matches interpret_key:
-    // summary modal > fork picker > model picker > slash palette.
+    // summary > fork > thinking > model > slash palette.
     if let Some(m) = &app.summary_prompt {
         draw_menu(buf, chunks[0], m, "summarize branch?");
     } else if let Some(m) = &app.fork_picker {
         draw_menu(buf, chunks[0], m, "user message");
+    } else if let Some(m) = &app.thinking_picker {
+        draw_menu(buf, chunks[0], m, "thinking level");
     } else if let Some(m) = &app.model_picker {
         draw_menu(buf, chunks[0], m, "model");
     } else if let Some(m) = &app.palette {
@@ -1673,6 +1760,15 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     }
     l2.push(Span::raw(" · "));
     l2.push(Span::styled(app.model.clone(), Style::default().fg(Color::LightBlue)));
+    if let Some(lvl) = app.thinking {
+        l2.push(Span::raw(" · "));
+        l2.push(Span::styled(
+            format!("think:{}", lvl),
+            Style::default()
+                .fg(Color::Indexed(108))
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
     // Context ratio (`1.4%/205k (auto)`), color-coded by usage.
     // Auto-compact is always on today; if we add a config toggle we
     // can wire it here.

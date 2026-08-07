@@ -4,6 +4,7 @@
 pub mod context;
 pub mod branch_summary;
 pub mod compact;
+pub mod thinking;
 pub mod hook;
 pub mod permission;
 pub mod loop_;
