@@ -79,6 +79,12 @@ enum SlashCmd {
     ForkOrTree,
     /// Dump a keybinding cheat-sheet into scrollback.
     Hotkeys,
+    /// Print session stats (tokens, cost, model, turns) to scrollback.
+    SessionInfo,
+    /// Enter capture mode; next Enter sets the session's `name`.
+    Name,
+    /// Copy the last assistant message to the OS clipboard via OSC 52.
+    Copy,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -91,6 +97,9 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/resume",   "Open a picker over past sessions",  SlashCmd::Resume),
         MenuItem::new("/fork",     "Fork at a past user message",       SlashCmd::ForkOrTree),
         MenuItem::new("/tree",     "Navigate the session tree",         SlashCmd::ForkOrTree),
+        MenuItem::new("/session",  "Show session stats (tokens, cost)", SlashCmd::SessionInfo),
+        MenuItem::new("/name",     "Set the current session's name",    SlashCmd::Name),
+        MenuItem::new("/copy",     "Copy last assistant reply",         SlashCmd::Copy),
         MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
         MenuItem::new("/hotkeys",  "Show all keyboard shortcuts",       SlashCmd::Hotkeys),
         MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
@@ -306,6 +315,9 @@ struct App {
     /// Enter on the input box will submit the typed text as the
     /// custom summarize instructions, not as a chat turn.
     capture_custom_prompt: bool,
+    /// True after `/name` — next Enter renames the session to the
+    /// typed text (empty text clears the name).
+    capture_name: bool,
     /// While a branch summary is being generated, hold the join handle
     /// so the main loop can poll for completion via `is_finished`.
     summarize_task: Option<tokio::task::JoinHandle<SummarizeOutcome>>,
@@ -397,6 +409,7 @@ impl App {
             thinking: None,
             turn_was_cancelled: false,
             resume_picker: None,
+            capture_name: false,
         }
     }
 }
@@ -487,6 +500,14 @@ enum KeyAction {
     ResumeSession(PathBuf),
     /// `/hotkeys`: dump keybinding help into scrollback.
     ShowHotkeys,
+    /// `/session`: dump usage / cost / model summary into scrollback.
+    ShowSessionInfo,
+    /// `/name`: enter capture mode; next Enter renames the session.
+    OpenNameCapture,
+    /// The user typed a session name in capture mode; apply it.
+    ApplyName(String),
+    /// `/copy`: copy the last assistant message via OSC 52.
+    CopyLastReply,
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
     OpenForkPicker,
@@ -675,7 +696,10 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         }
         TbAction::Exit => KeyAction::Exit,
         TbAction::Submit(text) => {
-            if app.capture_custom_prompt {
+            if app.capture_name {
+                app.capture_name = false;
+                KeyAction::ApplyName(text.trim().to_string())
+            } else if app.capture_custom_prompt {
                 // We're in "type your custom summarize prompt" mode.
                 // Anything the user submits goes to the summarizer,
                 // NOT to the model as a chat turn. Empty text falls
@@ -736,6 +760,9 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
         SlashCmd::Resume => KeyAction::OpenResumePicker,
         SlashCmd::ForkOrTree => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
+        SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
+        SlashCmd::Name => KeyAction::OpenNameCapture,
+        SlashCmd::Copy => KeyAction::CopyLastReply,
     }
 }
 
@@ -1192,6 +1219,179 @@ async fn handle_action(
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]))?;
+        }
+        KeyAction::ShowSessionInfo => {
+            let (session_id, model, turn_count, usage, ctx_chars, name) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => {
+                        // Header on disk carries the /name value.
+                        let name = session::read_session(&a.session_path)
+                            .ok()
+                            .and_then(|(h, _)| h.name);
+                        (
+                            a.session_id.to_string(),
+                            a.model.clone(),
+                            a.turn_count,
+                            a.usage_total.clone(),
+                            a.context.estimate_chars(),
+                            name,
+                        )
+                    }
+                    None => return Ok(()),
+                }
+            };
+            let cost_str = crate::render::status_line::cost_string(&model, &usage);
+            let ctx_pct = crate::render::status_line::context_percent(&model, ctx_chars)
+                .map(|p| format!("{p:.1}%"))
+                .unwrap_or_else(|| "?%".into());
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    "Session info",
+                    Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::BOLD),
+                ),
+            ]))?;
+            let dim = Style::default().fg(Color::DarkGray);
+            let cyan = Style::default().fg(Color::Cyan);
+            let row = |k: &str, v: &str| -> Line {
+                Line::from(vec![
+                    Span::styled(format!("  {:<12}", k), dim),
+                    Span::styled(v.to_string(), cyan),
+                ])
+            };
+            if let Some(n) = name.as_ref() {
+                insert_line(term, row("name", n))?;
+            }
+            insert_line(term, row("id", &session_id[..std::cmp::min(session_id.len(), 8)]))?;
+            insert_line(term, row("model", &model))?;
+            insert_line(term, row("turns", &turn_count.to_string()))?;
+            insert_line(term, row(
+                "tokens",
+                &format!(
+                    "↑{}k ↓{}k (cache R{}k W{}k)",
+                    usage.input_tokens / 1000,
+                    usage.output_tokens / 1000,
+                    usage.cache_read_tokens / 1000,
+                    usage.cache_write_tokens / 1000,
+                ),
+            ))?;
+            if !cost_str.is_empty() {
+                insert_line(term, row("cost", &cost_str))?;
+            }
+            insert_line(term, row("context", &format!("{ctx_pct} ({ctx_chars} chars)")))?;
+            insert_line(term, Line::from(""))?;
+        }
+        KeyAction::OpenNameCapture => {
+            let current_name = {
+                let g = agent_slot.lock().await;
+                g.as_ref().and_then(|a| {
+                    session::read_session(&a.session_path)
+                        .ok()
+                        .and_then(|(h, _)| h.name)
+                })
+            };
+            if let Some(n) = &current_name {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("[current name: {n} — type a new one and Enter, or Enter with empty to clear]"),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+            }
+            app.capture_name = true;
+            app.status_note = Some("session name — Enter to save".into());
+        }
+        KeyAction::ApplyName(new_name) => {
+            app.status_note = None;
+            let (path, name_to_write) = {
+                let g = agent_slot.lock().await;
+                let a = match g.as_ref() {
+                    Some(a) => a,
+                    None => return Ok(()),
+                };
+                let n = if new_name.is_empty() { None } else { Some(new_name.clone()) };
+                (a.session_path.clone(), n)
+            };
+            match session::set_session_name(&path, name_to_write.clone()) {
+                Ok(()) => {
+                    let label = name_to_write.as_deref().unwrap_or("(cleared)");
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[session name → {label}]"),
+                            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]))?;
+                }
+                Err(e) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[/name failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                }
+            }
+        }
+        KeyAction::CopyLastReply => {
+            // Find the last Assistant text block in context.
+            let last_reply = {
+                let g = agent_slot.lock().await;
+                g.as_ref().and_then(|a| {
+                    a.context.messages.iter().rev().find_map(|m| match m {
+                        crate::agent::context::ContextMessage::Assistant { content } => {
+                            let text: String = content
+                                .iter()
+                                .filter_map(|b| match b {
+                                    crate::agent::context::AssistantBlock::Text { text } => {
+                                        Some(text.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            if text.trim().is_empty() { None } else { Some(text) }
+                        }
+                        _ => None,
+                    })
+                })
+            };
+            match last_reply {
+                Some(text) => {
+                    // OSC 52 clipboard write. Modern terminals (iTerm2,
+                    // Alacritty, WezTerm, tmux with `set-clipboard on`,
+                    // most native emulators) honor this. Fallback: user
+                    // sees the escape output visibly if the terminal
+                    // strips it, no harm done.
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+                    use std::io::Write;
+                    // Write to stdout so crossterm's raw-mode-managed
+                    // TTY handles it; the sequence is invisible.
+                    let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x1b\\", b64);
+                    let _ = std::io::stdout().flush();
+                    let preview: String = text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[copied last reply ({} bytes) — {}]", text.len(), preview),
+                            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]))?;
+                }
+                None => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            "[/copy: no assistant reply to copy yet]",
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]))?;
+                }
+            }
         }
         KeyAction::ShowHotkeys => {
             let hotkey_lines: &[(&str, &str)] = &[

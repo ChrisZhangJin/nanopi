@@ -55,6 +55,10 @@ pub enum SessionEntry {
         cwd: String,
         model: String,
         base_url: String,
+        /// Optional user-assigned session name (set via `/name`).
+        /// Not required — old sessions load with `name: None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -118,6 +122,8 @@ pub struct SessionHeader {
     pub cwd: PathBuf,
     pub model: String,
     pub base_url: String,
+    /// User-assigned name via `/name`. `None` until first set.
+    pub name: Option<String>,
 }
 
 /// Compute the directory where session JSONL files live.
@@ -151,6 +157,7 @@ pub fn new_session(cwd: &Path, model: &str, base_url: &str) -> Result<(PathBuf, 
         cwd: cwd.to_path_buf(),
         model: model.to_string(),
         base_url: base_url.to_string(),
+        name: None,
     };
     let entry = SessionEntry::Header {
         version: 2,
@@ -160,6 +167,7 @@ pub fn new_session(cwd: &Path, model: &str, base_url: &str) -> Result<(PathBuf, 
         cwd: cwd.display().to_string(),
         model: model.to_string(),
         base_url: base_url.to_string(),
+        name: None,
     };
     append_entry(&path, &entry)?;
     Ok((path, header))
@@ -273,6 +281,7 @@ pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader
         cwd: cwd.to_path_buf(),
         model: src_hdr.model.clone(),
         base_url: src_hdr.base_url.clone(),
+        name: src_hdr.name.clone(),
     };
     let header_entry = SessionEntry::Header {
         version: 2,
@@ -282,6 +291,7 @@ pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader
         cwd: cwd.display().to_string(),
         model: src_hdr.model.clone(),
         base_url: src_hdr.base_url.clone(),
+        name: src_hdr.name.clone(),
     };
     append_entry(&path, &header_entry)?;
     for e in entries {
@@ -334,6 +344,7 @@ pub fn fork_session_at(
         cwd: cwd.to_path_buf(),
         model: src_hdr.model.clone(),
         base_url: src_hdr.base_url.clone(),
+        name: src_hdr.name.clone(),
     };
     let header_entry = SessionEntry::Header {
         version: 2,
@@ -343,6 +354,7 @@ pub fn fork_session_at(
         cwd: cwd.display().to_string(),
         model: src_hdr.model.clone(),
         base_url: src_hdr.base_url.clone(),
+        name: src_hdr.name.clone(),
     };
     append_entry(&path, &header_entry)?;
     for e in entries.iter().take(copy_until) {
@@ -461,6 +473,40 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
 fn collapse_ws_truncate(s: &str, max_chars: usize) -> String {
     let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     one_line.chars().take(max_chars).collect()
+}
+
+/// Update the `name` field on a session file's header. Reads the
+/// whole file, rewrites line 0 with the new name, keeps every other
+/// line as-is. Called by `/name` in the TUI. Fails only on IO / JSON
+/// errors — an empty/absent header would already have failed the
+/// first read.
+pub fn set_session_name(path: &Path, name: Option<String>) -> Result<(), SessionError> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::fs::File::open(path)
+        .map_err(|e| SessionError::Io { path: path.to_path_buf(), source: e })?
+        .read_to_string(&mut buf)
+        .map_err(|e| SessionError::Io { path: path.to_path_buf(), source: e })?;
+    let mut lines: Vec<String> = buf.split('\n').map(|s| s.to_string()).collect();
+    // First non-empty line is the header. Rewrite it.
+    for line in lines.iter_mut() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut entry: SessionEntry = serde_json::from_str(line).map_err(|e| SessionError::Parse {
+            path: path.to_path_buf(),
+            line: 1,
+            source: e,
+        })?;
+        if let SessionEntry::Header { name: ref mut n, .. } = entry {
+            *n = name.clone();
+            *line = serde_json::to_string(&entry).expect("re-serialize header");
+        }
+        break; // only the first entry is the header
+    }
+    std::fs::write(path, lines.join("\n"))
+        .map_err(|e| SessionError::Io { path: path.to_path_buf(), source: e })?;
+    Ok(())
 }
 
 /// Summary row for the `/resume` picker: a session file with enough
@@ -598,7 +644,7 @@ pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), S
             // First non-empty line is the header. Validate and consume; do
             // NOT push into `entries` (caller wants header separately).
             match &entry {
-                SessionEntry::Header { version, id, parent_id, cwd, model, base_url, .. } => {
+                SessionEntry::Header { version, id, parent_id, cwd, model, base_url, name, .. } => {
                     if *version != 2 {
                         return Err(SessionError::UnsupportedVersion {
                             found: *version,
@@ -613,6 +659,7 @@ pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), S
                         cwd: PathBuf::from(cwd),
                         model: model.clone(),
                         base_url: base_url.clone(),
+                        name: name.clone(),
                     });
                 }
                 _ => return Err(SessionError::NotASession),
@@ -1273,6 +1320,44 @@ mod tests {
         assert!(s.contains("\"replaced_count\":12"), "got {s}");
         let back: SessionEntry = serde_json::from_str(&s).unwrap();
         matches!(back, SessionEntry::Compaction { .. });
+    }
+
+    #[test]
+    fn set_session_name_roundtrips() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+        let (path, _hdr) = new_session(&cwd, "m", "http://x").unwrap();
+        append_entry(&path, &SessionEntry::Message {
+            id: "u1".into(), timestamp: "".into(),
+            role: "user".into(), content: "hello".into(),
+        }).unwrap();
+
+        // Initially no name.
+        let (h, _e) = read_session(&path).unwrap();
+        assert_eq!(h.name, None);
+
+        // Set.
+        set_session_name(&path, Some("my project".into())).unwrap();
+        let (h, entries) = read_session(&path).unwrap();
+        assert_eq!(h.name.as_deref(), Some("my project"));
+        // Body preserved.
+        assert_eq!(entries.len(), 1);
+
+        // Clear.
+        set_session_name(&path, None).unwrap();
+        let (h, _e) = read_session(&path).unwrap();
+        assert_eq!(h.name, None);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// BranchSummary is the fork-time counterpart of Compaction —
