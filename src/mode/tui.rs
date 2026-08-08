@@ -1184,14 +1184,13 @@ async fn handle_action(
             app.turn_count = 0;
             app.input.clear();
             app.thinking = None;
-            // Also wipe the visible scrollback + terminal history so
-            // the fresh session opens on a blank canvas, matching PI's
-            // "clear conversation" UX (see interactive-mode.ts:5938).
-            // Emitted as raw ANSI: ESC[3J purges scrollback, ESC[2J
-            // clears the screen, ESC[H homes cursor. ratatui will
-            // re-draw the dock on the next tick.
+            // PI's /new clears the visible chat area but does NOT
+            // purge terminal scrollback — users can still scroll up
+            // to review earlier turns (see interactive-mode.ts:5938
+            // handleClearCommand). ESC[2J clears the visible screen,
+            // ESC[H homes the cursor; scrollback stays intact.
             use std::io::Write;
-            let _ = write!(std::io::stdout(), "\x1b[3J\x1b[2J\x1b[H");
+            let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
             let _ = std::io::stdout().flush();
             let _ = term.clear();
             insert_line(term, Line::from(vec![
@@ -1376,17 +1375,28 @@ async fn handle_action(
                         .and_then(|(h, _)| h.name)
                 })
             };
-            let label = current_name.as_deref().unwrap_or("(unnamed)");
-            insert_line(term, Line::from(vec![
-                Span::styled(
-                    format!("[session name: {label}]"),
-                    Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
-                ),
-                Span::styled(
-                    "  (run `/name <text>` to rename)".to_string(),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
+            match current_name {
+                None => {
+                    // No name set — PI prints a usage warning
+                    // (interactive-mode.ts:5701).
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            "Warning: Usage: /name <name>",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]))?;
+                }
+                Some(n) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("Session name: {n}"),
+                            Style::default().fg(Color::Indexed(108)),
+                        ),
+                    ]))?;
+                }
+            }
         }
         KeyAction::ApplyName(new_name) => {
             app.status_note = None;
@@ -1401,11 +1411,16 @@ async fn handle_action(
             };
             match session::set_session_name(&path, name_to_write.clone()) {
                 Ok(()) => {
-                    let label = name_to_write.as_deref().unwrap_or("(cleared)");
+                    // PI wording (interactive-mode.ts:5715):
+                    // "Session name set: <name>".
+                    let text = match name_to_write.as_deref() {
+                        Some(n) => format!("Session name set: {n}"),
+                        None => "Session name cleared".to_string(),
+                    };
                     insert_line(term, Line::from(vec![
                         Span::styled(
-                            format!("[session name → {label}]"),
-                            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                            text,
+                            Style::default().fg(Color::Indexed(108)),
                         ),
                     ]))?;
                 }
