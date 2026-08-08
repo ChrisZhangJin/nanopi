@@ -231,8 +231,11 @@ struct WireRequest<'a> {
 #[derive(Debug, Clone, Serialize)]
 struct WireMessage {
     role: String,
-    /// OpenAI accepts string content for text-only messages.
-    content: String,
+    /// OpenAI accepts either a string (text-only) OR a content array
+    /// with `{type:"text",...}` and `{type:"image_url",...}` blocks
+    /// (multimodal, user-role only). Using `Value` here so both
+    /// shapes serialize naturally.
+    content: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     /// For assistant messages that include tool_calls.
@@ -276,7 +279,7 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
     if let Some(sys) = &ctx.system {
         messages.push(WireMessage {
             role: "system".into(),
-            content: sys.clone(),
+            content: json!(sys),
             tool_call_id: None,
             tool_calls: None,
         });
@@ -297,7 +300,7 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
                     .join("");
                 messages.push(WireMessage {
                     role: "user".into(),
-                    content: text,
+                    content: json!(text),
                     tool_call_id: None,
                     tool_calls: None,
                 });
@@ -324,32 +327,65 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
                 }
                 messages.push(WireMessage {
                     role: "assistant".into(),
-                    content: text,
+                    content: json!(text),
                     tool_call_id: None,
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                 });
             }
             crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error, images } => {
-                // OpenAI's tool-role message uses string content; the
-                // multimodal image-block form is user-role only.
-                // For MVP, if a tool returned images, append a text
-                // note that images were attached — the model won't
-                // see the pixels but at least learns the tool
-                // produced visual output.
-                let payload = if images.is_empty() {
+                // The tool-role message itself is text-only — OpenAI's
+                // spec doesn't allow multimodal here. When there are
+                // images AND the model supports vision, we push a
+                // follow-up user message right after carrying the
+                // actual pixels as `image_url` data-URL blocks. This
+                // is the same trick most OpenAI-compatible gateways
+                // use to route vision to the underlying model.
+                let has_images = !images.is_empty();
+                let vision_ok = crate::agent::thinking::supports_vision(model);
+                let payload = if !has_images {
                     content.clone()
+                } else if vision_ok {
+                    format!("{} (image(s) attached in the next message)", content)
                 } else {
                     format!(
-                        "{}\n\n({} image(s) attached — OpenAI tool-role does not carry image blocks in this adapter)",
+                        "{} ({} image(s) omitted — model does not support vision)",
                         content, images.len()
                     )
                 };
+                let _ = is_error; // is_error is content-only, no wire field on tool role
                 messages.push(WireMessage {
-                    role: if *is_error { "tool".into() } else { "tool".into() },
-                    content: payload,
+                    role: "tool".into(),
+                    content: json!(payload),
                     tool_call_id: Some(tool_call_id.clone()),
                     tool_calls: None,
                 });
+                if has_images && vision_ok {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "(image content from tool_call {})",
+                            tool_call_id
+                        ),
+                    }));
+                    for img in images {
+                        blocks.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!(
+                                    "data:{};base64,{}",
+                                    img.media_type, img.data_base64
+                                )
+                            }
+                        }));
+                    }
+                    messages.push(WireMessage {
+                        role: "user".into(),
+                        content: Value::Array(blocks),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                }
             }
         }
     }
@@ -735,6 +771,65 @@ mod tests {
         assert_eq!(req.messages.len(), 2); // system + user
         assert_eq!(req.messages[0].role, "system");
         assert_eq!(req.messages[1].role, "user");
+    }
+
+    /// When a tool returns an image AND the model supports vision,
+    /// the OpenAI adapter emits the tool-role message as text-only
+    /// (per spec) followed by a synthetic user-role message with the
+    /// image encoded as an `image_url` data-URL block. That's how
+    /// OpenAI-compatible gateways surface tool-supplied images to
+    /// the underlying vision model.
+    #[test]
+    fn build_request_forwards_tool_images_via_follow_up_user_message() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result_with_images(
+            "call_A",
+            "Read image file [image/png]",
+            false,
+            vec![crate::tool::ImageAttachment {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+        );
+        let req = build_request(&ctx, "gpt-4o");
+        // Two messages: the tool result + the follow-up user with image_url.
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, "tool");
+        assert_eq!(req.messages[0].tool_call_id.as_deref(), Some("call_A"));
+
+        // Follow-up must be a user message with an array content
+        // holding a text block + an image_url block.
+        assert_eq!(req.messages[1].role, "user");
+        let blocks = req.messages[1]
+            .content
+            .as_array()
+            .expect("follow-up user should use array content for multimodal");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image_url");
+        let url = blocks[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        assert!(url.ends_with("AAAA"));
+    }
+
+    /// If the model doesn't do vision, we don't emit the follow-up
+    /// user message — just a text note on the tool result.
+    #[test]
+    fn build_request_skips_follow_up_for_text_only_model() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result_with_images(
+            "call_A",
+            "Read image file [image/png]",
+            false,
+            vec![crate::tool::ImageAttachment {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+        );
+        let req = build_request(&ctx, "some-text-only-model");
+        assert_eq!(req.messages.len(), 1, "no follow-up user for non-vision model");
+        assert_eq!(req.messages[0].role, "tool");
+        let text = req.messages[0].content.as_str().unwrap();
+        assert!(text.contains("image(s) omitted"), "got {text:?}");
     }
 
     #[test]
