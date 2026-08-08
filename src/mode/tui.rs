@@ -791,7 +791,17 @@ fn sync_palette(app: &mut App) {
             app.palette = Some(MenuState::new(slash_items()));
         }
         if let Some(m) = app.palette.as_mut() {
-            let filter = first_line.strip_prefix('/').unwrap_or("").to_string();
+            // Filter only on the command WORD (chars up to the first
+            // whitespace). Anything after the space is the command's
+            // argument — e.g. "/name 123" filters as "name" so the
+            // /name item stays selectable, and the "123" is picked
+            // up by dispatch_slash's arg-splitter on Enter.
+            let after_slash = first_line.strip_prefix('/').unwrap_or("");
+            let filter = after_slash
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
             m.set_filter(filter);
         }
     } else if app.palette.is_some() {
