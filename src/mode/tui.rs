@@ -1287,14 +1287,40 @@ async fn handle_action(
             app.input.clear();
             app.thinking = None;
             refresh_status(app, agent_slot).await;
+
+            // Redraw the resumed session's transcript into scrollback
+            // so users see the full history they're picking up on
+            // (matches PI's /resume — the whole conversation gets
+            // repainted, not just a "resumed" marker).
+            let entries = match session::read_session(&path) {
+                Ok((_, e)) => e,
+                Err(_) => Vec::new(),
+            };
+            // Clear visible screen first so the replay starts at the
+            // top of the view. Scrollback stays; ESC[2J only clears
+            // the viewport, not the terminal's history buffer.
+            use std::io::Write as _;
+            let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
+            let _ = std::io::stdout().flush();
+            let _ = term.clear();
+            let short = &new_session_id.to_string()[..8];
+            let hdr_name = session::read_session(&path)
+                .ok()
+                .and_then(|(h, _)| h.name);
+            let title = match hdr_name {
+                Some(n) => format!("─── Resumed session {short} · {n} ───"),
+                None => format!("─── Resumed session {short} ───"),
+            };
             insert_line(term, Line::from(vec![
                 Span::styled(
-                    format!("[resumed session {}]", &new_session_id.to_string()[..8]),
+                    title,
                     Style::default()
                         .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]))?;
+            insert_line(term, Line::from(""))?;
+            replay_history(term, app, &entries)?;
         }
         KeyAction::ShowSessionInfo => {
             let (session_id, model, turn_count, usage, ctx_chars, name) = {
@@ -1907,25 +1933,8 @@ async fn handle_action(
             if app.status == Status::Streaming {
                 return Ok(());
             }
-            // Echo user message into scrollback, PI-style: blank line +
-            // full-width gray "card" (3 rows: pad, content, pad) + blank.
-            // Use 256-color palette (Indexed 238) — visible on every
-            // terminal including tmux without truecolor passthrough.
-            // Truecolor (RGB) fails silently on tmux-256color, which is
-            // the default in most setups.
-            let user_bg = Style::default()
-                .bg(Color::Indexed(238))
-                .fg(Color::Indexed(255));
-            insert_line(term, Line::from(""))?;
-            insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
-            for line in msg.lines() {
-                insert_line_bg(term, Line::from(vec![
-                    Span::styled("  ", user_bg),
-                    Span::styled(line.to_string(), user_bg),
-                ]), Some(user_bg))?;
-            }
-            insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
-            insert_line(term, Line::from(""))?;
+            // Echo user message into scrollback, PI-style gray card.
+            render_user_echo(term, &msg)?;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
             let ct = CancellationToken::new();
             let ct_task = ct.clone();
@@ -2368,6 +2377,137 @@ fn render_tool_card(
 
     // Breathing room below.
     insert_line(term, Line::from(""))?;
+    Ok(())
+}
+
+/// Insert the PI-style gray "user echo" card into scrollback. Used
+/// both by StartTurn (live) and by replay_history when resuming a
+/// past session (`/resume`). 3-row block: pad, content, pad, with a
+/// blank line above + below.
+fn render_user_echo(term: &mut Term, msg: &str) -> Result<()> {
+    // 256-color palette (Indexed 238) — visible on tmux-256color too;
+    // truecolor fails silently there.
+    let user_bg = Style::default()
+        .bg(Color::Indexed(238))
+        .fg(Color::Indexed(255));
+    insert_line(term, Line::from(""))?;
+    insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
+    for line in msg.lines() {
+        insert_line_bg(term, Line::from(vec![
+            Span::styled("  ", user_bg),
+            Span::styled(line.to_string(), user_bg),
+        ]), Some(user_bg))?;
+    }
+    insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
+    insert_line(term, Line::from(""))?;
+    Ok(())
+}
+
+/// Redraw a session's transcript into scrollback by walking its
+/// entries and dispatching each to `on_agent_event` (assistant text
+/// / tool calls / tool results) or rendering directly (user echo,
+/// compaction markers, branch summaries). Called from
+/// KeyAction::ResumeSession so `/resume` shows the full past
+/// conversation, matching PI's behavior.
+fn replay_history(
+    term: &mut Term,
+    app: &mut App,
+    entries: &[session::SessionEntry],
+) -> Result<()> {
+    // Ensure any live-streaming state is fresh (fenced-block toggle etc).
+    app.md_state = crate::render::markdown::MdState::default();
+    app.stream_buf.clear();
+    app.thinking_buf.clear();
+    app.pending_tool_call = None;
+
+    for entry in entries {
+        match entry {
+            session::SessionEntry::Message { role, content, .. } => match role.as_str() {
+                "user" => render_user_echo(term, content)?,
+                "assistant" => {
+                    // Feed a single big TextDelta so on_agent_event
+                    // splits on newlines + renders through markdown
+                    // exactly like the live streaming path.
+                    let mut text = content.clone();
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    on_agent_event(
+                        term,
+                        app,
+                        AgentEvent::TextDelta { content_index: 0, text },
+                    )?;
+                    // Blank spacer between assistant reply and next turn.
+                    insert_line(term, Line::from(""))?;
+                }
+                _ => {}
+            },
+            session::SessionEntry::ToolCall { id, tool_name, arguments, .. } => {
+                on_agent_event(
+                    term,
+                    app,
+                    AgentEvent::ToolCall {
+                        content_index: 0,
+                        call: crate::event::ToolCall {
+                            id: id.clone(),
+                            name: tool_name.clone(),
+                            arguments: arguments.clone(),
+                        },
+                    },
+                )?;
+            }
+            session::SessionEntry::ToolResult { tool_call_id, content, is_error, .. } => {
+                on_agent_event(
+                    term,
+                    app,
+                    AgentEvent::ToolResult {
+                        call_id: tool_call_id.clone(),
+                        tool_name: String::new(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                        elapsed_ms: 0,
+                    },
+                )?;
+            }
+            session::SessionEntry::Compaction { summary, replaced_count, .. } => {
+                let preview: String = summary
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(80)
+                    .collect();
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("[compaction: {replaced_count} msgs → {preview}]"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+            }
+            session::SessionEntry::BranchSummary { summary, .. } => {
+                let preview: String = summary
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(80)
+                    .collect();
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("[branch summary: {preview}]"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+            }
+            _ => {}
+        }
+    }
+    // Flush any tail assistant text that didn't end on a newline.
+    flush_stream_buf(term, app)?;
     Ok(())
 }
 
