@@ -69,8 +69,16 @@ enum SlashCmd {
     Compact,
     Quit,
     Model,
-    // Future: Login, Settings, Export, Import.
-    //
+    /// Start a fresh session in the same cwd.
+    NewSession,
+    /// Open a picker over recent sessions in this cwd and switch to
+    /// the one selected.
+    Resume,
+    /// Open the same fork/tree picker as Esc-Esc — user-message
+    /// selector with the DFS tree render across the parent chain.
+    ForkOrTree,
+    /// Dump a keybinding cheat-sheet into scrollback.
+    Hotkeys,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -79,7 +87,12 @@ enum SlashCmd {
 fn slash_items() -> Vec<MenuItem<SlashCmd>> {
     vec![
         MenuItem::new("/model",    "Switch to a different model",       SlashCmd::Model),
+        MenuItem::new("/new",      "Start a fresh session in this cwd", SlashCmd::NewSession),
+        MenuItem::new("/resume",   "Open a picker over past sessions",  SlashCmd::Resume),
+        MenuItem::new("/fork",     "Fork at a past user message",       SlashCmd::ForkOrTree),
+        MenuItem::new("/tree",     "Navigate the session tree",         SlashCmd::ForkOrTree),
         MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
+        MenuItem::new("/hotkeys",  "Show all keyboard shortcuts",       SlashCmd::Hotkeys),
         MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
         MenuItem::new("/exit",     "Exit the session",                  SlashCmd::Quit),
     ]
@@ -277,6 +290,9 @@ struct App {
     /// `parent_id` chain, so the user can revive tails that were cut
     /// off by earlier forks.
     fork_picker: Option<MenuState<(PathBuf, usize)>>,
+    /// When Some, the `/resume` picker over past sessions in this
+    /// cwd is open. Payload is the file path of the chosen session.
+    resume_picker: Option<MenuState<PathBuf>>,
     /// After picking a fork target: modal asking whether to summarize
     /// the cut-off branch. Three options match PI's UX:
     /// No summary / Summarize (default prompt) / Summarize with custom
@@ -380,6 +396,7 @@ impl App {
             summarize_task: None,
             thinking: None,
             turn_was_cancelled: false,
+            resume_picker: None,
         }
     }
 }
@@ -462,6 +479,14 @@ enum KeyAction {
     /// the next level to the current Agent.
     CycleThinking,
     ExpandLastTool,
+    /// `/new`: swap the Agent for a fresh session in the same cwd.
+    NewSession,
+    /// `/resume`: open a picker over sessions on disk.
+    OpenResumePicker,
+    /// User picked a session in the resume picker.
+    ResumeSession(PathBuf),
+    /// `/hotkeys`: dump keybinding help into scrollback.
+    ShowHotkeys,
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
     OpenForkPicker,
@@ -508,6 +533,23 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
             MenuAction::Cancel => {
                 app.summary_prompt = None;
                 return KeyAction::CancelPendingFork;
+            }
+            MenuAction::Nothing => return KeyAction::Nothing,
+        }
+    }
+    // ── Resume picker ───────────────────────────────────────────────
+    if app.resume_picker.is_some() {
+        let m = app.resume_picker.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(path) => {
+                app.resume_picker = None;
+                app.input.clear();
+                return KeyAction::ResumeSession(path);
+            }
+            MenuAction::Cancel => {
+                app.resume_picker = None;
+                app.input.clear();
+                return KeyAction::Nothing;
             }
             MenuAction::Nothing => return KeyAction::Nothing,
         }
@@ -690,6 +732,10 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
         SlashCmd::Compact => KeyAction::Compact,
         SlashCmd::Quit => KeyAction::Exit,
         SlashCmd::Model => KeyAction::OpenModelPicker,
+        SlashCmd::NewSession => KeyAction::NewSession,
+        SlashCmd::Resume => KeyAction::OpenResumePicker,
+        SlashCmd::ForkOrTree => KeyAction::OpenForkPicker,
+        SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
     }
 }
 
@@ -975,6 +1021,214 @@ async fn handle_action(
                     ),
                 ]))?;
             }
+        }
+        KeyAction::NewSession => {
+            // Fresh session in the same cwd. Preserves model, api,
+            // hooks, permission from the current agent.
+            let (cwd, model, base_url, api_key, permission, hooks) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => (
+                        a.cwd.clone(),
+                        a.model.clone(),
+                        a.base_url.clone(),
+                        a.api_key.clone(),
+                        a.permission.clone(),
+                        a.hooks.clone(),
+                    ),
+                    None => return Ok(()),
+                }
+            };
+            let (new_path, new_header) =
+                match session::new_session(&cwd, &model, &base_url) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        insert_line(term, Line::from(vec![
+                            Span::styled(
+                                format!("[/new failed: {e}]"),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ]))?;
+                        return Ok(());
+                    }
+                };
+            let _ = session::set_active_session(&cwd, &new_path);
+            let registry = crate::tool::ToolRegistry::standard();
+            let new_agent = Agent {
+                context: Context {
+                    system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
+                    messages: Vec::new(),
+                    tools: registry.all_specs(),
+                    thinking: None,
+                },
+                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model),
+                registry,
+                session_path: new_path,
+                session_id: new_header.id,
+                cwd,
+                permission,
+                hooks,
+                model: model.clone(),
+                base_url,
+                api_key,
+                usage_total: crate::event::Usage::default(),
+                turn_count: 0,
+            };
+            {
+                let mut g = agent_slot.lock().await;
+                *g = Some(new_agent);
+            }
+            app.session_id = new_header.id.to_string();
+            app.usage = crate::event::Usage::default();
+            app.context_chars = 0;
+            app.turn_count = 0;
+            app.input.clear();
+            app.thinking = None;
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[new session {}]", &new_header.id.to_string()[..8]),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
+        }
+        KeyAction::OpenResumePicker => {
+            let (cwd, current_path) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => (a.cwd.clone(), a.session_path.clone()),
+                    None => return Ok(()),
+                }
+            };
+            let items_meta = session::list_sessions_for_cwd(&cwd, Some(&current_path));
+            if items_meta.is_empty() {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        "[no other sessions in this cwd]",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+                return Ok(());
+            }
+            let items: Vec<MenuItem<PathBuf>> = items_meta
+                .into_iter()
+                .map(|s| {
+                    let short = &s.header.id.to_string()[..8];
+                    let preview = if s.preview.is_empty() {
+                        "(no user messages)".to_string()
+                    } else {
+                        s.preview
+                    };
+                    MenuItem::new(
+                        preview,
+                        format!("{} · {}", short, s.header.model),
+                        s.path,
+                    )
+                })
+                .collect();
+            app.resume_picker = Some(MenuState::new(items));
+        }
+        KeyAction::ResumeSession(path) => {
+            // Snapshot the caller's Agent trappings (api/hooks/etc.)
+            // then swap the underlying session by loading `path`.
+            let (cwd, model, base_url, api_key, permission, hooks) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => (
+                        a.cwd.clone(),
+                        a.model.clone(),
+                        a.base_url.clone(),
+                        a.api_key.clone(),
+                        a.permission.clone(),
+                        a.hooks.clone(),
+                    ),
+                    None => return Ok(()),
+                }
+            };
+            let mut new_agent = match Agent::load_session(&path, &cwd) {
+                Ok(a) => a,
+                Err(e) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[/resume load failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                    return Ok(());
+                }
+            };
+            new_agent.provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+            new_agent.model = model.clone();
+            new_agent.base_url = base_url;
+            new_agent.api_key = api_key;
+            new_agent.permission = permission;
+            new_agent.hooks = hooks;
+            new_agent.registry = crate::tool::ToolRegistry::standard();
+            if new_agent.context.system.is_none() {
+                new_agent.context.system = Some(
+                    crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
+                );
+            }
+            new_agent.context.tools = new_agent.registry.all_specs();
+            let new_session_id = new_agent.session_id;
+            let _ = session::set_active_session(&cwd, &path);
+            {
+                let mut g = agent_slot.lock().await;
+                *g = Some(new_agent);
+            }
+            app.session_id = new_session_id.to_string();
+            app.usage = crate::event::Usage::default();
+            app.context_chars = 0;
+            app.turn_count = 0;
+            app.input.clear();
+            app.thinking = None;
+            refresh_status(app, agent_slot).await;
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[resumed session {}]", &new_session_id.to_string()[..8]),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
+        }
+        KeyAction::ShowHotkeys => {
+            let hotkey_lines: &[(&str, &str)] = &[
+                ("Enter",       "submit prompt"),
+                ("Shift+Enter", "insert newline (multi-line input)"),
+                ("Esc",         "interrupt streaming turn / open fork picker on empty (double-tap)"),
+                ("Ctrl+C",      "same as Esc (interrupt / exit on empty)"),
+                ("Ctrl+D",      "delete char forward, or exit when empty"),
+                ("Ctrl+O",      "expand last tool output into scrollback"),
+                ("Ctrl+A / E",  "cursor to line start / end"),
+                ("Ctrl+K / U",  "kill to line end / start"),
+                ("Ctrl+W",      "kill previous word"),
+                ("Ctrl+Y",      "yank last killed text"),
+                ("Ctrl+Z / -",  "undo (fish-style word-coalesced)"),
+                ("Alt+B / F",   "move cursor by word"),
+                ("↑ / ↓",       "prompt history when editor empty"),
+                ("Shift+Tab",   "cycle thinking level (Off → Minimal → … → Max)"),
+                ("/",           "open slash-command palette"),
+            ];
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    "Keyboard shortcuts",
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))?;
+            for (k, desc) in hotkey_lines {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("  {:<15}", k),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
+                ]))?;
+            }
+            insert_line(term, Line::from(""))?;
         }
         KeyAction::OpenForkPicker => {
             // Tree-aware picker: walk the parent_id chain upward from
@@ -1694,9 +1948,11 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         .split(area);
 
     // ── Overlay menus (dropdown). Priority matches interpret_key:
-    // summary > fork > model > slash palette.
+    // summary > resume > fork > model > slash palette.
     if let Some(m) = &app.summary_prompt {
         draw_menu(buf, chunks[0], m, "summarize branch?");
+    } else if let Some(m) = &app.resume_picker {
+        draw_menu(buf, chunks[0], m, "resume session");
     } else if let Some(m) = &app.fork_picker {
         draw_menu(buf, chunks[0], m, "user message");
     } else if let Some(m) = &app.model_picker {

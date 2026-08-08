@@ -463,6 +463,73 @@ fn collapse_ws_truncate(s: &str, max_chars: usize) -> String {
     one_line.chars().take(max_chars).collect()
 }
 
+/// Summary row for the `/resume` picker: a session file with enough
+/// metadata to identify it visually (short id, model, first user
+/// message preview).
+#[derive(Debug, Clone)]
+pub struct SessionListItem {
+    pub path: PathBuf,
+    pub header: SessionHeader,
+    /// First user message content, one-line-collapsed and truncated.
+    /// Empty when the session has no user messages yet.
+    pub preview: String,
+    /// File mtime seconds since epoch (0 if unknown). Used to sort
+    /// newest-first.
+    pub mtime_secs: u64,
+}
+
+/// List every session file that originated in `cwd` (matched by
+/// `SessionHeader.cwd`), newest first by file mtime. Failed
+/// individual reads are silently skipped so a corrupt file doesn't
+/// hide the rest. Excludes `current_path` when Some (so `/resume`
+/// doesn't offer the session you're already in).
+pub fn list_sessions_for_cwd(cwd: &Path, current_path: Option<&Path>) -> Vec<SessionListItem> {
+    let Some(dir) = sessions_dir() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<SessionListItem> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(cur) = current_path {
+            if path == cur {
+                continue;
+            }
+        }
+        let mtime_secs = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let Ok((header, body)) = read_session(&path) else { continue };
+        if header.cwd != cwd {
+            continue;
+        }
+        let preview = body
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Message { role, content, .. } if role == "user" => {
+                    let one_line: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+                    Some(one_line.chars().take(72).collect::<String>())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        out.push(SessionListItem {
+            path,
+            header,
+            preview,
+            mtime_secs,
+        });
+    }
+    // Newest first — matches user expectation for a "recent sessions" list.
+    out.sort_by(|a, b| b.mtime_secs.cmp(&a.mtime_secs));
+    out
+}
+
 /// Walk `parent_id` up from `current` toward the root. Returns
 /// `[(path, header, tree_rows)]` with `current` at index 0 and the
 /// root at the last index. Each session's tree_rows are its
