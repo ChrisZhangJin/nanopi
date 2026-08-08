@@ -2371,9 +2371,42 @@ fn render_tool_card(
     Ok(())
 }
 
-/// Insert one line above the viewport into scrollback.
+/// Insert a line into scrollback above the viewport. Wraps to
+/// multiple rows when the content exceeds the terminal width so long
+/// assistant replies stay visible instead of getting silently
+/// truncated at the right edge (matches PI's wrapping — see
+/// SCR-20260808-sihi.png).
 fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
-    insert_line_bg(term, line, None)
+    // Fast path for empty lines.
+    if line.spans.iter().all(|s| s.content.is_empty()) {
+        return insert_line_bg(term, line, None);
+    }
+    let width = term.size().map(|r| r.width).unwrap_or(80).max(1);
+    // Rough visual-length estimate: char count. Good enough for the
+    // ASCII/CJK mix we ship; unicode-width would be marginally better
+    // but adds a dep for a display fudge.
+    let total_chars: usize = line
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum();
+    let rows_needed = ((total_chars + width as usize - 1) / width as usize).max(1);
+    let rows_needed = rows_needed.min(200); // guard against runaway
+    // ratatui Line borrows its spans; hoist into owned strings so the
+    // FnOnce closure can move them into insert_before.
+    let owned_spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|s| Span::styled(s.content.to_string(), s.style))
+        .collect();
+    term.insert_before(rows_needed as u16, move |buf: &mut Buffer| {
+        // Paragraph does the actual wrapping. `trim: false` preserves
+        // leading whitespace so indented code / markdown stays aligned.
+        let para = Paragraph::new(Line::from(owned_spans))
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        para.render(buf.area, buf);
+    })?;
+    Ok(())
 }
 
 /// Insert one line with an optional full-row background style. If
