@@ -74,9 +74,12 @@ enum SlashCmd {
     /// Open a picker over recent sessions in this cwd and switch to
     /// the one selected.
     Resume,
-    /// Open the same fork/tree picker as Esc-Esc — user-message
-    /// selector with the DFS tree render across the parent chain.
-    ForkOrTree,
+    /// Open the fork picker (same as Esc-Esc) — DFS tree render
+    /// across the parent chain, selecting any entry forks from
+    /// there. PI has a separate `/tree` for tree navigation; we
+    /// collapsed both into `/fork` since our picker already shows
+    /// the full tree with all entry types.
+    Fork,
     /// Dump a keybinding cheat-sheet into scrollback.
     Hotkeys,
     /// Print session stats (tokens, cost, model, turns) to scrollback.
@@ -101,8 +104,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/model",    "Switch to a different model",       SlashCmd::Model),
         MenuItem::new("/new",      "Start a fresh session in this cwd", SlashCmd::NewSession),
         MenuItem::new("/resume",   "Open a picker over past sessions",  SlashCmd::Resume),
-        MenuItem::new("/fork",     "Fork at a past user message",       SlashCmd::ForkOrTree),
-        MenuItem::new("/tree",     "Navigate the session tree",         SlashCmd::ForkOrTree),
+        MenuItem::new("/fork",     "Fork the session at a past turn",   SlashCmd::Fork),
         MenuItem::new("/session",  "Show session stats (tokens, cost)", SlashCmd::SessionInfo),
         MenuItem::new("/name",     "Set the current session's name",    SlashCmd::Name),
         MenuItem::new("/copy",     "Copy last assistant reply",         SlashCmd::Copy),
@@ -805,7 +807,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Model => KeyAction::OpenModelPicker,
         SlashCmd::NewSession => KeyAction::NewSession,
         SlashCmd::Resume => KeyAction::OpenResumePicker,
-        SlashCmd::ForkOrTree => KeyAction::OpenForkPicker,
+        SlashCmd::Fork => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
         // PI's /name: bare shows current, `/name X` sets it. See
