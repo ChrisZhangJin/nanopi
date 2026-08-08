@@ -92,6 +92,7 @@ const DOCK_HEIGHT: u16 = 10; // palette(5) + input(3) + footer(2)
 // ─────────────────────────────────────────────────────────────────────
 
 pub async fn run_tui_mode(
+    api_kind: crate::provider::ApiKind,
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -123,7 +124,7 @@ pub async fn run_tui_mode(
     };
     let _ = session::set_active_session(&cwd, &session_path);
 
-    let provider = OpenAiProvider::new(base_url, api_key, model);
+    let provider = crate::provider::build(api_kind, base_url, api_key, model);
     let registry = ToolRegistry::standard();
     let hooks = match settings::load_settings(&cwd) {
         Ok(h) => h,
@@ -136,7 +137,7 @@ pub async fn run_tui_mode(
     let agent: Agent = if let SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-        a.provider = Box::new(provider);
+        a.provider = provider;
         a.registry = registry;
         a.permission = permission;
         a.hooks = hooks;
@@ -155,7 +156,7 @@ pub async fn run_tui_mode(
                 tools: registry.all_specs(),
                 thinking: None,
             },
-            provider: Box::new(provider),
+            provider,
             registry,
             session_path: session_path.clone(),
             session_id: header.id,
@@ -185,7 +186,7 @@ pub async fn run_tui_mode(
     print_startup_banner(model, &header.id.to_string());
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(header.id.to_string(), model.to_string(), cwd.clone());
+    let mut app = App::new(header.id.to_string(), model.to_string(), cwd.clone(), api_kind);
     let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
     let _ = teardown_terminal(&mut terminal);
 
@@ -302,6 +303,10 @@ struct App {
     model: String,
     should_exit: bool,
     cwd: PathBuf,
+    /// Which wire protocol to build follow-up Providers with — used
+    /// by `/model` swap and fork-agent rebuild so a session that
+    /// started on Anthropic stays on Anthropic.
+    api_kind: crate::provider::ApiKind,
     usage: crate::event::Usage,
     context_chars: usize,
     turn_count: u32,
@@ -345,7 +350,7 @@ struct App {
 }
 
 impl App {
-    fn new(session_id: String, model: String, cwd: PathBuf) -> Self {
+    fn new(session_id: String, model: String, cwd: PathBuf, api_kind: crate::provider::ApiKind) -> Self {
         Self {
             input: TextBuffer::new(),
             palette: None,
@@ -355,6 +360,7 @@ impl App {
             model,
             should_exit: false,
             cwd,
+            api_kind,
             usage: crate::event::Usage::default(),
             context_chars: 0,
             turn_count: 0,
@@ -953,12 +959,13 @@ async fn handle_action(
         KeyAction::SwapModel(new_model) => {
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
-                let new_provider = crate::provider::openai::OpenAiProvider::new(
+                let new_provider = crate::provider::build(
+                    app.api_kind,
                     &a.base_url,
                     &a.api_key,
                     &new_model,
                 );
-                a.provider = Box::new(new_provider);
+                a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();
                 insert_line(term, Line::from(vec![
@@ -1276,9 +1283,7 @@ async fn execute_fork(
             return Ok(());
         }
     };
-    new_agent.provider = Box::new(crate::provider::openai::OpenAiProvider::new(
-        &base_url, &api_key, &model,
-    ));
+    new_agent.provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
     new_agent.model = model.clone();
     new_agent.base_url = base_url;
     new_agent.api_key = api_key;
@@ -1341,14 +1346,13 @@ async fn spawn_summarize_task(
             None => return,
         }
     };
-    let provider =
-        crate::provider::openai::OpenAiProvider::new(&base_url, &api_key, &model);
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
     let cut_off = pending.cut_off.clone();
     let task = tokio::spawn(async move {
         let summary = crate::agent::branch_summary::summarize_branch(
             &cut_off,
             custom.as_deref(),
-            &provider,
+            provider.as_ref(),
         )
         .await;
         SummarizeOutcome::Ok { summary, fork: pending }
@@ -2096,7 +2100,12 @@ mod tests {
     use super::*;
 
     fn mkapp() -> App {
-        App::new("s".into(), "m".into(), std::path::PathBuf::from("/tmp"))
+        App::new(
+            "s".into(),
+            "m".into(),
+            std::path::PathBuf::from("/tmp"),
+            crate::provider::ApiKind::Openai,
+        )
     }
 
     fn seed_input(app: &mut App, text: &str) {

@@ -21,6 +21,7 @@ use crate::settings;
 use crate::tool::ToolRegistry;
 
 pub async fn run_interactive_mode(
+    api_kind: crate::provider::ApiKind,
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -56,7 +57,7 @@ pub async fn run_interactive_mode(
     // Remember this cwd's active session for next --continue.
     let _ = session::set_active_session(&cwd, &session_path);
 
-    let provider = OpenAiProvider::new(base_url, api_key, model);
+    let provider = crate::provider::build(api_kind, base_url, api_key, model);
     let registry = ToolRegistry::standard();
 
     let hooks = match settings::load_settings(&cwd) {
@@ -73,7 +74,7 @@ pub async fn run_interactive_mode(
         if let SessionChoice::Resume(_) = &choice {
             let mut a = Agent::load_session(&session_path, &cwd)
                 .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-            a.provider = Box::new(provider);
+            a.provider = provider;
             a.registry = registry;
             a.permission = permission_for_resume;
             a.hooks = hooks;
@@ -92,7 +93,7 @@ pub async fn run_interactive_mode(
                     tools: registry.all_specs(),
                     thinking: None,
                 },
-                provider: Box::new(provider),
+                provider,
                 registry,
                 session_path: session_path.clone(),
                 session_id: header.id,

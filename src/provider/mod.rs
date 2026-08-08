@@ -1,6 +1,70 @@
-//! LLM provider adapters (OpenAI-compatible first; Anthropic in v0.6).
+//! LLM provider adapters — OpenAI-compatible + Anthropic-native.
 
 pub mod anthropic;
 pub mod openai;
 pub mod retry;
 pub mod sse;
+
+use crate::agent::loop_::Provider;
+
+/// Wire-protocol kind. Determines which Provider impl talks to
+/// `base_url`. Parsed from `api_kind` in config / `--api-kind` CLI
+/// flag; unrecognized inputs collapse to `Openai` (the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKind {
+    /// OpenAI's chat/completions API — endpoint suffix
+    /// `/chat/completions`, works for OpenAI itself plus every
+    /// gateway (oneapi, newapi, litellm, DeepSeek, Groq, …) that
+    /// exposes the OpenAI-compat surface.
+    Openai,
+    /// Anthropic's native messages API — endpoint suffix
+    /// `/v1/messages`. Use for Anthropic direct or a proxy that
+    /// speaks the Anthropic protocol natively.
+    Anthropic,
+}
+
+impl ApiKind {
+    /// Best-effort parse from a config string. `None` and unknown
+    /// values → `Openai` so an empty config stays working.
+    pub fn from_config(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("anthropic") | Some("claude") => ApiKind::Anthropic,
+            _ => ApiKind::Openai,
+        }
+    }
+}
+
+/// Build a Provider trait object for the given wire kind. Callers
+/// hand the returned Box straight to Agent.provider.
+pub fn build(
+    kind: ApiKind,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Box<dyn Provider> {
+    match kind {
+        ApiKind::Openai => Box::new(openai::OpenAiProvider::new(base_url, api_key, model)),
+        ApiKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(base_url, api_key, model)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_kind_parse_defaults_to_openai() {
+        assert_eq!(ApiKind::from_config(None), ApiKind::Openai);
+        assert_eq!(ApiKind::from_config(Some("")), ApiKind::Openai);
+        assert_eq!(ApiKind::from_config(Some("nonsense")), ApiKind::Openai);
+        assert_eq!(ApiKind::from_config(Some("openai")), ApiKind::Openai);
+        assert_eq!(ApiKind::from_config(Some("OPENAI")), ApiKind::Openai);
+    }
+
+    #[test]
+    fn api_kind_parse_recognizes_anthropic() {
+        assert_eq!(ApiKind::from_config(Some("anthropic")), ApiKind::Anthropic);
+        assert_eq!(ApiKind::from_config(Some("Anthropic")), ApiKind::Anthropic);
+        assert_eq!(ApiKind::from_config(Some("claude")), ApiKind::Anthropic);
+    }
+}

@@ -48,6 +48,17 @@ pub struct Config {
     /// at load time so the user notices before committing.
     pub api_key: Option<String>,
 
+    /// Which wire protocol to speak to `base_url`. Valid values are
+    /// `"openai"` (default — most gateways: oneapi, newapi, litellm,
+    /// OpenAI itself, DeepSeek, Groq via OpenAI-compat) and
+    /// `"anthropic"` (talk to `/v1/messages` in Anthropic's native
+    /// format — Anthropic direct, or a proxy that exposes the
+    /// Anthropic API).
+    ///
+    /// Unrecognized values fall back to `"openai"`. The `--api-kind`
+    /// CLI flag overrides this per-invocation.
+    pub api_kind: Option<String>,
+
     /// Tool whitelist. Empty/absent = all standard tools.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -87,6 +98,7 @@ impl Config {
             base_url: None,
             api_key_file: None,
             api_key: None,
+            api_kind: None,
             tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
@@ -164,6 +176,7 @@ fn merge(a: Config, b: Config) -> Config {
         base_url: b.base_url.or(a.base_url),
         api_key_file: b.api_key_file.or(a.api_key_file),
         api_key: b.api_key.or(a.api_key),
+        api_kind: b.api_kind.or(a.api_kind),
         tools,
         trust: TrustConfig {
             default: b.trust.default.or(a.trust.default),
@@ -296,6 +309,7 @@ base_url = "https://project.example/v1"
             base_url: None,
             api_key_file: Some("/tmp/key".into()),
             api_key: None,
+            api_kind: None,
             tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
@@ -306,6 +320,7 @@ base_url = "https://project.example/v1"
             base_url: Some("https://b".into()),
             api_key_file: None,
             api_key: None,
+            api_kind: None,
             tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),

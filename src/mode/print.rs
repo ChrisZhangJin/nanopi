@@ -40,6 +40,7 @@ pub struct JsonEnvelope {
 }
 
 pub async fn run_print_mode(
+    api_kind: crate::provider::ApiKind,
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -81,7 +82,7 @@ let (session_path, header) = match &choice {
     let _ = session::set_active_session(&cwd, &session_path);
 
     // Build the agent.
-    let provider = OpenAiProvider::new(base_url, api_key, model);
+    let provider = crate::provider::build(api_kind, base_url, api_key, model);
     let permission = PermissionGate::from_cli(yolo, no_hooks, approve);
 
     // For v0.5: no hooks loaded yet (settings.toml loader is a separate
@@ -102,7 +103,7 @@ let (session_path, header) = match &choice {
     let mut agent = if let session::SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-        a.provider = Box::new(provider);
+        a.provider = provider;
         a.registry = registry;
         a.permission = permission_for_resume;
         a.hooks = hooks;
@@ -121,7 +122,7 @@ let (session_path, header) = match &choice {
                 tools: registry.all_specs(),
                 thinking: None,
             },
-            provider: Box::new(provider),
+            provider,
             registry,
             session_path: session_path.clone(),
             session_id: header.id,

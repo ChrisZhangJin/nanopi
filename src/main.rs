@@ -9,6 +9,7 @@ use clap::Parser;
 
 use nanopi::config;
 use nanopi::mode::{interactive, print, tui};
+use nanopi::provider;
 
 /// Minimal CLI — covers the v0.5 acceptance criteria.
 #[derive(Parser, Debug)]
@@ -90,6 +91,13 @@ struct Args {
     /// Tool whitelist (comma-separated names). Default: all standard tools.
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
+
+    /// Which wire protocol to use against `base_url`. Overrides
+    /// `api_kind` in config.toml. `openai` (default) talks to
+    /// `/chat/completions`; `anthropic` talks to `/v1/messages`.
+    /// Accepts `openai` or `anthropic` (aliases: `claude`).
+    #[arg(long = "api-kind", value_name = "KIND")]
+    api_kind: Option<String>,
 }
 
 #[tokio::main]
@@ -193,6 +201,16 @@ async fn main() -> ExitCode {
         print::OutputFormat::Text
     };
 
+    // Resolve wire-protocol kind: CLI --api-kind overrides config's
+    // api_kind, which itself defaults to "openai". Announce the choice
+    // once at startup so users don't have to guess.
+    let api_kind = provider::ApiKind::from_config(
+        args.api_kind.as_deref().or(cfg.api_kind.as_deref()),
+    );
+    if matches!(api_kind, provider::ApiKind::Anthropic) {
+        eprintln!("• api_kind = anthropic — talking to {base_url}/v1/messages");
+    }
+
     let result = if args.print {
         let message = args.message.as_deref().or(args.positional_message.as_deref());
         let message = match message {
@@ -203,6 +221,7 @@ async fn main() -> ExitCode {
             }
         };
         print::run_print_mode(
+            api_kind,
             &base_url,
             &model,
             &api_key,
@@ -219,6 +238,7 @@ async fn main() -> ExitCode {
         .await
     } else if should_use_tui(&args) {
         tui::run_tui_mode(
+            api_kind,
             &base_url,
             &model,
             &api_key,
@@ -234,6 +254,7 @@ async fn main() -> ExitCode {
     } else {
         let message = args.message.clone().or(args.positional_message.clone());
         interactive::run_interactive_mode(
+            api_kind,
             &base_url,
             &model,
             &api_key,
