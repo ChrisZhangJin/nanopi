@@ -428,8 +428,6 @@ enum CaptureMode {
     /// After picking "Summarize with custom prompt" on the fork
     /// summary modal — text becomes the summarizer's system prompt.
     CustomSummary,
-    /// After `/name` — text becomes the session name.
-    SessionName,
     /// After `/export` — text is the destination path for the JSONL
     /// dump.
     ExportPath,
@@ -525,9 +523,9 @@ enum KeyAction {
     ShowHotkeys,
     /// `/session`: dump usage / cost / model summary into scrollback.
     ShowSessionInfo,
-    /// `/name`: enter capture mode; next Enter renames the session.
-    OpenNameCapture,
-    /// The user typed a session name in capture mode; apply it.
+    /// Bare `/name` — print the session's current name to scrollback.
+    ShowCurrentName,
+    /// `/name X` — set the session name to `X` on the header.
     ApplyName(String),
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
@@ -696,9 +694,22 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
             let m = app.palette.as_mut().unwrap();
             match m.handle_key(k) {
                 MenuAction::Chosen(cmd) => {
+                    // Split off any inline argument the user typed
+                    // after the command, e.g. "/name my-experiment".
+                    // dispatch_slash gets to see it so commands like
+                    // /name can act immediately without a capture
+                    // step (PI parity, see interactive-mode.ts:5701).
+                    let full = app.input.as_string();
+                    let arg = full
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_once(' ')
+                        .map(|(_, rest)| rest.trim().to_string())
+                        .unwrap_or_default();
                     app.palette = None;
                     app.input.clear();
-                    return dispatch_slash(cmd);
+                    return dispatch_slash(cmd, arg);
                 }
                 MenuAction::Cancel => {
                     app.palette = None;
@@ -732,7 +743,6 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         TbAction::Submit(text) => {
             let mode = std::mem::replace(&mut app.capture, CaptureMode::None);
             match mode {
-                CaptureMode::SessionName => KeyAction::ApplyName(text.trim().to_string()),
                 CaptureMode::ExportPath => KeyAction::ApplyExport(text.trim().to_string()),
                 CaptureMode::ImportPath => KeyAction::ApplyImport(text.trim().to_string()),
                 CaptureMode::CustomSummary => {
@@ -789,7 +799,7 @@ fn sync_palette(app: &mut App) {
     }
 }
 
-fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
+fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
     match cmd {
         SlashCmd::Compact => KeyAction::Compact,
         SlashCmd::Quit => KeyAction::Exit,
@@ -799,10 +809,33 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
         SlashCmd::ForkOrTree => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
-        SlashCmd::Name => KeyAction::OpenNameCapture,
+        // PI's /name: bare shows current, `/name X` sets it. See
+        // packages/coding-agent/src/modes/interactive/interactive-
+        // mode.ts:5699-5721.
+        SlashCmd::Name => {
+            if arg.is_empty() {
+                KeyAction::ShowCurrentName
+            } else {
+                KeyAction::ApplyName(arg)
+            }
+        }
         SlashCmd::Copy => KeyAction::CopyLastReply,
-        SlashCmd::Export => KeyAction::OpenExportCapture,
-        SlashCmd::Import => KeyAction::OpenImportCapture,
+        // `/export <path>` writes immediately; `/export` alone
+        // captures the path via the input box.
+        SlashCmd::Export => {
+            if arg.is_empty() {
+                KeyAction::OpenExportCapture
+            } else {
+                KeyAction::ApplyExport(arg)
+            }
+        }
+        SlashCmd::Import => {
+            if arg.is_empty() {
+                KeyAction::OpenImportCapture
+            } else {
+                KeyAction::ApplyImport(arg)
+            }
+        }
     }
 }
 
@@ -1151,12 +1184,25 @@ async fn handle_action(
             app.turn_count = 0;
             app.input.clear();
             app.thinking = None;
+            // Also wipe the visible scrollback + terminal history so
+            // the fresh session opens on a blank canvas, matching PI's
+            // "clear conversation" UX (see interactive-mode.ts:5938).
+            // Emitted as raw ANSI: ESC[3J purges scrollback, ESC[2J
+            // clears the screen, ESC[H homes cursor. ratatui will
+            // re-draw the dock on the next tick.
+            use std::io::Write;
+            let _ = write!(std::io::stdout(), "\x1b[3J\x1b[2J\x1b[H");
+            let _ = std::io::stdout().flush();
+            let _ = term.clear();
             insert_line(term, Line::from(vec![
                 Span::styled(
-                    format!("[new session {}]", &new_header.id.to_string()[..8]),
+                    format!(
+                        "✓ New session started ({})",
+                        &new_header.id.to_string()[..8]
+                    ),
                     Style::default()
                         .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]))?;
         }
@@ -1321,7 +1367,7 @@ async fn handle_action(
             insert_line(term, row("context", &format!("{ctx_pct} ({ctx_chars} chars)")))?;
             insert_line(term, Line::from(""))?;
         }
-        KeyAction::OpenNameCapture => {
+        KeyAction::ShowCurrentName => {
             let current_name = {
                 let g = agent_slot.lock().await;
                 g.as_ref().and_then(|a| {
@@ -1330,16 +1376,17 @@ async fn handle_action(
                         .and_then(|(h, _)| h.name)
                 })
             };
-            if let Some(n) = &current_name {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
-                        format!("[current name: {n} — type a new one and Enter, or Enter with empty to clear]"),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
-            }
-            app.capture = CaptureMode::SessionName;
-            app.status_note = Some("session name — Enter to save".into());
+            let label = current_name.as_deref().unwrap_or("(unnamed)");
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[session name: {label}]"),
+                    Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled(
+                    "  (run `/name <text>` to rename)".to_string(),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
         }
         KeyAction::ApplyName(new_name) => {
             app.status_note = None;
