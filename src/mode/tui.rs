@@ -428,11 +428,6 @@ enum CaptureMode {
     /// After picking "Summarize with custom prompt" on the fork
     /// summary modal — text becomes the summarizer's system prompt.
     CustomSummary,
-    /// After `/export` — text is the destination path for the JSONL
-    /// dump.
-    ExportPath,
-    /// After `/import` — text is the source path of a JSONL to load.
-    ImportPath,
 }
 
 /// Three options in the post-fork "Summarize branch?" modal — mirrors
@@ -529,16 +524,12 @@ enum KeyAction {
     ApplyName(String),
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
-    /// `/export`: enter capture mode, next Enter writes a copy of
-    /// the current session JSONL to the typed path (default:
-    /// ./nanopi-session-<8chars>.jsonl in cwd).
-    OpenExportCapture,
-    /// User typed a path for /export.
+    /// `/export [path]` — write the current session to a file.
+    /// Empty path auto-generates `./nanopi-session-<ts>_<8>.html`.
+    /// `.jsonl` extension picks JSONL, everything else defaults to HTML.
     ApplyExport(String),
-    /// `/import`: enter capture mode, next Enter loads a JSONL at
-    /// the typed path as a new session (adopted as active).
-    OpenImportCapture,
-    /// User typed a path for /import.
+    /// `/import <path>` — load a JSONL and switch to it. Bare
+    /// `/import` (empty) prints a usage warning.
     ApplyImport(String),
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
@@ -743,8 +734,6 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         TbAction::Submit(text) => {
             let mode = std::mem::replace(&mut app.capture, CaptureMode::None);
             match mode {
-                CaptureMode::ExportPath => KeyAction::ApplyExport(text.trim().to_string()),
-                CaptureMode::ImportPath => KeyAction::ApplyImport(text.trim().to_string()),
                 CaptureMode::CustomSummary => {
                     let t = text.trim().to_string();
                     if t.is_empty() {
@@ -830,22 +819,14 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             }
         }
         SlashCmd::Copy => KeyAction::CopyLastReply,
-        // `/export <path>` writes immediately; `/export` alone
-        // captures the path via the input box.
-        SlashCmd::Export => {
-            if arg.is_empty() {
-                KeyAction::OpenExportCapture
-            } else {
-                KeyAction::ApplyExport(arg)
-            }
-        }
-        SlashCmd::Import => {
-            if arg.is_empty() {
-                KeyAction::OpenImportCapture
-            } else {
-                KeyAction::ApplyImport(arg)
-            }
-        }
+        // PI's /export (interactive-mode.ts:5501-5544):
+        //   * bare `/export` → HTML file in cwd, auto-named
+        //   * `/export <path.html>` → HTML at that path
+        //   * `/export <path.jsonl>` → JSONL at that path
+        //   * `/export <path>` no extension → HTML at path.html
+        SlashCmd::Export => KeyAction::ApplyExport(arg),
+        // /import always inline; PI errors on bare /import.
+        SlashCmd::Import => KeyAction::ApplyImport(arg),
     }
 }
 
@@ -1505,26 +1486,7 @@ async fn handle_action(
                 }
             }
         }
-        KeyAction::OpenExportCapture => {
-            let default_hint = {
-                let g = agent_slot.lock().await;
-                g.as_ref().map(|a| {
-                    let short = &a.session_id.to_string()[..8];
-                    format!("./nanopi-session-{short}.jsonl")
-                })
-            };
-            let hint = default_hint.as_deref().unwrap_or("./nanopi-session.jsonl");
-            insert_line(term, Line::from(vec![
-                Span::styled(
-                    format!("[/export path — Enter with empty defaults to {hint}]"),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
-            app.capture = CaptureMode::ExportPath;
-            app.status_note = Some("export path — Enter".into());
-        }
         KeyAction::ApplyExport(typed_path) => {
-            app.status_note = None;
             let (session_path, session_id, cwd) = {
                 let g = agent_slot.lock().await;
                 match g.as_ref() {
@@ -1536,19 +1498,68 @@ async fn handle_action(
                     None => return Ok(()),
                 }
             };
+            // Resolve final target path + format. PI's naming shape:
+            // `pi-session-<ISO>_<uuid>.html`; nanopi uses the same
+            // ISO-plus-shortid layout but `nanopi-` prefixed.
+            let short = &session_id.to_string()[..8];
             let target: PathBuf = if typed_path.is_empty() {
-                let short = &session_id.to_string()[..8];
-                cwd.join(format!("nanopi-session-{short}.jsonl"))
+                // ISO timestamp, filename-safe (colons → dashes).
+                let ts = crate::util::time::now_iso8601().replace(':', "-");
+                cwd.join(format!("nanopi-session-{ts}_{short}.html"))
             } else {
-                let p = std::path::PathBuf::from(&typed_path);
-                if p.is_absolute() { p } else { cwd.join(p) }
+                let mut p = std::path::PathBuf::from(&typed_path);
+                if p.is_absolute() { p.clone() } else { p = cwd.join(&p); p }
             };
-            match std::fs::copy(&session_path, &target) {
+            // Extension → format. .jsonl = raw session dump; anything
+            // else (including no extension) = HTML (matches PI's default).
+            let is_jsonl = target
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("jsonl"))
+                .unwrap_or(false);
+            let effective_target: PathBuf = if is_jsonl {
+                target
+            } else if target.extension().is_none() {
+                // No extension → default to .html so the browser opens it.
+                let mut t = target.clone();
+                t.set_extension("html");
+                t
+            } else {
+                target
+            };
+            let result: std::io::Result<u64> = if is_jsonl {
+                // JSONL export = plain file copy of the on-disk session.
+                std::fs::copy(&session_path, &effective_target)
+            } else {
+                // HTML export = render header + entries with the export
+                // template, then write.
+                match session::read_session(&session_path) {
+                    Ok((hdr, entries)) => {
+                        let html = crate::render::export_html::build(&hdr, &entries);
+                        std::fs::write(&effective_target, &html)
+                            .map(|_| html.len() as u64)
+                    }
+                    Err(e) => {
+                        insert_line(term, Line::from(vec![
+                            Span::styled(
+                                format!("[/export read failed: {e}]"),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ]))?;
+                        return Ok(());
+                    }
+                }
+            };
+            match result {
                 Ok(bytes) => {
                     insert_line(term, Line::from(vec![
                         Span::styled(
-                            format!("[/export → {} ({} bytes)]", target.display(), bytes),
-                            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                            format!(
+                                "Session exported to: {} ({} bytes)",
+                                effective_target.display(),
+                                bytes
+                            ),
+                            Style::default().fg(Color::Indexed(108)),
                         ),
                     ]))?;
                 }
@@ -1562,23 +1573,12 @@ async fn handle_action(
                 }
             }
         }
-        KeyAction::OpenImportCapture => {
-            insert_line(term, Line::from(vec![
-                Span::styled(
-                    "[/import: type path to a session JSONL, then Enter]",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
-            app.capture = CaptureMode::ImportPath;
-            app.status_note = Some("import path — Enter".into());
-        }
         KeyAction::ApplyImport(typed_path) => {
-            app.status_note = None;
             if typed_path.is_empty() {
                 insert_line(term, Line::from(vec![
                     Span::styled(
-                        "[/import cancelled — no path]",
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        "Warning: Usage: /import <path.jsonl>",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
                 ]))?;
                 return Ok(());

@@ -5,6 +5,7 @@
 //! is a v0.6+ concern.
 
 pub mod alt_screen;
+pub mod export_html;
 pub mod markdown;
 pub mod menu;
 pub mod panel;
