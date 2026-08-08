@@ -85,6 +85,12 @@ enum SlashCmd {
     Name,
     /// Copy the last assistant message to the OS clipboard via OSC 52.
     Copy,
+    /// Enter capture mode; next Enter writes a JSONL copy of the
+    /// current session to the typed path.
+    Export,
+    /// Enter capture mode; next Enter loads a JSONL from the typed
+    /// path as a new session and switches to it.
+    Import,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -100,6 +106,8 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/session",  "Show session stats (tokens, cost)", SlashCmd::SessionInfo),
         MenuItem::new("/name",     "Set the current session's name",    SlashCmd::Name),
         MenuItem::new("/copy",     "Copy last assistant reply",         SlashCmd::Copy),
+        MenuItem::new("/export",   "Export current session to JSONL",   SlashCmd::Export),
+        MenuItem::new("/import",   "Import a session from JSONL",       SlashCmd::Import),
         MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
         MenuItem::new("/hotkeys",  "Show all keyboard shortcuts",       SlashCmd::Hotkeys),
         MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
@@ -311,13 +319,10 @@ struct App {
     /// Carries the fork target and the cut-off entries so the summary
     /// LLM call doesn't need to re-read the session file.
     pending_fork: Option<PendingFork>,
-    /// True after user picks "Summarize with custom prompt" — the next
-    /// Enter on the input box will submit the typed text as the
-    /// custom summarize instructions, not as a chat turn.
-    capture_custom_prompt: bool,
-    /// True after `/name` — next Enter renames the session to the
-    /// typed text (empty text clears the name).
-    capture_name: bool,
+    /// What the next Enter submit should do — chat turn, or
+    /// consumed by a slash-command capture flow (`/name` /
+    /// summarize-custom / `/export` / `/import`).
+    capture: CaptureMode,
     /// While a branch summary is being generated, hold the join handle
     /// so the main loop can poll for completion via `is_finished`.
     summarize_task: Option<tokio::task::JoinHandle<SummarizeOutcome>>,
@@ -404,14 +409,32 @@ impl App {
             last_esc_at: None,
             summary_prompt: None,
             pending_fork: None,
-            capture_custom_prompt: false,
             summarize_task: None,
             thinking: None,
             turn_was_cancelled: false,
             resume_picker: None,
-            capture_name: false,
+            capture: CaptureMode::None,
         }
     }
+}
+
+/// What the input box should do with the next Enter submit besides
+/// starting a chat turn. Each slash command that needs free-form text
+/// input flips this into its dedicated mode; the Submit path checks
+/// this flag before falling through to StartTurn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CaptureMode {
+    None,
+    /// After picking "Summarize with custom prompt" on the fork
+    /// summary modal — text becomes the summarizer's system prompt.
+    CustomSummary,
+    /// After `/name` — text becomes the session name.
+    SessionName,
+    /// After `/export` — text is the destination path for the JSONL
+    /// dump.
+    ExportPath,
+    /// After `/import` — text is the source path of a JSONL to load.
+    ImportPath,
 }
 
 /// Three options in the post-fork "Summarize branch?" modal — mirrors
@@ -508,6 +531,17 @@ enum KeyAction {
     ApplyName(String),
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
+    /// `/export`: enter capture mode, next Enter writes a copy of
+    /// the current session JSONL to the typed path (default:
+    /// ./nanopi-session-<8chars>.jsonl in cwd).
+    OpenExportCapture,
+    /// User typed a path for /export.
+    ApplyExport(String),
+    /// `/import`: enter capture mode, next Enter loads a JSONL at
+    /// the typed path as a new session (adopted as active).
+    OpenImportCapture,
+    /// User typed a path for /import.
+    ApplyImport(String),
     /// User double-tapped Esc on an empty editor — build the
     /// user-message picker from the current session.
     OpenForkPicker,
@@ -696,41 +730,45 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         }
         TbAction::Exit => KeyAction::Exit,
         TbAction::Submit(text) => {
-            if app.capture_name {
-                app.capture_name = false;
-                KeyAction::ApplyName(text.trim().to_string())
-            } else if app.capture_custom_prompt {
-                // We're in "type your custom summarize prompt" mode.
-                // Anything the user submits goes to the summarizer,
-                // NOT to the model as a chat turn. Empty text falls
-                // back to the default prompt (same as picking
-                // "Summarize" instead of "Custom").
-                app.capture_custom_prompt = false;
-                let t = text.trim().to_string();
-                if t.is_empty() {
-                    KeyAction::SummaryChosen(SummaryChoice::DefaultSummary)
-                } else {
-                    KeyAction::RunCustomSummary(t)
+            let mode = std::mem::replace(&mut app.capture, CaptureMode::None);
+            match mode {
+                CaptureMode::SessionName => KeyAction::ApplyName(text.trim().to_string()),
+                CaptureMode::ExportPath => KeyAction::ApplyExport(text.trim().to_string()),
+                CaptureMode::ImportPath => KeyAction::ApplyImport(text.trim().to_string()),
+                CaptureMode::CustomSummary => {
+                    let t = text.trim().to_string();
+                    if t.is_empty() {
+                        KeyAction::SummaryChosen(SummaryChoice::DefaultSummary)
+                    } else {
+                        KeyAction::RunCustomSummary(t)
+                    }
                 }
-            } else if app.status == Status::Streaming {
-                // Ignore submits mid-turn.
-                KeyAction::Nothing
-            } else {
-                let t = text.trim();
-                if t.is_empty() {
-                    KeyAction::Nothing
-                } else if t == "/quit" || t == "/exit" {
-                    KeyAction::Exit
-                } else if t == "/compact" {
-                    KeyAction::Compact
-                } else {
-                    KeyAction::StartTurn(t.to_string())
-                }
+                CaptureMode::None => submit_or_chat(app, text),
             }
         }
     };
     sync_palette(app);
     out
+}
+
+/// Interpret a bare Enter submit (no capture mode active) as either
+/// exit, compact, or a chat turn. Extracted so the Submit path in
+/// interpret_key stays readable now that capture modes have their
+/// own branches.
+fn submit_or_chat(app: &App, text: String) -> KeyAction {
+    if app.status == Status::Streaming {
+        return KeyAction::Nothing;
+    }
+    let t = text.trim();
+    if t.is_empty() {
+        KeyAction::Nothing
+    } else if t == "/quit" || t == "/exit" {
+        KeyAction::Exit
+    } else if t == "/compact" {
+        KeyAction::Compact
+    } else {
+        KeyAction::StartTurn(t.to_string())
+    }
 }
 
 /// Sync palette state with the input buffer: open if first line
@@ -763,6 +801,8 @@ fn dispatch_slash(cmd: SlashCmd) -> KeyAction {
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
         SlashCmd::Name => KeyAction::OpenNameCapture,
         SlashCmd::Copy => KeyAction::CopyLastReply,
+        SlashCmd::Export => KeyAction::OpenExportCapture,
+        SlashCmd::Import => KeyAction::OpenImportCapture,
     }
 }
 
@@ -1298,7 +1338,7 @@ async fn handle_action(
                     ),
                 ]))?;
             }
-            app.capture_name = true;
+            app.capture = CaptureMode::SessionName;
             app.status_note = Some("session name — Enter to save".into());
         }
         KeyAction::ApplyName(new_name) => {
@@ -1392,6 +1432,180 @@ async fn handle_action(
                     ]))?;
                 }
             }
+        }
+        KeyAction::OpenExportCapture => {
+            let default_hint = {
+                let g = agent_slot.lock().await;
+                g.as_ref().map(|a| {
+                    let short = &a.session_id.to_string()[..8];
+                    format!("./nanopi-session-{short}.jsonl")
+                })
+            };
+            let hint = default_hint.as_deref().unwrap_or("./nanopi-session.jsonl");
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!("[/export path — Enter with empty defaults to {hint}]"),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
+            app.capture = CaptureMode::ExportPath;
+            app.status_note = Some("export path — Enter".into());
+        }
+        KeyAction::ApplyExport(typed_path) => {
+            app.status_note = None;
+            let (session_path, session_id, cwd) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => (
+                        a.session_path.clone(),
+                        a.session_id,
+                        a.cwd.clone(),
+                    ),
+                    None => return Ok(()),
+                }
+            };
+            let target: PathBuf = if typed_path.is_empty() {
+                let short = &session_id.to_string()[..8];
+                cwd.join(format!("nanopi-session-{short}.jsonl"))
+            } else {
+                let p = std::path::PathBuf::from(&typed_path);
+                if p.is_absolute() { p } else { cwd.join(p) }
+            };
+            match std::fs::copy(&session_path, &target) {
+                Ok(bytes) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[/export → {} ({} bytes)]", target.display(), bytes),
+                            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]))?;
+                }
+                Err(e) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[/export failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                }
+            }
+        }
+        KeyAction::OpenImportCapture => {
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    "[/import: type path to a session JSONL, then Enter]",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
+            app.capture = CaptureMode::ImportPath;
+            app.status_note = Some("import path — Enter".into());
+        }
+        KeyAction::ApplyImport(typed_path) => {
+            app.status_note = None;
+            if typed_path.is_empty() {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        "[/import cancelled — no path]",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ),
+                ]))?;
+                return Ok(());
+            }
+            let (cwd, model, base_url, api_key, permission, hooks) = {
+                let g = agent_slot.lock().await;
+                match g.as_ref() {
+                    Some(a) => (
+                        a.cwd.clone(),
+                        a.model.clone(),
+                        a.base_url.clone(),
+                        a.api_key.clone(),
+                        a.permission.clone(),
+                        a.hooks.clone(),
+                    ),
+                    None => return Ok(()),
+                }
+            };
+            let source: PathBuf = {
+                let p = PathBuf::from(&typed_path);
+                if p.is_absolute() { p } else { cwd.join(p) }
+            };
+            // Copy the source into sessions_dir so it participates in
+            // /resume + --continue like every other session.
+            let dest = match session::sessions_dir() {
+                Some(dir) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let new_id = crate::util::uuid::v7();
+                    dir.join(format!("{new_id}.jsonl"))
+                }
+                None => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            "[/import: cannot locate sessions dir]",
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                    return Ok(());
+                }
+            };
+            if let Err(e) = std::fs::copy(&source, &dest) {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("[/import copy failed: {e}]"),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]))?;
+                return Ok(());
+            }
+            // Validate we can load it as a session.
+            let mut new_agent = match Agent::load_session(&dest, &cwd) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&dest);
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("[/import load failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                    return Ok(());
+                }
+            };
+            new_agent.provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+            new_agent.model = model.clone();
+            new_agent.base_url = base_url;
+            new_agent.api_key = api_key;
+            new_agent.permission = permission;
+            new_agent.hooks = hooks;
+            new_agent.registry = crate::tool::ToolRegistry::standard();
+            if new_agent.context.system.is_none() {
+                new_agent.context.system = Some(
+                    crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
+                );
+            }
+            new_agent.context.tools = new_agent.registry.all_specs();
+            let new_session_id = new_agent.session_id;
+            let _ = session::set_active_session(&cwd, &dest);
+            {
+                let mut g = agent_slot.lock().await;
+                *g = Some(new_agent);
+            }
+            app.session_id = new_session_id.to_string();
+            app.usage = crate::event::Usage::default();
+            app.context_chars = 0;
+            app.turn_count = 0;
+            app.input.clear();
+            app.thinking = None;
+            refresh_status(app, agent_slot).await;
+            insert_line(term, Line::from(vec![
+                Span::styled(
+                    format!(
+                        "[imported → new session {} (from {})]",
+                        &new_session_id.to_string()[..8],
+                        source.display(),
+                    ),
+                    Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+                ),
+            ]))?;
         }
         KeyAction::ShowHotkeys => {
             let hotkey_lines: &[(&str, &str)] = &[
@@ -1561,7 +1775,7 @@ async fn handle_action(
                     // Stash again; wait for the next TextBuffer Submit
                     // to arrive as RunCustomSummary(text).
                     app.pending_fork = Some(pending);
-                    app.capture_custom_prompt = true;
+                    app.capture = CaptureMode::CustomSummary;
                     app.status_note =
                         Some("custom summarize prompt — Enter to submit".into());
                 }
@@ -1594,7 +1808,7 @@ async fn handle_action(
         }
         KeyAction::CancelPendingFork => {
             app.pending_fork = None;
-            app.capture_custom_prompt = false;
+            app.capture = CaptureMode::None;
             app.status_note = None;
         }
         KeyAction::Compact => {
