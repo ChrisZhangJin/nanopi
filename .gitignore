@@ -1,6 +1,13 @@
 # Rust
 /target/
 
+# Release binaries staged at repo root (built by cargo, not tracked)
+/nanopi
+/nanopi-*-linux-*
+/nanopi-*-linux-*-musl
+/nanopi-*-macos-*
+/nanopi-*-windows-*.exe
+
 # OS
 .DS_Store
 

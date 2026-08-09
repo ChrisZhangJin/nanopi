@@ -32,6 +32,7 @@ pub async fn run_interactive_mode(
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
+    skill_load: crate::agent::build::SkillLoadPolicy,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -68,44 +69,38 @@ pub async fn run_interactive_mode(
     };
 
     // ── Build the Agent (resume or fresh) ───────────────────────────────
-    let permission_for_resume = permission.clone();
-    let agent: Option<Agent> = Some({
-        if let SessionChoice::Resume(_) = &choice {
-            let mut a = Agent::load_session(&session_path, &cwd)
-                .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-            a.provider = provider;
-            a.registry = registry;
-            a.permission = permission_for_resume;
-            a.hooks = hooks;
-            a.model = model.to_string();
-            a.base_url = base_url.to_string();
-            a.api_key = api_key.to_string();
-            if a.context.system.is_none() {
-                a.context.system = Some(crate::agent::system_prompt::build(&cwd, &a.registry.names()));
-            }
-            a
-        } else {
-            Agent {
-                context: Context {
-                    system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
-                    messages: Vec::new(),
-                    tools: registry.all_specs(),
-                    thinking: None,
-                },
-                provider,
-                registry,
-                session_path: session_path.clone(),
-                session_id: header.id,
-                cwd: cwd.clone(),
-                permission,
-                hooks,
-                model: model.to_string(),
-                base_url: base_url.to_string(),
-                api_key: api_key.to_string(),
-                usage_total: crate::event::Usage::default(),
-                turn_count: 0,
-            }
-        }
+    use crate::agent::build::{AgentBuildInputs, print_skill_diagnostics};
+    let agent: Option<Agent> = Some(if let SessionChoice::Resume(_) = &choice {
+        let mut a = Agent::load_session(&session_path, &cwd)
+            .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
+        let diags = a.hydrate_resumed(
+            provider,
+            registry,
+            permission,
+            hooks,
+            model.to_string(),
+            base_url.to_string(),
+            api_key.to_string(),
+            skill_load,
+        );
+        print_skill_diagnostics(&diags);
+        a
+    } else {
+        let (a, diags) = Agent::build_fresh(AgentBuildInputs {
+            cwd: cwd.clone(),
+            registry,
+            provider,
+            session_path: session_path.clone(),
+            session_id: header.id,
+            permission,
+            hooks,
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            skill_load,
+        });
+        print_skill_diagnostics(&diags);
+        a
     });
 
     // ── If `--message` is set, run one turn and exit (v0.5 compat) ─────
@@ -152,8 +147,7 @@ pub async fn run_interactive_mode(
     use rustyline::Editor;
     use rustyline::history::FileHistory;
 
-    let history_path = dirs::home_dir()
-        .map(|h| h.join(".nanopi").join("history.txt"));
+    let history_path = crate::paths::history_path();
     let editor: Arc<StdMutex<Editor<(), FileHistory>>> = Arc::new(StdMutex::new({
         let mut e: Editor<(), FileHistory> = Editor::new()
             .expect("init editor");

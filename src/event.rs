@@ -61,6 +61,22 @@ pub enum AgentEvent {
         /// True if the LLM actually summarized; false = placeholder fallback.
         used_llm: bool,
     },
+
+    /// User invoked a skill via `/skill:name [args]`. Emitted after
+    /// expansion, before the user message hits the model. Mirrors PI's
+    /// `SkillInvocation` display path (see
+    /// `pi/packages/coding-agent/src/modes/interactive/components/
+    /// skill-invocation-message.ts`). The TUI renders this as a
+    /// collapsible card; other modes may ignore it.
+    SkillInvocation {
+        name: String,
+        location: String,
+        base_dir: String,
+        /// SKILL.md body with frontmatter stripped, trimmed.
+        body: String,
+        /// Optional extra user text following the command.
+        user_message: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +126,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::CompactionStart { .. } => "compaction_start",
             AgentEvent::CompactionEnd { .. } => "compaction_end",
+            AgentEvent::SkillInvocation { .. } => "skill_invocation",
         }
     }
 }

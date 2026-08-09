@@ -79,6 +79,10 @@ impl StdoutRenderer {
                 )?;
                 out.flush()?;
             }
+            AgentEvent::SkillInvocation { name, .. } => {
+                write!(out, "\x1b[2m[skill: {}]\x1b[0m\n", name)?;
+                out.flush()?;
+            }
         }
         Ok(())
     }

@@ -83,11 +83,9 @@ pub enum TrustChoice {
 /// Persist a trust choice to `~/.nanopi/trust/<encoded-cwd>=<value>`.
 /// `SessionOnly` is NOT persisted (it's an in-memory flag).
 pub fn persist_trust_choice(cwd: &Path, choice: TrustChoice) -> std::io::Result<()> {
-    let home = match std::env::var_os("NANOPI_HOME").or_else(|| std::env::var_os("HOME")) {
-        Some(h) => std::path::PathBuf::from(h),
-        None => return Ok(()),
+    let Some(dir) = crate::paths::trust_dir() else {
+        return Ok(());
     };
-    let dir = home.join("trust");
     std::fs::create_dir_all(&dir)?;
     let key = encode_cwd_key(cwd);
     match choice {

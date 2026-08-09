@@ -13,7 +13,8 @@ A minimal Rust port of [Pi](https://github.com/earendil-works/pi) — a tiny, st
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.8.1** | ✅ current | ~3.9 MB | Full ratatui TUI, `/fork` (PI-parity), `--continue`/`--session`/`--fork`, hooks, JSONL sessions; `--yolo` removed for PI-parity |
+| **v0.9.0** | ✅ current | ~4.0 MB | Skills (PI-parity): SKILL.md dirs, `/skill:name` expansion, `--skill`/`--no-skills`, `disable-model-invocation`, folded TUI card + Ctrl-O expand, `UserPromptSubmit` hook wired |
+| v0.8.1 | released | ~3.9 MB | Full ratatui TUI, `/fork` (PI-parity), `--continue`/`--session`/`--fork`, hooks, JSONL sessions; `--yolo` removed for PI-parity |
 | v0.5.0 | released | ~3.0 MB | Tools (read/write/edit/bash), `-p` mode, JSON output, Claude Code-style hooks, JSONL sessions |
 | v0.1.0 | released | 2.4 MB | Single-file OpenAI streaming demo (preserved as `nanopi_v0_1` binary) |
 
@@ -63,8 +64,62 @@ echo "What is 2+2?" | ./nanopi --model deepseek-v4-flash --base-url https://api.
 | `-a`, `--approve` | false | Trust project-local resources for this run |
 | `-N`, `--distrust` | false | Distrust project-local resources for this run |
 | `--tools` | (all) | Tool whitelist (reserved; v0.5 ships all 4 always-on) |
+| `--skill <path>` | — | Load a skill file/dir (repeatable); loads even with `--no-skills` |
+| `-S`, `--no-skills` | false | Disable user + project skill discovery |
 | `--help`, `-h` | — | |
 | `--version`, `-V` | — | |
+
+## Skills
+
+Nanopi implements the [Agent Skills standard](https://agentskills.io/specification) — same shape as PI, Claude Code, and OpenAI Codex. A skill is a directory holding a `SKILL.md` with YAML frontmatter:
+
+```
+~/.nanopi/skills/greet/SKILL.md
+---
+name: greet
+description: Greet the user warmly. Use for hellos.
+---
+Say "hi, friend" — nothing else.
+```
+
+**Locations** (loaded in order; earlier wins on name collisions):
+
+- User:    `~/.nanopi/skills/`
+- Project: `<cwd>/.nanopi/skills/` (only when the project is trusted via `-a` or a persisted decision in `~/.nanopi/trust/`)
+- CLI:     `--skill <path>` (files or dirs; additive even with `--no-skills`)
+
+**Discovery rules** (mirror PI's `loadSkillsFromDirInternal`):
+
+- A directory containing `SKILL.md` → skill root, no further recursion
+- Root-level `*.md` files at the top-level scan are also picked up
+- Subdirectories are recursed looking for `SKILL.md`
+- `.dot` directories and `node_modules/` are skipped
+
+**Frontmatter** (per Agent Skills spec):
+
+- `name` — 1-64 chars, lowercase `a-z0-9-`, no leading/trailing/consecutive hyphens (falls back to parent-dir name if absent)
+- `description` — required, ≤1024 chars (drops the skill if missing)
+- `disable-model-invocation` — when `true`, hides the skill from the system prompt; still invocable via `/skill:name`
+
+**How it works.** At startup nanopi scans the locations above and builds an `<available_skills>` block, appending it to the system prompt whenever the `read` tool is available. The model sees names + descriptions + absolute file paths, and reads the full body on demand. Users can also invoke explicitly:
+
+```bash
+/skill:greet             # expands SKILL.md into the message before sending
+/skill:greet in french   # extra text is appended after the block
+```
+
+In the TUI, an invocation renders as a folded `[skill] greet (Ctrl+O to expand)` card — Ctrl-O splashes the full SKILL.md body into scrollback. Sessions persist `SkillInvocation` entries so `/resume` and `--continue` replay the card intact.
+
+**Config:**
+
+```toml
+# ~/.nanopi/config.toml
+[skills]
+disabled  = ["old-skill"]        # hide a discovered skill by name
+extra_dirs = []                  # reserved
+```
+
+Deferred from v0.9 (see `docs/v0.9-plan.md`): `.gitignore` awareness inside skill dirs; extension-provided skill paths (nanopi has no extension system yet).
 
 ## Setup
 

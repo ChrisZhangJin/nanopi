@@ -132,11 +132,7 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
 }
 
 pub fn global_settings_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("NANOPI_HOME") {
-        return Some(PathBuf::from(p).join("settings.toml"));
-    }
-    let home = dirs::home_dir()?;
-    Some(home.join(".nanopi").join("settings.toml"))
+    crate::paths::global_settings_path()
 }
 
 fn load_one(path: &Path) -> Result<Settings, SettingsError> {

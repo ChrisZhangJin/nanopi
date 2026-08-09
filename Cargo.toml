@@ -1,6 +1,6 @@
 [package]
 name = "nanopi"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 description = "A minimal Rust port of Pi agent"
 

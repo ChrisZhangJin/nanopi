@@ -53,6 +53,10 @@ fn flatten_entries(entries: &[SessionEntry]) -> String {
             SessionEntry::BranchSummary { summary, .. } => {
                 out.push_str(&format!("[branch summary] {summary}\n\n"));
             }
+            SessionEntry::SkillInvocation { name, user_message, .. } => {
+                let extra = user_message.as_deref().unwrap_or("");
+                out.push_str(&format!("[skill {name}] {extra}\n\n"));
+            }
             SessionEntry::Header { .. } | SessionEntry::ModelChange { .. } => {}
         }
     }

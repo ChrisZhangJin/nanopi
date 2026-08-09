@@ -64,7 +64,12 @@ use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 
 /// Slash commands available in the palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Copy` is deliberately dropped so `Skill(String)` can carry the
+/// invocation name — a small refactor from v0.8 to match PI's
+/// autocomplete provider (`interactive-mode.ts:649-661`) which
+/// includes a `skill:<name>` entry per loaded skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashCmd {
     Compact,
     Quit,
@@ -94,6 +99,15 @@ enum SlashCmd {
     /// Enter capture mode; next Enter loads a JSONL from the typed
     /// path as a new session and switches to it.
     Import,
+    /// Invoke a skill via `/skill:<name>`. Payload is the skill name;
+    /// dispatch_slash turns it back into a StartTurn with the
+    /// `/skill:<name> <arg>` string so run_turn's expansion path
+    /// still handles it.
+    Skill(String),
+    /// List all loaded skills into scrollback (name · description ·
+    /// source · path). Doesn't take an arg. PI does this implicitly
+    /// on startup; nanopi adds the on-demand relist.
+    ListSkills,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -112,9 +126,35 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/import",   "Import a session from JSONL",       SlashCmd::Import),
         MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
         MenuItem::new("/hotkeys",  "Show all keyboard shortcuts",       SlashCmd::Hotkeys),
+        MenuItem::new("/skills",   "List all loaded skills",            SlashCmd::ListSkills),
         MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
         MenuItem::new("/exit",     "Exit the session",                  SlashCmd::Quit),
     ]
+}
+
+/// Palette items for the currently-loaded skills. Called every time
+/// the palette opens so a mid-session `/new` or `/resume` picks up
+/// its target session's skill list.
+fn skill_menu_items(skills: &[crate::resources::Skill]) -> Vec<MenuItem<SlashCmd>> {
+    skills
+        .iter()
+        .map(|s| {
+            // Truncate the description so long ones don't blow out
+            // the palette row (matches PI's autocomplete label rules
+            // in interactive-mode.ts prefixAutocompleteDescription).
+            let desc: String = s.description.chars().take(80).collect();
+            let desc = if s.description.chars().count() > 80 {
+                format!("{desc}…")
+            } else {
+                desc
+            };
+            MenuItem::new(
+                format!("/skill:{}", s.name),
+                desc,
+                SlashCmd::Skill(s.name.clone()),
+            )
+        })
+        .collect()
 }
 
 const DOCK_HEIGHT: u16 = 10; // palette(5) + input(3) + footer(2)
@@ -134,6 +174,7 @@ pub async fn run_tui_mode(
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
+    skill_load: crate::agent::build::SkillLoadPolicy,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -165,41 +206,39 @@ pub async fn run_tui_mode(
         }
     };
 
+    use crate::agent::build::{AgentBuildInputs, print_skill_diagnostics};
+    let skill_load_for_rebuilds = skill_load.clone();
     let agent: Agent = if let SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-        a.provider = provider;
-        a.registry = registry;
-        a.permission = permission;
-        a.hooks = hooks;
-        a.model = model.to_string();
-        a.base_url = base_url.to_string();
-        a.api_key = api_key.to_string();
-        if a.context.system.is_none() {
-            a.context.system = Some(crate::agent::system_prompt::build(&cwd, &a.registry.names()));
-        }
-        a
-    } else {
-        Agent {
-            context: Context {
-                system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
-                messages: Vec::new(),
-                tools: registry.all_specs(),
-                thinking: None,
-            },
+        let diags = a.hydrate_resumed(
             provider,
             registry,
+            permission,
+            hooks,
+            model.to_string(),
+            base_url.to_string(),
+            api_key.to_string(),
+            skill_load,
+        );
+        print_skill_diagnostics(&diags);
+        a
+    } else {
+        let (a, diags) = Agent::build_fresh(AgentBuildInputs {
+            cwd: cwd.clone(),
+            registry,
+            provider,
             session_path: session_path.clone(),
             session_id: header.id,
-            cwd: cwd.clone(),
             permission,
             hooks,
             model: model.to_string(),
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
-            usage_total: crate::event::Usage::default(),
-            turn_count: 0,
-        }
+            skill_load,
+        });
+        print_skill_diagnostics(&diags);
+        a
     };
 
     let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
@@ -214,10 +253,23 @@ pub async fn run_tui_mode(
 
     // ── Startup banner (one-shot to stdout, scrolls up like normal
     // output). Printed BEFORE we enter raw mode so println! behaves.
-    print_startup_banner(model, &header.id.to_string());
+    let loaded_skills = {
+        let g = agent_slot.lock().await;
+        g.as_ref().map(|a| a.skills.clone()).unwrap_or_default()
+    };
+    print_startup_banner(model, &header.id.to_string(), &loaded_skills);
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(header.id.to_string(), model.to_string(), cwd.clone(), api_kind);
+    let mut app = App::new(
+        header.id.to_string(),
+        model.to_string(),
+        cwd.clone(),
+        api_kind,
+        skill_load_for_rebuilds,
+    );
+    // Prime the skills cache from the just-built agent so the very
+    // first `/` palette open includes /skill:<name> entries.
+    refresh_status(&mut app, &agent_slot).await;
     let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
     let _ = teardown_terminal(&mut terminal);
 
@@ -239,18 +291,56 @@ pub async fn run_tui_mode(
     result
 }
 
-fn print_startup_banner(model: &str, session_id: &str) {
+fn print_startup_banner(model: &str, session_id: &str, skills: &[crate::resources::Skill]) {
     let sid_short = &session_id[..8.min(session_id.len())];
     // Title line: bold nanopi + dim details.
     println!(
         "\x1b[1mnanopi\x1b[0m \x1b[2mv{}  {}  session {}\x1b[0m",
         env!("CARGO_PKG_VERSION"), model, sid_short
     );
+    // Loaded resources — mirrors PI's `showLoadedResources` startup
+    // section (interactive-mode.ts:1480). Skills grouped by source.
+    if !skills.is_empty() {
+        print_startup_skills(skills);
+    }
     // Hint line, dim.
     println!(
-        "\x1b[2mCtrl-C interrupt · Ctrl-D exit · / commands · Enter submit\x1b[0m"
+        "\x1b[2mCtrl-C interrupt · Ctrl-D exit · / commands · /skills to relist · Enter submit\x1b[0m"
     );
     println!();
+}
+
+/// Print a compact "Skills" section listing all loaded skills grouped
+/// by source. Same shape as PI's addLoadedSection for skills.
+fn print_startup_skills(skills: &[crate::resources::Skill]) {
+    use crate::resources::SkillSource;
+    let mut by_source: std::collections::BTreeMap<&str, Vec<&crate::resources::Skill>> =
+        std::collections::BTreeMap::new();
+    for s in skills {
+        let key = match s.source {
+            SkillSource::User => "user",
+            SkillSource::Project => "project",
+            SkillSource::Cli => "cli",
+        };
+        by_source.entry(key).or_default().push(s);
+    }
+    let total = skills.len();
+    println!(
+        "\x1b[2mSkills ({total}): \x1b[0m{}",
+        skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // Per-source breakdown, one line each — dim.
+    for (src, list) in by_source {
+        let names: Vec<String> = list.iter().map(|s| s.name.clone()).collect();
+        println!(
+            "  \x1b[2m{src}:\x1b[0m {}",
+            names.join(", ")
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -381,10 +471,27 @@ struct App {
     /// the recv-None wrap-up so the transcript gets an
     /// "[Operation aborted]" marker matching PI's UX.
     turn_was_cancelled: bool,
+    /// Skill-load policy remembered from startup so `/new`, `/fork`,
+    /// `/resume`, and `/model` can rebuild the Agent with the same
+    /// discovery rules the user asked for on the command line.
+    skill_load: crate::agent::build::SkillLoadPolicy,
+    /// Most recent skill invocation, captured collapsed on scrollback.
+    /// Ctrl-O expands it once. `None` outside a skill invocation.
+    last_skill_block: Option<CollapsedSkill>,
+    /// Snapshot of agent.skills so `sync_palette` can list `/skill:X`
+    /// entries without reaching into the agent (which is behind an
+    /// async lock). Refreshed by `refresh_status` after every rebuild.
+    skills_cache: Vec<crate::resources::Skill>,
 }
 
 impl App {
-    fn new(session_id: String, model: String, cwd: PathBuf, api_kind: crate::provider::ApiKind) -> Self {
+    fn new(
+        session_id: String,
+        model: String,
+        cwd: PathBuf,
+        api_kind: crate::provider::ApiKind,
+        skill_load: crate::agent::build::SkillLoadPolicy,
+    ) -> Self {
         Self {
             input: TextBuffer::new(),
             palette: None,
@@ -415,6 +522,9 @@ impl App {
             turn_was_cancelled: false,
             resume_picker: None,
             capture: CaptureMode::None,
+            skill_load,
+            last_skill_block: None,
+            skills_cache: Vec::new(),
         }
     }
 }
@@ -491,6 +601,21 @@ struct LastTool {
     expanded: bool,
 }
 
+/// A skill invocation captured on scrollback in collapsed form. Ctrl-O
+/// expands it once (append-only), matching how tool output expansion
+/// works today. Mirrors PI's `SkillInvocationMessageComponent`
+/// (skill-invocation-message.ts).
+#[derive(Debug, Clone)]
+struct CollapsedSkill {
+    name: String,
+    #[allow(dead_code)]
+    location: String,
+    base_dir: String,
+    body: String,
+    user_message: Option<String>,
+    expanded: bool,
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Key → action
 // ─────────────────────────────────────────────────────────────────────
@@ -517,6 +642,8 @@ enum KeyAction {
     ResumeSession(PathBuf),
     /// `/hotkeys`: dump keybinding help into scrollback.
     ShowHotkeys,
+    /// `/skills`: dump the loaded skill list into scrollback.
+    ShowSkills,
     /// `/session`: dump usage / cost / model summary into scrollback.
     ShowSessionInfo,
     /// Bare `/name` — print the session's current name to scrollback.
@@ -772,13 +899,18 @@ fn submit_or_chat(app: &App, text: String) -> KeyAction {
 }
 
 /// Sync palette state with the input buffer: open if first line
-/// starts with `/`, else close. Also refreshes the filter query.
+/// starts with `/`, else close. Also refreshes the filter query. When
+/// skills are loaded, their `/skill:<name>` entries are appended to
+/// the built-in list — mirrors PI's autocomplete provider
+/// (interactive-mode.ts:649-661).
 fn sync_palette(app: &mut App) {
     let full = app.input.as_string();
     let first_line = full.lines().next().unwrap_or("");
     if first_line.starts_with('/') {
         if app.palette.is_none() {
-            app.palette = Some(MenuState::new(slash_items()));
+            let mut items = slash_items();
+            items.extend(skill_menu_items(&app.skills_cache));
+            app.palette = Some(MenuState::new(items));
         }
         if let Some(m) = app.palette.as_mut() {
             // Filter only on the command WORD (chars up to the first
@@ -808,6 +940,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Resume => KeyAction::OpenResumePicker,
         SlashCmd::Fork => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
+        SlashCmd::ListSkills => KeyAction::ShowSkills,
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
         // PI's /name: bare shows current, `/name X` sets it. See
         // packages/coding-agent/src/modes/interactive/interactive-
@@ -828,6 +961,18 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Export => KeyAction::ApplyExport(arg),
         // /import always inline; PI errors on bare /import.
         SlashCmd::Import => KeyAction::ApplyImport(arg),
+        // /skill:<name>: hand back a StartTurn with the full raw
+        // string so run_turn's expander does the heavy lifting.
+        // Matches PI's approach — the palette entry is UX; expansion
+        // is done in one place (agent-session.ts:1301).
+        SlashCmd::Skill(name) => {
+            let full = if arg.is_empty() {
+                format!("/skill:{name}")
+            } else {
+                format!("/skill:{name} {arg}")
+            };
+            KeyAction::StartTurn(full)
+        }
     }
 }
 
@@ -1015,17 +1160,31 @@ async fn handle_action(
             }
         }
         KeyAction::ExpandLastTool => {
-            // Only expand once per tool result — flip the flag.
-            let last = match app.last_tool_output.take() {
+            // Only expand once per source. Priority: tool result first
+            // (matches historical behavior), otherwise the last skill
+            // block. Expand-once model — collapse-back is BACKLOG.md.
+            let tool = match app.last_tool_output.take() {
                 Some(l) if !l.expanded => Some(l),
                 other => {
                     app.last_tool_output = other;
                     None
                 }
             };
-            if let Some(l) = last {
+            if let Some(l) = tool {
                 render_tool_expansion(term, &l.content, l.is_error)?;
                 app.last_tool_output = None;
+            } else {
+                let skill = match app.last_skill_block.take() {
+                    Some(s) if !s.expanded => Some(s),
+                    other => {
+                        app.last_skill_block = other;
+                        None
+                    }
+                };
+                if let Some(s) = skill {
+                    render_skill_expansion(term, &s)?;
+                    app.last_skill_block = None;
+                }
             }
         }
         KeyAction::OpenModelPicker => {
@@ -1146,26 +1305,20 @@ async fn handle_action(
                 };
             let _ = session::set_active_session(&cwd, &new_path);
             let registry = crate::tool::ToolRegistry::standard();
-            let new_agent = Agent {
-                context: Context {
-                    system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
-                    messages: Vec::new(),
-                    tools: registry.all_specs(),
-                    thinking: None,
-                },
-                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model),
+            let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
+                cwd: cwd.clone(),
                 registry,
+                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model),
                 session_path: new_path,
                 session_id: new_header.id,
-                cwd,
                 permission,
                 hooks,
                 model: model.clone(),
                 base_url,
                 api_key,
-                usage_total: crate::event::Usage::default(),
-                turn_count: 0,
-            };
+                skill_load: app.skill_load.clone(),
+            });
+            crate::agent::build::print_skill_diagnostics(&diags);
             {
                 let mut g = agent_slot.lock().await;
                 *g = Some(new_agent);
@@ -1196,6 +1349,7 @@ async fn handle_action(
                         .add_modifier(Modifier::BOLD),
                 ),
             ]))?;
+            refresh_status(app, &agent_slot).await;
         }
         KeyAction::OpenResumePicker => {
             let (cwd, current_path) = {
@@ -1262,19 +1416,20 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            new_agent.provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
-            new_agent.model = model.clone();
-            new_agent.base_url = base_url;
-            new_agent.api_key = api_key;
-            new_agent.permission = permission;
-            new_agent.hooks = hooks;
-            new_agent.registry = crate::tool::ToolRegistry::standard();
-            if new_agent.context.system.is_none() {
-                new_agent.context.system = Some(
-                    crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
-                );
-            }
-            new_agent.context.tools = new_agent.registry.all_specs();
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+            let registry = crate::tool::ToolRegistry::standard();
+            new_agent.context.tools = registry.all_specs();
+            let diags = new_agent.hydrate_resumed(
+                provider,
+                registry,
+                permission,
+                hooks,
+                model.clone(),
+                base_url,
+                api_key,
+                app.skill_load.clone(),
+            );
+            crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id;
             let _ = session::set_active_session(&cwd, &path);
             {
@@ -1669,19 +1824,20 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            new_agent.provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
-            new_agent.model = model.clone();
-            new_agent.base_url = base_url;
-            new_agent.api_key = api_key;
-            new_agent.permission = permission;
-            new_agent.hooks = hooks;
-            new_agent.registry = crate::tool::ToolRegistry::standard();
-            if new_agent.context.system.is_none() {
-                new_agent.context.system = Some(
-                    crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
-                );
-            }
-            new_agent.context.tools = new_agent.registry.all_specs();
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+            let registry = crate::tool::ToolRegistry::standard();
+            new_agent.context.tools = registry.all_specs();
+            let diags = new_agent.hydrate_resumed(
+                provider,
+                registry,
+                permission,
+                hooks,
+                model.clone(),
+                base_url,
+                api_key,
+                app.skill_load.clone(),
+            );
+            crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id;
             let _ = session::set_active_session(&cwd, &dest);
             {
@@ -1742,6 +1898,65 @@ async fn handle_action(
                 ]))?;
             }
             insert_line(term, Line::from(""))?;
+        }
+        KeyAction::ShowSkills => {
+            // Snapshot skills from the current agent so /new, /resume,
+            // /fork changes are reflected immediately.
+            let skills = {
+                let g = agent_slot.lock().await;
+                g.as_ref().map(|a| a.skills.clone()).unwrap_or_default()
+            };
+            if skills.is_empty() {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        "No skills loaded.".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))?;
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        "  Add SKILL.md files under ~/.nanopi/skills/ or <cwd>/.nanopi/skills/ (project needs `-a` to trust).".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))?;
+                insert_line(term, Line::from(""))?;
+            } else {
+                insert_line(term, Line::from(vec![
+                    Span::styled(
+                        format!("Loaded skills ({})", skills.len()),
+                        Style::default()
+                            .fg(Color::Indexed(108))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))?;
+                for s in &skills {
+                    let src = s.source.label();
+                    let hidden = if s.disable_model_invocation { " (hidden)" } else { "" };
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("  /skill:{:<24}", s.name),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("[{src}]{hidden} "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            s.description.clone(),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]))?;
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            format!("      {}", s.file_path.display()),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]))?;
+                }
+                insert_line(term, Line::from(""))?;
+            }
         }
         KeyAction::OpenForkPicker => {
             // Tree-aware picker: walk the parent_id chain upward from
@@ -2039,19 +2254,20 @@ async fn execute_fork(
             return Ok(());
         }
     };
-    new_agent.provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
-    new_agent.model = model.clone();
-    new_agent.base_url = base_url;
-    new_agent.api_key = api_key;
-    new_agent.permission = permission;
-    new_agent.hooks = hooks;
-    new_agent.registry = crate::tool::ToolRegistry::standard();
-    if new_agent.context.system.is_none() {
-        new_agent.context.system = Some(
-            crate::agent::system_prompt::build(&cwd, &new_agent.registry.names()),
-        );
-    }
-    new_agent.context.tools = new_agent.registry.all_specs();
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+    let registry = crate::tool::ToolRegistry::standard();
+    new_agent.context.tools = registry.all_specs();
+    let diags = new_agent.hydrate_resumed(
+        provider,
+        registry,
+        permission,
+        hooks,
+        model.clone(),
+        base_url,
+        api_key,
+        app.skill_load.clone(),
+    );
+    crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
 
     {
@@ -2125,6 +2341,7 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.turn_count = a.turn_count;
         app.cwd = a.cwd.clone();
         app.thinking = a.context.thinking;
+        app.skills_cache = a.skills.clone();
     }
 }
 
@@ -2212,6 +2429,24 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             ]))?;
             // Refresh cached context estimate for the status footer.
             app.context_chars = 0; // will be re-populated on next event
+        }
+        AgentEvent::SkillInvocation { name, location, base_dir, body, user_message } => {
+            flush_stream_buf(term, app)?;
+            flush_thinking_buf(term, app)?;
+            render_skill_card(term, &name)?;
+            // Stash for Ctrl-O expansion, using a second slot alongside
+            // last_tool_output so tool + skill expand paths don't
+            // collide. Expand-once semantics match tool expansion (see
+            // BACKLOG.md — collapse-back isn't feasible on our
+            // append-only scrollback).
+            app.last_skill_block = Some(CollapsedSkill {
+                name,
+                location,
+                base_dir,
+                body,
+                user_message,
+                expanded: false,
+            });
         }
         AgentEvent::Done { .. } | AgentEvent::Start { .. } => {}
     }
@@ -2387,6 +2622,28 @@ fn render_tool_card(
     Ok(())
 }
 
+/// Insert a collapsed skill invocation card into scrollback. Mirrors
+/// PI's `SkillInvocationMessageComponent` (`skill-invocation-message.ts`)
+/// in its collapsed state: a single row with `[skill] name (Ctrl+O to
+/// expand)`, styled with the same subtle bg used for custom messages.
+/// The expanded body lands in scrollback via `expand_last_skill_block`.
+fn render_skill_card(term: &mut Term, name: &str) -> Result<()> {
+    let bg = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(255));
+    let dim = Style::default().bg(Color::Indexed(236)).fg(Color::DarkGray);
+    insert_line(term, Line::from(""))?;
+    insert_line_bg(
+        term,
+        Line::from(vec![
+            Span::styled("  [skill] ".to_string(), bg.add_modifier(Modifier::BOLD)),
+            Span::styled(name.to_string(), bg),
+            Span::styled(" (Ctrl+O to expand)".to_string(), dim),
+        ]),
+        Some(bg),
+    )?;
+    insert_line(term, Line::from(""))?;
+    Ok(())
+}
+
 /// Insert the PI-style gray "user echo" card into scrollback. Used
 /// both by StartTurn (live) and by replay_history when resuming a
 /// past session (`/resume`). 3-row block: pad, content, pad, with a
@@ -2509,6 +2766,26 @@ fn replay_history(
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]))?;
+            }
+            session::SessionEntry::SkillInvocation {
+                name,
+                location,
+                base_dir,
+                body,
+                user_message,
+                ..
+            } => {
+                on_agent_event(
+                    term,
+                    app,
+                    AgentEvent::SkillInvocation {
+                        name: name.clone(),
+                        location: location.clone(),
+                        base_dir: base_dir.clone(),
+                        body: body.clone(),
+                        user_message: user_message.clone(),
+                    },
+                )?;
             }
             _ => {}
         }
@@ -2782,6 +3059,53 @@ fn render_tool_expansion(term: &mut Term, content: &str, is_error: bool) -> Resu
     Ok(())
 }
 
+/// Expanded skill card: header + full SKILL.md body rendered through
+/// the markdown pipeline, styled with the same subtle bg as the
+/// collapsed row. If the user passed args after `/skill:name`, they
+/// appear as an italic footer. PI equivalent: expanded
+/// `SkillInvocationMessageComponent`.
+fn render_skill_expansion(term: &mut Term, s: &CollapsedSkill) -> Result<()> {
+    let bg = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(255));
+    let dim = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(250));
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled(
+            format!("  ── skill: {} ({}) ──", s.name, s.base_dir),
+            dim.add_modifier(Modifier::ITALIC),
+        )]),
+        Some(bg),
+    )?;
+    // Render body through the shared markdown parser so headings /
+    // code / emphasis look consistent with assistant replies.
+    let mut md = crate::render::markdown::MdState::default();
+    for line in s.body.lines() {
+        let spans = crate::render::markdown::render_line(line, &mut md);
+        let mut owned: Vec<Span<'static>> = vec![Span::styled("  ", bg)];
+        for sp in spans {
+            owned.push(Span::styled(sp.content.into_owned(), bg.patch(sp.style)));
+        }
+        insert_line_bg(term, Line::from(owned), Some(bg))?;
+    }
+    if let Some(u) = &s.user_message {
+        insert_line_bg(term, Line::from(vec![Span::styled("", bg)]), Some(bg))?;
+        insert_line_bg(
+            term,
+            Line::from(vec![Span::styled(
+                format!("  > {u}"),
+                dim.add_modifier(Modifier::ITALIC),
+            )]),
+            Some(bg),
+        )?;
+    }
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled("", bg)]),
+        Some(bg),
+    )?;
+    insert_line(term, Line::from(""))?;
+    Ok(())
+}
+
 /// Draw the 1-row activity strip between palette and input box.
 /// - tool running → blue `$ cmd  Elapsed X.Xs` (matches PI's blue bar
 ///   in img/PI_work_status.jpg)
@@ -2999,6 +3323,7 @@ mod tests {
             "m".into(),
             std::path::PathBuf::from("/tmp"),
             crate::provider::ApiKind::Openai,
+            crate::agent::build::SkillLoadPolicy::default(),
         )
     }
 

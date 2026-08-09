@@ -112,6 +112,23 @@ pub enum SessionEntry {
         timestamp: String,
         summary: String,
     },
+    /// Written when the user invokes `/skill:name [args]`. The
+    /// immediately-following Message entry (role=user) holds the
+    /// fully-expanded `<skill>...</skill>` block that was sent to
+    /// the model — this entry preserves the semantic invocation so
+    /// TUI replay can redraw the folded card. Mirrors PI's Skill
+    /// invocation persistence (see agent-session.ts session events).
+    #[serde(rename = "skill_invocation")]
+    SkillInvocation {
+        id: String,
+        timestamp: String,
+        name: String,
+        location: String,
+        base_dir: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_message: Option<String>,
+    },
 }
 
 /// Metadata extracted from the session header.
@@ -456,6 +473,18 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
                     entry_index: i,
                     role: "[branch summary]".into(),
                     preview: collapse_ws_truncate(summary, 60),
+                    prefill_text: None,
+                });
+            }
+            SessionEntry::SkillInvocation { name, user_message, .. } => {
+                let preview = match user_message {
+                    Some(u) => format!("{} · {}", name, collapse_ws_truncate(u, 40)),
+                    None => name.clone(),
+                };
+                out.push(TreeRow {
+                    entry_index: i,
+                    role: "[skill]".into(),
+                    preview,
                     prefill_text: None,
                 });
             }

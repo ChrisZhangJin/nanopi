@@ -3,6 +3,7 @@
 
 pub mod context;
 pub mod branch_summary;
+pub mod build;
 pub mod compact;
 pub mod thinking;
 pub mod hook;

@@ -94,6 +94,17 @@ struct Args {
     /// Accepts `openai` or `anthropic` (aliases: `claude`).
     #[arg(long = "api-kind", value_name = "KIND")]
     api_kind: Option<String>,
+
+    /// Load a skill file or directory (repeatable). Additive:
+    /// still loads even when `--no-skills` is set.
+    /// Mirrors PI's `--skill` (`pi/packages/coding-agent/src/cli/args.ts:156`).
+    #[arg(long = "skill", value_name = "PATH")]
+    skill: Vec<PathBuf>,
+
+    /// Disable user + project skill discovery. Explicit `--skill` paths
+    /// still load. Mirrors PI's `--no-skills` / `-ns`.
+    #[arg(long = "no-skills", short = 'S')]
+    no_skills: bool,
 }
 
 #[tokio::main]
@@ -183,6 +194,26 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Project trust decides whether project-local `.nanopi/skills/` is
+    // discovered. Precedence: explicit CLI (`-a`/`-N`) > persisted
+    // decision in `~/.nanopi/trust/`. Default is untrusted — matches
+    // PI's "trust prompt on first encounter" model with the prompt
+    // stubbed out for now.
+    let project_trusted = match approve {
+        Some(v) => v,
+        None => matches!(
+            nanopi::trust::check_trust_status(&cwd),
+            nanopi::trust::TrustStatus::AlreadyTrusted
+        ),
+    };
+    let skill_load = nanopi::agent::build::SkillLoadPolicy::from_cli(
+        &cwd,
+        args.skill.clone(),
+        args.no_skills,
+        project_trusted,
+        cfg.skills.disabled.clone(),
+    );
+
     let output_format = if args.output == "json" {
         print::OutputFormat::Json
     } else {
@@ -221,6 +252,7 @@ async fn main() -> ExitCode {
             args.continue_session,
             args.session_id.clone(),
             args.fork_id.clone(),
+            skill_load.clone(),
         )
         .await
     } else if should_use_tui(&args) {
@@ -235,6 +267,7 @@ async fn main() -> ExitCode {
             args.continue_session,
             args.session_id.clone(),
             args.fork_id.clone(),
+            skill_load.clone(),
         )
         .await
     } else {
@@ -251,6 +284,7 @@ async fn main() -> ExitCode {
             args.continue_session,
             args.session_id.clone(),
             args.fork_id.clone(),
+            skill_load.clone(),
         )
         .await
     };

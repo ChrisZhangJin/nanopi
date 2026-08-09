@@ -92,6 +92,19 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
+            SessionEntry::SkillInvocation { name, body, user_message, timestamp, .. } => {
+                let mut text = format!("# {name}\n\n{body}");
+                if let Some(u) = user_message {
+                    text.push_str("\n\n---\n\n");
+                    text.push_str(u);
+                }
+                body_html.push_str(&format_turn(
+                    "meta",
+                    &format!("[skill] {name}"),
+                    &html_escape(&text),
+                    Some(timestamp),
+                ));
+            }
         }
     }
 

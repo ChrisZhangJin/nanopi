@@ -87,6 +87,11 @@ pub struct Agent {
     pub usage_total: Usage,
     /// Turn counter, incremented at the start of every `run_turn`.
     pub turn_count: u32,
+    /// Skills loaded at Agent build time (via `Agent::build_fresh` or
+    /// `Agent::hydrate_resumed`). Consulted by `/skill:name` expansion
+    /// in `run_turn`. Empty when discovery is disabled and no --skill
+    /// paths were passed.
+    pub skills: Vec<crate::resources::Skill>,
 }
 
 impl Agent {
@@ -152,6 +157,7 @@ impl Agent {
             api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
+            skills: Vec::new(),
         })
     }
 
@@ -263,16 +269,100 @@ impl Agent {
         self.maybe_compact(tx).await;
         self.turn_count = self.turn_count.saturating_add(1);
 
+        // ── UserPromptSubmit hook (mirrors PI's beforeUserMessage) ────
+        // Allow user hooks to inspect / transform the raw prompt before
+        // any skill-command expansion, and to block outright. Same
+        // Allow/Block/Transform semantics as pre_tool_use hooks; Block
+        // aborts the turn with a synthetic assistant marker so the user
+        // sees why. Transform mutates the prompt in place.
+        let mut effective_msg = user_msg.to_string();
+        if self.permission.hooks_active() && !self.hooks.user_prompt_submit.is_empty() {
+            let (outcome, new_args) = run_hooks(
+                &self.hooks.user_prompt_submit,
+                HookEvent::UserPromptSubmit,
+                "", // no tool name for prompt submit
+                serde_json::json!({ "prompt": effective_msg }),
+                &self.cwd,
+                Some(&self.session_id.to_string()),
+            )
+            .await;
+            match outcome {
+                HookOutcome::Block { reason } => {
+                    let marker = format!(
+                        "[UserPromptSubmit hook blocked the prompt: {reason}]"
+                    );
+                    let _ = tx
+                        .send(AgentEvent::Error { error: marker.clone() })
+                        .await;
+                    return Ok(marker);
+                }
+                HookOutcome::Transform { new_arguments } => {
+                    if let Some(v) = new_arguments
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                    {
+                        effective_msg = v.to_string();
+                    }
+                }
+                HookOutcome::Allow => {
+                    if let Some(v) = new_args
+                        .as_ref()
+                        .and_then(|a| a.get("prompt"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if v != effective_msg {
+                            effective_msg = v.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── /skill:name expansion (mirrors PI's _expandSkillCommand) ──
+        // Runs AFTER the UserPromptSubmit hook so a hook that rewrites
+        // the prompt into a /skill: call still triggers expansion.
+        // Emits SkillInvocation so the TUI can render its own card.
+        if let Some(expansion) =
+            crate::resources::expand_skill_command(&effective_msg, &self.skills)
+        {
+            let _ = tx
+                .send(AgentEvent::SkillInvocation {
+                    name: expansion.name.clone(),
+                    location: expansion.location.display().to_string(),
+                    base_dir: expansion.base_dir.display().to_string(),
+                    body: expansion.body.clone(),
+                    user_message: expansion.user_args.clone(),
+                })
+                .await;
+            // Persist a SkillInvocation entry alongside the expanded
+            // user message so `--continue` and TUI replay reproduce
+            // the card. Written BEFORE the user message so replay
+            // order matches original.
+            session::append_entry(
+                &self.session_path,
+                &SessionEntry::SkillInvocation {
+                    id: uuid::v7().to_string(),
+                    timestamp: time::now_iso8601(),
+                    name: expansion.name,
+                    location: expansion.location.display().to_string(),
+                    base_dir: expansion.base_dir.display().to_string(),
+                    body: expansion.body,
+                    user_message: expansion.user_args,
+                },
+            )?;
+            effective_msg = expansion.expanded_text;
+        }
+
         // Append user message to context + session.
         let user_id = uuid::v7().to_string();
-        self.context.push_user_text(user_msg.to_string());
+        self.context.push_user_text(effective_msg.clone());
         session::append_entry(
             &self.session_path,
             &SessionEntry::Message {
                 id: user_id,
                 timestamp: time::now_iso8601(),
                 role: "user".into(),
-                content: user_msg.into(),
+                content: effective_msg,
             },
         )?;
 
@@ -766,6 +856,7 @@ mod tests {
             api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
+            skills: Vec::new(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -821,6 +912,7 @@ mod tests {
             api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
+            skills: Vec::new(),
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -889,6 +981,7 @@ mod tests {
             api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
+            skills: Vec::new(),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -972,6 +1065,7 @@ mod tests {
             api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
+            skills: Vec::new(),
         };
         (agent, dir)
     }
@@ -1219,6 +1313,7 @@ mod tests {
             api_key: String::new(),
             usage_total: Usage::default(),
             turn_count: 0,
+            skills: Vec::new(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);

@@ -74,6 +74,24 @@ pub struct Config {
     /// loaded for backward compatibility — see `settings::load_settings`).
     #[serde(default)]
     pub hooks: HooksSection,
+
+    /// v0.9: skill configuration. `disabled` hides named skills after
+    /// discovery. Mirrors the intent of PI's package-manager
+    /// enable/disable toggles.
+    #[serde(default)]
+    pub skills: SkillsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Names to hide even if discovered on disk.
+    pub disabled: Vec<String>,
+    /// Extra directories to scan for skills, in addition to
+    /// `~/.nanopi/skills` and `<cwd>/.nanopi/skills`. Reserved for a
+    /// future release — currently unused by the loader (callers pass
+    /// dirs directly through `LoadSkillsOptions`).
+    pub extra_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -103,6 +121,7 @@ impl Config {
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
             hooks: HooksSection::default(),
+            skills: SkillsConfig::default(),
         }
     }
 }
@@ -131,11 +150,7 @@ pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
 /// Path to the global config file. Honors NANOPI_HOME for test
 /// isolation; otherwise falls back to `$HOME/.nanopi/config.toml`.
 pub fn global_config_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("NANOPI_HOME") {
-        return Some(PathBuf::from(p).join("config.toml"));
-    }
-    let home = dirs::home_dir()?;
-    Some(home.join(".nanopi").join("config.toml"))
+    crate::paths::global_config_path()
 }
 
 fn load_one(path: &Path) -> Result<Config, ConfigError> {
@@ -171,6 +186,13 @@ fn merge(a: Config, b: Config) -> Config {
     hooks.session_end.extend(b.hooks.session_end);
     // tools whitelist: `b` (project) wins if it declares any; else keep `a`.
     let tools = if b.tools.is_empty() { a.tools } else { b.tools };
+    // skills: disabled + extra_dirs concatenate (both sides additive).
+    let mut skills = SkillsConfig {
+        disabled: a.skills.disabled,
+        extra_dirs: a.skills.extra_dirs,
+    };
+    skills.disabled.extend(b.skills.disabled);
+    skills.extra_dirs.extend(b.skills.extra_dirs);
     Config {
         model: b.model.or(a.model),
         base_url: b.base_url.or(a.base_url),
@@ -186,6 +208,7 @@ fn merge(a: Config, b: Config) -> Config {
             file: b.logging.file.or(a.logging.file),
         },
         hooks,
+        skills,
     }
 }
 
@@ -314,6 +337,7 @@ base_url = "https://project.example/v1"
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
             hooks: HooksSection::default(),
+            skills: SkillsConfig::default(),
         };
         let b = Config {
             model: None,
@@ -325,6 +349,7 @@ base_url = "https://project.example/v1"
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
             hooks: HooksSection::default(),
+            skills: SkillsConfig::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));

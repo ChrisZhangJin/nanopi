@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::agent::context::Context;
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::AgentEvent;
@@ -52,6 +51,7 @@ pub async fn run_print_mode(
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
+    skill_load: crate::agent::build::SkillLoadPolicy,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
@@ -96,44 +96,40 @@ let (session_path, header) = match &choice {
 
     let registry = ToolRegistry::standard();
 
-// If we resumed an existing session, hydrate the Agent with its
+    // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
-    let permission_for_resume = permission.clone();
+    use crate::agent::build::{AgentBuildInputs, print_skill_diagnostics};
     let mut agent = if let session::SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-        a.provider = provider;
-        a.registry = registry;
-        a.permission = permission_for_resume;
-        a.hooks = hooks;
-        a.model = model.to_string();
-        a.base_url = base_url.to_string();
-        a.api_key = api_key.to_string();
-        if a.context.system.is_none() {
-            a.context.system = Some(crate::agent::system_prompt::build(&cwd, &a.registry.names()));
-        }
-        a
-    } else {
-        Agent {
-            context: Context {
-                system: Some(crate::agent::system_prompt::build(&cwd, &registry.names())),
-                messages: Vec::new(),
-                tools: registry.all_specs(),
-                thinking: None,
-            },
+        let diags = a.hydrate_resumed(
             provider,
             registry,
+            permission,
+            hooks,
+            model.to_string(),
+            base_url.to_string(),
+            api_key.to_string(),
+            skill_load,
+        );
+        print_skill_diagnostics(&diags);
+        a
+    } else {
+        let (a, diags) = Agent::build_fresh(AgentBuildInputs {
+            cwd: cwd.clone(),
+            registry,
+            provider,
             session_path: session_path.clone(),
             session_id: header.id,
-            cwd: cwd.clone(),
             permission,
             hooks,
             model: model.to_string(),
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
-            usage_total: crate::event::Usage::default(),
-            turn_count: 0,
-        }
+            skill_load,
+        });
+        print_skill_diagnostics(&diags);
+        a
     };
 
     // Fire session_start hooks before the first turn.
