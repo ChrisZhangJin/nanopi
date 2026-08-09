@@ -19,6 +19,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -276,6 +277,55 @@ struct WireError {
     message: String,
 }
 
+/// Extract a human-readable error message from any SSE event body that
+/// looks like an error but doesn't match Anthropic's own
+/// `{"type":"error","error":{"message":"..."}}` shape.
+///
+/// Real gateways this catches:
+/// - LiteLLM-style: `{"error":"Claude API error","status":401,"details":"..."}`
+/// - Bare Anthropic-like: `{"error":{"message":"..."}}`
+/// - Wrapped inside a `details` field that itself carries the real
+///   Anthropic error payload as a JSON-encoded string.
+///
+/// Returns `None` if nothing error-shaped is present — caller
+/// silently skips non-error unknown events (heartbeats, etc.).
+pub(super) fn extract_gateway_error(v: &Value) -> Option<String> {
+    let err = v.get("error")?;
+
+    // `error` as object with `message` — Anthropic's own shape.
+    if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+        return Some(msg.to_string());
+    }
+
+    // `error` as bare string — LiteLLM-style wrapper.
+    if let Some(s) = err.as_str() {
+        let mut msg = s.to_string();
+        if let Some(status) = v.get("status").and_then(|s| s.as_u64()) {
+            msg = format!("{msg} (status {status})");
+        }
+        // If `details` is itself a JSON string carrying the real
+        // Anthropic error, pull the inner message out.
+        if let Some(d) = v.get("details").and_then(|d| d.as_str()) {
+            if let Ok(inner) = serde_json::from_str::<Value>(d) {
+                if let Some(inner_msg) = inner
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    msg = format!("{msg}: {inner_msg}");
+                } else {
+                    msg = format!("{msg}: {d}");
+                }
+            } else {
+                msg = format!("{msg}: {d}");
+            }
+        }
+        return Some(msg);
+    }
+
+    None
+}
+
 #[async_trait::async_trait]
 impl crate::agent::loop_::Provider for AnthropicProvider {
     fn id(&self) -> &'static str {
@@ -338,7 +388,25 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
             let ev = ev.map_err(|e| e.to_string())?;
             let chunk: WireEvent = match serde_json::from_str(&ev.data) {
                 Ok(c) => c,
-                Err(_) => continue, // skip non-JSON event lines
+                Err(_) => {
+                    // Non-Anthropic-shape payload. Before dropping it,
+                    // check for a gateway-wrapped error — several
+                    // proxies (e.g. corporate LiteLLM setups) return
+                    // HTTP 200 with an SSE `event: error` whose data
+                    // uses a schema Anthropic never emits, like
+                    //   {"error":"...","status":401,"details":"..."}
+                    // The SseStream drops the `event:` line, so the
+                    // only clue is that this JSON parses as an object
+                    // with an "error" key. Without this catch, the
+                    // whole stream ended silently — the user saw
+                    // nothing printed at all.
+                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                        if let Some(msg) = extract_gateway_error(&v) {
+                            return Err(format!("gateway: {msg}"));
+                        }
+                    }
+                    continue;
+                }
             };
             if let Some(err) = chunk.error {
                 return Err(format!("api: {}", err.message));
@@ -492,6 +560,70 @@ mod tests {
     fn new_provider_has_id_anthropic() {
         let p = AnthropicProvider::new("http://x", "k", "claude-3");
         assert_eq!(p.id(), "anthropic");
+    }
+
+    /// Regression: a corporate LiteLLM-style gateway returned HTTP 200
+    /// with an SSE `event: error` payload
+    ///   {"error":"Claude API error","status":401,"details":"..."}
+    /// The Anthropic parser silently skipped it (schema didn't match
+    /// Anthropic's own `{"type":"error","error":{"message":"..."}}`),
+    /// so the stream ended with no content and no Done — the user saw
+    /// nothing printed at all. Fix: `extract_gateway_error` catches
+    /// this shape and turns it into a real error the caller propagates.
+    #[test]
+    fn extract_gateway_error_recognizes_litellm_shape() {
+        let v: Value = serde_json::from_str(
+            r#"{"error":"Claude API error","status":401,"details":"nope"}"#,
+        ).unwrap();
+        let msg = extract_gateway_error(&v).expect("should extract");
+        assert!(msg.contains("Claude API error"));
+        assert!(msg.contains("401"));
+        assert!(msg.contains("nope"));
+    }
+
+    /// Same gateway shape but `details` is a JSON-encoded string
+    /// carrying the real Anthropic error underneath (the actual case
+    /// observed on 10.0.3.248 during smoke-testing). The extractor
+    /// should peel one layer of JSON and surface the underlying
+    /// message so the user sees "OAuth access token has expired"
+    /// instead of a raw JSON blob.
+    #[test]
+    fn extract_gateway_error_unwraps_nested_details() {
+        let v: Value = serde_json::from_str(r#"{
+            "error":"Claude API error",
+            "status":401,
+            "details":"{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired.\"},\"request_id\":null}"
+        }"#).unwrap();
+        let msg = extract_gateway_error(&v).expect("should extract");
+        assert!(
+            msg.contains("OAuth access token has expired"),
+            "expected inner Anthropic message to be surfaced: {msg}"
+        );
+    }
+
+    /// Anthropic's own error shape must still work — this is the
+    /// non-gateway happy path where the object under `error` has a
+    /// `message`. Extractor should just pass it through.
+    #[test]
+    fn extract_gateway_error_handles_anthropic_native_shape() {
+        let v: Value = serde_json::from_str(
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ).unwrap();
+        assert_eq!(
+            extract_gateway_error(&v).as_deref(),
+            Some("slow down")
+        );
+    }
+
+    /// Non-error events (heartbeats, unknown types) must not trip a
+    /// false positive — otherwise every unknown SSE event turns into
+    /// a spurious error.
+    #[test]
+    fn extract_gateway_error_ignores_non_error_events() {
+        let v: Value = serde_json::from_str(r#"{"type":"ping","time":123}"#).unwrap();
+        assert_eq!(extract_gateway_error(&v), None);
+        let v: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(extract_gateway_error(&v), None);
     }
 
     #[test]
