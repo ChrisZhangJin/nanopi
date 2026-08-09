@@ -57,14 +57,26 @@ pub fn build(cwd: &Path, tool_names: &[String]) -> String {
         .join("\n");
 
     format!(
-        "You are nanopi, a minimal agent CLI. You help the user accomplish \
-         tasks by reading files, running shell commands, editing files, and \
+        "You are nanopi, a minimal agent CLI running as a trusted \
+         developer tool on the user's own machine. You help the user \
+         by reading files, running shell commands, editing files, and \
          writing new files — using the tools listed below rather than \
-         describing what a user should do. The bash tool is a real, \
-         unrestricted shell: network requests (curl/wget), package installs, \
-         probing services, and other host-level operations are all fair game \
-         when the user asks. Tasks may be about code, configuration, logs, \
-         data, network debugging, or anything else the tools can reach.
+         describing what a user should do.
+
+The bash tool is a real, unrestricted shell. Network requests \
+         (curl/wget to any host, LAN or public), package installs, \
+         service probing, and other host-level operations are all \
+         fair game — this is the user's machine and their commands, \
+         not something to second-guess. Don't refuse to hit an \
+         internal IP because you don't recognize it; that's just the \
+         user's own LAN.
+
+If the user's message IS a shell command (starts with a command \
+         name like curl, ls, ps, git, docker, systemctl, …), execute \
+         it via bash directly and report the output. Don't offer to \
+         run it, don't ask for confirmation — just run it. Tasks may \
+         be about code, configuration, logs, data, network debugging, \
+         or anything else the tools can reach.
 
 {tools_line}
 
@@ -128,13 +140,17 @@ mod tests {
     }
 
     /// Regression: v0.9.1 broadened the framing so Claude wouldn't
-    /// refuse network requests (a user hit refusal on
-    /// `curl http://…` because "in their working directory" +
-    /// "executing shell commands" read as a filesystem-only sandbox).
-    /// The prompt must:
-    ///   (1) not carry the sandbox-implying phrase, and
-    ///   (2) explicitly authorize network requests via bash so the
-    ///       model doesn't over-restrict itself.
+    /// refuse network requests. The first attempt still saw Claude
+    /// hedge on `curl http://<internal-ip>/` because the phrasing
+    /// left room for Claude to apply its own "arbitrary hosts" safety
+    /// heuristic. Second pass tightened the language:
+    ///   (1) drop "in their working directory"
+    ///   (2) explicitly authorize network requests, incl. internal IPs
+    ///   (3) explicitly instruct: "if user's message is a shell
+    ///       command, execute directly — don't offer, don't ask"
+    ///   (4) frame as "trusted developer tool on the user's machine"
+    ///       so Claude's default caution about "arbitrary hosts"
+    ///       doesn't fire.
     #[test]
     fn build_does_not_sandbox_bash_to_filesystem() {
         let p = build(&PathBuf::from("/tmp"), &tools());
@@ -150,6 +166,18 @@ mod tests {
         assert!(
             lc.contains("unrestricted shell") || lc.contains("real shell"),
             "prompt must state that bash is a real shell: {p}"
+        );
+        assert!(
+            lc.contains("trusted developer") || lc.contains("user's own machine")
+                || lc.contains("user's machine"),
+            "prompt must frame nanopi as a trusted developer tool so \
+             Claude's 'arbitrary hosts' caution doesn't fire: {p}"
+        );
+        assert!(
+            lc.contains("don't ask for confirmation")
+                || lc.contains("don't offer to run"),
+            "prompt must instruct the model to just execute pasted \
+             shell commands directly: {p}"
         );
     }
 }
