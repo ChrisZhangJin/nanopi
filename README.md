@@ -13,7 +13,8 @@ A minimal Rust port of [Pi](https://github.com/earendil-works/pi) — a tiny, st
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.5.0** | ✅ current | ~3.0 MB | Tools (read/write/edit/bash), `-p` mode, JSON output, Claude Code-style hooks, `--yolo`, JSONL sessions |
+| **v0.8.1** | ✅ current | ~3.9 MB | Full ratatui TUI, `/fork` (PI-parity), `--continue`/`--session`/`--fork`, hooks, JSONL sessions; `--yolo` removed for PI-parity |
+| v0.5.0 | released | ~3.0 MB | Tools (read/write/edit/bash), `-p` mode, JSON output, Claude Code-style hooks, JSONL sessions |
 | v0.1.0 | released | 2.4 MB | Single-file OpenAI streaming demo (preserved as `nanopi_v0_1` binary) |
 
 See `docs/v0.5-research.md` for the design and `docs/PLAN.md` for the implementation plan.
@@ -32,19 +33,16 @@ cargo build --release --target x86_64-unknown-linux-musl
     "用一句话介绍你自己"
 
 # Or via stdin
-echo "What is 2+2?" | ./nanopi --yolo --model deepseek-v4-flash --base-url https://api.deepseek.com/v1 --api-key sk-...
+echo "What is 2+2?" | ./nanopi --model deepseek-v4-flash --base-url https://api.deepseek.com/v1 --api-key sk-...
 
 # -p mode (Claude Code semantics): non-interactive, output to stdout
-./nanopi -p "读 /etc/hostname 告诉我内容" --yolo --model ... --base-url ... --api-key ...
+./nanopi -p "读 /etc/hostname 告诉我内容" --model ... --base-url ... --api-key ...
 
 # JSON output for programmatic use
-./nanopi -p --output json "say hi" --yolo --model ... --base-url ... --api-key ...
+./nanopi -p --output json "say hi" --model ... --base-url ... --api-key ...
 
 # Tools: read/write/edit/bash are auto-available
-./nanopi -p "read /etc/hostname and tell me what you see" --yolo --model ... --base-url ... --api-key ...
-
-# YOLO: skip trust prompts + hook blocks (CI-friendly)
-./nanopi -p --yolo "auto-format src/"
+./nanopi -p "read /etc/hostname and tell me what you see" --model ... --base-url ... --api-key ...
 
 # Hooks: configure under ~/.nanopi/settings.toml
 # NOTE: TOML keys are snake_case (`pre_tool_use`, not `PreToolUse`).
@@ -61,7 +59,6 @@ echo "What is 2+2?" | ./nanopi --yolo --model deepseek-v4-flash --base-url https
 | `-m`, `--message` | (stdin in interactive) | User message; first positional arg also accepted |
 | `-p`, `--print` | false | Non-interactive mode (Claude Code's `-p` semantics) |
 | `--output` | `text` | `-p` mode output: `text` \| `json` |
-| `--yolo` | false | Skip trust prompts, hook blocks (logs only), permission dialogs |
 | `--no-hooks` | false | Disable all hooks (emergency switch) |
 | `-a`, `--approve` | false | Trust project-local resources for this run |
 | `-N`, `--distrust` | false | Distrust project-local resources for this run |
@@ -117,9 +114,11 @@ export OPENAI_MODEL=deepseek-v4-flash
 | Version | Scope | Status |
 |---|---|---|
 | v0.1 | OpenAI streaming + JSONL sessions | released |
-| **v0.5** | Tools + -p mode + JSON output + hooks + --yolo | **current** |
-| v0.6 | Anthropic provider, parallel tool execution, full TUI | planned |
-| v1.0 | Full Pi parity (rustyline, themes, compaction) | future |
+| v0.5 | Tools + -p mode + JSON output + hooks | released |
+| v0.6 | Anthropic provider, parallel tool execution, TUI opt-in | released |
+| v0.7 | TUI as default mode, `/fork` PI-parity, static musl release | released |
+| **v0.8** | System prompt broadened to general Agent, `--yolo` removed (PI-parity) | **current** |
+| v1.0 | Full Pi parity (themes, compaction) | future |
 
 ## License
 

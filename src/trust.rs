@@ -5,7 +5,7 @@
 //! `~/.nanopi/trust/<encoded-cwd>=<value>` (see `persist_trust_choice`).
 //!
 //! For v0.5, the TUI prompt logic is stubbed (returns Trusted by default
-//! when --yolo or --approve is set). The full TUI prompt UI is v0.6.
+//! when --approve is set). The full TUI prompt UI is v0.6.
 
 use std::path::{Path, PathBuf};
 

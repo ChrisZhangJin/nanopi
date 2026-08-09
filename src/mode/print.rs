@@ -47,7 +47,6 @@ pub async fn run_print_mode(
     message: &str,
     output: OutputFormat,
     cwd: PathBuf,
-    yolo: bool,
     no_hooks: bool,
     approve: Option<bool>,
     continue_session: bool,
@@ -83,10 +82,10 @@ let (session_path, header) = match &choice {
 
     // Build the agent.
     let provider = crate::provider::build(api_kind, base_url, api_key, model);
-    let permission = PermissionGate::from_cli(yolo, no_hooks, approve);
+    let permission = PermissionGate::from_cli(no_hooks, approve);
 
     // For v0.5: no hooks loaded yet (settings.toml loader is a separate
-    // concern). YOLO mode means trust is implicit.
+    // concern).
     let hooks = match settings::load_settings(&cwd) {
         Ok(h) => h,
         Err(e) => {

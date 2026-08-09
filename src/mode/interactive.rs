@@ -27,14 +27,13 @@ pub async fn run_interactive_mode(
     api_key: &str,
     message: Option<String>,
     cwd: PathBuf,
-    yolo: bool,
     no_hooks: bool,
     approve: Option<bool>,
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
 ) -> Result<i32> {
-    let permission = PermissionGate::from_cli(yolo, no_hooks, approve);
+    let permission = PermissionGate::from_cli(no_hooks, approve);
 
     // ── Resolve which session file to use ─────────────────────────────────
     let choice = session::resolve_session(

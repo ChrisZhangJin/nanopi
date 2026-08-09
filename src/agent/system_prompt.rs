@@ -1,9 +1,13 @@
-//! Default system prompt for the coding-agent role.
+//! Default system prompt for the agent role.
 //!
-//! Modeled after PI's `packages/coding-agent/src/core/system-prompt.ts`
-//! (see `buildSystemPrompt`) — same shape (identity + tools + guidelines
-//! + cwd), trimmed to what nanopi actually ships. Kept short so we
-//! don't waste input tokens.
+//! Structurally modeled after PI's `packages/coding-agent/src/core/
+//! system-prompt.ts` (see `buildSystemPrompt`) — same shape (identity
+//! + tools + guidelines + cwd), trimmed to what nanopi actually
+//! ships. Deliberately diverges from PI's "expert coding assistant"
+//! wording: nanopi's tools (read/write/edit/bash/grep/find/ls) work
+//! for many tasks beyond code — log spelunking, config edits, ad-hoc
+//! shell work — so we frame it as a general-purpose agent. Kept
+//! short so we don't waste input tokens.
 //!
 //! Injected into `Context.system` when constructing a FRESH Agent.
 //! Resumed sessions keep whatever prompt was persisted with them.
@@ -45,10 +49,12 @@ pub fn build(cwd: &Path, tool_names: &[String]) -> String {
         .join("\n");
 
     format!(
-        "You are nanopi, a minimal coding-agent CLI. You help the user by \
-         reading files, executing shell commands, editing code, and writing \
-         new files — using the tools listed below rather than describing \
-         what a user should do.
+        "You are nanopi, a minimal agent CLI. You help the user accomplish \
+         tasks in their working directory — reading files, executing shell \
+         commands, editing files, and writing new files — using the tools \
+         listed below rather than describing what a user should do. Tasks \
+         may be about code, configuration, logs, data, or anything else \
+         the tools can reach.
 
 {tools_line}
 

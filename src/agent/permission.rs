@@ -1,4 +1,9 @@
-//! Permission gate — `--yolo`, hook enable/disable, project trust.
+//! Permission gate — hook enable/disable, project trust.
+//!
+//! PI has no per-tool-call permission popups (see the "No permission
+//! popups" line in `packages/coding-agent/README.md`'s Philosophy
+//! section). The remaining gate covers project-trust and hook
+//! toggling, which PI also has.
 //!
 //! See `docs/v0.5-research.md` §4.4 for design.
 
@@ -27,34 +32,33 @@ impl Default for TrustLevel {
 /// the user be asked to confirm?". Built once per session.
 #[derive(Debug, Clone)]
 pub struct PermissionGate {
-    pub yolo: bool,
     pub hooks_enabled: bool,
     pub project_trust: TrustLevel,
 }
 
 impl PermissionGate {
-    pub fn new(yolo: bool, hooks_enabled: bool, project_trust: TrustLevel) -> Self {
+    pub fn new(hooks_enabled: bool, project_trust: TrustLevel) -> Self {
         Self {
-            yolo,
             hooks_enabled,
             project_trust,
         }
     }
 
-    /// Build from CLI args + cwd. Default is Ask/hooks-on/yolo-off.
-    pub fn from_cli(yolo: bool, no_hooks: bool, approve: Option<bool>) -> Self {
+    /// Build from CLI args + cwd. Default is Ask/hooks-on.
+    pub fn from_cli(no_hooks: bool, approve: Option<bool>) -> Self {
         let trust = match approve {
             Some(true) => TrustLevel::Trusted,
             Some(false) => TrustLevel::Distrusted,
             None => TrustLevel::Ask,
         };
-        Self::new(yolo, !no_hooks, trust)
+        Self::new(!no_hooks, trust)
     }
 
     /// Decide whether a PreToolUse block decision should be honored.
-    /// In yolo mode, blocks are ignored (logged only).
+    /// Always true now that per-call yolo bypass is gone; `--no-hooks`
+    /// is the way to opt out of hook enforcement entirely.
     pub fn should_honor_pretooluse_block(&self) -> bool {
-        !self.yolo
+        true
     }
 
     /// Should we run any hooks at all?
@@ -64,7 +68,7 @@ impl PermissionGate {
 
     /// Should we even prompt the user about project trust?
     pub fn should_prompt_trust(&self) -> bool {
-        !self.yolo && self.project_trust == TrustLevel::Ask
+        self.project_trust == TrustLevel::Ask
     }
 }
 
@@ -107,47 +111,33 @@ mod tests {
 
     #[test]
     fn default_is_ask_hooks_on() {
-        let p = PermissionGate::from_cli(false, false, None);
-        assert!(!p.yolo);
+        let p = PermissionGate::from_cli(false, None);
         assert!(p.hooks_active());
         assert_eq!(p.project_trust, TrustLevel::Ask);
         assert!(p.should_prompt_trust());
     }
 
     #[test]
-    fn yolo_skips_trust_prompt() {
-        let p = PermissionGate::from_cli(true, false, None);
-        assert!(p.yolo);
-        assert!(!p.should_prompt_trust());
-    }
-
-    #[test]
     fn no_hooks_disables_hooks() {
-        let p = PermissionGate::from_cli(false, true, None);
+        let p = PermissionGate::from_cli(true, None);
         assert!(!p.hooks_active());
     }
 
     #[test]
     fn approve_sets_trust_to_trusted() {
-        let p = PermissionGate::from_cli(false, false, Some(true));
+        let p = PermissionGate::from_cli(false, Some(true));
         assert_eq!(p.project_trust, TrustLevel::Trusted);
     }
 
     #[test]
     fn no_approve_sets_trust_to_distrusted() {
-        let p = PermissionGate::from_cli(false, false, Some(false));
+        let p = PermissionGate::from_cli(false, Some(false));
         assert_eq!(p.project_trust, TrustLevel::Distrusted);
     }
 
     #[test]
-    fn yolo_ignores_pretooluse_block() {
-        let p = PermissionGate::from_cli(true, false, None);
-        assert!(!p.should_honor_pretooluse_block());
-    }
-
-    #[test]
-    fn default_honors_block() {
-        let p = PermissionGate::from_cli(false, false, None);
+    fn pretooluse_block_always_honored() {
+        let p = PermissionGate::from_cli(false, None);
         assert!(p.should_honor_pretooluse_block());
     }
 

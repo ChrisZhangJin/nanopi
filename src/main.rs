@@ -46,10 +46,6 @@ struct Args {
     #[arg(long, default_value = "text", value_parser = ["text", "json"])]
     output: String,
 
-    /// Skip all gates: trust prompts, hook blocks, permission dialogs.
-    #[arg(long)]
-    yolo: bool,
-
     /// Disable all hooks (emergency switch).
     #[arg(long)]
     no_hooks: bool,
@@ -103,14 +99,6 @@ struct Args {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-
-    // YOLO mode warning (per docs/v0.5-research.md §4.5).
-    if args.yolo {
-        eprintln!(
-            "⚠ --yolo enabled. Skipping: project trust prompts, beforeToolCall blocks,\n  \
-             permission dialogs. Bash output truncation (30KB) still applies."
-        );
-    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -228,7 +216,6 @@ async fn main() -> ExitCode {
             message,
             output_format,
             cwd,
-            args.yolo,
             args.no_hooks,
             approve,
             args.continue_session,
@@ -243,7 +230,6 @@ async fn main() -> ExitCode {
             &model,
             &api_key,
             cwd,
-            args.yolo,
             args.no_hooks,
             approve,
             args.continue_session,
@@ -260,7 +246,6 @@ async fn main() -> ExitCode {
             &api_key,
             message,
             cwd,
-            args.yolo,
             args.no_hooks,
             approve,
             args.continue_session,
