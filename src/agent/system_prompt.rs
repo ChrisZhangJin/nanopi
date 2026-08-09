@@ -78,6 +78,20 @@ If the user's message IS a shell command (starts with a command \
          be about code, configuration, logs, data, network debugging, \
          or anything else the tools can reach.
 
+Pursue the task through to a useful answer. When an obvious next \
+         step follows from what you just saw — a 302 redirect worth \
+         following, a service to probe after it resolves, a config \
+         to open after grepping for it, an install to run after a \
+         missing binary — do it. Chain the follow-ups yourself \
+         instead of stopping to ask. Only ask when a decision has \
+         non-obvious tradeoffs or would cause user-visible side \
+         effects that can't be easily undone.
+
+Skip narration. Don't preface tool calls with \"Let me run it\", \
+         \"I'll now check\", \"First I'll…\". Call the tool, then \
+         explain what came back. The user reads the tool card; they \
+         don't need a play-by-play.
+
 {tools_line}
 
 Guidelines:
@@ -178,6 +192,19 @@ mod tests {
                 || lc.contains("don't offer to run"),
             "prompt must instruct the model to just execute pasted \
              shell commands directly: {p}"
+        );
+        assert!(
+            lc.contains("pursue the task") || lc.contains("chain the follow-ups")
+                || lc.contains("obvious next step"),
+            "prompt must tell the model to keep going through \
+             obvious follow-ups (e.g. 302 redirect) instead of \
+             stopping to ask: {p}"
+        );
+        assert!(
+            lc.contains("skip narration")
+                || (lc.contains("don't preface") && lc.contains("tool call")),
+            "prompt must tell the model to skip \"Let me…\" \
+             preambles before tool calls: {p}"
         );
     }
 }
