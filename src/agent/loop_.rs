@@ -367,7 +367,16 @@ impl Agent {
         )?;
 
         let mut final_text = String::new();
-        const MAX_ITERATIONS: u32 = 16;
+        // Safety belt against runaway tool loops. PI has no hard cap and
+        // relies on `finish_reason=stop`; nanopi keeps a cap because a
+        // broken provider or gateway that never sends `Done` would burn
+        // tokens forever. 16 was too tight — research-style prompts
+        // ("investigate X across the codebase") legitimately need dozens
+        // of `read`/`grep` rounds. 50 fits the observed p99 without
+        // giving up the safety belt. Bumping this alone is not a fix
+        // for a stuck-looking session; see the fix below to
+        // SessionEntry::Message content that also went out in v0.9.1.
+        const MAX_ITERATIONS: u32 = 50;
 
         for _ in 0..MAX_ITERATIONS {
             // If a cancel token was provided, bail before starting a new
@@ -520,6 +529,20 @@ impl Agent {
             // Persist assistant text + push assistant message to context.
             // CRITICAL: must include ToolCall blocks so the provider knows
             // the following Tool messages are responses.
+            //
+            // v0.9.1 fix: previously wrote `final_text` (cumulative across
+            // ALL tool-loop iterations of this turn) into every session
+            // entry — so N iterations produced N assistant messages with
+            // ever-growing content, and `--continue` / `/resume` replayed
+            // them all, poisoning context. The session entry must carry
+            // only THIS iteration's fresh text; the tool_call / tool_result
+            // entries interleave in JSONL order.
+            //
+            // Guard also tightened: skip the Message entry entirely when
+            // there's no new text (pure tool-call iteration). Tool calls
+            // are already logged as their own SessionEntry::ToolCall by
+            // execute_tool_calls below, so a text-less Message would be
+            // redundant noise on replay.
             if !assistant_text.is_empty() || !calls.is_empty() {
                 final_text.push_str(&assistant_text);
                 let mut assistant_blocks = Vec::new();
@@ -541,15 +564,17 @@ impl Agent {
                         },
                     );
                 }
-                session::append_entry(
-                    &self.session_path,
-                    &SessionEntry::Message {
-                        id: uuid::v7().to_string(),
-                        timestamp: time::now_iso8601(),
-                        role: "assistant".into(),
-                        content: final_text.clone(),
-                    },
-                )?;
+                if !assistant_text.is_empty() {
+                    session::append_entry(
+                        &self.session_path,
+                        &SessionEntry::Message {
+                            id: uuid::v7().to_string(),
+                            timestamp: time::now_iso8601(),
+                            role: "assistant".into(),
+                            content: assistant_text.clone(),
+                        },
+                    )?;
+                }
                 self.context.messages.push(
                     crate::agent::context::ContextMessage::Assistant {
                         content: assistant_blocks,
@@ -1291,6 +1316,126 @@ mod tests {
     /// Two bash calls that each sleep 1s — they MUST run in parallel
     /// (total wall time < 1.8s), not sequentially (<2s). v0.5 was
     /// sequential; this test pins the new parallel contract.
+    /// Regression: v0.9 shipped with an accumulation bug where
+    /// SessionEntry::Message stored the cumulative `final_text` across
+    /// every tool-loop iteration, so a 3-iteration turn wrote 3
+    /// messages with growing prefixes ("A", "AB", "ABC"). This test
+    /// pins the fix: each iteration's session entry must carry only
+    /// its own fresh text, and iterations that produce only tool
+    /// calls (no text) must not emit a Message entry at all.
+    #[tokio::test]
+    async fn session_assistant_messages_are_per_iteration_not_cumulative() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct SteppedProvider {
+            step: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for SteppedProvider {
+            fn id(&self) -> &'static str { "stepped" }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let step = self.step.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(AgentEvent::Start { message_id: "m".into() }).await;
+                match step {
+                    0 => {
+                        // Iteration 1: text + a tool call → provider says
+                        // "call tools then come back to me".
+                        let _ = tx.send(AgentEvent::TextDelta {
+                            content_index: 0,
+                            text: "first".into(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::ToolCall {
+                            content_index: 0,
+                            call: ToolCall {
+                                id: "c1".into(),
+                                name: "bash".into(),
+                                arguments: json!({"command": "echo hi"}),
+                            },
+                        }).await;
+                        let _ = tx.send(AgentEvent::Done {
+                            finish_reason: FinishReason::ToolCalls,
+                            usage: Usage::default(),
+                        }).await;
+                    }
+                    1 => {
+                        // Iteration 2: fresh text only, then stop. No
+                        // cumulative "firstsecond" should appear.
+                        let _ = tx.send(AgentEvent::TextDelta {
+                            content_index: 0,
+                            text: "second".into(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::Done {
+                            finish_reason: FinishReason::Stop,
+                            usage: Usage::default(),
+                        }).await;
+                    }
+                    _ => unreachable!("provider called too many times"),
+                }
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("accum.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"stepped\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let step = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProvider { step: step.clone() }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "stepped".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        // Drain events so the sender doesn't block.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let final_text = agent.run_turn("go", &tx, None).await.expect("turn");
+        drop(tx);
+        drain.await.unwrap();
+
+        // final_text still concatenates for the caller — that's the
+        // whole turn's assistant output, useful for -p mode.
+        assert_eq!(final_text, "firstsecond");
+
+        // Read the session file and inspect the assistant messages.
+        let content = std::fs::read_to_string(&session_path).unwrap();
+        let assistant_contents: Vec<String> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .filter_map(|v| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        assert_eq!(
+            assistant_contents,
+            vec!["first".to_string(), "second".to_string()],
+            "each iteration's session entry must carry only its own fresh text"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn execute_tool_calls_runs_in_parallel_not_sequence() {
         use std::time::Instant;

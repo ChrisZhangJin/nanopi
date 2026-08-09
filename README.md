@@ -13,7 +13,8 @@ A minimal Rust port of [Pi](https://github.com/earendil-works/pi) — a tiny, st
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.9.0** | ✅ current | ~4.0 MB | Skills (PI-parity): SKILL.md dirs, `/skill:name` expansion, `--skill`/`--no-skills`, `disable-model-invocation`, folded TUI card + Ctrl-O expand, `UserPromptSubmit` hook wired |
+| **v0.9.1** | ✅ current | ~3.9 MB | Fixes v0.9.0 tool-loop bugs: assistant messages no longer accumulate cumulative content across iterations; `MAX_ITERATIONS` raised 16 → 50 for research-heavy prompts |
+| v0.9.0 | released | ~4.0 MB | Skills (PI-parity): SKILL.md dirs, `/skill:name` expansion, `--skill`/`--no-skills`, `disable-model-invocation`, folded TUI card + Ctrl-O expand, `UserPromptSubmit` hook wired |
 | v0.8.1 | released | ~3.9 MB | Full ratatui TUI, `/fork` (PI-parity), `--continue`/`--session`/`--fork`, hooks, JSONL sessions; `--yolo` removed for PI-parity |
 | v0.5.0 | released | ~3.0 MB | Tools (read/write/edit/bash), `-p` mode, JSON output, Claude Code-style hooks, JSONL sessions |
 | v0.1.0 | released | 2.4 MB | Single-file OpenAI streaming demo (preserved as `nanopi_v0_1` binary) |
