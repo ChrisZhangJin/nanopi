@@ -233,17 +233,37 @@ fn parse_json_decision(stdout: &str) -> Option<HookOutcome> {
         .map(|l| l.trim())
         .find(|l| !l.is_empty())?;
     let v: Value = serde_json::from_str(line).ok()?;
-    let decision = v.get("decision").and_then(|x| x.as_str())?;
-    match decision {
-        "allow" => Some(HookOutcome::Allow),
-        "block" => {
-            let reason = v
-                .get("reason")
-                .and_then(|x| x.as_str())
-                .unwrap_or("blocked by hook")
-                .to_string();
-            Some(HookOutcome::Block { reason })
+
+    // `decision: "block"` always wins — even if `updated_input` is
+    // present, a block hook must refuse the call outright.
+    let decision = v.get("decision").and_then(|x| x.as_str());
+    if decision == Some("block") {
+        let reason = v
+            .get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("blocked by hook")
+            .to_string();
+        return Some(HookOutcome::Block { reason });
+    }
+
+    // `updated_input` (object) → Transform, whether `decision` is
+    // "allow", omitted, or unrecognized. v0.9.1 fix: the previous
+    // parser only handled "allow" / "block" strings and threw away
+    // `updated_input` entirely, so `HookOutcome::Transform` was
+    // unreachable from any real hook. Also accept `hookSpecificOutput`
+    // as an alias since some Claude-Code-style hooks emit that.
+    let updated = v
+        .get("updated_input")
+        .or_else(|| v.get("hookSpecificOutput"))
+        .cloned();
+    if let Some(new_arguments) = updated {
+        if new_arguments.is_object() {
+            return Some(HookOutcome::Transform { new_arguments });
         }
+    }
+
+    match decision {
+        Some("allow") => Some(HookOutcome::Allow),
         _ => None,
     }
 }
@@ -421,6 +441,78 @@ mod tests {
     #[test]
     fn parse_json_decision_invalid_json_returns_none() {
         assert_eq!(parse_json_decision("not json"), None);
+    }
+
+    /// Regression: pre-v0.9.1 dropped `updated_input` entirely, so a
+    /// hook that returned `{"decision":"allow","updated_input":{...}}`
+    /// silently produced no Transform. Fixed by extending the parser
+    /// to recognize `updated_input` (and `hookSpecificOutput` as an
+    /// alias).
+    #[test]
+    fn parse_json_decision_transform_via_updated_input() {
+        let s = r#"{"decision":"allow","updated_input":{"command":"echo TRANSFORMED"}}"#;
+        match parse_json_decision(s) {
+            Some(HookOutcome::Transform { new_arguments }) => {
+                assert_eq!(
+                    new_arguments.get("command").and_then(|v| v.as_str()),
+                    Some("echo TRANSFORMED")
+                );
+            }
+            other => panic!("expected Transform, got {other:?}"),
+        }
+    }
+
+    /// `updated_input` without an explicit `decision` still transforms.
+    /// Reasonable ergonomics — hook authors shouldn't have to write
+    /// `decision:"allow"` alongside a rewrite.
+    #[test]
+    fn parse_json_decision_updated_input_alone_transforms() {
+        let s = r#"{"updated_input":{"command":"safer"}}"#;
+        match parse_json_decision(s) {
+            Some(HookOutcome::Transform { new_arguments }) => {
+                assert_eq!(
+                    new_arguments.get("command").and_then(|v| v.as_str()),
+                    Some("safer")
+                );
+            }
+            other => panic!("expected Transform, got {other:?}"),
+        }
+    }
+
+    /// `decision: "block"` overrides even when `updated_input` is
+    /// present — a blocking hook must refuse the call outright, not
+    /// silently rewrite and allow.
+    #[test]
+    fn parse_json_decision_block_beats_updated_input() {
+        let s = r#"{"decision":"block","reason":"nope","updated_input":{"x":1}}"#;
+        match parse_json_decision(s) {
+            Some(HookOutcome::Block { reason }) => assert_eq!(reason, "nope"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// Non-object `updated_input` (e.g. a string or null) is ignored —
+    /// tool arguments are always JSON objects in nanopi's schema.
+    #[test]
+    fn parse_json_decision_non_object_updated_input_is_ignored() {
+        let s = r#"{"updated_input":"oops"}"#;
+        assert_eq!(parse_json_decision(s), None);
+    }
+
+    /// `hookSpecificOutput` is an alias used by Claude-Code-style
+    /// hooks. Same effect as `updated_input`.
+    #[test]
+    fn parse_json_decision_hook_specific_output_alias() {
+        let s = r#"{"hookSpecificOutput":{"command":"aliased"}}"#;
+        match parse_json_decision(s) {
+            Some(HookOutcome::Transform { new_arguments }) => {
+                assert_eq!(
+                    new_arguments.get("command").and_then(|v| v.as_str()),
+                    Some("aliased")
+                );
+            }
+            other => panic!("expected Transform, got {other:?}"),
+        }
     }
 
     // End-to-end bash hook integration.
