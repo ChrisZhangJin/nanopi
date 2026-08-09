@@ -594,7 +594,21 @@ impl Agent {
             }
 
             let Some((finish_reason, usage)) = done else {
-                // Stream ended without Done. Treat as Stop.
+                // Stream ended without Done. If we accumulated ANY
+                // text or completed tool calls this iteration, treat
+                // that as an implicit Stop and return what we have.
+                // But if the whole turn produced nothing at all —
+                // no text, no tool calls, no error — that's a silent
+                // failure (v0.9.1: observed with a gateway that
+                // returned HTTP 200 + one non-conforming SSE error
+                // event that got silently skipped). Emit a real Error
+                // event and surface it so the user sees something
+                // instead of the "nothing was printed" bug.
+                if final_text.is_empty() && assistant_text.is_empty() && calls.is_empty() {
+                    let msg = "empty response — provider ended the stream with no text, tool call, or Done event (likely gateway silently dropped an error)".to_string();
+                    let _ = tx.send(AgentEvent::Error { error: msg.clone() }).await;
+                    return Err(AgentError::Provider(msg));
+                }
                 return Ok(final_text);
             };
 
@@ -1299,6 +1313,80 @@ mod tests {
                 .await;
             Ok(Usage::default())
         }
+    }
+
+    /// Regression: v0.9.1 discovered nanopi could return silently
+    /// when the provider stream ended without any TextDelta, ToolCall,
+    /// or Done event — the exact shape seen when a corporate gateway
+    /// returned HTTP 200 + an unrecognized SSE `event: error` that
+    /// the Anthropic parser silently skipped. Fix: `run_turn` now
+    /// surfaces this as a Provider error instead of returning
+    /// `Ok("")`. That way the user always sees SOMETHING.
+    #[tokio::test]
+    async fn empty_stream_without_done_surfaces_error() {
+        struct SilentProvider;
+        #[async_trait::async_trait]
+        impl Provider for SilentProvider {
+            fn id(&self) -> &'static str { "silent" }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                // Not even a Start event. Just drop the channel.
+                drop(tx);
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("empty.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"silent\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SilentProvider),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "silent".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        let drain = tokio::spawn(async move {
+            let mut got_error = false;
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, AgentEvent::Error { .. }) {
+                    got_error = true;
+                }
+            }
+            got_error
+        });
+
+        let r = agent.run_turn("hi", &tx, None).await;
+        drop(tx);
+        let got_error_event = drain.await.unwrap();
+
+        // Must be an error, not Ok("").
+        assert!(
+            matches!(r, Err(AgentError::Provider(_))),
+            "silent stream must surface as Provider error, got {r:?}"
+        );
+        // And an Error event must have been streamed for the renderer.
+        assert!(got_error_event, "renderer must receive an Error event");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: v0.9.1 discovered `--no-hooks` didn't gate the
