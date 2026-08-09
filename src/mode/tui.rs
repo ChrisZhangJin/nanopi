@@ -2544,6 +2544,18 @@ const TOOL_PREVIEW_LINES: usize = 6;
 /// All rows share the same bg (green on success, red on error). The
 /// pending bar text was stashed by the earlier ToolCall event; if
 /// missing (shouldn't happen), we still render output + timing.
+/// Replace `\t` with four spaces so styled backgrounds fill the whole
+/// visible line inside tool / skill / user cards. Bare `\t` bytes
+/// reach the terminal and are expanded by the terminal itself using
+/// its DEFAULT (unstyled) background — the styled span covers only
+/// the one tab character, leaving 3-7 columns of black gap per tab.
+/// Most visible on TypeScript / Go / Makefile output where tabs
+/// are the indent standard. See SCR-20260810-bfry.png for the
+/// bug we're fixing.
+fn expand_tabs(s: &str) -> String {
+    s.replace('\t', "    ")
+}
+
 fn render_tool_card(
     term: &mut Term,
     app: &mut App,
@@ -2598,9 +2610,10 @@ fn render_tool_card(
     let start = total.saturating_sub(TOOL_PREVIEW_LINES);
     for line in &lines[start..] {
         // Prefix with 2 spaces for visual indent inside the card.
+        // Expand tabs so the bg doesn't tear open on tab-indented output.
         insert_line_bg(term, Line::from(vec![
             Span::styled("  ", dim_style),
-            Span::styled(line.to_string(), dim_style),
+            Span::styled(expand_tabs(line), dim_style),
         ]), Some(dim_style))?;
     }
 
@@ -2659,7 +2672,7 @@ fn render_user_echo(term: &mut Term, msg: &str) -> Result<()> {
     for line in msg.lines() {
         insert_line_bg(term, Line::from(vec![
             Span::styled("  ", user_bg),
-            Span::styled(line.to_string(), user_bg),
+            Span::styled(expand_tabs(line), user_bg),
         ]), Some(user_bg))?;
     }
     insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
@@ -3039,12 +3052,13 @@ fn render_tool_expansion(term: &mut Term, content: &str, is_error: bool) -> Resu
         Some(bar_style),
     )?;
     // Every content line rendered as `  <line>` on the same bg.
+    // Expand tabs so the bg doesn't tear open on tab-indented output.
     for line in content.lines() {
         insert_line_bg(
             term,
             Line::from(vec![
                 Span::styled("  ", bar_style),
-                Span::styled(line.to_string(), bar_style),
+                Span::styled(expand_tabs(line), bar_style),
             ]),
             Some(bar_style),
         )?;
@@ -3076,10 +3090,13 @@ fn render_skill_expansion(term: &mut Term, s: &CollapsedSkill) -> Result<()> {
         Some(bg),
     )?;
     // Render body through the shared markdown parser so headings /
-    // code / emphasis look consistent with assistant replies.
+    // code / emphasis look consistent with assistant replies. Expand
+    // tabs BEFORE parsing so both the markdown parser and the bg
+    // paint agree on column widths.
     let mut md = crate::render::markdown::MdState::default();
-    for line in s.body.lines() {
-        let spans = crate::render::markdown::render_line(line, &mut md);
+    for raw_line in s.body.lines() {
+        let expanded = expand_tabs(raw_line);
+        let spans = crate::render::markdown::render_line(&expanded, &mut md);
         let mut owned: Vec<Span<'static>> = vec![Span::styled("  ", bg)];
         for sp in spans {
             owned.push(Span::styled(sp.content.into_owned(), bg.patch(sp.style)));
@@ -3316,6 +3333,20 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tabs must be expanded to spaces before we hand a line to
+    /// ratatui. Otherwise the terminal's own tab expansion paints
+    /// with default bg, tearing black holes in tool / skill cards
+    /// (see SCR-20260810-bfry.png).
+    #[test]
+    fn expand_tabs_replaces_all_tabs_with_four_spaces() {
+        assert_eq!(expand_tabs("no tabs"), "no tabs");
+        assert_eq!(expand_tabs("\thello"), "    hello");
+        assert_eq!(expand_tabs("a\tb\tc"), "a    b    c");
+        assert_eq!(expand_tabs("\t\t"), "        ");
+        // Leaves other whitespace alone.
+        assert_eq!(expand_tabs("  a\tb"), "  a    b");
+    }
 
     fn mkapp() -> App {
         App::new(
