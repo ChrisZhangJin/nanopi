@@ -817,13 +817,30 @@ async fn run_one_tool(
         })
         .await;
 
-    // PostToolUse hooks.
+    // PostToolUse hooks. Payload mirrors Claude Code's PostToolUse
+    // wire schema so hooks can inspect what actually happened —
+    // `tool_input` (final args after any PreToolUse transform) and
+    // `tool_response` (content + is_error + duration_ms).
+    //
+    // v0.9.1 fix: previously passed `Value::Object(Default::default())`
+    // (empty `{}`), so hooks could see tool_name and session_id but
+    // nothing about the call itself — no way to log outputs, react
+    // to failures, or scrape secrets from stdout. Everything the
+    // hook actually needs to be useful was missing.
     if permission.hooks_active() && !hooks.post_tool_use.is_empty() {
+        let post_payload = serde_json::json!({
+            "tool_input": effective_args,
+            "tool_response": {
+                "content": content,
+                "is_error": is_error,
+                "duration_ms": elapsed.as_millis() as u64,
+            },
+        });
         let _ = run_hooks(
             &hooks.post_tool_use,
             HookEvent::PostToolUse,
             &call.name,
-            Value::Object(Default::default()),
+            post_payload,
             &cwd,
             Some(&session_id.to_string()),
         )
@@ -925,6 +942,103 @@ mod tests {
             _ => panic!("expected Tool message, got {last:?}"),
         }
         assert!(count >= 1, "expected at least one rendered event");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: v0.9.1 PostToolUse used to be called with
+    /// `Value::Object(Default::default())` (empty `{}`) — hooks
+    /// couldn't see what the tool actually did. Fix populates the
+    /// payload with `tool_input` (final args) and `tool_response`
+    /// (content / is_error / duration_ms). This test writes the
+    /// hook stdin JSON to disk and asserts every field is present.
+    #[tokio::test]
+    async fn post_tool_use_hook_receives_input_and_response() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        // Post-tool hook that dumps its stdin JSON to a known path.
+        let stdin_dump = dir.join("post.json");
+        let hook_script = dir.join("post.sh");
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/usr/bin/env bash\ncat > {}\nexit 0\n",
+                stdin_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &hook_script,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let post_hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let hooks = HooksConfig {
+            pre_tool_use: vec![],
+            post_tool_use: vec![post_hook],
+            user_prompt_submit: vec![],
+            session_start: vec![],
+            session_end: vec![],
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .execute_tool_calls(
+                vec![ToolCall {
+                    id: "call_pt".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "echo hi"}),
+                }],
+                &tx,
+            )
+            .await
+            .unwrap();
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        let dumped = std::fs::read_to_string(&stdin_dump)
+            .expect("hook must have written its stdin JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&dumped).expect("stdin was JSON");
+
+        assert_eq!(v["event"], "post_tool_use");
+        assert_eq!(v["tool_name"], "bash");
+        // tool_input carries the (post-transform) tool arguments.
+        assert_eq!(v["arguments"]["tool_input"]["command"], "echo hi");
+        // tool_response fields must all be present so hooks can react
+        // to failures / scrape output / measure durations.
+        assert!(v["arguments"]["tool_response"]["content"]
+            .as_str()
+            .map(|s| s.contains("hi"))
+            .unwrap_or(false), "content missing/wrong: {v}");
+        assert_eq!(v["arguments"]["tool_response"]["is_error"], false);
+        assert!(v["arguments"]["tool_response"]["duration_ms"].is_u64());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
