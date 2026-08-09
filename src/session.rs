@@ -576,42 +576,6 @@ pub fn list_sessions_for_cwd(cwd: &Path, current_path: Option<&Path>) -> Vec<Ses
     out
 }
 
-/// Walk `parent_id` up from `current` toward the root. Returns
-/// `[(path, header, tree_rows)]` with `current` at index 0 and the
-/// root at the last index. Each session's tree_rows are its
-/// full displayable entry list (user + assistant + tools + compact),
-/// used by the fork picker to render a PI-style DFS tree.
-pub fn walk_parent_chain(
-    current: &Path,
-) -> Vec<(PathBuf, SessionHeader, Vec<TreeRow>)> {
-    let mut out = Vec::new();
-    let mut cur = Some(current.to_path_buf());
-    while let Some(p) = cur.take() {
-        let (hdr, entries) = match read_session(&p) {
-            Ok(t) => t,
-            Err(_) => break,
-        };
-        let rows = tree_items(&entries);
-        let parent_id_opt = hdr.parent_id.map(|id| id.to_string());
-        out.push((p, hdr, rows));
-        if let Some(pid) = parent_id_opt {
-            cur = session_by_id(&pid);
-        }
-    }
-    out
-}
-
-/// Longest common prefix length between two TreeRow lists — compares
-/// role + preview. Used by the fork picker to skip rows a child
-/// inherited from its parent so we don't show duplicates.
-pub fn common_tree_row_prefix(a: &[TreeRow], b: &[TreeRow]) -> usize {
-    let mut n = 0;
-    while n < a.len() && n < b.len() && a[n].role == b[n].role && a[n].preview == b[n].preview {
-        n += 1;
-    }
-    n
-}
-
 /// Iterate over entries in a session file. Returns header + body.
 pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), SessionError> {
     if let Some(parent) = path.parent() {
@@ -1095,93 +1059,6 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    #[test]
-    fn walk_parent_chain_returns_current_to_root() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
-        let cwd = home_tmp();
-
-        // Root session with one user message.
-        let (root_path, _root_hdr) = new_session(&cwd, "m", "http://x").unwrap();
-        append_entry(
-            &root_path,
-            &SessionEntry::Message {
-                id: uuid::v7().to_string(),
-                timestamp: time::now_iso8601(),
-                role: "user".into(),
-                content: "root-1".into(),
-            },
-        )
-        .unwrap();
-        append_entry(
-            &root_path,
-            &SessionEntry::Message {
-                id: uuid::v7().to_string(),
-                timestamp: time::now_iso8601(),
-                role: "user".into(),
-                content: "root-2".into(),
-            },
-        )
-        .unwrap();
-
-        // Fork at message 1 (keeps only "root-1").
-        let (child_path, _child_hdr, _text) =
-            fork_session_at(&cwd, &root_path, 1).unwrap();
-        // Add one more user message to the child.
-        append_entry(
-            &child_path,
-            &SessionEntry::Message {
-                id: uuid::v7().to_string(),
-                timestamp: time::now_iso8601(),
-                role: "user".into(),
-                content: "child-1".into(),
-            },
-        )
-        .unwrap();
-
-        let chain = walk_parent_chain(&child_path);
-        assert_eq!(chain.len(), 2, "current + root");
-        assert_eq!(chain[0].0, child_path, "current at index 0");
-        assert_eq!(chain[1].0, root_path, "root at last");
-        // Child's tree rows: root-1 (inherited via fork prefix) + child-1
-        let child_previews: Vec<&str> = chain[0].2.iter().map(|r| r.preview.as_str()).collect();
-        assert_eq!(child_previews, vec!["root-1", "child-1"]);
-        // Root's: root-1, root-2
-        let root_previews: Vec<&str> = chain[1].2.iter().map(|r| r.preview.as_str()).collect();
-        assert_eq!(root_previews, vec!["root-1", "root-2"]);
-
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    #[test]
-    fn common_tree_row_prefix_finds_divergence() {
-        fn row(role: &str, preview: &str) -> TreeRow {
-            TreeRow {
-                entry_index: 0,
-                role: role.into(),
-                preview: preview.into(),
-                prefill_text: None,
-            }
-        }
-        let a = vec![row("user", "a"), row("assistant", "b"), row("user", "c")];
-        let b_same = vec![row("user", "a"), row("assistant", "b"), row("user", "c")];
-        assert_eq!(common_tree_row_prefix(&a, &b_same), 3);
-        let b_extended = vec![row("user", "a"), row("assistant", "b"), row("user", "c"), row("user", "d")];
-        assert_eq!(common_tree_row_prefix(&a, &b_extended), 3);
-        let b_diverge = vec![row("user", "a"), row("assistant", "b'")];
-        assert_eq!(common_tree_row_prefix(&a, &b_diverge), 1);
-        let b_role_mismatch = vec![row("assistant", "a")];
-        assert_eq!(common_tree_row_prefix(&a, &b_role_mismatch), 0);
     }
 
     #[test]

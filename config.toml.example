@@ -19,6 +19,16 @@ model = "gpt-5"
 # gateway, or non-OpenAI provider (DeepSeek, Gemini via gateway, etc.).
 base_url = "https://api.openai.com/v1"
 
+# Wire protocol spoken at `base_url`. Defaults to "openai" — the
+# de-facto OpenAI chat/completions surface used by OpenAI, DeepSeek,
+# oneapi/newapi/litellm, ollama, vLLM, etc. Set to "anthropic" when
+# the endpoint speaks Anthropic's native Messages API instead (path
+# suffix `/v1/messages`) — e.g. Anthropic direct, or a vendor's
+# Anthropic-compat surface like `https://api.minimaxi.com/anthropic`.
+# Wrong choice here means requests hit the wrong path → 404.
+# api_kind = "openai"      # default
+# api_kind = "anthropic"
+
 # ─── API key: pick ONE of the two below ─────────────────────────────
 
 # Option A — file (recommended). Path to a chmod-600 file containing

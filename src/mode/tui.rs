@@ -32,7 +32,7 @@
 //! MVP: single-line input; multi-line + Emacs keys come in v0.7 S2.
 
 use std::io::{self, Stdout, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -244,8 +244,8 @@ fn print_startup_banner(model: &str, session_id: &str) {
     let sid_short = &session_id[..8.min(session_id.len())];
     // Title line: bold nanopi + dim details.
     println!(
-        "\x1b[1mnanopi\x1b[0m \x1b[2mv0.6+  {}  session {}\x1b[0m",
-        model, sid_short
+        "\x1b[1mnanopi\x1b[0m \x1b[2mv{}  {}  session {}\x1b[0m",
+        env!("CARGO_PKG_VERSION"), model, sid_short
     );
     // Hint line, dim.
     println!(
@@ -1766,24 +1766,27 @@ async fn handle_action(
                 return Ok(());
             };
 
-            let mut chain = session::walk_parent_chain(&session_path);
-            if chain.is_empty() {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
-                        "[fork: could not read current session]",
-                        Style::default().fg(Color::Red),
-                    ),
-                ]))?;
-                return Ok(());
-            }
-            // chain[0] = current, last = root. Reverse to [root, …, current]
-            // so DFS starts at the root and dips into child branches.
-            chain.reverse();
-
-            let mut items: Vec<MenuItem<(PathBuf, usize)>> = Vec::new();
-            render_fork_tree(&chain, 0, 0, &session_path, &mut items);
-
-            if items.is_empty() {
+            // PI-parity: the picker lists user messages from THIS session
+            // only. To fork off an ancestor, `/resume` it first, then
+            // `/fork`. See `packages/coding-agent/src/modes/interactive/
+            // components/user-message-selector.ts` — PI has no cross-
+            // session tree either.
+            let entries = match session::read_session(&session_path) {
+                Ok((_, e)) => e,
+                Err(_) => {
+                    insert_line(term, Line::from(vec![
+                        Span::styled(
+                            "[fork: could not read current session]",
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]))?;
+                    return Ok(());
+                }
+            };
+            let rows = session::tree_items(&entries);
+            let user_rows: Vec<&session::TreeRow> =
+                rows.iter().filter(|r| r.role == "user").collect();
+            if user_rows.is_empty() {
                 insert_line(term, Line::from(vec![
                     Span::styled(
                         "[fork: no user messages in this session yet]",
@@ -1792,22 +1795,25 @@ async fn handle_action(
                 ]))?;
                 return Ok(());
             }
+            let total = user_rows.len();
+            let items: Vec<MenuItem<(PathBuf, usize)>> = user_rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    MenuItem::new(
+                        row.preview.clone(),
+                        format!("Message {} of {}", i + 1, total),
+                        (session_path.clone(), row.entry_index),
+                    )
+                })
+                .collect();
             app.fork_picker = Some(MenuState::new(items));
         }
         KeyAction::ForkChosen(source_path, target_idx) => {
-            // Compute cut-off (tail of CURRENT session that this fork
-            // will abandon) and prefill (target message text if it's a
-            // user message). Only sessions where source == current
-            // have a meaningful cut-off — cross-session forks to an
-            // ancestor abandon nothing summarizable in the ancestor
-            // itself, so we skip the summary prompt in that case.
-            let current_path = {
-                let g = agent_slot.lock().await;
-                match g.as_ref() {
-                    Some(a) => a.session_path.clone(),
-                    None => return Ok(()),
-                }
-            };
+            // Since the picker only surfaces the current session,
+            // `source_path` is always the active session and the cut-off
+            // is the tail from target_idx onward. prefill = the target
+            // user message's text (all picker items are user rows now).
             let src_entries = match session::read_session(&source_path) {
                 Ok((_, e)) => e,
                 Err(e) => {
@@ -1826,7 +1832,7 @@ async fn handle_action(
                 }
                 _ => None,
             });
-            let cut_off = if source_path == current_path && target_idx < src_entries.len() {
+            let cut_off = if target_idx < src_entries.len() {
                 src_entries[target_idx..].to_vec()
             } else {
                 Vec::new()
@@ -2847,58 +2853,6 @@ fn split_at_col(s: &str, col: usize) -> (&str, &str) {
     s.split_at(clamped)
 }
 
-/// Recursively populate `items` with a DFS traversal of the session
-/// tree. `chain` is ordered [root, ..., parent, current]. At each
-/// level `depth`, we walk the session's user messages starting at
-/// `start`; whenever we reach the index where the next-deeper chain
-/// entry diverges (its common-prefix-length with us), we descend
-/// into that deeper session's "new tail" before emitting our own
-/// message at that index. Result: the picker shows fork branches
-/// nested inline at their branch points, PI-style
-/// (see img/pi_fork_tree.jpg).
-fn render_fork_tree(
-    chain: &[(PathBuf, session::SessionHeader, Vec<session::TreeRow>)],
-    depth: usize,
-    start: usize,
-    current_path: &Path,
-    items: &mut Vec<MenuItem<(PathBuf, usize)>>,
-) {
-    let (path, hdr, rows) = &chain[depth];
-    let deeper_start = if depth + 1 < chain.len() {
-        Some(session::common_tree_row_prefix(rows, &chain[depth + 1].2))
-    } else {
-        None
-    };
-    let is_current = path == current_path;
-    let short = &hdr.id.to_string()[..8];
-    let branch_label = if is_current { "current" } else { "past branch" };
-    let indent = "  ".repeat(depth);
-    let total = rows.len();
-
-    for i in start..rows.len() {
-        if Some(i) == deeper_start {
-            render_fork_tree(chain, depth + 1, i, current_path, items);
-        }
-        let row = &rows[i];
-        // Payload is the ENTRY index in the source session, not the
-        // tree-row index — that's what fork_session_at slices on.
-        items.push(MenuItem::new(
-            format!("{}{}: {}", indent, row.role, row.preview),
-            format!("{} · {} · row {}/{}", branch_label, short, i + 1, total),
-            (path.clone(), row.entry_index),
-        ));
-    }
-
-    // Edge case: deeper session diverges AT OR PAST our end (it fully
-    // shares our prefix and adds new rows beyond us). Descend after
-    // the loop so those rows still appear.
-    if let Some(ds) = deeper_start {
-        if ds >= rows.len() {
-            render_fork_tree(chain, depth + 1, ds, current_path, items);
-        }
-    }
-}
-
 /// Same as draw_palette but for MenuState<String> (model picker etc).
 /// A minimal re-implementation — TODO: unify via a trait once we have
 /// a third menu type.
@@ -2925,6 +2879,9 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
     };
     let end = (start + max_rows).min(vis.len());
     let mut lines: Vec<Line> = Vec::new();
+    let total_w = area.width as usize;
+    let arrow_w = 2; // "→ " or "  " — both 2 display cols
+    let gap_w = 2;   // gap between label and right-aligned description
     for (i, item) in vis[start..end].iter().enumerate() {
         let absolute = start + i;
         let is_sel = absolute == sel;
@@ -2935,9 +2892,30 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
             Style::default().fg(Color::Gray)
         };
         let desc_style = Style::default().fg(Color::DarkGray);
+
+        // Right-align description to the row's right edge; truncate
+        // the label with an ellipsis when the two would collide.
+        // Without this, long labels (e.g. a full user-message preview)
+        // push the description off past the right edge and the column
+        // stops aligning between rows.
+        let desc_w = item.description.chars().count();
+        let label_max = total_w.saturating_sub(arrow_w + gap_w + desc_w);
+        let label_w = item.label.chars().count();
+        let label_str = if label_w > label_max {
+            let take = label_max.saturating_sub(1);
+            let mut s: String = item.label.chars().take(take).collect();
+            s.push('…');
+            s
+        } else {
+            item.label.clone()
+        };
+        let pad = label_max.saturating_sub(label_str.chars().count());
+        let label_padded = format!("{}{}", label_str, " ".repeat(pad));
+
         lines.push(Line::from(vec![
             Span::styled(arrow, label_style),
-            Span::styled(format!("{:<32}", item.label), label_style),
+            Span::styled(label_padded, label_style),
+            Span::styled(" ".repeat(gap_w), desc_style),
             Span::styled(item.description.clone(), desc_style),
         ]));
     }
