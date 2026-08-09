@@ -11,6 +11,14 @@
 //!
 //! Injected into `Context.system` when constructing a FRESH Agent.
 //! Resumed sessions keep whatever prompt was persisted with them.
+//!
+//! Framing note: v0.9.1 dropped the "in their working directory"
+//! phrasing and the plain "executing shell commands" description
+//! after a user hit refusal on `curl http://192.168.32.101:18081/`
+//! — Claude read the prompt as sandboxing the shell to filesystem
+//! work and self-restricted. The bash tool has no such limit; the
+//! prompt must be explicit about that so the model actually uses
+//! it.
 
 use std::path::Path;
 
@@ -50,11 +58,13 @@ pub fn build(cwd: &Path, tool_names: &[String]) -> String {
 
     format!(
         "You are nanopi, a minimal agent CLI. You help the user accomplish \
-         tasks in their working directory — reading files, executing shell \
-         commands, editing files, and writing new files — using the tools \
-         listed below rather than describing what a user should do. Tasks \
-         may be about code, configuration, logs, data, or anything else \
-         the tools can reach.
+         tasks by reading files, running shell commands, editing files, and \
+         writing new files — using the tools listed below rather than \
+         describing what a user should do. The bash tool is a real, \
+         unrestricted shell: network requests (curl/wget), package installs, \
+         probing services, and other host-level operations are all fair game \
+         when the user asks. Tasks may be about code, configuration, logs, \
+         data, network debugging, or anything else the tools can reach.
 
 {tools_line}
 
@@ -115,5 +125,31 @@ mod tests {
     fn build_omits_rg_hint_when_grep_present() {
         let p = build(&PathBuf::from("/tmp"), &tools());
         assert!(!p.to_ascii_lowercase().contains("ripgrep"));
+    }
+
+    /// Regression: v0.9.1 broadened the framing so Claude wouldn't
+    /// refuse network requests (a user hit refusal on
+    /// `curl http://…` because "in their working directory" +
+    /// "executing shell commands" read as a filesystem-only sandbox).
+    /// The prompt must:
+    ///   (1) not carry the sandbox-implying phrase, and
+    ///   (2) explicitly authorize network requests via bash so the
+    ///       model doesn't over-restrict itself.
+    #[test]
+    fn build_does_not_sandbox_bash_to_filesystem() {
+        let p = build(&PathBuf::from("/tmp"), &tools());
+        assert!(
+            !p.contains("in their working directory"),
+            "prompt still carries the sandbox-implying phrase"
+        );
+        let lc = p.to_ascii_lowercase();
+        assert!(
+            lc.contains("network requests") || lc.contains("curl"),
+            "prompt must explicitly authorize network requests: {p}"
+        );
+        assert!(
+            lc.contains("unrestricted shell") || lc.contains("real shell"),
+            "prompt must state that bash is a real shell: {p}"
+        );
     }
 }
