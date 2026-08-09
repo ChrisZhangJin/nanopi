@@ -170,7 +170,14 @@ impl Agent {
 
     /// Fire all `session_start` hooks. Advisory — outcome is not enforced.
     /// Call once, after Agent construction, before the first turn.
+    ///
+    /// v0.9.1 fix: honors `--no-hooks` — previously session lifecycle
+    /// hooks leaked through the emergency switch because only the
+    /// tool-facing sites gated on `hooks_active()`.
     pub async fn fire_session_start(&self) {
+        if !self.permission.hooks_active() {
+            return;
+        }
         run_session_hooks(
             &self.hooks.session_start,
             HookEvent::SessionStart,
@@ -182,7 +189,11 @@ impl Agent {
 
     /// Fire all `session_end` hooks. Advisory. Call before the process
     /// exits (or before Agent is dropped in the interactive loop).
+    /// See `fire_session_start` for the `--no-hooks` note.
     pub async fn fire_session_end(&self) {
+        if !self.permission.hooks_active() {
+            return;
+        }
         run_session_hooks(
             &self.hooks.session_end,
             HookEvent::SessionEnd,
@@ -1174,6 +1185,79 @@ mod tests {
                 .await;
             Ok(Usage::default())
         }
+    }
+
+    /// Regression: v0.9.1 discovered `--no-hooks` didn't gate the
+    /// session lifecycle hooks — SessionStart and SessionEnd fired
+    /// regardless. Fix guarded both on `permission.hooks_active()`.
+    /// This test writes a marker file from a session_start hook and
+    /// asserts the marker never appears when `--no-hooks` is set.
+    #[tokio::test]
+    async fn no_hooks_disables_session_start_and_end() {
+        let dir = tmp();
+        let marker = dir.join("session_start_fired");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/usr/bin/env bash\ntouch {}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &hook_script,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let session_path = dir.join("noh.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"m\",\"base_url\":\"\"}\n",
+        )
+        .unwrap();
+
+        // Same hook wired for both session_start and session_end.
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+
+        // --no-hooks → permission.hooks_active()==false.
+        let agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider { response: "ok".into() }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(true /*no_hooks*/, None),
+            hooks: HooksConfig {
+                pre_tool_use: vec![],
+                post_tool_use: vec![],
+                user_prompt_submit: vec![],
+                session_start: vec![hook_cfg.clone()],
+                session_end: vec![hook_cfg],
+            },
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+        };
+        agent.fire_session_start().await;
+        agent.fire_session_end().await;
+
+        assert!(
+            !marker.exists(),
+            "--no-hooks must disable both session_start and session_end"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─────── v0.6: --continue / continue_last_session ───────
