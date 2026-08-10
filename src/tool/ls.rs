@@ -91,13 +91,9 @@ fn resolve_dir(cwd: &Path, p: &str) -> Result<PathBuf, ToolError> {
     let normalized = std::fs::canonicalize(&candidate).map_err(|e| {
         ToolError::Execution(format!("cannot resolve {}: {e}", candidate.display()))
     })?;
-    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    if !normalized.starts_with(&cwd_canon) {
-        return Err(ToolError::Execution(format!(
-            "path escapes cwd: {}",
-            candidate.display()
-        )));
-    }
+    // v0.9.2: no cwd-escape guard on read-only tools (see tool/read.rs
+    // for the rationale — PI / Claude Code don't sandbox these, and
+    // bash bypasses them anyway).
     if !normalized.is_dir() {
         return Err(ToolError::Execution(format!(
             "not a directory: {}",
@@ -145,13 +141,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v0.9.2 relaxed the read-only sandbox to match PI / Claude Code.
+    /// Absolute paths outside cwd now succeed when the target exists
+    /// and is a directory.
     #[tokio::test]
-    async fn rejects_outside_cwd() {
-        let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
-        let r = LsTool.execute(json!({"path": "/etc"}), &ctx).await;
-        assert!(r.is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+    async fn absolute_path_outside_cwd_is_allowed() {
+        let cwd = tmp();
+        let other = tmp();
+        std::fs::write(other.join("marker.txt"), "").unwrap();
+        let ctx = ToolContext { cwd: cwd.clone() };
+        let out = LsTool
+            .execute(json!({"path": other.display().to_string()}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("marker.txt"));
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[tokio::test]

@@ -131,13 +131,7 @@ fn resolve_dir(cwd: &Path, p: &str) -> Result<PathBuf, ToolError> {
     let normalized = std::fs::canonicalize(&candidate).map_err(|e| {
         ToolError::Execution(format!("cannot resolve {}: {e}", candidate.display()))
     })?;
-    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    if !normalized.starts_with(&cwd_canon) {
-        return Err(ToolError::Execution(format!(
-            "path escapes cwd: {}",
-            candidate.display()
-        )));
-    }
+    // v0.9.2: no cwd-escape guard on read-only tools (see tool/read.rs).
     if !normalized.is_dir() {
         return Err(ToolError::Execution(format!(
             "not a directory: {}",
