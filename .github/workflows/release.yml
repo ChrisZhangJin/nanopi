@@ -16,6 +16,11 @@ on:
         required: true
         type: string
 
+# GitHub tightened default GITHUB_TOKEN scopes to read-only for new repos;
+# creating releases and uploading assets both need `contents: write`.
+permissions:
+  contents: write
+
 jobs:
   # Idempotently ensures the GitHub Release exists so the matrix upload
   # step below has somewhere to attach assets. Safe to re-run — creating
