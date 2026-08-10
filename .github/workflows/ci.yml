@@ -35,4 +35,8 @@ jobs:
         continue-on-error: true
 
       - name: cargo test
-        run: cargo test --all-targets
+        # Serial execution — several tests spawn subprocesses for hook /
+        # bash-tool coverage, and CI runners (4 vCPU, shared fd table)
+        # hit intermittent spawn/wait races when everything runs in
+        # parallel. Deterministic > fast on CI; local runs stay parallel.
+        run: cargo test --all-targets -- --test-threads=1

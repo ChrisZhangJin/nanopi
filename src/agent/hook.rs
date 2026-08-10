@@ -309,8 +309,19 @@ pub async fn run_hooks(
             Ok(HookOutcome::Transform { new_arguments }) => {
                 current_args = new_arguments;
             }
-            Err(_) => {
-                // Hook crashed — fail open (allow). Documented in research.
+            Err(e) => {
+                // Hook crashed — fail open (allow). Documented in
+                // research.md, matches PI's advisory behavior. Log via
+                // tracing so subprocess-flakes are visible instead of
+                // silently degrading to unhooked behavior (a CI test
+                // used to fail here with no signal about *why*).
+                tracing::warn!(
+                    target: "nanopi::hook",
+                    tool = tool_name,
+                    matcher = %h.matcher,
+                    error = %e,
+                    "hook errored; failing open (allow)"
+                );
             }
         }
     }
