@@ -536,6 +536,14 @@ impl TextBuffer {
                 // of DEL (0x7f). Handle that here so users don't get a
                 // literal 'h' inserted when pressing Backspace.
                 KeyCode::Char('h') => { self.backspace();       return self.slash_or_nothing(); }
+                // Ctrl+J = LF (0x0A) — the portable "insert newline"
+                // shortcut. Terminals that don't disambiguate
+                // Shift+Enter from plain Enter (iTerm2, tmux, most
+                // Linux TTYs) still emit LF for Ctrl+J, so this is the
+                // only reliable multiline trigger. Matches PI (see
+                // packages/tui/src/keybindings.ts:125 —
+                // "tui.input.newLine": ["shift+enter", "ctrl+j"]).
+                KeyCode::Char('j') => { self.insert_newline();  return Action::Nothing; }
                 _ => {}
             }
         }
@@ -645,6 +653,16 @@ mod tests {
         let mut b = TextBuffer::new();
         type_str(&mut b, "line1");
         let k = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        b.handle_key(k);
+        type_str(&mut b, "line2");
+        assert_eq!(b.as_string(), "line1\nline2");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline() {
+        let mut b = TextBuffer::new();
+        type_str(&mut b, "line1");
+        let k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
         b.handle_key(k);
         type_str(&mut b, "line2");
         assert_eq!(b.as_string(), "line1\nline2");

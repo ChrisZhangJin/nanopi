@@ -96,33 +96,39 @@ impl Tool for BashTool {
         let max_bytes = self.max_bytes;
         let max_lines = self.max_lines;
 
-        // Race the child against a timeout. Use tokio::join! to read both
-        // pipes concurrently with a single task that waits + reads.
-        let join_handle = tokio::spawn(async move {
+        // Race the child against a timeout. Read stdout + stderr + wait
+        // INLINE (no `tokio::spawn` for the reader) — a spawned inner
+        // task would survive after our future is dropped mid-cancel,
+        // leaving `child` alive until the process naturally exited. By
+        // keeping `child` on THIS future's stack, a drop propagates:
+        // `child` is dropped → `kill_on_drop = true` → SIGKILL. That's
+        // what makes Esc cancel a long-running bash command
+        // immediately (see `agent/loop_.rs::execute_tool_calls`).
+        let (out, err, status) = {
             let mut out = String::new();
             let mut err = String::new();
             let mut stdout_reader = BufReader::new(stdout);
             let mut stderr_reader = BufReader::new(stderr);
-            // Read fully (we truncate later).
-            let _ = stdout_reader.read_to_string(&mut out).await;
-            let _ = stderr_reader.read_to_string(&mut err).await;
-            let status = child.wait().await;
-            (out, err, status)
-        });
-
-        let (out, err, status) = match tokio::time::timeout(timeout, join_handle).await {
-            Ok(Ok(t)) => t,
-            Ok(Err(join_err)) => {
-                return Err(ToolError::Execution(format!("task join error: {join_err}")));
-            }
-            Err(_) => {
-                // Timed out; kill the child via drop (kill_on_drop=true).
-                return Ok(ToolOutput {
-                    content: format!("command timed out after {timeout:?}"),
-                    is_error: true,
-                    images: Vec::new(),
-                    metadata: None,
-                });
+            let read_and_wait = async {
+                let (_, _, status) = tokio::join!(
+                    stdout_reader.read_to_string(&mut out),
+                    stderr_reader.read_to_string(&mut err),
+                    child.wait(),
+                );
+                status
+            };
+            match tokio::time::timeout(timeout, read_and_wait).await {
+                Ok(status) => (out, err, status),
+                Err(_) => {
+                    // Timed out; child dropped when this scope exits →
+                    // kill_on_drop terminates it.
+                    return Ok(ToolOutput {
+                        content: format!("command timed out after {timeout:?}"),
+                        is_error: true,
+                        images: Vec::new(),
+                        metadata: None,
+                    });
+                }
             }
         };
 

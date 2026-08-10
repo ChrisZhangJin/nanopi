@@ -627,8 +627,10 @@ impl Agent {
                         // LLM said "tool calls" but emitted none — done.
                         break;
                     }
-                    // Execute tools sequentially (v0.5).
-                    self.execute_tool_calls(calls, tx).await?;
+                    // Pass the cancel token so Esc can kill an in-flight
+                    // bash command instead of waiting for it to finish.
+                    self.execute_tool_calls(calls, tx, cancel.clone())
+                        .await?;
                     // Loop back to the next LLM turn.
                 }
                 FinishReason::Unknown => {
@@ -651,6 +653,7 @@ impl Agent {
         &mut self,
         calls: Vec<ToolCall>,
         tx: &mpsc::Sender<AgentEvent>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(), AgentError> {
         // Phase 1: Run all tool executions CONCURRENTLY via join_all.
         // Each future resolves to (ToolCall, Result<ToolOutput, ToolError>).
@@ -661,6 +664,14 @@ impl Agent {
         let session_id = self.session_id;
         let permission = self.permission.clone();
         let hooks = self.hooks.clone();
+
+        // Keep id/name copies so we can synthesize cancelled results if
+        // the whole batch gets dropped mid-flight (the calls Vec itself
+        // is moved into the futures).
+        let call_meta: Vec<(String, String)> = calls
+            .iter()
+            .map(|c| (c.id.clone(), c.name.clone()))
+            .collect();
 
         let futs: Vec<_> = calls
             .into_iter()
@@ -689,7 +700,52 @@ impl Agent {
             })
             .collect();
 
-let results = join_all(futs).await;
+        // Race the whole batch against the cancel token. `biased` gives
+        // priority to cancel so a fast-arriving Esc doesn't lose the
+        // race to a fast-completing tool. When cancel wins, `futs`
+        // (and everything they own, including any live tokio::process
+        // Child handles) is dropped; kill_on_drop = true sends SIGKILL
+        // to running bash children. We then synthesize cancelled
+        // tool_result entries so the assistant's tool_use blocks stay
+        // paired with tool_result blocks — otherwise the next request
+        // to Anthropic would 400 on unmatched tool_use ids.
+        let (results, cancelled) = match cancel.as_ref() {
+            Some(ct) => tokio::select! {
+                biased;
+                _ = ct.cancelled() => (Vec::new(), true),
+                r = join_all(futs) => (r, false),
+            },
+            None => (join_all(futs).await, false),
+        };
+
+        let results = if cancelled {
+            let mut synth = Vec::with_capacity(call_meta.len());
+            for (id, name) in call_meta {
+                let content =
+                    "[cancelled by user before tool completed]".to_string();
+                let _ = session::append_entry(
+                    &self.session_path,
+                    &SessionEntry::ToolResult {
+                        tool_call_id: id.clone(),
+                        timestamp: time::now_iso8601(),
+                        content: content.clone(),
+                        is_error: true,
+                        images: Vec::new(),
+                    },
+                );
+                synth.push(ToolCallOutcome {
+                    call_id: id,
+                    tool_name: name,
+                    args: Value::Null,
+                    content,
+                    is_error: true,
+                    images: Vec::new(),
+                });
+            }
+            synth
+        } else {
+            results
+        };
 
         // Phase 2: Push ToolResult messages into context in call order
         // so the next LLM turn sees them. Persistence already happened
@@ -935,6 +991,7 @@ mod tests {
                     arguments: json!({"command": "ls"}),
                 }],
                 &tx,
+                None,
             )
             .await
             .unwrap();
@@ -1029,6 +1086,7 @@ mod tests {
                     arguments: json!({"command": "echo hi"}),
                 }],
                 &tx,
+                None,
             )
             .await
             .unwrap();
@@ -1087,6 +1145,7 @@ mod tests {
                     arguments: json!({}),
                 }],
                 &tx,
+                None,
             )
             .await
             .unwrap();
@@ -1764,6 +1823,7 @@ mod tests {
                     },
                 ],
                 &tx,
+                None,
             )
             .await
             .expect("execute");

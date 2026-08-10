@@ -56,7 +56,80 @@ pub fn should_auto_compact(
 }
 
 /// System prompt used to drive the summarization LLM call.
-const SUMMARIZER_SYSTEM: &str = "You compress conversations. Given the transcript below, output a compact summary that preserves: user goals, decisions made, key facts learned, files/functions touched, and any open questions. Aim for 300-500 words. Output only the summary — no preamble, no meta-commentary.";
+///
+/// Ported from PI's SUMMARIZATION_PROMPT
+/// (`packages/coding-agent/src/core/compaction/compaction.ts:467-498`).
+/// The structured sections encourage the model to preserve the specific
+/// dimensions that matter for continuing work: what the user wants,
+/// what's been done, what's next, what to keep verbatim. A free-form
+/// "write a summary" prompt tends to lose exact file paths and task
+/// state on long conversations.
+const SUMMARIZER_SYSTEM: &str = "You compress conversations. \
+The messages provided are a conversation to summarize. Create a \
+structured context checkpoint summary that another LLM will use to \
+continue the work.\n\n\
+Use this EXACT format:\n\n\
+## Goal\n\
+[What is the user trying to accomplish? Can be multiple items if the \
+session covers different tasks.]\n\n\
+## Constraints & Preferences\n\
+- [Any constraints, preferences, or requirements mentioned by user]\n\
+- [Or \"(none)\" if none were mentioned]\n\n\
+## Progress\n\
+### Done\n\
+- [x] [Completed tasks/changes]\n\n\
+### In Progress\n\
+- [ ] [Current work]\n\n\
+### Blocked\n\
+- [Issues preventing progress, if any]\n\n\
+## Key Decisions\n\
+- **[Decision]**: [Brief rationale]\n\n\
+## Next Steps\n\
+1. [Ordered list of what should happen next]\n\n\
+## Critical Context\n\
+- [Any data, examples, or references needed to continue]\n\
+- [Or \"(none)\" if not applicable]\n\n\
+Keep each section concise. Preserve exact file paths, function \
+names, and error messages. Output only the summary — no preamble, no \
+meta-commentary.";
+
+/// System prompt for INCREMENTAL compaction — when the context already
+/// contains a prior summary from an earlier compact pass, merge the
+/// new range into it instead of overwriting. Ported from PI's
+/// `UPDATE_SUMMARIZATION_PROMPT` (`compaction.ts:500-537`). The caller
+/// supplies the previous summary in a `<previous-summary>...</previous-
+/// summary>` block appended to the transcript.
+const SUMMARIZER_UPDATE_SYSTEM: &str = "You compress conversations. \
+The messages provided are NEW conversation messages to incorporate \
+into the existing summary provided in <previous-summary> tags.\n\n\
+Update the existing structured summary with new information. RULES:\n\
+- PRESERVE all existing information from the previous summary\n\
+- ADD new progress, decisions, and context from the new messages\n\
+- UPDATE the Progress section: move items from \"In Progress\" to \
+\"Done\" when completed\n\
+- UPDATE \"Next Steps\" based on what was accomplished\n\
+- PRESERVE exact file paths, function names, and error messages\n\
+- If something is no longer relevant, you may remove it\n\n\
+Use this EXACT format:\n\n\
+## Goal\n\
+[Preserve existing goals, add new ones if the task expanded]\n\n\
+## Constraints & Preferences\n\
+- [Preserve existing, add new ones discovered]\n\n\
+## Progress\n\
+### Done\n\
+- [x] [Include previously done items AND newly completed items]\n\n\
+### In Progress\n\
+- [ ] [Current work - update based on progress]\n\n\
+### Blocked\n\
+- [Current blockers - remove if resolved]\n\n\
+## Key Decisions\n\
+- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n\
+## Next Steps\n\
+1. [Update based on current state]\n\n\
+## Critical Context\n\
+- [Preserve important context, add new if needed]\n\n\
+Keep each section concise. Preserve exact file paths, function \
+names, and error messages. Output only the updated summary.";
 
 /// Result of one successful compaction pass.
 #[derive(Debug, Clone)]
@@ -104,11 +177,27 @@ pub fn find_compact_boundary(
 pub async fn summarize_via_provider(
     provider: &dyn Provider,
     transcript: &str,
+    previous_summary: Option<&str>,
 ) -> Option<String> {
+    // Pick the fresh vs. update prompt based on whether we've compacted
+    // before this session. On update, append the prior summary as a
+    // <previous-summary> block so the model has explicit access to
+    // what it must preserve — matches PI's shape (see UPDATE_SUMMARIZATION_PROMPT
+    // in `compaction.ts:500`).
+    let (system, user_text) = match previous_summary {
+        Some(prev) => (
+            SUMMARIZER_UPDATE_SYSTEM,
+            format!(
+                "{transcript}\n\n<previous-summary>\n{prev}\n</previous-summary>"
+            ),
+        ),
+        None => (SUMMARIZER_SYSTEM, transcript.to_string()),
+    };
+
     let ctx = Context {
-        system: Some(SUMMARIZER_SYSTEM.into()),
+        system: Some(system.into()),
         messages: vec![ContextMessage::User {
-            content: vec![ContentBlock::Text { text: transcript.to_string() }],
+            content: vec![ContentBlock::Text { text: user_text }],
         }],
         tools: vec![],
         thinking: None,
@@ -137,18 +226,58 @@ pub async fn summarize_via_provider(
     }
 }
 
+/// Marker prefix that identifies a compaction-generated summary
+/// message inserted at the head of the context. `compact()` uses this
+/// to detect a prior summary on second and later passes and feed it
+/// into the UPDATE prompt for incremental compaction.
+pub(crate) const PRIOR_SUMMARY_PREFIX: &str = "[Prior conversation summary]\n\n";
+
+/// If the first context message is a compaction-inserted summary,
+/// return its body (without the marker prefix). Returns None otherwise.
+fn extract_prior_summary(messages: &[ContextMessage]) -> Option<String> {
+    let ContextMessage::User { content, .. } = messages.first()? else {
+        return None;
+    };
+    let ContentBlock::Text { text } = content.first()? else {
+        return None;
+    };
+    text.strip_prefix(PRIOR_SUMMARY_PREFIX).map(str::to_string)
+}
+
 /// Compact `ctx` in place: summarize the head, keep the tail.
 /// Returns `Some(CompactionResult)` if anything was compacted, `None`
 /// if no boundary was found (in which case ctx is unchanged).
+///
+/// On the first pass, the whole head range is summarized fresh. On
+/// subsequent passes, the prior "[Prior conversation summary]" message
+/// is detected and passed as `previous_summary` so the LLM MERGES the
+/// new range into the existing summary rather than starting over.
+/// Matches PI's `runSessionCompaction` update path.
 pub async fn compact(
     ctx: &mut Context,
     provider: &dyn Provider,
 ) -> Option<CompactionResult> {
     let cut = find_compact_boundary(&ctx.messages, KEEP_LAST_MESSAGES)?;
-    let transcript = ctx.flatten_range(0, cut);
-    let replaced_count = cut;
 
-    let (summary, used_llm) = match summarize_via_provider(provider, &transcript).await {
+    // Detect a prior summary at position 0 so we can drive incremental
+    // merge. If present, the messages being summarized are 1..cut
+    // (skipping the summary itself); the prior text is fed as context
+    // rather than re-summarized.
+    let prior = extract_prior_summary(&ctx.messages);
+    let (summarize_start, replaced_count) = if prior.is_some() {
+        (1usize, cut)
+    } else {
+        (0usize, cut)
+    };
+    let transcript = ctx.flatten_range(summarize_start, cut);
+
+    let (summary, used_llm) = match summarize_via_provider(
+        provider,
+        &transcript,
+        prior.as_deref(),
+    )
+    .await
+    {
         Some(s) => (s, true),
         None => (
             format!("[{} earlier messages truncated to save tokens]", replaced_count),
@@ -160,7 +289,7 @@ pub async fn compact(
     ctx.messages.clear();
     ctx.messages.push(ContextMessage::User {
         content: vec![ContentBlock::Text {
-            text: format!("[Prior conversation summary]\n\n{}", summary),
+            text: format!("{PRIOR_SUMMARY_PREFIX}{summary}"),
         }],
     });
     ctx.messages.extend(kept);
