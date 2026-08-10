@@ -17,8 +17,33 @@ on:
         type: string
 
 jobs:
+  # Idempotently ensures the GitHub Release exists so the matrix upload
+  # step below has somewhere to attach assets. Safe to re-run — creating
+  # an existing release is a no-op via `|| true`.
+  create-release:
+    name: create release if missing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -eux
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
   build:
     name: build ${{ matrix.name }}
+    needs: create-release
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

@@ -3,6 +3,9 @@ name = "nanopi"
 version = "0.9.1"
 edition = "2021"
 description = "A minimal Rust port of Pi agent"
+license = "MIT"
+repository = "https://github.com/ChrisZhangJin/nanopi"
+readme = "README.md"
 
 # v0.5 builds the modular binary; v0.1 entry kept around for regression testing.
 [[bin]]
