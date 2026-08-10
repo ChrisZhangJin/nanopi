@@ -127,27 +127,28 @@ impl Tool for ReadTool {
     }
 }
 
-/// Resolve a (possibly relative) path against cwd. Reject paths that
-/// escape cwd via `..` — security guard for read-only tools.
+/// Resolve a (possibly relative) path against cwd.
+///
+/// v0.9.2: no cwd-escape guard. `read` is read-only; PI / Claude Code
+/// both let the model read files anywhere (see PI's
+/// `core/tools/path-utils.ts::resolveToCwd`). The prior guard broke
+/// legitimate flows — most visibly, the `<available_skills>` block
+/// gives absolute paths under `~/.nanopi/skills/`, and the model's
+/// natural "read the SKILL.md" step failed with "path escapes cwd".
+/// Bash could always read those paths anyway, so the guard was
+/// security theater with a real UX cost.
+///
+/// The escape check still applies to the mutating `write` / `edit`
+/// tools (see `tool/write.rs`, `tool/edit.rs`).
 fn resolve_path(cwd: &std::path::Path, p: &str) -> Result<PathBuf, ToolError> {
     let candidate = if std::path::Path::new(p).is_absolute() {
         PathBuf::from(p)
     } else {
         cwd.join(p)
     };
-    let normalized = match std::fs::canonicalize(&candidate) {
-        Ok(p) => p,
-        Err(_) => candidate.clone(), // may be a new file; check parent below
-    };
-    // Only enforce the boundary if the file exists. For non-existent paths,
-    // best-effort: ensure it doesn't contain `..` after normalization.
-    if normalized.starts_with(cwd) {
-        Ok(normalized)
-    } else {
-        Err(ToolError::Execution(format!(
-            "path escapes cwd: {}",
-            candidate.display()
-        )))
+    match std::fs::canonicalize(&candidate) {
+        Ok(p) => Ok(p),
+        Err(_) => Ok(candidate), // may not exist yet; downstream will error
     }
 }
 
@@ -244,14 +245,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v0.9.2 relaxed the cwd sandbox on read to match PI / Claude
+    /// Code, so the model can pull SKILL.md files under `~/.nanopi/`
+    /// even when the session's cwd is a project directory. Absolute
+    /// path pointing outside cwd now succeeds if the file is readable.
     #[tokio::test]
-    async fn rejects_path_outside_cwd() {
-        let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
-        let r = ReadTool
-            .execute(json!({"path": "/etc/shadow"}), &ctx)
-            .await;
-        assert!(r.is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+    async fn absolute_path_outside_cwd_is_allowed() {
+        let cwd = tmp();
+        let other = tmp();
+        let outside = other.join("skill.md");
+        std::fs::write(&outside, "---\nname: x\n---\nbody\n").unwrap();
+        let ctx = ToolContext { cwd: cwd.clone() };
+        let out = ReadTool
+            .execute(json!({"path": outside.display().to_string()}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("body"));
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }

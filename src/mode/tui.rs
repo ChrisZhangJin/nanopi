@@ -714,7 +714,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.summary_prompt = None;
                 return KeyAction::CancelPendingFork;
             }
-            MenuAction::Nothing => return KeyAction::Nothing,
+            // Tab in a modal picker is a no-op — nothing to autocomplete
+            // when the user is choosing one of a fixed short list.
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
         }
     }
     // ── Resume picker ───────────────────────────────────────────────
@@ -731,7 +733,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.input.clear();
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
         }
     }
     // ── Fork picker (opens summary modal on Chosen) ─────────────────
@@ -747,7 +749,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.fork_picker = None;
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
         }
     }
 
@@ -808,7 +810,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.input.clear();
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
         }
     }
     // ── Palette owns navigation keys when open. ─────────────────────
@@ -837,6 +839,17 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     app.palette = None;
                     app.input.clear();
                     return dispatch_slash(cmd, arg);
+                }
+                MenuAction::Filled(label) => {
+                    // Tab-complete: replace input with the label + a
+                    // trailing space so the user can type args or hit
+                    // Enter to commit. Palette stays open — sync_palette
+                    // below rebuilds the filter against the new input,
+                    // so `/skill:name ` produces an empty match set and
+                    // the palette collapses naturally.
+                    app.input.clear();
+                    app.input.insert_str(&format!("{label} "));
+                    return KeyAction::Nothing;
                 }
                 MenuAction::Cancel => {
                     app.palette = None;
@@ -3424,6 +3437,17 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
         sel - max_rows / 2
     };
     let end = (start + max_rows).min(vis.len());
+    // Dynamic label pad: line up descriptions past the widest visible
+    // label (with a 2-space gutter). Prevents descriptions from
+    // crashing into long `/skill:<name>` labels when the palette
+    // mixes built-in commands with skills.
+    let label_w = vis
+        .iter()
+        .map(|it| it.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10); // baseline for the short built-ins
+    let pad = label_w + 2;
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in vis[start..end].iter().enumerate() {
         let absolute = start + i;
@@ -3437,7 +3461,7 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
         let desc_style = Style::default().fg(Color::DarkGray);
         lines.push(Line::from(vec![
             Span::styled(arrow, label_style),
-            Span::styled(format!("{:<12}", item.label), label_style),
+            Span::styled(format!("{:<pad$}", item.label, pad = pad), label_style),
             Span::styled(item.description.clone(), desc_style),
         ]));
     }

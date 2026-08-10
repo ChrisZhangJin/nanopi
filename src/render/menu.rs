@@ -35,8 +35,13 @@ pub enum MenuAction<T> {
     /// Nothing to do; state may have changed (cursor moved) but the
     /// outer loop just needs to redraw.
     Nothing,
-    /// User picked an item.
+    /// User pressed Enter — commit the selected payload.
     Chosen(T),
+    /// User pressed Tab — fill the input buffer with `label` (with a
+    /// trailing space) but do NOT commit. Caller replaces the input
+    /// so the user can type args and hit Enter, matching typical
+    /// shell-style tab completion (readline / zsh / fish).
+    Filled(String),
     /// User pressed Esc — outer loop should close the menu.
     Cancel,
 }
@@ -145,8 +150,12 @@ impl<T: Clone> MenuState<T> {
                 self.move_down();
                 MenuAction::Nothing
             }
-            KeyCode::Enter | KeyCode::Tab => match self.selected() {
+            KeyCode::Enter => match self.selected() {
                 Some(it) => MenuAction::Chosen(it.payload),
+                None => MenuAction::Nothing,
+            },
+            KeyCode::Tab => match self.selected() {
+                Some(it) => MenuAction::Filled(it.label),
                 None => MenuAction::Nothing,
             },
             _ => MenuAction::Nothing,
@@ -209,6 +218,16 @@ mod tests {
         match m.handle_key(k) {
             MenuAction::Chosen(p) => assert_eq!(p, "/compact"),
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn tab_fills_without_committing() {
+        let mut m = MenuState::new(items());
+        let k = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        match m.handle_key(k) {
+            MenuAction::Filled(label) => assert_eq!(label, "compact"),
+            other => panic!("expected Filled, got {other:?}"),
         }
     }
 
