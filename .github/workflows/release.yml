@@ -100,6 +100,19 @@ jobs:
       - name: build release
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: install upx (ubuntu)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get install -y upx-ucl
+
+      - name: install upx (macos)
+        if: startsWith(matrix.runner, 'macos')
+        run: brew install upx
+
+      - name: install upx (windows)
+        if: startsWith(matrix.runner, 'windows')
+        shell: pwsh
+        run: choco install upx --no-progress -y
+
       - name: stage asset
         shell: bash
         run: |
@@ -109,11 +122,18 @@ jobs:
           OUT="nanopi-${TAG}-${{ matrix.name }}${{ matrix.ext }}"
           mkdir -p dist
           cp "$SRC" "dist/$OUT"
-          # Strip on Unix targets to shrink the binary. Windows keeps
-          # symbols so debuggers can find them.
+          # Strip on Unix targets first (UPX packs better against
+          # stripped binaries). Windows keeps symbols so debuggers can
+          # find them.
           if [ "${{ matrix.name }}" != "windows-x86_64" ]; then
             strip "dist/$OUT" || true
           fi
+          # UPX-pack every platform: --best --lzma gives ~60% shrink at
+          # a ~100 ms startup cost, which is unnoticeable for TUI use.
+          # `|| true` so a platform that trips UPX (rare, but possible
+          # on some macOS builds) doesn't fail the whole release —
+          # the unpacked binary is still uploaded.
+          upx --best --lzma "dist/$OUT" || true
           ls -lh "dist/$OUT"
 
       - name: upload to release
