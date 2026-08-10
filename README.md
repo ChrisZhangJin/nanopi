@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 ![Binary](https://img.shields.io/badge/binary-~4%20MB-brightgreen?style=flat-square)
 ![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-linux-lightgrey?style=flat-square&logo=linux&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey?style=flat-square)
 ![Static musl](https://img.shields.io/badge/static-musl-informational?style=flat-square)
 [![CI](https://img.shields.io/github/actions/workflow/status/ChrisZhangJin/nanopi/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/ChrisZhangJin/nanopi/actions/workflows/ci.yml)
 
@@ -49,9 +49,13 @@ chmod +x nanopi
 ./nanopi --version
 ```
 
-Two Linux x86_64 variants ship per release:
-- `nanopi-<ver>-linux-x86_64-musl` — fully static, works on anything (recommended)
-- `nanopi-<ver>-linux-x86_64` — dynamic glibc, slightly smaller
+Per release, prebuilt binaries ship for:
+- `nanopi-<ver>-linux-x86_64-musl` — fully static Linux, works on anything (recommended)
+- `nanopi-<ver>-linux-x86_64` — dynamic glibc Linux, slightly smaller
+- `nanopi-<ver>-macos-aarch64` — Apple Silicon (M1+)
+- `nanopi-<ver>-windows-x86_64.exe` — Windows 10/11
+
+macOS Intel isn't prebuilt (GitHub runner supply is scarce); build from source with `cargo build --target x86_64-apple-darwin`.
 
 ### Build from source
 
@@ -157,7 +161,7 @@ Keys are `snake_case` (`pre_tool_use`, not `PreToolUse`). Full protocol in [`doc
 ## Roadmap
 
 - **v1.0** — full PI parity: themes, compaction, extension system
-- Windows / macOS prebuilt binaries (currently Linux-only; source builds work on macOS)
+- Linux aarch64 prebuilt binary (only x86_64 today)
 
 ## Cargo mirror (China)
 

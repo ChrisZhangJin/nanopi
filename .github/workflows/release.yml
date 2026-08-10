@@ -68,10 +68,9 @@ jobs:
             runner: macos-latest
             target: aarch64-apple-darwin
             ext: ''
-          - name: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            ext: ''
+          # macos-x86_64 (Intel) dropped: GitHub's `macos-13` runner supply
+          # is scarce (jobs sit in queue for 10+ min) and Apple Silicon covers
+          # M1+ users. Intel users can `cargo build --target x86_64-apple-darwin`.
           - name: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc

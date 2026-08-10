@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 ![Binary](https://img.shields.io/badge/binary-~4%20MB-brightgreen?style=flat-square)
 ![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-linux-lightgrey?style=flat-square&logo=linux&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey?style=flat-square)
 ![Static musl](https://img.shields.io/badge/static-musl-informational?style=flat-square)
 [![CI](https://img.shields.io/github/actions/workflow/status/ChrisZhangJin/nanopi/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/ChrisZhangJin/nanopi/actions/workflows/ci.yml)
 
@@ -49,9 +49,13 @@ chmod +x nanopi
 ./nanopi --version
 ```
 
-每个 release 会提供两种 Linux x86_64 版本：
-- `nanopi-<ver>-linux-x86_64-musl` —— 全静态链接，跑在任何地方（推荐）
-- `nanopi-<ver>-linux-x86_64` —— 动态 glibc，体积稍小
+每个 release 提供预编译二进制：
+- `nanopi-<ver>-linux-x86_64-musl` —— 全静态 Linux，跑在任何地方（推荐）
+- `nanopi-<ver>-linux-x86_64` —— 动态 glibc Linux，体积稍小
+- `nanopi-<ver>-macos-aarch64` —— Apple Silicon（M1+）
+- `nanopi-<ver>-windows-x86_64.exe` —— Windows 10/11
+
+macOS Intel 不预编译（GitHub 的 Intel Mac runner 供给紧俏）；有需要自己编：`cargo build --target x86_64-apple-darwin`。
 
 ### 从源码编译
 
@@ -157,7 +161,7 @@ TOML key 是 snake_case（`pre_tool_use`，不是 `PreToolUse`）。完整协议
 ## 路线图
 
 - **v1.0** —— 完整 PI parity：themes、compaction、扩展系统
-- Windows / macOS 预编译（当前只有 Linux 二进制；源码编译在 macOS 上可用）
+- Linux aarch64 预编译（当前只有 x86_64）
 
 ## Cargo 国内镜像
 
