@@ -40,7 +40,8 @@ dirs = "5.0"
 # --- v0.5 NEW ---
 # TUI (alt-screen, color, cursor, events).
 # crossterm 0.29+ dropped the granular features (cursor/terminal/style);
-# defaults include events + windows, which we trim to skip Windows deps.
+# defaults include events + windows. We skip `windows` on Unix targets
+# and only enable it on Windows below (see [target.'cfg(windows)'…]).
 crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream", "bracketed-paste"] }
 
 # v0.6+: ratatui full TUI (opt-in via --tui). Layered on crossterm.
@@ -70,6 +71,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # v0.8: image base64 encoding for the read tool's vision path.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
+
+# Windows-only: crossterm needs its `windows` feature to compile on
+# Windows targets (pulls in crossterm_winapi / windows-sys). Merging
+# happens via feature-union, so Unix targets stay lean.
+[target.'cfg(windows)'.dependencies]
+crossterm = { version = "0.29", features = ["windows"] }
 
 [profile.release]
 opt-level = "z"          # optimize for size
