@@ -50,9 +50,6 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 # UUID v7 (time-ordered). Needs `std` for now_v7() (timestamp source).
 uuid = { version = "1.10", default-features = false, features = ["v7", "std", "serde"] }
 
-# YAML frontmatter for skills
-serde_yaml = "0.9"
-
 # Config + settings files
 toml = "0.8"
 

@@ -15,6 +15,12 @@
 //! for a rarely-exercised code path. Track as v0.10 candidate.
 //!
 //! Prompt-template loading is unchanged from v0.5 (not in v0.9 scope).
+//!
+//! v0.9.2: frontmatter is parsed by a hand-rolled line reader, not
+//! `serde_yaml`. Agent Skills fields are all flat scalars, and strict
+//! YAML rejects the very common `description: something: with colons`
+//! pattern that PI / Claude Code accept in the wild. See
+//! [`parse_flat_frontmatter`] for the exact grammar.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -110,43 +116,30 @@ pub fn load_prompts_from_dir(dir: &Path) -> Result<Vec<PromptTemplate>> {
 
 fn parse_prompt_file(path: &Path) -> Result<Option<PromptTemplate>> {
     let content = std::fs::read_to_string(path)?;
-    let (fm, body) = split_frontmatter(&content);
-    let fm: PromptFrontmatter = match serde_yaml::from_str(&fm) {
-        Ok(f) => f,
-        Err(_) => return Ok(None),
+    let (fm_text, body) = split_frontmatter(&content);
+    let fm = parse_flat_frontmatter(&fm_text);
+    let name = match fm.get("name") {
+        Some(n) if !n.trim().is_empty() => n.clone(),
+        _ => return Ok(None),
+    };
+    let description = match fm.get("description") {
+        Some(d) if !d.trim().is_empty() => d.clone(),
+        _ => return Ok(None),
     };
     let args = fm
-        .args
+        .get("args")
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
     Ok(Some(PromptTemplate {
-        name: fm.name,
-        description: fm.description,
+        name,
+        description,
         args,
         body,
         location: path.to_path_buf(),
     }))
 }
 
-#[derive(Debug, Deserialize)]
-struct PromptFrontmatter {
-    name: String,
-    description: String,
-    #[serde(default)]
-    args: Option<String>,
-}
-
 // -- skills --
-
-#[derive(Debug, Deserialize)]
-struct SkillFrontmatter {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default, rename = "disable-model-invocation")]
-    disable_model_invocation: bool,
-}
 
 const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
@@ -233,17 +226,7 @@ fn parse_and_push(path: &Path, source: SkillSource, out: &mut LoadSkillsResult) 
         }
     };
     let (fm_text, _) = split_frontmatter(&content);
-    let fm: SkillFrontmatter = match serde_yaml::from_str(&fm_text) {
-        Ok(f) => f,
-        Err(e) => {
-            out.diagnostics.push(SkillDiagnostic {
-                level: DiagnosticLevel::Warning,
-                message: format!("invalid frontmatter: {e}"),
-                path: path.to_path_buf(),
-            });
-            return;
-        }
-    };
+    let fm = parse_flat_frontmatter(&fm_text);
 
     let base_dir = path
         .parent()
@@ -251,7 +234,7 @@ fn parse_and_push(path: &Path, source: SkillSource, out: &mut LoadSkillsResult) 
         .unwrap_or_else(|| PathBuf::from("."));
 
     // description is hard-required
-    let description = match &fm.description {
+    let description = match fm.get("description") {
         Some(d) if !d.trim().is_empty() => d.clone(),
         _ => {
             out.diagnostics.push(SkillDiagnostic {
@@ -280,8 +263,7 @@ fn parse_and_push(path: &Path, source: SkillSource, out: &mut LoadSkillsResult) 
         .unwrap_or("")
         .to_string();
     let name = fm
-        .name
-        .as_ref()
+        .get("name")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or(parent_dir_name);
@@ -294,14 +276,67 @@ fn parse_and_push(path: &Path, source: SkillSource, out: &mut LoadSkillsResult) 
         });
     }
 
+    let disable_model_invocation = fm
+        .get("disable-model-invocation")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     out.skills.push(Skill {
         name,
         description,
         file_path: path.to_path_buf(),
         base_dir,
         source,
-        disable_model_invocation: fm.disable_model_invocation,
+        disable_model_invocation,
     });
+}
+
+/// Line-based frontmatter reader: extracts flat `key: value` pairs and
+/// returns them as a map. Deliberately more permissive than strict YAML
+/// so an unquoted `description: Foo: bar` yields `Foo: bar` (splits on
+/// the FIRST `:` per line). Mirrors what PI / Claude Code effectively
+/// accept from the wild-caught SKILL.md files on their skill hubs,
+/// where descriptions with `:` are common and rarely quoted.
+///
+/// Supports:
+/// - blank lines and `#` comments (skipped)
+/// - `key: value` where value runs to end-of-line
+/// - surrounding single or double quotes on the value (stripped)
+///
+/// Not supported (returns pair verbatim / doesn't parse):
+/// - block scalars (`|`, `>`), sequences, nested maps.
+/// The Agent Skills spec fields (`name`, `description`,
+/// `disable-model-invocation`) are all flat scalars, so this covers
+/// every real-world SKILL.md we care about.
+fn parse_flat_frontmatter(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(colon) = line.find(':') else { continue };
+        let key = line[..colon].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let raw = line[colon + 1..].trim();
+        let value = strip_wrap_quotes(raw);
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
+fn strip_wrap_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 fn validate_name(name: &str) -> Vec<String> {
@@ -882,6 +917,100 @@ mod tests {
         let (fm, body) = split_frontmatter(s);
         assert!(fm.contains("name: x"));
         assert_eq!(body, "body");
+    }
+
+    // -- flat frontmatter parser (v0.9.2 PI-parity leniency) --
+
+    #[test]
+    fn description_with_unquoted_colon_loads() {
+        let dir = tmp();
+        write_skill(
+            &dir.join("s"),
+            "s",
+            "Office skillhub: publish, query, download",
+            "body",
+        );
+        let r = load_skills_from_dir(&dir, SkillSource::User);
+        assert_eq!(r.skills.len(), 1);
+        assert_eq!(
+            r.skills[0].description,
+            "Office skillhub: publish, query, download"
+        );
+        assert!(
+            r.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            r.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quoted_description_is_dequoted() {
+        let dir = tmp();
+        std::fs::write(
+            dir.join("s.md"),
+            "---\nname: s\ndescription: \"Foo: bar\"\n---\nbody\n",
+        )
+        .unwrap();
+        let r = load_skills_from_dir(&dir, SkillSource::User);
+        assert_eq!(r.skills.len(), 1);
+        assert_eq!(r.skills[0].description, "Foo: bar");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_quoted_description_is_dequoted() {
+        let dir = tmp();
+        std::fs::write(
+            dir.join("s.md"),
+            "---\nname: s\ndescription: 'has # in it'\n---\nbody\n",
+        )
+        .unwrap();
+        let r = load_skills_from_dir(&dir, SkillSource::User);
+        assert_eq!(r.skills[0].description, "has # in it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_frontmatter_keys_ignored() {
+        let dir = tmp();
+        std::fs::write(
+            dir.join("s.md"),
+            "---\nname: s\ndescription: d\ncustom: whatever\nversion: 1.2.0\n---\nbody\n",
+        )
+        .unwrap();
+        let r = load_skills_from_dir(&dir, SkillSource::User);
+        assert_eq!(r.skills.len(), 1);
+        assert!(r.diagnostics.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn comments_and_blank_lines_skipped() {
+        let dir = tmp();
+        std::fs::write(
+            dir.join("s.md"),
+            "---\n# top comment\nname: s\n\n# mid comment\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        let r = load_skills_from_dir(&dir, SkillSource::User);
+        assert_eq!(r.skills.len(), 1);
+        assert_eq!(r.skills[0].name, "s");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disable_model_invocation_bool_from_string() {
+        let dir = tmp();
+        std::fs::write(
+            dir.join("s.md"),
+            "---\nname: s\ndescription: d\ndisable-model-invocation: true\n---\nbody\n",
+        )
+        .unwrap();
+        let r = load_skills_from_dir(&dir, SkillSource::User);
+        assert_eq!(r.skills.len(), 1);
+        assert!(r.skills[0].disable_model_invocation);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
