@@ -108,6 +108,10 @@ enum SlashCmd {
     /// source · path). Doesn't take an arg. PI does this implicitly
     /// on startup; nanopi adds the on-demand relist.
     ListSkills,
+    /// Re-read config.toml + settings.toml + skills without exiting
+    /// the session. Mirrors PI's `/reload` — new skills installed
+    /// mid-session become visible to the model on the next turn.
+    Reload,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -127,6 +131,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
         MenuItem::new("/hotkeys",  "Show all keyboard shortcuts",       SlashCmd::Hotkeys),
         MenuItem::new("/skills",   "List all loaded skills",            SlashCmd::ListSkills),
+        MenuItem::new("/reload",   "Reload skills, config, settings",   SlashCmd::Reload),
         MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
         MenuItem::new("/exit",     "Exit the session",                  SlashCmd::Quit),
     ]
@@ -682,6 +687,9 @@ enum KeyAction {
     /// User pressed Esc in the summary modal — abandon the pending
     /// fork, don't switch sessions.
     CancelPendingFork,
+    /// `/reload`: re-read config.toml / settings.toml / skills without
+    /// exiting the session. New skills become visible on the next turn.
+    Reload,
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -973,6 +981,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             };
             KeyAction::StartTurn(full)
         }
+        SlashCmd::Reload => KeyAction::Reload,
     }
 }
 
@@ -2131,6 +2140,9 @@ async fn handle_action(
             app.capture = CaptureMode::None;
             app.status_note = None;
         }
+        KeyAction::Reload => {
+            handle_reload(term, app, agent_slot).await?;
+        }
         KeyAction::Compact => {
             app.status_note = Some("compacting…".into());
             term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
@@ -2343,6 +2355,122 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.thinking = a.context.thinking;
         app.skills_cache = a.skills.clone();
     }
+}
+
+/// `/reload` handler: re-reads `config.toml`, `settings.toml`, and
+/// re-discovers skills, then updates the live Agent in place. Mirrors
+/// PI's `session.reload()` (`agent-session.ts:2602`) minus the
+/// extension system and provider swap — nanopi has no extensions, and
+/// mid-session provider swaps stay behind `/model` to avoid
+/// accidentally dropping an in-flight streaming connection.
+///
+/// What it touches: `agent.skills`, `agent.hooks`, `agent.context.
+/// system` (rebuilt via `compose_system_prompt` so newly installed
+/// skills appear in `<available_skills>`). What it does NOT touch:
+/// `agent.provider`, `agent.model`, `agent.base_url`, `agent.api_key`,
+/// session state, or messages.
+async fn handle_reload(
+    term: &mut Term,
+    app: &mut App,
+    agent: &Arc<Mutex<Option<Agent>>>,
+) -> Result<()> {
+    use ratatui::text::Line as L;
+
+    // ── 1. config.toml (only skills.disabled is applied live; model /
+    //       base_url / api_key changes need /model or restart) ──
+    let config_note: Option<String> = match crate::config::load_config(&app.cwd) {
+        Ok(cfg) => {
+            app.skill_load.disabled = cfg.skills.disabled.clone();
+            None
+        }
+        Err(e) => Some(format!("config.toml: {e}")),
+    };
+
+    // ── 2. settings.toml → hooks ──
+    let (hooks_new, settings_note): (Option<HooksConfig>, Option<String>) =
+        match settings::load_settings(&app.cwd) {
+            Ok(h) => (Some(h), None),
+            Err(e) => (None, Some(format!("settings.toml: {e}"))),
+        };
+
+    // ── 3. skills — uses the (possibly refreshed) disabled list ──
+    let skill_result =
+        crate::resources::load_skills(app.skill_load.clone().into_options());
+    let n_skills = skill_result.skills.len();
+    let n_diagnostics = skill_result.diagnostics.len();
+
+    // ── 4. apply to the live agent under the async lock ──
+    let n_hooks: usize = {
+        let mut g = agent.lock().await;
+        if let Some(a) = g.as_mut() {
+            a.skills = skill_result.skills.clone();
+            if let Some(ref h) = hooks_new {
+                a.hooks = h.clone();
+            }
+            let tool_names = a.registry.names();
+            a.context.system = Some(crate::agent::build::compose_system_prompt(
+                &a.cwd,
+                &tool_names,
+                &a.skills,
+            ));
+            let h = &a.hooks;
+            h.pre_tool_use.len()
+                + h.post_tool_use.len()
+                + h.user_prompt_submit.len()
+                + h.session_start.len()
+                + h.session_end.len()
+        } else {
+            0
+        }
+    };
+    app.skills_cache = skill_result.skills;
+
+    // ── 5. report to scrollback ──
+    insert_line(
+        term,
+        L::from(vec![Span::styled(
+            format!(
+                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s){}",
+                if let Some(e) = &config_note {
+                    format!(" · {e}")
+                } else {
+                    String::new()
+                },
+            ),
+            Style::default()
+                .fg(Color::Indexed(108))
+                .add_modifier(Modifier::BOLD),
+        )]),
+    )?;
+    if let Some(e) = &settings_note {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                format!("  {e}"),
+                Style::default().fg(Color::Yellow),
+            )]),
+        )?;
+    }
+    for d in &skill_result.diagnostics {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                format!("  skill: {} ({})", d.message, d.path.display()),
+                Style::default().fg(Color::Yellow),
+            )]),
+        )?;
+    }
+    if n_diagnostics == 0 && settings_note.is_none() && config_note.is_none() {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                "  no warnings".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )]),
+        )?;
+    }
+    insert_line(term, L::from(""))?;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────

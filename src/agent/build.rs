@@ -59,7 +59,7 @@ impl SkillLoadPolicy {
         }
     }
 
-    fn into_options(self) -> LoadSkillsOptions {
+    pub fn into_options(self) -> LoadSkillsOptions {
         LoadSkillsOptions {
             user_dir: self.user_dir,
             project_dir: self.project_dir,
