@@ -182,7 +182,15 @@ fn skill_menu_items(skills: &[crate::resources::Skill]) -> Vec<MenuItem<SlashCmd
         .collect()
 }
 
-const DOCK_HEIGHT: u16 = 10; // palette(5) + input(3) + footer(2)
+const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
+
+/// Max input content lines shown at once when no overlay menu is open.
+/// The input box grows with the buffer up to this, then scrolls to keep
+/// the cursor visible (Claude Code's bounded-viewport model, sized to
+/// our fixed inline dock — see `draw_dock`). 5 = DOCK_HEIGHT − status(1)
+/// − borders(2) − footer(2), i.e. it reclaims the otherwise-blank
+/// palette rows when no dropdown is up.
+const MAX_INPUT_LINES: usize = 5;
 
 // ─────────────────────────────────────────────────────────────────────
 // Entry
@@ -299,6 +307,36 @@ pub async fn run_tui_mode(
     // Prime the skills cache from the just-built agent so the very
     // first `/` palette open includes /skill:<name> entries.
     refresh_status(&mut app, &agent_slot).await;
+
+    // On resume (--continue / --session / --fork), repaint the prior
+    // transcript into scrollback so the user sees the conversation they
+    // are picking up on — mirrors the in-session `/resume` behavior (and
+    // PI). Without this, --continue loaded the history into context but
+    // left the screen blank below the banner.
+    if let SessionChoice::Resume(_) = &choice {
+        let entries = session::read_session(&session_path)
+            .map(|(_, e)| e)
+            .unwrap_or_default();
+        if !entries.is_empty() {
+            let short = &header.id.to_string()[..8.min(header.id.to_string().len())];
+            let title = match header.name.as_deref() {
+                Some(n) => format!("─── Resumed session {short} · {n} ───"),
+                None => format!("─── Resumed session {short} ───"),
+            };
+            insert_line(
+                &mut terminal,
+                Line::from(vec![Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+            insert_line(&mut terminal, Line::from(""))?;
+            replay_history(&mut terminal, &mut app, &entries)?;
+        }
+    }
+
     let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
     let _ = teardown_terminal(&mut terminal);
 
@@ -3156,28 +3194,92 @@ fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
     if line.spans.iter().all(|s| s.content.is_empty()) {
         return insert_line_bg(term, line, None);
     }
-    let width = term.size().map(|r| r.width).unwrap_or(80).max(1);
-    // Rough visual-length estimate: char count. Good enough for the
-    // ASCII/CJK mix we ship; unicode-width would be marginally better
-    // but adds a dep for a display fudge.
-    let total_chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-    let rows_needed = ((total_chars + width as usize - 1) / width as usize).max(1);
-    let rows_needed = rows_needed.min(200); // guard against runaway
-                                            // ratatui Line borrows its spans; hoist into owned strings so the
-                                            // FnOnce closure can move them into insert_before.
-    let owned_spans: Vec<Span<'static>> = line
+    let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
+
+    // We lay the line out ourselves — ONE terminal column per `char` —
+    // instead of handing off to ratatui's `Paragraph`. Paragraph measures
+    // glyphs via the `unicode-width` crate, which classifies CJK as
+    // East-Asian *Wide* (2 columns) and reserves a blank cell after each
+    // one. On terminals/fonts that draw CJK single-width that reserved
+    // cell shows up as a gap — assistant text ends up "你 好" while the
+    // user's own echoed input (rendered by `insert_line_bg`, also 1
+    // col/char) stays tight. Matching that path keeps output visually
+    // identical to input. Leading whitespace is preserved (no trimming),
+    // so indented code / markdown stays aligned.
+    let chars: Vec<(char, Style)> = line
         .spans
         .iter()
-        .map(|s| Span::styled(s.content.to_string(), s.style))
+        .flat_map(|s| {
+            let style = s.style;
+            s.content.chars().map(move |c| (c, style))
+        })
         .collect();
-    term.insert_before(rows_needed as u16, move |buf: &mut Buffer| {
-        // Paragraph does the actual wrapping. `trim: false` preserves
-        // leading whitespace so indented code / markdown stays aligned.
-        let para =
-            Paragraph::new(Line::from(owned_spans)).wrap(ratatui::widgets::Wrap { trim: false });
-        para.render(buf.area, buf);
+
+    let mut rows = wrap_chars(&chars, width);
+    rows.truncate(200); // guard against runaway
+    let rows_needed = rows.len().max(1) as u16;
+
+    term.insert_before(rows_needed, move |buf: &mut Buffer| {
+        for (row_idx, row) in rows.iter().enumerate() {
+            let y = row_idx as u16;
+            if y >= buf.area.height {
+                break;
+            }
+            for (col, (ch, style)) in row.iter().enumerate() {
+                if col as u16 >= buf.area.width {
+                    break;
+                }
+                if let Some(cell) = buf.cell_mut((col as u16, y)) {
+                    cell.set_char(*ch).set_style(*style);
+                }
+            }
+        }
     })?;
     Ok(())
+}
+
+/// Soft-wrap a flat list of styled chars into rows of at most `width`
+/// columns, counting exactly one column per char (matching the user-echo
+/// renderer, `insert_line_bg`). Breaks at the last space when a word
+/// would overflow; hard-breaks words longer than the line.
+fn wrap_chars(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    let mut last_space: Option<usize> = None; // index in `cur` of last ' '
+
+    for &(ch, style) in chars {
+        cur.push((ch, style));
+        if ch == ' ' {
+            last_space = Some(cur.len() - 1);
+        }
+        if cur.len() > width {
+            match last_space {
+                // Break at the last space: keep the head, drop the space,
+                // carry the tail to the next row.
+                Some(sp) if sp > 0 => {
+                    let tail: Vec<(char, Style)> = cur.split_off(sp + 1);
+                    cur.pop(); // drop the trailing space
+                    rows.push(std::mem::take(&mut cur));
+                    cur = tail;
+                    last_space = cur.iter().rposition(|(c, _)| *c == ' ');
+                }
+                // No usable space — hard-break the over-long word.
+                _ => {
+                    let carried = cur.pop().unwrap();
+                    rows.push(std::mem::take(&mut cur));
+                    cur.push(carried);
+                    last_space = None;
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
 }
 
 /// Insert one line with an optional full-row background style. If
@@ -3224,16 +3326,46 @@ fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> R
 // Dock rendering (5-row region at bottom)
 // ─────────────────────────────────────────────────────────────────────
 
+/// Compute the `[start, end)` slice of buffer lines to show in the input
+/// box so the cursor row stays visible. Once the buffer overflows the
+/// `visible` window, the window anchors to the bottom (cursor pinned to
+/// the last visible row) — Claude Code's bounded-viewport scroll.
+fn input_scroll_window(cursor_row: usize, total: usize, visible: usize) -> (usize, usize) {
+    let visible = visible.max(1);
+    let start = if cursor_row < visible {
+        0
+    } else {
+        cursor_row + 1 - visible
+    };
+    let end = (start + visible).min(total);
+    (start, end)
+}
+
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
-    // Layout: 4 palette + 1 status/working + 3 input + 2 footer = 10.
+    // Is a dropdown overlay open? When one is, it claims the top 4 rows
+    // and the input box collapses to a single content line. When none is
+    // open, the input box grows into those rows (up to MAX_INPUT_LINES)
+    // and scrolls internally to keep the cursor visible.
+    let overlay_open = app.summary_prompt.is_some()
+        || app.resume_picker.is_some()
+        || app.fork_picker.is_some()
+        || app.model_picker.is_some()
+        || app.palette.is_some();
+    let max_input_lines = if overlay_open { 1 } else { MAX_INPUT_LINES };
+    let input_content_h = app.input.row_count().clamp(1, max_input_lines) as u16;
+
+    // Layout: [overlay/top-slack] + status(1) + input(2 border+content)
+    // + footer(2) = DOCK_HEIGHT. `Min(0)` absorbs the slack at the top so
+    // the input box stays anchored just above the footer and grows
+    // upward; when an overlay is open it lands in that same top region.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // palette area (blank when closed)
-            Constraint::Length(1), // status strip (blue tool bar / thinking spinner / blank)
-            Constraint::Length(3), // input box (top border + content + bottom border)
-            Constraint::Length(1), // cwd + branch
-            Constraint::Length(1), // stats
+            Constraint::Min(0),                      // palette / overlay / slack
+            Constraint::Length(1),                   // status strip
+            Constraint::Length(2 + input_content_h), // input box (borders + content)
+            Constraint::Length(1),                   // cwd + branch
+            Constraint::Length(1),                   // stats
         ])
         .split(area);
 
@@ -3256,61 +3388,65 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     draw_status_strip(buf, chunks[1], app);
 
     // ── Input box ────────────────────────────────────────────────
-    // TextBuffer can be multi-line but for MVP we render only the row
-    // containing the cursor + trim overflow. The bordered block is 3
-    // rows total (top ─, content, bottom ─).
-    let cursor_row = app.input.cursor().0;
-    let cursor_col = app.input.cursor().1;
-    let display_row = app
-        .input
-        .lines()
-        .get(cursor_row)
-        .cloned()
-        .unwrap_or_default();
-    // Render prefix + text-so-far + cursor block + text-after.
-    let (pre, post) = split_at_col(&display_row, cursor_col);
-    let mut input_spans: Vec<Span> = vec![
-        Span::styled(
-            "> ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(pre.to_string()),
-        // Reverse-video block as cursor; either the char under it or space.
-        {
+    // The box shows up to `input_content_h` buffer lines, scrolling so
+    // the cursor's line stays visible. The bordered block is
+    // (2 + input_content_h) rows total (top ─, content…, bottom ─).
+    let (cursor_row, cursor_col) = app.input.cursor();
+    let lines = app.input.lines();
+    let total = lines.len();
+    let visible = input_content_h as usize;
+    let (start, end) = input_scroll_window(cursor_row, total, visible);
+
+    let marker_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut input_lines: Vec<Line> = Vec::with_capacity(end - start);
+    for row in start..end {
+        let text = lines.get(row).map(String::as_str).unwrap_or("");
+        // Prompt marker on the first logical line; continuation lines get
+        // matching 2-space indent so text stays column-aligned.
+        let marker = if row == 0 { "> " } else { "  " };
+        let mut spans: Vec<Span> = vec![Span::styled(marker, marker_style)];
+        if row == cursor_row {
+            let (pre, post) = split_at_col(text, cursor_col);
+            spans.push(Span::raw(pre.to_string()));
+            // Reverse-video block as cursor; char under it or a space.
             let cursor_char: String = post
                 .chars()
                 .next()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| " ".into());
-            Span::styled(
+            spans.push(Span::styled(
                 cursor_char,
                 Style::default().add_modifier(Modifier::REVERSED),
-            )
-        },
-        Span::raw(post.chars().skip(1).collect::<String>()),
-    ];
-    if let Some(note) = &app.status_note {
-        input_spans.push(Span::raw("  "));
-        input_spans.push(Span::styled(
-            format!("({note})"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::ITALIC),
-        ));
+            ));
+            spans.push(Span::raw(post.chars().skip(1).collect::<String>()));
+            if let Some(note) = &app.status_note {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("({note})"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
+        } else {
+            spans.push(Span::raw(text.to_string()));
+        }
+        // Only when the buffer overflows the box do we hint at scroll
+        // position — shown once, on the top visible row.
+        if total > visible && row == start {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("(line {}/{})", cursor_row + 1, total),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        input_lines.push(Line::from(spans));
     }
-    // If multi-line, show "(+N more lines)" hint on the right.
-    if app.input.row_count() > 1 {
-        input_spans.push(Span::raw("  "));
-        input_spans.push(Span::styled(
-            format!("(line {}/{})", cursor_row + 1, app.input.row_count()),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    }
-    let input_para = Paragraph::new(Line::from(input_spans))
+    let input_para = Paragraph::new(input_lines)
         .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
     input_para.render(chunks[2], buf);
 
@@ -3720,6 +3856,73 @@ mod tests {
     /// ratatui. Otherwise the terminal's own tab expansion paints
     /// with default bg, tearing black holes in tool / skill cards
     /// (see SCR-20260810-bfry.png).
+    fn as_strings(rows: &[Vec<(char, Style)>]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r.iter().map(|(c, _)| *c).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_chars_one_column_per_char() {
+        // CJK counts as ONE column here (unlike unicode-width), so a run
+        // of 5 chars fits in width 5 on a single row — no double-width gap.
+        let chars: Vec<(char, Style)> =
+            "你好世界吗".chars().map(|c| (c, Style::default())).collect();
+        let rows = wrap_chars(&chars, 5);
+        assert_eq!(as_strings(&rows), vec!["你好世界吗"]);
+    }
+
+    #[test]
+    fn wrap_chars_breaks_at_space() {
+        let chars: Vec<(char, Style)> = "hello world foo"
+            .chars()
+            .map(|c| (c, Style::default()))
+            .collect();
+        // width 11 → "hello world" fits (11), then "foo" wraps.
+        let rows = wrap_chars(&chars, 11);
+        assert_eq!(as_strings(&rows), vec!["hello world", "foo"]);
+    }
+
+    #[test]
+    fn wrap_chars_hard_breaks_long_word() {
+        let chars: Vec<(char, Style)> = "abcdefghij"
+            .chars()
+            .map(|c| (c, Style::default()))
+            .collect();
+        let rows = wrap_chars(&chars, 4);
+        assert_eq!(as_strings(&rows), vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_chars_preserves_leading_indent() {
+        let chars: Vec<(char, Style)> =
+            "    indented".chars().map(|c| (c, Style::default())).collect();
+        let rows = wrap_chars(&chars, 80);
+        assert_eq!(as_strings(&rows), vec!["    indented"]);
+    }
+
+    #[test]
+    fn input_scroll_window_fits_without_scroll() {
+        // 3 lines, cursor on line 1, window of 5 → show all, no scroll.
+        assert_eq!(input_scroll_window(1, 3, 5), (0, 3));
+    }
+
+    #[test]
+    fn input_scroll_window_anchors_to_cursor_on_overflow() {
+        // 33 lines, cursor on the last (32), window 5 → show 28..33.
+        assert_eq!(input_scroll_window(32, 33, 5), (28, 33));
+        // Cursor mid-buffer past the first window → window ends at cursor+1.
+        assert_eq!(input_scroll_window(10, 33, 5), (6, 11));
+        // Cursor still within the first window → pinned to top.
+        assert_eq!(input_scroll_window(4, 33, 5), (0, 5));
+    }
+
+    #[test]
+    fn input_scroll_window_handles_degenerate_visible() {
+        // visible clamps to at least 1 so we never produce an empty box.
+        assert_eq!(input_scroll_window(0, 1, 0), (0, 1));
+    }
+
     #[test]
     fn expand_tabs_replaces_all_tabs_with_four_spaces() {
         assert_eq!(expand_tabs("no tabs"), "no tabs");
