@@ -50,11 +50,7 @@ fn is_jpeg(bytes: &[u8]) -> bool {
     // JPEG starts with 0xFF 0xD8 0xFF <marker>. The <marker> byte
     // 0xF7 identifies JPEG-LS (lossless variant Anthropic rejects);
     // exclude that prefix.
-    bytes.len() >= 4
-        && bytes[0] == 0xFF
-        && bytes[1] == 0xD8
-        && bytes[2] == 0xFF
-        && bytes[3] != 0xF7
+    bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF && bytes[3] != 0xF7
 }
 
 fn is_gif(bytes: &[u8]) -> bool {

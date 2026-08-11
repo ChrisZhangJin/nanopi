@@ -11,7 +11,7 @@ use std::fmt;
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -175,7 +175,10 @@ fn json_error_message(v: &serde_json::Value) -> Option<String> {
 /// through unchanged.
 fn normalize_mangled_tool_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    lower.strip_suffix("_tool").map(String::from).unwrap_or(lower)
+    lower
+        .strip_suffix("_tool")
+        .map(String::from)
+        .unwrap_or(lower)
 }
 
 /// Cheap 0..1 pseudo-random from the current nanosecond of the clock.
@@ -207,7 +210,11 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
@@ -329,10 +336,19 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
                     role: "assistant".into(),
                     content: json!(text),
                     tool_call_id: None,
-                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                 });
             }
-            crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error, images } => {
+            crate::agent::context::ContextMessage::Tool {
+                tool_call_id,
+                content,
+                is_error,
+                images,
+            } => {
                 // The tool-role message itself is text-only — OpenAI's
                 // spec doesn't allow multimodal here. When there are
                 // images AND the model supports vision, we push a
@@ -349,7 +365,8 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
                 } else {
                     format!(
                         "{} ({} image(s) omitted — model does not support vision)",
-                        content, images.len()
+                        content,
+                        images.len()
                     )
                 };
                 let _ = is_error; // is_error is content-only, no wire field on tool role
@@ -456,35 +473,30 @@ impl OpenAiProvider {
                 .bearer_auth(&self.api_key)
                 .json(&body)
                 .send();
-            let send_res = match tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                send_fut,
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    // Synthesize a retryable transport error so the
-                    // existing retry/report code path handles it.
-                    if attempt >= retry.max_attempts {
-                        return Err(OpenAiError::Api(
-                            "send timeout: no response headers after 60s".into(),
-                        ));
+            let send_res =
+                match tokio::time::timeout(std::time::Duration::from_secs(60), send_fut).await {
+                    Ok(res) => res,
+                    Err(_elapsed) => {
+                        // Synthesize a retryable transport error so the
+                        // existing retry/report code path handles it.
+                        if attempt >= retry.max_attempts {
+                            return Err(OpenAiError::Api(
+                                "send timeout: no response headers after 60s".into(),
+                            ));
+                        }
+                        let delay =
+                            crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
+                        eprintln!(
+                            "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
+                            attempt + 1,
+                            retry.max_attempts,
+                            delay.as_secs_f64(),
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry;
                     }
-                    let delay = crate::provider::retry::compute_delay(
-                        attempt, &retry, None, rand01(),
-                    );
-                    eprintln!(
-                        "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
-                        attempt + 1,
-                        retry.max_attempts,
-                        delay.as_secs_f64(),
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue 'retry;
-                }
-            };
+                };
 
             let resp = match send_res {
                 Ok(resp) if resp.status().is_success() => resp,
@@ -492,8 +504,8 @@ impl OpenAiProvider {
                     let status = resp.status();
                     let hint = crate::provider::retry::parse_retry_after(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
-                    let clean = extract_error_message(&body_text)
-                        .unwrap_or_else(|| body_text.clone());
+                    let clean =
+                        extract_error_message(&body_text).unwrap_or_else(|| body_text.clone());
                     let retryable = crate::provider::retry::is_retryable_status(status.as_u16())
                         || crate::provider::retry::is_retryable_message(&clean);
                     if attempt >= retry.max_attempts || !retryable {
@@ -502,13 +514,14 @@ impl OpenAiProvider {
                             body: clean,
                         });
                     }
-                    let delay = crate::provider::retry::compute_delay(
-                        attempt, &retry, hint, rand01(),
-                    );
+                    let delay =
+                        crate::provider::retry::compute_delay(attempt, &retry, hint, rand01());
                     eprintln!(
                         "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
-                        attempt + 1, retry.max_attempts,
-                        delay.as_secs_f64(), status.as_u16(),
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                        status.as_u16(),
                         truncate(&clean, 100),
                     );
                     tokio::time::sleep(delay).await;
@@ -521,13 +534,14 @@ impl OpenAiProvider {
                     if attempt >= retry.max_attempts || !retryable {
                         return Err(OpenAiError::Http(e));
                     }
-                    let delay = crate::provider::retry::compute_delay(
-                        attempt, &retry, None, rand01(),
-                    );
+                    let delay =
+                        crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
                     eprintln!(
                         "[retrying ({}/{}) after {:.1}s: {}]",
-                        attempt + 1, retry.max_attempts,
-                        delay.as_secs_f64(), truncate(&msg, 100),
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                        truncate(&msg, 100),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
@@ -535,9 +549,7 @@ impl OpenAiProvider {
                 }
             };
 
-            let byte_stream = resp
-                .bytes_stream()
-                .map_err(|e| OpenAiError::Http(e));
+            let byte_stream = resp.bytes_stream().map_err(|e| OpenAiError::Http(e));
             let sse = SseStream::new(byte_stream);
 
             let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
@@ -557,13 +569,14 @@ impl OpenAiProvider {
                         && attempt < retry.max_attempts
                         && crate::provider::retry::is_retryable_message(&msg)
                     {
-                        let delay = crate::provider::retry::compute_delay(
-                            attempt, &retry, None, rand01(),
-                        );
+                        let delay =
+                            crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
                         eprintln!(
                             "[retrying ({}/{}) after {:.1}s: {}]",
-                            attempt + 1, retry.max_attempts,
-                            delay.as_secs_f64(), truncate(&msg, 100),
+                            attempt + 1,
+                            retry.max_attempts,
+                            delay.as_secs_f64(),
+                            truncate(&msg, 100),
                         );
                         tokio::time::sleep(delay).await;
                         attempt += 1;
@@ -571,98 +584,104 @@ impl OpenAiProvider {
                     }
                     return Err(OpenAiError::Api(msg));
                 }
-            if !started {
-                started = true;
-                let id = chunk.id.clone().unwrap_or_else(|| "msg".into());
-                let _ = tx.send(AgentEvent::Start { message_id: id }).await;
-            }
-            for choice in chunk.choices {
-                let delta = &choice.delta;
-                if let Some(t) = &delta.content {
-                    if !t.is_empty() {
-                        let _ = tx
-                            .send(AgentEvent::TextDelta {
-                                content_index: choice.index,
-                                text: t.clone(),
-                            })
-                            .await;
-                    }
+                if !started {
+                    started = true;
+                    let id = chunk.id.clone().unwrap_or_else(|| "msg".into());
+                    let _ = tx.send(AgentEvent::Start { message_id: id }).await;
                 }
-                if let Some(t) = &delta.reasoning_content {
-                    if !t.is_empty() {
-                        let _ = tx
-                            .send(AgentEvent::ThinkingDelta {
-                                content_index: choice.index,
-                                text: t.clone(),
-                            })
-                            .await;
-                    }
-                }
-                // Tool call deltas.
-                for tc in &delta.tool_calls {
-                    let idx = tc.index.unwrap_or(0);
-                    let entry = pending.entry(idx).or_insert_with(|| PendingToolCall {
-                        id: None,
-                        name: None,
-                        args_buf: String::new(),
-                    });
-                    if let Some(id) = &tc.id {
-                        entry.id = Some(id.clone());
-                    }
-                    // Either `tc.arguments` directly (DeepSeek / some others)
-                    // or `tc.function.arguments` (OpenAI proper).
-                    if let Some(args) = &tc.arguments {
-                        entry.args_buf.push_str(args);
-                    }
-                    if let Some(func) = &tc.function {
-                        if let Some(name) = &func.name {
-                            entry.name = Some(name.clone());
+                for choice in chunk.choices {
+                    let delta = &choice.delta;
+                    if let Some(t) = &delta.content {
+                        if !t.is_empty() {
+                            let _ = tx
+                                .send(AgentEvent::TextDelta {
+                                    content_index: choice.index,
+                                    text: t.clone(),
+                                })
+                                .await;
                         }
-                        if let Some(args) = &func.arguments {
+                    }
+                    if let Some(t) = &delta.reasoning_content {
+                        if !t.is_empty() {
+                            let _ = tx
+                                .send(AgentEvent::ThinkingDelta {
+                                    content_index: choice.index,
+                                    text: t.clone(),
+                                })
+                                .await;
+                        }
+                    }
+                    // Tool call deltas.
+                    for tc in &delta.tool_calls {
+                        let idx = tc.index.unwrap_or(0);
+                        let entry = pending.entry(idx).or_insert_with(|| PendingToolCall {
+                            id: None,
+                            name: None,
+                            args_buf: String::new(),
+                        });
+                        if let Some(id) = &tc.id {
+                            entry.id = Some(id.clone());
+                        }
+                        // Either `tc.arguments` directly (DeepSeek / some others)
+                        // or `tc.function.arguments` (OpenAI proper).
+                        if let Some(args) = &tc.arguments {
                             entry.args_buf.push_str(args);
                         }
+                        if let Some(func) = &tc.function {
+                            if let Some(name) = &func.name {
+                                entry.name = Some(name.clone());
+                            }
+                            if let Some(args) = &func.arguments {
+                                entry.args_buf.push_str(args);
+                            }
+                        }
                     }
-                }
-                // Flush completed tool calls on finish_reason.
-                if let Some(fr) = &choice.finish_reason {
-                    flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, choice.index).await;
-                    let finish = match fr.as_str() {
-                        "stop" => FinishReason::Stop,
-                        "tool_calls" | "function_call" => FinishReason::ToolCalls,
-                        "length" => FinishReason::Length,
-                        "content_filter" => FinishReason::Refusal,
-                        _ => FinishReason::Unknown,
-                    };
-                    if let Some(u) = &chunk.usage {
-                        usage_local = Usage {
-                            input_tokens: u.prompt_tokens,
-                            output_tokens: u.completion_tokens,
-                            cache_read_tokens: u.cached_tokens,
-                            cache_write_tokens: 0,
-                        };
-                    }
-                    let _ = tx
-                        .send(AgentEvent::Done {
-                            finish_reason: finish,
-                            usage: usage_local.clone(),
-                        })
+                    // Flush completed tool calls on finish_reason.
+                    if let Some(fr) = &choice.finish_reason {
+                        flush_pending_tool_calls(
+                            &mut pending,
+                            &mut emitted_call_ids,
+                            &tx,
+                            choice.index,
+                        )
                         .await;
+                        let finish = match fr.as_str() {
+                            "stop" => FinishReason::Stop,
+                            "tool_calls" | "function_call" => FinishReason::ToolCalls,
+                            "length" => FinishReason::Length,
+                            "content_filter" => FinishReason::Refusal,
+                            _ => FinishReason::Unknown,
+                        };
+                        if let Some(u) = &chunk.usage {
+                            usage_local = Usage {
+                                input_tokens: u.prompt_tokens,
+                                output_tokens: u.completion_tokens,
+                                cache_read_tokens: u.cached_tokens,
+                                cache_write_tokens: 0,
+                            };
+                        }
+                        let _ = tx
+                            .send(AgentEvent::Done {
+                                finish_reason: finish,
+                                usage: usage_local.clone(),
+                            })
+                            .await;
+                    }
+                }
+                if let Some(u) = chunk.usage {
+                    usage_local = Usage {
+                        input_tokens: u.prompt_tokens,
+                        output_tokens: u.completion_tokens,
+                        cache_read_tokens: u.cached_tokens,
+                        cache_write_tokens: 0,
+                    };
                 }
             }
-            if let Some(u) = chunk.usage {
-                usage_local = Usage {
-                    input_tokens: u.prompt_tokens,
-                    output_tokens: u.completion_tokens,
-                    cache_read_tokens: u.cached_tokens,
-                    cache_write_tokens: 0,
-                };
-            }
-        }
 
-        // Stream closed without an explicit finish_reason; emit Done with what we have.
-        flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, 0).await;
-        final_usage = usage_local;
-        break 'retry;
+            // Stream closed without an explicit finish_reason; emit Done with what we have.
+            flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, 0).await;
+            final_usage = usage_local;
+            break 'retry;
         }
         Ok(final_usage)
     }
@@ -721,7 +740,11 @@ async fn flush_pending_tool_calls(
         let _ = tx
             .send(AgentEvent::ToolCall {
                 content_index,
-                call: ToolCall { id, name, arguments: args },
+                call: ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                },
             })
             .await;
     }
@@ -746,13 +769,19 @@ mod tests {
     #[test]
     fn extract_error_from_flat_string() {
         let body = r#"{"error":"OAuth expired"}"#;
-        assert_eq!(extract_error_message(body).as_deref(), Some("OAuth expired"));
+        assert_eq!(
+            extract_error_message(body).as_deref(),
+            Some("OAuth expired")
+        );
     }
 
     #[test]
     fn extract_error_from_sse_stream() {
         let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"queue_timeout\",\"message\":\"queue full, retry later\"}}\n\ndata: [DONE]\n";
-        assert_eq!(extract_error_message(body).as_deref(), Some("queue full, retry later"));
+        assert_eq!(
+            extract_error_message(body).as_deref(),
+            Some("queue full, retry later")
+        );
     }
 
     #[test]
@@ -826,7 +855,11 @@ mod tests {
             }],
         );
         let req = build_request(&ctx, "some-text-only-model");
-        assert_eq!(req.messages.len(), 1, "no follow-up user for non-vision model");
+        assert_eq!(
+            req.messages.len(),
+            1,
+            "no follow-up user for non-vision model"
+        );
         assert_eq!(req.messages[0].role, "tool");
         let text = req.messages[0].content.as_str().unwrap();
         assert!(text.contains("image(s) omitted"), "got {text:?}");
@@ -877,7 +910,10 @@ mod tests {
         let tc = &chunk.choices[0].delta.tool_calls[0];
         assert_eq!(tc.id.as_deref(), Some("call_1"));
         assert_eq!(tc.function.as_ref().unwrap().name.as_deref(), Some("bash"));
-        assert_eq!(tc.function.as_ref().unwrap().arguments.as_deref(), Some("{\"comma"));
+        assert_eq!(
+            tc.function.as_ref().unwrap().arguments.as_deref(),
+            Some("{\"comma")
+        );
     }
 
     #[test]
@@ -894,6 +930,8 @@ mod tests {
     // clarity but don't use it directly.
     #[allow(dead_code)]
     fn _ensure_event_compiles() -> AgentEvent {
-        AgentEvent::Start { message_id: "x".into() }
+        AgentEvent::Start {
+            message_id: "x".into(),
+        }
     }
 }

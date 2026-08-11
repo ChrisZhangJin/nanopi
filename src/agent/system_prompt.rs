@@ -45,9 +45,7 @@ pub fn build(cwd: &Path, tool_names: &[String]) -> String {
         "Be concise. Skip preamble.".to_string(),
     ];
     // Nudge lightweight tools if bash but no dedicated grep exists.
-    if tool_names.iter().any(|n| n == "bash")
-        && !tool_names.iter().any(|n| n == "grep")
-    {
+    if tool_names.iter().any(|n| n == "bash") && !tool_names.iter().any(|n| n == "grep") {
         guidelines.insert(1, "For code search use `bash rg` (ripgrep).".to_string());
     }
     let guidelines_block = guidelines
@@ -140,10 +138,7 @@ mod tests {
 
     #[test]
     fn build_suggests_rg_when_no_grep() {
-        let p = build(
-            &PathBuf::from("/tmp"),
-            &vec!["read".into(), "bash".into()],
-        );
+        let p = build(&PathBuf::from("/tmp"), &vec!["read".into(), "bash".into()]);
         assert!(p.to_ascii_lowercase().contains("ripgrep"));
     }
 
@@ -182,19 +177,20 @@ mod tests {
             "prompt must state that bash is a real shell: {p}"
         );
         assert!(
-            lc.contains("trusted developer") || lc.contains("user's own machine")
+            lc.contains("trusted developer")
+                || lc.contains("user's own machine")
                 || lc.contains("user's machine"),
             "prompt must frame nanopi as a trusted developer tool so \
              Claude's 'arbitrary hosts' caution doesn't fire: {p}"
         );
         assert!(
-            lc.contains("don't ask for confirmation")
-                || lc.contains("don't offer to run"),
+            lc.contains("don't ask for confirmation") || lc.contains("don't offer to run"),
             "prompt must instruct the model to just execute pasted \
              shell commands directly: {p}"
         );
         assert!(
-            lc.contains("pursue the task") || lc.contains("chain the follow-ups")
+            lc.contains("pursue the task")
+                || lc.contains("chain the follow-ups")
                 || lc.contains("obvious next step"),
             "prompt must tell the model to keep going through \
              obvious follow-ups (e.g. 302 redirect) instead of \

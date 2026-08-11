@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 
-use crossterm::{ExecutableCommand, QueueableCommand, cursor, queue, terminal};
+use crossterm::{cursor, queue, terminal, ExecutableCommand, QueueableCommand};
 
 /// RAII guard that puts the terminal into alt-screen on construction
 /// and restores it on drop (or explicit `leave()`).
@@ -23,7 +23,10 @@ impl AltScreen {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?
             .execute(cursor::Hide)?;
-        Ok(Self { stdout, entered: true })
+        Ok(Self {
+            stdout,
+            entered: true,
+        })
     }
 
     /// Restore the main screen early. Idempotent. After this, Drop is a no-op.
@@ -42,7 +45,8 @@ impl Drop for AltScreen {
     fn drop(&mut self) {
         // Best-effort restore. We can't return an error from Drop.
         if self.entered {
-            let _ = self.stdout
+            let _ = self
+                .stdout
                 .queue(cursor::Show)
                 .and_then(|q| q.queue(terminal::LeaveAlternateScreen))
                 .and_then(|q| q.flush());

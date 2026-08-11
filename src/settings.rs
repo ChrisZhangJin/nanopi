@@ -82,7 +82,9 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
         Ok(cfg) => {
             hooks.pre_tool_use.extend(cfg.hooks.pre_tool_use);
             hooks.post_tool_use.extend(cfg.hooks.post_tool_use);
-            hooks.user_prompt_submit.extend(cfg.hooks.user_prompt_submit);
+            hooks
+                .user_prompt_submit
+                .extend(cfg.hooks.user_prompt_submit);
             hooks.session_start.extend(cfg.hooks.session_start);
             hooks.session_end.extend(cfg.hooks.session_end);
         }
@@ -117,16 +119,12 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     }
 
     // Validate regex matchers up front; surface errors at startup.
-    crate::agent::hook::validate_hooks(&hooks.pre_tool_use)
-        .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.post_tool_use)
-        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.pre_tool_use).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.post_tool_use).map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.user_prompt_submit)
         .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_start)
-        .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_end)
-        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_start).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_end).map_err(SettingsError::Matcher)?;
 
     Ok(hooks)
 }

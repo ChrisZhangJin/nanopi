@@ -11,7 +11,9 @@ pub struct StdoutRenderer {
 
 impl StdoutRenderer {
     pub fn new() -> Self {
-        Self { buffer: String::new() }
+        Self {
+            buffer: String::new(),
+        }
     }
 
     /// Render one AgentEvent to stdout.
@@ -34,12 +36,26 @@ impl StdoutRenderer {
                 out.flush()?;
             }
             AgentEvent::ToolCall { call, .. } => {
-                write!(out, "\x1b[33m\n[tool_call: {} {}]\x1b[0m\n", call.name, call.id)?;
+                write!(
+                    out,
+                    "\x1b[33m\n[tool_call: {} {}]\x1b[0m\n",
+                    call.name, call.id
+                )?;
                 out.flush()?;
             }
-            AgentEvent::ToolResult { tool_name, content, is_error, elapsed_ms, .. } => {
+            AgentEvent::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                elapsed_ms,
+                ..
+            } => {
                 // Compact: `[bash → 794 bytes  Took 32ms]` colored by outcome.
-                let (sep, color) = if *is_error { ("✗", "\x1b[31m") } else { ("→", "\x1b[2m") };
+                let (sep, color) = if *is_error {
+                    ("✗", "\x1b[31m")
+                } else {
+                    ("→", "\x1b[2m")
+                };
                 let took = if *elapsed_ms < 50 {
                     format!("Took {}ms", elapsed_ms)
                 } else {
@@ -70,7 +86,10 @@ impl StdoutRenderer {
                 write!(out, "\x1b[2m\n[compacting context ({})…]\x1b[0m\n", reason)?;
                 out.flush()?;
             }
-            AgentEvent::CompactionEnd { replaced_count, used_llm } => {
+            AgentEvent::CompactionEnd {
+                replaced_count,
+                used_llm,
+            } => {
                 let via = if *used_llm { "summary" } else { "truncation" };
                 write!(
                     out,

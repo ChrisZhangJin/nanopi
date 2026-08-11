@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -85,12 +85,14 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| ToolError::Execution(format!("failed to spawn bash: {e}")))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ToolError::Execution("bash stdout not captured".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            ToolError::Execution("bash stderr not captured".into())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::Execution("bash stdout not captured".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::Execution("bash stderr not captured".into()))?;
 
         let timeout = self.timeout;
         let max_bytes = self.max_bytes;
@@ -165,9 +167,7 @@ impl Tool for BashTool {
         let is_error = !status.success();
 
         let content = if let Some(path) = &overflow_path {
-            format!(
-                "{truncated}\n[output truncated; full output at {path}]"
-            )
+            format!("{truncated}\n[output truncated; full output at {path}]")
         } else {
             truncated
         };
@@ -255,7 +255,11 @@ mod tests {
             .execute(json!({"command": "yes line | head -n 10000"}), &ctx)
             .await
             .unwrap();
-        assert!(out.content.len() <= 30_000 + 200, "got len {}", out.content.len());
+        assert!(
+            out.content.len() <= 30_000 + 200,
+            "got len {}",
+            out.content.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

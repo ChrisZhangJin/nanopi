@@ -11,14 +11,14 @@
 use std::path::PathBuf;
 
 use nanopi::agent::build::{AgentBuildInputs, SkillLoadPolicy};
-use nanopi::agent::loop_::Agent;
 use nanopi::agent::hook::HookConfig as _HookConfig;
+use nanopi::agent::loop_::Agent;
 use nanopi::agent::loop_::HooksConfig;
 use nanopi::agent::permission::PermissionGate;
 use nanopi::provider::openai::OpenAiProvider;
 use nanopi::resources::{
-    DiagnosticLevel, LoadSkillsOptions, SkillSource, expand_skill_command,
-    format_skills_for_prompt, load_skills, load_skills_from_dir,
+    expand_skill_command, format_skills_for_prompt, load_skills, load_skills_from_dir,
+    DiagnosticLevel, LoadSkillsOptions, SkillSource,
 };
 use nanopi::tool::ToolRegistry;
 use nanopi::util::uuid;
@@ -56,6 +56,7 @@ fn stub_agent_inputs(
         base_url: String::new(),
         api_key: String::new(),
         skill_load,
+        no_context_files: false,
     }
 }
 
@@ -65,7 +66,12 @@ fn agent_loads_user_and_project_skills_into_prompt() {
     let proj_root = tmp_dir("proj");
     let proj_skills = proj_root.join(".nanopi").join("skills");
     write_skill(&user.join("greet"), "greet", "greet the user warmly", "hi");
-    write_skill(&proj_skills.join("format"), "format", "format code cleanly", "run rustfmt");
+    write_skill(
+        &proj_skills.join("format"),
+        "format",
+        "format code cleanly",
+        "run rustfmt",
+    );
 
     let policy = SkillLoadPolicy {
         user_dir: Some(user.clone()),
@@ -75,18 +81,27 @@ fn agent_loads_user_and_project_skills_into_prompt() {
         disabled: Vec::new(),
     };
     let sess_dir = tmp_dir("sess");
-    let (agent, diagnostics) =
-        Agent::build_fresh(stub_agent_inputs(proj_root.clone(), sess_dir.join("s.jsonl"), policy));
+    let (agent, diagnostics) = Agent::build_fresh(stub_agent_inputs(
+        proj_root.clone(),
+        sess_dir.join("s.jsonl"),
+        policy,
+    ));
 
     assert_eq!(agent.skills.len(), 2, "both skills should load");
-    assert!(diagnostics.is_empty(), "no diagnostics expected: {diagnostics:?}");
+    assert!(
+        diagnostics.is_empty(),
+        "no diagnostics expected: {diagnostics:?}"
+    );
 
     let names: Vec<_> = agent.skills.iter().map(|s| s.name.clone()).collect();
     assert!(names.contains(&"greet".to_string()));
     assert!(names.contains(&"format".to_string()));
 
     let prompt = agent.context.system.as_ref().expect("system prompt set");
-    assert!(prompt.contains("<available_skills>"), "prompt has skills block");
+    assert!(
+        prompt.contains("<available_skills>"),
+        "prompt has skills block"
+    );
     assert!(prompt.contains("<name>greet</name>"), "greet listed");
     assert!(prompt.contains("<name>format</name>"), "format listed");
 
@@ -99,12 +114,25 @@ fn agent_loads_user_and_project_skills_into_prompt() {
 fn distrusted_project_gates_off_project_skills() {
     let root = tmp_dir("distrust");
     let proj_skills = root.join(".nanopi").join("skills");
-    write_skill(&proj_skills.join("leak"), "leak", "would leak env", "cat env");
+    write_skill(
+        &proj_skills.join("leak"),
+        "leak",
+        "would leak env",
+        "cat env",
+    );
 
     // from_cli with project_trusted=false clears the project_dir arm.
-    let policy =
-        SkillLoadPolicy::from_cli(&root, Vec::new(), true /*no_skills*/, false, Vec::new());
-    assert!(policy.project_dir.is_none(), "distrust must drop project dir");
+    let policy = SkillLoadPolicy::from_cli(
+        &root,
+        Vec::new(),
+        true, /*no_skills*/
+        false,
+        Vec::new(),
+    );
+    assert!(
+        policy.project_dir.is_none(),
+        "distrust must drop project dir"
+    );
     assert!(policy.no_discovery);
 
     // Even with the raw options that include the dir, --no-skills drops
@@ -147,8 +175,11 @@ fn no_skills_still_honors_cli_paths() {
     };
     let root = tmp_dir("root");
     let sess = tmp_dir("sess");
-    let (agent, _) =
-        Agent::build_fresh(stub_agent_inputs(root.clone(), sess.join("s.jsonl"), policy));
+    let (agent, _) = Agent::build_fresh(stub_agent_inputs(
+        root.clone(),
+        sess.join("s.jsonl"),
+        policy,
+    ));
 
     let names: Vec<_> = agent.skills.iter().map(|s| s.name.clone()).collect();
     assert_eq!(names, vec!["explicit".to_string()]);
@@ -167,15 +198,16 @@ fn expand_skill_command_matches_pi_shape() {
     let r = load_skills_from_dir(&dir, SkillSource::User);
     assert_eq!(r.skills.len(), 1);
 
-    let e = expand_skill_command("/skill:brave-search rust async", &r.skills)
-        .expect("expansion");
+    let e = expand_skill_command("/skill:brave-search rust async", &r.skills).expect("expansion");
     assert_eq!(e.name, "brave-search");
     assert_eq!(e.user_args.as_deref(), Some("rust async"));
 
     // Exact PI shape: `<skill name="X" location="Y">\nReferences are
     // relative to Z.\n\n<body>\n</skill>\n\n<args>`.
-    let expected_header =
-        format!("<skill name=\"brave-search\" location=\"{}\">", base.join("SKILL.md").display());
+    let expected_header = format!(
+        "<skill name=\"brave-search\" location=\"{}\">",
+        base.join("SKILL.md").display()
+    );
     assert!(e.expanded_text.starts_with(&expected_header));
     assert!(e.expanded_text.contains("References are relative to"));
     assert!(e.expanded_text.contains("Run ./search.js."));

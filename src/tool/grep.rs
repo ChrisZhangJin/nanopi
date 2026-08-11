@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use regex::RegexBuilder;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -17,7 +17,13 @@ const MAX_MATCHES: usize = 500;
 const MAX_DEPTH: usize = 32;
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024; // skip files > 5 MB
 const IGNORE_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", ".venv", "dist", "build", ".direnv",
+    ".git",
+    "node_modules",
+    "target",
+    ".venv",
+    "dist",
+    "build",
+    ".direnv",
 ];
 
 pub struct GrepTool;
@@ -69,7 +75,9 @@ impl Tool for GrepTool {
             .map_err(|e| ToolError::InvalidArgs(format!("invalid regex: {e}")))?;
         let base_str = args["path"].as_str().unwrap_or(".");
         let base = resolve_path_within(&ctx.cwd, base_str)?;
-        let root = if base.is_dir() { base.clone() } else {
+        let root = if base.is_dir() {
+            base.clone()
+        } else {
             base.parent().unwrap_or(Path::new(".")).to_path_buf()
         };
 
@@ -78,9 +86,25 @@ impl Tool for GrepTool {
         let mut files_scanned = 0usize;
 
         if base.is_file() {
-            grep_file(&root, &base, &re, &mut matches, &mut truncated, &mut files_scanned);
+            grep_file(
+                &root,
+                &base,
+                &re,
+                &mut matches,
+                &mut truncated,
+                &mut files_scanned,
+            );
         } else {
-            walk(&root, &base, &re, all, 0, &mut matches, &mut truncated, &mut files_scanned);
+            walk(
+                &root,
+                &base,
+                &re,
+                all,
+                0,
+                &mut matches,
+                &mut truncated,
+                &mut files_scanned,
+            );
         }
 
         let out = if matches.is_empty() {
@@ -116,7 +140,9 @@ fn walk(
     if *truncated || depth > MAX_DEPTH {
         return;
     }
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in read.flatten() {
         if *truncated {
             return;
@@ -133,7 +159,16 @@ fn walk(
         }
         let full = e.path();
         if is_dir {
-            walk(root, &full, re, all, depth + 1, out, truncated, files_scanned);
+            walk(
+                root,
+                &full,
+                re,
+                all,
+                depth + 1,
+                out,
+                truncated,
+                files_scanned,
+            );
         } else {
             grep_file(root, &full, re, out, truncated, files_scanned);
         }
@@ -155,7 +190,9 @@ fn grep_file(
     if meta.len() > MAX_FILE_BYTES {
         return;
     }
-    let Ok(bytes) = std::fs::read(file) else { return };
+    let Ok(bytes) = std::fs::read(file) else {
+        return;
+    };
     if is_binary(&bytes) {
         return;
     }
@@ -189,9 +226,8 @@ fn resolve_path_within(cwd: &Path, p: &str) -> Result<PathBuf, ToolError> {
         cwd.join(p)
     };
     // v0.9.2: no cwd-escape guard on read-only tools (see tool/read.rs).
-    std::fs::canonicalize(&candidate).map_err(|e| {
-        ToolError::Execution(format!("cannot resolve {}: {e}", candidate.display()))
-    })
+    std::fs::canonicalize(&candidate)
+        .map_err(|e| ToolError::Execution(format!("cannot resolve {}: {e}", candidate.display())))
 }
 
 #[cfg(test)]

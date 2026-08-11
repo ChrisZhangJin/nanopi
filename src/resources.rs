@@ -153,7 +153,11 @@ pub fn load_skills_from_dir(dir: &Path, source: SkillSource) -> LoadSkillsResult
     load_from_dir_inner(dir, source, true)
 }
 
-fn load_from_dir_inner(dir: &Path, source: SkillSource, include_root_files: bool) -> LoadSkillsResult {
+fn load_from_dir_inner(
+    dir: &Path,
+    source: SkillSource,
+    include_root_files: bool,
+) -> LoadSkillsResult {
     let mut out = LoadSkillsResult::default();
     if !dir.exists() {
         return out;
@@ -315,7 +319,9 @@ fn parse_flat_frontmatter(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let key = line[..colon].trim();
         if key.is_empty() {
             continue;
@@ -354,8 +360,7 @@ fn validate_name(name: &str) -> Vec<String> {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         errs.push(
-            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)"
-                .into(),
+            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)".into(),
         );
     }
     if name.starts_with('-') || name.ends_with('-') {
@@ -442,12 +447,16 @@ pub fn load_skills(opts: LoadSkillsOptions) -> LoadSkillsResult {
                 &disabled,
                 load_skills_from_dir(&raw, SkillSource::Cli),
             );
-        } else if md.is_file()
-            && raw.extension().and_then(|s| s.to_str()) == Some("md")
-        {
+        } else if md.is_file() && raw.extension().and_then(|s| s.to_str()) == Some("md") {
             let mut one = LoadSkillsResult::default();
             parse_and_push(&raw, SkillSource::Cli, &mut one);
-            merge_batch(&mut acc, &mut seen_names, &mut seen_real_paths, &disabled, one);
+            merge_batch(
+                &mut acc,
+                &mut seen_names,
+                &mut seen_real_paths,
+                &disabled,
+                one,
+            );
         } else {
             acc.diagnostics.push(SkillDiagnostic {
                 level: DiagnosticLevel::Warning,
@@ -472,8 +481,8 @@ fn merge_batch(
         if disabled.contains(&skill.name) {
             continue;
         }
-        let real = std::fs::canonicalize(&skill.file_path)
-            .unwrap_or_else(|_| skill.file_path.clone());
+        let real =
+            std::fs::canonicalize(&skill.file_path).unwrap_or_else(|_| skill.file_path.clone());
         if !seen_real_paths.insert(real) {
             continue;
         }
@@ -500,7 +509,10 @@ fn merge_batch(
 /// inject into the system prompt. Skills with
 /// `disable_model_invocation = true` are hidden.
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
-    let visible: Vec<&Skill> = skills.iter().filter(|s| !s.disable_model_invocation).collect();
+    let visible: Vec<&Skill> = skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
     if visible.is_empty() {
         return String::new();
     }
@@ -673,7 +685,11 @@ mod tests {
     fn skill_md_dir_wins_over_flat_md() {
         let dir = tmp();
         // Flat sibling file that should still be picked up too.
-        std::fs::write(dir.join("flat.md"), "---\nname: flat\ndescription: d\n---\n").unwrap();
+        std::fs::write(
+            dir.join("flat.md"),
+            "---\nname: flat\ndescription: d\n---\n",
+        )
+        .unwrap();
         // A subdir with SKILL.md — the subdir stops recursion.
         write_skill(&dir.join("subskill"), "sub", "d", "body");
         let r = load_skills_from_dir(&dir, SkillSource::User);
@@ -721,11 +737,7 @@ mod tests {
     #[test]
     fn missing_description_drops_skill_with_diagnostic() {
         let dir = tmp();
-        std::fs::write(
-            dir.join("bad.md"),
-            "---\nname: bad\n---\nno description\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("bad.md"), "---\nname: bad\n---\nno description\n").unwrap();
         let r = load_skills_from_dir(&dir, SkillSource::User);
         assert!(r.skills.is_empty());
         assert!(!r.diagnostics.is_empty());
@@ -772,11 +784,7 @@ mod tests {
         let sub = dir.join("fallback-name");
         std::fs::create_dir_all(&sub).unwrap();
         // no `name:` field
-        std::fs::write(
-            sub.join("SKILL.md"),
-            "---\ndescription: d\n---\nbody\n",
-        )
-        .unwrap();
+        std::fs::write(sub.join("SKILL.md"), "---\ndescription: d\n---\nbody\n").unwrap();
         let r = load_skills_from_dir(&dir, SkillSource::User);
         assert_eq!(r.skills.len(), 1);
         assert_eq!(r.skills[0].name, "fallback-name");
@@ -835,18 +843,10 @@ mod tests {
     #[test]
     fn no_discovery_still_loads_cli() {
         let user = tmp();
-        std::fs::write(
-            user.join("x.md"),
-            "---\nname: x\ndescription: d\n---\nb\n",
-        )
-        .unwrap();
+        std::fs::write(user.join("x.md"), "---\nname: x\ndescription: d\n---\nb\n").unwrap();
         let extra = tmp();
         let extra_file = extra.join("y.md");
-        std::fs::write(
-            &extra_file,
-            "---\nname: y\ndescription: d\n---\nb\n",
-        )
-        .unwrap();
+        std::fs::write(&extra_file, "---\nname: y\ndescription: d\n---\nb\n").unwrap();
         let r = load_skills(LoadSkillsOptions {
             user_dir: Some(user.clone()),
             cli_paths: vec![extra_file.clone()],
@@ -866,7 +866,10 @@ mod tests {
             ..Default::default()
         });
         assert!(r.skills.is_empty());
-        assert!(r.diagnostics.iter().any(|d| d.message.contains("does not exist")));
+        assert!(r
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not exist")));
     }
 
     #[test]

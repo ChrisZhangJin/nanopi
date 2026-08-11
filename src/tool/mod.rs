@@ -162,8 +162,7 @@ impl ToolRegistry {
 }
 
 /// Names of all standard tools. Useful for the `--tools` whitelist filter.
-pub const STANDARD_TOOL_NAMES: &[&str] =
-    &["read", "write", "edit", "bash", "grep", "find", "ls"];
+pub const STANDARD_TOOL_NAMES: &[&str] = &["read", "write", "edit", "bash", "grep", "find", "ls"];
 
 /// Parse the `--tools` comma-separated whitelist and return the set of
 /// tool names the agent is allowed to invoke. Unknown names are an error.
@@ -267,7 +266,9 @@ mod tests {
     #[tokio::test]
     async fn tool_execute_returns_content() {
         let tool = EchoTool;
-        let ctx = ToolContext { cwd: PathBuf::from("/tmp") };
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+        };
         let out = tool.execute(json!({"text":"hi"}), &ctx).await.unwrap();
         assert_eq!(out.content, "hi");
         assert!(!out.is_error);

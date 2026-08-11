@@ -54,7 +54,11 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
@@ -111,7 +115,12 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> serde_json::Value 
                     messages.push(json!({"role": "assistant", "content": blocks}));
                 }
             }
-            crate::agent::context::ContextMessage::Tool { tool_call_id, content, is_error, images } => {
+            crate::agent::context::ContextMessage::Tool {
+                tool_call_id,
+                content,
+                is_error,
+                images,
+            } => {
                 // Anthropic tool results go inside a `user` message with a
                 // `tool_result` content block. Text-only results use the
                 // string-content form (compact wire); multimodal results
@@ -355,12 +364,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
             .header("content-type", "application/json")
             .json(&body)
             .send();
-        let resp = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            send_fut,
-        )
-        .await
-        {
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(60), send_fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Err(e.to_string()),
             Err(_elapsed) => {
@@ -419,7 +423,9 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                 } else {
                     started = true;
                     let _ = tx
-                        .send(AgentEvent::Start { message_id: "msg".into() })
+                        .send(AgentEvent::Start {
+                            message_id: "msg".into(),
+                        })
                         .await;
                 }
             }
@@ -572,9 +578,9 @@ mod tests {
     /// this shape and turns it into a real error the caller propagates.
     #[test]
     fn extract_gateway_error_recognizes_litellm_shape() {
-        let v: Value = serde_json::from_str(
-            r#"{"error":"Claude API error","status":401,"details":"nope"}"#,
-        ).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"error":"Claude API error","status":401,"details":"nope"}"#)
+                .unwrap();
         let msg = extract_gateway_error(&v).expect("should extract");
         assert!(msg.contains("Claude API error"));
         assert!(msg.contains("401"));
@@ -606,13 +612,10 @@ mod tests {
     /// `message`. Extractor should just pass it through.
     #[test]
     fn extract_gateway_error_handles_anthropic_native_shape() {
-        let v: Value = serde_json::from_str(
-            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
-        ).unwrap();
-        assert_eq!(
-            extract_gateway_error(&v).as_deref(),
-            Some("slow down")
-        );
+        let v: Value =
+            serde_json::from_str(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#)
+                .unwrap();
+        assert_eq!(extract_gateway_error(&v).as_deref(), Some("slow down"));
     }
 
     /// Non-error events (heartbeats, unknown types) must not trip a
@@ -685,7 +688,7 @@ mod tests {
         let t = v.get("thinking").expect("thinking block should be present");
         assert_eq!(t["type"], "enabled");
         assert_eq!(t["budget_tokens"], 8192); // medium
-        // max_tokens must exceed the budget or Anthropic will reject.
+                                              // max_tokens must exceed the budget or Anthropic will reject.
         assert!(v["max_tokens"].as_u64().unwrap() > 8192);
     }
 
@@ -712,12 +715,15 @@ mod tests {
         );
         let v = build_request(&ctx, "claude-opus-4-7");
         let msgs = v["messages"].as_array().unwrap();
-        let tr = msgs.iter()
+        let tr = msgs
+            .iter()
             .flat_map(|m| m["content"].as_array())
             .flatten()
             .find(|b| b["type"] == "tool_result")
             .expect("tool_result block present");
-        let inner = tr["content"].as_array().expect("content array on multimodal");
+        let inner = tr["content"]
+            .as_array()
+            .expect("content array on multimodal");
         assert_eq!(inner[0]["type"], "text");
         assert_eq!(inner[0]["text"], "Read image file [image/png]");
         assert_eq!(inner[1]["type"], "image");
@@ -741,7 +747,8 @@ mod tests {
         // Made-up id nobody supports — supports_vision returns false.
         let v = build_request(&ctx, "some-text-only-model-2100");
         let msgs = v["messages"].as_array().unwrap();
-        let tr = msgs.iter()
+        let tr = msgs
+            .iter()
             .flat_map(|m| m["content"].as_array())
             .flatten()
             .find(|b| b["type"] == "tool_result")
@@ -758,7 +765,8 @@ mod tests {
         ctx.push_tool_result("call_1", "ok", false);
         let v = build_request(&ctx, "claude-opus-4-7");
         let msgs = v["messages"].as_array().unwrap();
-        let tr = msgs.iter()
+        let tr = msgs
+            .iter()
             .flat_map(|m| m["content"].as_array())
             .flatten()
             .find(|b| b["type"] == "tool_result")

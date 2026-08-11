@@ -40,7 +40,10 @@ pub enum AgentEvent {
     },
 
     /// Stream finished; carries final usage.
-    Done { finish_reason: FinishReason, usage: Usage },
+    Done {
+        finish_reason: FinishReason,
+        usage: Usage,
+    },
 
     /// Stream errored.
     Error { error: String },
@@ -137,7 +140,10 @@ mod tests {
 
     #[test]
     fn serialize_uses_tagged_format() {
-        let e = AgentEvent::TextDelta { content_index: 0, text: "hi".into() };
+        let e = AgentEvent::TextDelta {
+            content_index: 0,
+            text: "hi".into(),
+        };
         let s = serde_json::to_string(&e).unwrap();
         assert_eq!(s, r#"{"type":"text_delta","content_index":0,"text":"hi"}"#);
     }
@@ -145,9 +151,17 @@ mod tests {
     #[test]
     fn deserialize_roundtrip_all_variants() {
         let variants = vec![
-            AgentEvent::Start { message_id: "msg_1".into() },
-            AgentEvent::TextDelta { content_index: 0, text: "hello".into() },
-            AgentEvent::ThinkingDelta { content_index: 0, text: "hmm".into() },
+            AgentEvent::Start {
+                message_id: "msg_1".into(),
+            },
+            AgentEvent::TextDelta {
+                content_index: 0,
+                text: "hello".into(),
+            },
+            AgentEvent::ThinkingDelta {
+                content_index: 0,
+                text: "hmm".into(),
+            },
             AgentEvent::ToolCall {
                 content_index: 0,
                 call: ToolCall {
@@ -158,17 +172,27 @@ mod tests {
             },
             AgentEvent::Done {
                 finish_reason: FinishReason::Stop,
-                usage: Usage { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0 },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
             },
-            AgentEvent::Error { error: "timeout".into() },
+            AgentEvent::Error {
+                error: "timeout".into(),
+            },
         ];
         for v in &variants {
             let s = serde_json::to_string(v).unwrap();
             let back: AgentEvent = serde_json::from_str(&s).unwrap();
             // Re-serialize and compare for roundtrip equality.
             let s2 = serde_json::to_string(&back).unwrap();
-            assert_eq!(serde_json::to_value(v).unwrap(), serde_json::to_value(&back).unwrap(),
-                "roundtrip failed for {s}");
+            assert_eq!(
+                serde_json::to_value(v).unwrap(),
+                serde_json::to_value(&back).unwrap(),
+                "roundtrip failed for {s}"
+            );
         }
     }
 

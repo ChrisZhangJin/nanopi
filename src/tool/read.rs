@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use base64::Engine;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
 use crate::tool::{ImageAttachment, Tool, ToolContext, ToolError, ToolOutput};
@@ -68,9 +68,8 @@ impl Tool for ReadTool {
         // Read raw bytes first so we can magic-byte-detect. Images
         // don't need to be UTF-8 valid, and treating them as text would
         // return garbage.
-        let raw = std::fs::read(&abs).map_err(|e| {
-            ToolError::Execution(format!("cannot read {}: {e}", abs.display()))
-        })?;
+        let raw = std::fs::read(&abs)
+            .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
 
         if let Some(media_type) = crate::util::image_detect::detect_media_type(&raw) {
             if raw.len() > MAX_IMAGE_RAW_BYTES {
@@ -108,9 +107,7 @@ impl Tool for ReadTool {
         let total = lines.len();
 
         let start = offset.min(total);
-        let end = limit
-            .map(|n| (start + n).min(total))
-            .unwrap_or(total);
+        let end = limit.map(|n| (start + n).min(total)).unwrap_or(total);
         let slice: Vec<&str> = lines[start..end].to_vec();
         let out = if slice.is_empty() {
             String::new()
@@ -122,7 +119,9 @@ impl Tool for ReadTool {
             content: out,
             is_error: false,
             images: Vec::new(),
-            metadata: Some(json!({"path": abs.display().to_string(), "lines": total, "offset": start, "limit": limit})),
+            metadata: Some(
+                json!({"path": abs.display().to_string(), "lines": total, "offset": start, "limit": limit}),
+            ),
         })
     }
 }
@@ -180,7 +179,10 @@ mod tests {
     #[tokio::test]
     async fn reads_with_offset_and_limit() {
         let dir = tmp();
-        let body = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.join("lines.txt"), &body).unwrap();
         let ctx = ToolContext { cwd: dir.clone() };
         // offset=2 (0-indexed → start at line3), limit=3 → lines 3,4,5
@@ -199,9 +201,7 @@ mod tests {
     async fn missing_file_is_error() {
         let dir = tmp();
         let ctx = ToolContext { cwd: dir.clone() };
-        let r = ReadTool
-            .execute(json!({"path": "nope.txt"}), &ctx)
-            .await;
+        let r = ReadTool.execute(json!({"path": "nope.txt"}), &ctx).await;
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

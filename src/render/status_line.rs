@@ -111,11 +111,7 @@ pub fn context_color(pct: f64) -> &'static str {
 ///
 /// Example output:
 ///   `claude-opus-4-7 · ↑1.2k ↓340 · $0.05 · ~/nanopi · main`
-pub fn classic_status_line(
-    model: &str,
-    usage: &Usage,
-    cwd: &Path,
-) -> String {
+pub fn classic_status_line(model: &str, usage: &Usage, cwd: &Path) -> String {
     let mut parts = vec![model.to_string(), tokens_summary(usage)];
     let cost = cost_string(model, usage);
     if !cost.is_empty() {
@@ -235,6 +231,6 @@ mod tests {
         assert!(line.contains("claude-opus-4-7"));
         assert!(line.contains("↑1.0k"));
         assert!(line.contains("↓500"));
-        assert!(line.contains("$"));  // known model → cost present
+        assert!(line.contains("$")); // known model → cost present
     }
 }

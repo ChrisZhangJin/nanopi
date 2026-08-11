@@ -109,13 +109,12 @@ where
             if let Some(idx) = this.buf.iter().position(|&b| b == b'\n') {
                 let line_bytes: Vec<u8> = this.buf.drain(..=idx).collect();
                 // Strip trailing \n (and any \r before it).
-                let line_bytes = if line_bytes.len() >= 2
-                    && line_bytes[line_bytes.len() - 2] == b'\r'
-                {
-                    &line_bytes[..line_bytes.len() - 2]
-                } else {
-                    &line_bytes[..line_bytes.len() - 1]
-                };
+                let line_bytes =
+                    if line_bytes.len() >= 2 && line_bytes[line_bytes.len() - 2] == b'\r' {
+                        &line_bytes[..line_bytes.len() - 2]
+                    } else {
+                        &line_bytes[..line_bytes.len() - 1]
+                    };
 
                 let line = match std::str::from_utf8(line_bytes) {
                     Ok(s) => s,
@@ -175,7 +174,7 @@ where
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use futures_util::{StreamExt, stream};
+    use futures_util::{stream, StreamExt};
 
     /// Helper: collect all events from an SseStream into a Vec<Result>.
     async fn collect<S, E>(sse: SseStream<S, E>) -> Vec<Result<SseEvent, SseError>>
@@ -238,7 +237,12 @@ mod tests {
 
     #[tokio::test]
     async fn done_terminates_stream() {
-        let s = chunks(vec!["data: a\n\n", "data: b\n\n", "data: [DONE]\n\n", "data: c\n\n"]);
+        let s = chunks(vec![
+            "data: a\n\n",
+            "data: b\n\n",
+            "data: [DONE]\n\n",
+            "data: c\n\n",
+        ]);
         let events = unwrap_ok(collect(SseStream::new(s)).await);
         // c should not appear.
         assert_eq!(events.len(), 2);

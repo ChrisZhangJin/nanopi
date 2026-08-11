@@ -37,13 +37,23 @@ fn flatten_entries(entries: &[SessionEntry]) -> String {
                 };
                 out.push_str(&format!("{tag}: {content}\n\n"));
             }
-            SessionEntry::ToolCall { tool_name, arguments, .. } => {
+            SessionEntry::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
                 let args_line = arguments.to_string();
                 let trimmed: String = args_line.chars().take(500).collect();
                 out.push_str(&format!("[tool_call {tool_name}] {trimmed}\n"));
             }
-            SessionEntry::ToolResult { content, is_error, .. } => {
-                let tag = if *is_error { "tool_error" } else { "tool_result" };
+            SessionEntry::ToolResult {
+                content, is_error, ..
+            } => {
+                let tag = if *is_error {
+                    "tool_error"
+                } else {
+                    "tool_result"
+                };
                 let trimmed: String = content.chars().take(500).collect();
                 out.push_str(&format!("[{tag}] {trimmed}\n\n"));
             }
@@ -53,7 +63,9 @@ fn flatten_entries(entries: &[SessionEntry]) -> String {
             SessionEntry::BranchSummary { summary, .. } => {
                 out.push_str(&format!("[branch summary] {summary}\n\n"));
             }
-            SessionEntry::SkillInvocation { name, user_message, .. } => {
+            SessionEntry::SkillInvocation {
+                name, user_message, ..
+            } => {
                 let extra = user_message.as_deref().unwrap_or("");
                 out.push_str(&format!("[skill {name}] {extra}\n\n"));
             }
@@ -120,20 +132,26 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Provider for FakeProvider {
-        fn id(&self) -> &'static str { "fake" }
+        fn id(&self) -> &'static str {
+            "fake"
+        }
         async fn stream_turn(
             &self,
             _ctx: &Context,
             tx: mpsc::Sender<AgentEvent>,
         ) -> Result<Usage, String> {
-            let _ = tx.send(AgentEvent::TextDelta {
-                content_index: 0,
-                text: self.response.clone(),
-            }).await;
-            let _ = tx.send(AgentEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage: Usage::default(),
-            }).await;
+            let _ = tx
+                .send(AgentEvent::TextDelta {
+                    content_index: 0,
+                    text: self.response.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage::default(),
+                })
+                .await;
             Ok(Usage::default())
         }
     }
@@ -150,14 +168,18 @@ mod tests {
     #[tokio::test]
     async fn summarize_returns_provider_response() {
         let entries = vec![user("hi"), user("what's up")];
-        let p = FakeProvider { response: "  they said hi twice  ".into() };
+        let p = FakeProvider {
+            response: "  they said hi twice  ".into(),
+        };
         let out = summarize_branch(&entries, None, &p).await;
         assert_eq!(out.as_deref(), Some("they said hi twice"));
     }
 
     #[tokio::test]
     async fn summarize_none_on_empty_entries() {
-        let p = FakeProvider { response: "unused".into() };
+        let p = FakeProvider {
+            response: "unused".into(),
+        };
         assert!(summarize_branch(&[], None, &p).await.is_none());
     }
 
@@ -166,7 +188,9 @@ mod tests {
         struct Broken;
         #[async_trait::async_trait]
         impl Provider for Broken {
-            fn id(&self) -> &'static str { "broken" }
+            fn id(&self) -> &'static str {
+                "broken"
+            }
             async fn stream_turn(
                 &self,
                 _ctx: &Context,
@@ -182,7 +206,9 @@ mod tests {
     #[tokio::test]
     async fn custom_prompt_replaces_default() {
         let entries = vec![user("hi")];
-        let p = FakeProvider { response: "answer".into() };
+        let p = FakeProvider {
+            response: "answer".into(),
+        };
         let custom = "Summarize in exactly 10 words. No preamble.";
         let out = summarize_branch(&entries, Some(custom), &p).await;
         // We can't inspect the system prompt directly via FakeProvider,

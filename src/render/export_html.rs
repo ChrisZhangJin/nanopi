@@ -14,12 +14,7 @@ use crate::session::{SessionEntry, SessionHeader};
 
 /// Build the complete HTML document for a session.
 pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
-    let title = html_escape(
-        header
-            .name
-            .as_deref()
-            .unwrap_or_else(|| "nanopi session"),
-    );
+    let title = html_escape(header.name.as_deref().unwrap_or_else(|| "nanopi session"));
     let id = header.id.to_string();
     let short = &id[..std::cmp::min(id.len(), 8)];
     let model = html_escape(&header.model);
@@ -29,7 +24,12 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
     for e in entries {
         match e {
             SessionEntry::Header { .. } => {}
-            SessionEntry::Message { role, content, timestamp, .. } => {
+            SessionEntry::Message {
+                role,
+                content,
+                timestamp,
+                ..
+            } => {
                 let (class, label) = match role.as_str() {
                     "user" => ("user", "user"),
                     "assistant" => ("assistant", "assistant"),
@@ -42,7 +42,12 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
-            SessionEntry::ToolCall { tool_name, arguments, timestamp, .. } => {
+            SessionEntry::ToolCall {
+                tool_name,
+                arguments,
+                timestamp,
+                ..
+            } => {
                 let preview = match tool_name.as_str() {
                     "bash" => arguments
                         .get("command")
@@ -58,8 +63,17 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
-            SessionEntry::ToolResult { content, is_error, timestamp, .. } => {
-                let class = if *is_error { "tool-error" } else { "tool-result" };
+            SessionEntry::ToolResult {
+                content,
+                is_error,
+                timestamp,
+                ..
+            } => {
+                let class = if *is_error {
+                    "tool-error"
+                } else {
+                    "tool-result"
+                };
                 let label = if *is_error { "tool ✗" } else { "tool →" };
                 body_html.push_str(&format_turn(
                     class,
@@ -68,7 +82,11 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
-            SessionEntry::ModelChange { from, to, timestamp } => {
+            SessionEntry::ModelChange {
+                from,
+                to,
+                timestamp,
+            } => {
                 body_html.push_str(&format_turn(
                     "meta",
                     "model change",
@@ -76,7 +94,11 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
-            SessionEntry::Compaction { summary, replaced_count, timestamp } => {
+            SessionEntry::Compaction {
+                summary,
+                replaced_count,
+                timestamp,
+            } => {
                 body_html.push_str(&format_turn(
                     "meta",
                     &format!("compaction ({replaced_count} msgs)"),
@@ -92,7 +114,13 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
-            SessionEntry::SkillInvocation { name, body, user_message, timestamp, .. } => {
+            SessionEntry::SkillInvocation {
+                name,
+                body,
+                user_message,
+                timestamp,
+                ..
+            } => {
                 let mut text = format!("# {name}\n\n{body}");
                 if let Some(u) = user_message {
                     text.push_str("\n\n---\n\n");
@@ -249,17 +277,22 @@ mod tests {
     fn build_renders_all_entry_kinds() {
         let entries = vec![
             SessionEntry::Message {
-                id: "1".into(), timestamp: "".into(),
-                role: "user".into(), content: "u".into(),
+                id: "1".into(),
+                timestamp: "".into(),
+                role: "user".into(),
+                content: "u".into(),
             },
             SessionEntry::ToolCall {
-                id: "2".into(), timestamp: "".into(),
+                id: "2".into(),
+                timestamp: "".into(),
                 tool_name: "bash".into(),
                 arguments: serde_json::json!({"command": "ls"}),
             },
             SessionEntry::ToolResult {
-                tool_call_id: "2".into(), timestamp: "".into(),
-                content: "file.txt".into(), is_error: false,
+                tool_call_id: "2".into(),
+                timestamp: "".into(),
+                content: "file.txt".into(),
+                is_error: false,
                 images: vec![],
             },
             SessionEntry::Compaction {

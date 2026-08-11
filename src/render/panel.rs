@@ -50,7 +50,9 @@ impl ToolPanel {
     /// panel's call_id are consumed; others are ignored.
     pub fn feed(&mut self, ev: &AgentEvent) {
         match ev {
-            AgentEvent::Start { .. } | AgentEvent::TextDelta { .. } | AgentEvent::ThinkingDelta { .. } => {
+            AgentEvent::Start { .. }
+            | AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. } => {
                 // Run began.
                 if self.state == PanelState::Pending {
                     self.state = PanelState::Running;
@@ -60,17 +62,16 @@ impl ToolPanel {
                 // Self-feed (idempotent).
             }
             AgentEvent::Done { finish_reason, .. } => {
-                let chars = self
-                    .state
-                    .output_chars_ref()
-                    .unwrap_or(0);
+                let chars = self.state.output_chars_ref().unwrap_or(0);
                 self.state = match finish_reason {
                     FinishReason::Stop | FinishReason::Length | FinishReason::ToolCalls => {
-                        PanelState::Done { output_chars: chars }
+                        PanelState::Done {
+                            output_chars: chars,
+                        }
                     }
-                    FinishReason::Refusal | FinishReason::Unknown => {
-                        PanelState::Errored { output_chars: chars }
-                    }
+                    FinishReason::Refusal | FinishReason::Unknown => PanelState::Errored {
+                        output_chars: chars,
+                    },
                 };
             }
             _ => {}
@@ -130,7 +131,9 @@ mod tests {
     #[test]
     fn running_then_done_produces_done_state() {
         let mut p = ToolPanel::new(&call("read", json!({"path": "/etc/hostname"})));
-        p.feed(&AgentEvent::Start { message_id: "m".into() });
+        p.feed(&AgentEvent::Start {
+            message_id: "m".into(),
+        });
         assert_eq!(p.state, PanelState::Running);
         p.feed(&AgentEvent::Done {
             finish_reason: FinishReason::Stop,
@@ -142,7 +145,9 @@ mod tests {
     #[test]
     fn render_emits_one_line_with_state_tag() {
         let mut p = ToolPanel::new(&call("edit", json!({"path": "a.txt"})));
-        p.feed(&AgentEvent::Start { message_id: "m".into() });
+        p.feed(&AgentEvent::Start {
+            message_id: "m".into(),
+        });
         let mut buf: Vec<u8> = Vec::new();
         p.render(&mut buf).unwrap();
         let line = String::from_utf8(buf).unwrap();
@@ -153,7 +158,9 @@ mod tests {
     #[test]
     fn error_state_shows_err_tag() {
         let mut p = ToolPanel::new(&call("bash", json!({"command": "false"})));
-        p.feed(&AgentEvent::Start { message_id: "m".into() });
+        p.feed(&AgentEvent::Start {
+            message_id: "m".into(),
+        });
         p.feed(&AgentEvent::Done {
             finish_reason: FinishReason::Refusal,
             usage: Usage::default(),

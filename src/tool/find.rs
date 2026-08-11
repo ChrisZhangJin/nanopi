@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use regex::Regex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -16,7 +16,13 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 const MAX_RESULTS: usize = 1000;
 const MAX_DEPTH: usize = 32;
 const IGNORE_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", ".venv", "dist", "build", ".direnv",
+    ".git",
+    "node_modules",
+    "target",
+    ".venv",
+    "dist",
+    "build",
+    ".direnv",
 ];
 
 pub struct FindTool;
@@ -94,7 +100,9 @@ fn walk(
     if *truncated || depth > MAX_DEPTH {
         return;
     }
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in read.flatten() {
         if out.len() >= MAX_RESULTS {
             *truncated = true;
@@ -165,7 +173,9 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("a.rs"));
-        assert!(out.content.contains(&format!("sub{}c.rs", std::path::MAIN_SEPARATOR)));
+        assert!(out
+            .content
+            .contains(&format!("sub{}c.rs", std::path::MAIN_SEPARATOR)));
         assert!(!out.content.contains("b.txt"));
         let _ = std::fs::remove_dir_all(&dir);
     }

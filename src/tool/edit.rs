@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -53,9 +53,8 @@ impl Tool for EditTool {
             ctx.cwd.join(path_str)
         };
 
-        let content = std::fs::read_to_string(&abs).map_err(|e| {
-            ToolError::Execution(format!("cannot read {}: {e}", abs.display()))
-        })?;
+        let content = std::fs::read_to_string(&abs)
+            .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
 
         let count = content.matches(old).count();
         if count == 0 {
@@ -68,16 +67,20 @@ impl Tool for EditTool {
         }
 
         let updated = content.replacen(old, new, 1);
-        std::fs::write(&abs, &updated).map_err(|e| {
-            ToolError::Execution(format!("cannot write {}: {e}", abs.display()))
-        })?;
+        std::fs::write(&abs, &updated)
+            .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
 
         // Compute a tiny diff metadata (count of removed/added lines).
         let old_lines: Vec<&str> = old.lines().collect();
         let new_lines: Vec<&str> = new.lines().collect();
 
         Ok(ToolOutput {
-            content: format!("edited {}: -{} +{} lines", abs.display(), old_lines.len(), new_lines.len()),
+            content: format!(
+                "edited {}: -{} +{} lines",
+                abs.display(),
+                old_lines.len(),
+                new_lines.len()
+            ),
             is_error: false,
             images: Vec::new(),
             metadata: Some(json!({
@@ -106,7 +109,10 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "hello world\nfoo bar\n").unwrap();
         let ctx = ToolContext { cwd: dir.clone() };
         EditTool
-            .execute(json!({"path": "f.txt", "oldText": "foo bar", "newText": "baz qux"}), &ctx)
+            .execute(
+                json!({"path": "f.txt", "oldText": "foo bar", "newText": "baz qux"}),
+                &ctx,
+            )
             .await
             .unwrap();
         let content = std::fs::read_to_string(dir.join("f.txt")).unwrap();
@@ -121,7 +127,10 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "hello\n").unwrap();
         let ctx = ToolContext { cwd: dir.clone() };
         let r = EditTool
-            .execute(json!({"path": "f.txt", "oldText": "missing", "newText": "x"}), &ctx)
+            .execute(
+                json!({"path": "f.txt", "oldText": "missing", "newText": "x"}),
+                &ctx,
+            )
             .await;
         assert!(matches!(r, Err(ToolError::Execution(_))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -133,7 +142,10 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "foo\nfoo\n").unwrap();
         let ctx = ToolContext { cwd: dir.clone() };
         let r = EditTool
-            .execute(json!({"path": "f.txt", "oldText": "foo", "newText": "bar"}), &ctx)
+            .execute(
+                json!({"path": "f.txt", "oldText": "foo", "newText": "bar"}),
+                &ctx,
+            )
             .await;
         match r {
             Err(ToolError::Execution(msg)) => assert!(msg.contains("ambiguous")),
@@ -148,7 +160,10 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "AAA\nkeep me\nCCC\n").unwrap();
         let ctx = ToolContext { cwd: dir.clone() };
         EditTool
-            .execute(json!({"path": "f.txt", "oldText": "AAA", "newText": "BBB"}), &ctx)
+            .execute(
+                json!({"path": "f.txt", "oldText": "AAA", "newText": "BBB"}),
+                &ctx,
+            )
             .await
             .unwrap();
         let content = std::fs::read_to_string(dir.join("f.txt")).unwrap();

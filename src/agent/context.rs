@@ -211,15 +211,16 @@ impl Context {
                             AssistantBlock::ToolCall { call } => {
                                 out.push_str(&format!(
                                     "[tool_call {}({})]",
-                                    call.name,
-                                    call.arguments
+                                    call.name, call.arguments
                                 ));
                             }
                         }
                     }
                     out.push('\n');
                 }
-                ContextMessage::Tool { content, is_error, .. } => {
+                ContextMessage::Tool {
+                    content, is_error, ..
+                } => {
                     out.push_str(if *is_error { "TOOL_ERROR: " } else { "TOOL: " });
                     out.push_str(content);
                     out.push('\n');
@@ -284,9 +285,9 @@ mod tests {
     #[test]
     fn estimate_chars_sums_all_content() {
         let mut ctx = Context::default();
-        ctx.system = Some("hi".into());          // 2
-        ctx.push_user_text("hello");             // 5
-        ctx.push_assistant_text("world");        // 5
+        ctx.system = Some("hi".into()); // 2
+        ctx.push_user_text("hello"); // 5
+        ctx.push_assistant_text("world"); // 5
         ctx.push_tool_result("id", "output", false); // 6
         assert_eq!(ctx.estimate_chars(), 2 + 5 + 5 + 6);
     }

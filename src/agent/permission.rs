@@ -99,7 +99,13 @@ pub fn persist_trust_choice(cwd: &Path, choice: TrustChoice) -> std::io::Result<
 fn encode_cwd_key(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

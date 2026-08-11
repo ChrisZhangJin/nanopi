@@ -306,10 +306,7 @@ base_url = "https://project.example/v1"
         );
         let c = load_config(tmp.path()).unwrap();
         assert_eq!(c.model.as_deref(), Some("project-model"));
-        assert_eq!(
-            c.base_url.as_deref(),
-            Some("https://project.example/v1")
-        );
+        assert_eq!(c.base_url.as_deref(), Some("https://project.example/v1"));
     }
 
     #[test]
@@ -317,10 +314,7 @@ base_url = "https://project.example/v1"
         let _g = lock();
         let _h = HomeGuard::new();
         let tmp = TempDir::new();
-        tmp.write(
-            ".nanopi/config.toml",
-            "this is not valid toml = === =",
-        );
+        tmp.write(".nanopi/config.toml", "this is not valid toml = === =");
         let r = load_config(tmp.path());
         assert!(matches!(r, Err(ConfigError::Toml { .. })));
     }

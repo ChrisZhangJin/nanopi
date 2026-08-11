@@ -49,7 +49,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::context::Context;
@@ -57,11 +57,11 @@ use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::AgentEvent;
 use crate::provider::openai::OpenAiProvider;
+use crate::render::menu::{MenuAction, MenuItem, MenuState};
+use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
 use crate::settings;
 use crate::tool::ToolRegistry;
-use crate::render::menu::{MenuAction, MenuItem, MenuState};
-use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 
 /// Slash commands available in the palette.
 ///
@@ -119,21 +119,41 @@ enum SlashCmd {
 
 fn slash_items() -> Vec<MenuItem<SlashCmd>> {
     vec![
-        MenuItem::new("/model",    "Switch to a different model",       SlashCmd::Model),
-        MenuItem::new("/new",      "Start a fresh session in this cwd", SlashCmd::NewSession),
-        MenuItem::new("/resume",   "Open a picker over past sessions",  SlashCmd::Resume),
-        MenuItem::new("/fork",     "Fork the session at a past turn",   SlashCmd::Fork),
-        MenuItem::new("/session",  "Show session stats (tokens, cost)", SlashCmd::SessionInfo),
-        MenuItem::new("/name",     "Set the current session's name",    SlashCmd::Name),
-        MenuItem::new("/copy",     "Copy last assistant reply",         SlashCmd::Copy),
-        MenuItem::new("/export",   "Export current session to JSONL",   SlashCmd::Export),
-        MenuItem::new("/import",   "Import a session from JSONL",       SlashCmd::Import),
-        MenuItem::new("/compact",  "Force context compaction",          SlashCmd::Compact),
-        MenuItem::new("/hotkeys",  "Show all keyboard shortcuts",       SlashCmd::Hotkeys),
-        MenuItem::new("/skills",   "List all loaded skills",            SlashCmd::ListSkills),
-        MenuItem::new("/reload",   "Reload skills, config, settings",   SlashCmd::Reload),
-        MenuItem::new("/quit",     "Exit the session",                  SlashCmd::Quit),
-        MenuItem::new("/exit",     "Exit the session",                  SlashCmd::Quit),
+        MenuItem::new("/model", "Switch to a different model", SlashCmd::Model),
+        MenuItem::new(
+            "/new",
+            "Start a fresh session in this cwd",
+            SlashCmd::NewSession,
+        ),
+        MenuItem::new(
+            "/resume",
+            "Open a picker over past sessions",
+            SlashCmd::Resume,
+        ),
+        MenuItem::new("/fork", "Fork the session at a past turn", SlashCmd::Fork),
+        MenuItem::new(
+            "/session",
+            "Show session stats (tokens, cost)",
+            SlashCmd::SessionInfo,
+        ),
+        MenuItem::new("/name", "Set the current session's name", SlashCmd::Name),
+        MenuItem::new("/copy", "Copy last assistant reply", SlashCmd::Copy),
+        MenuItem::new(
+            "/export",
+            "Export current session to JSONL",
+            SlashCmd::Export,
+        ),
+        MenuItem::new("/import", "Import a session from JSONL", SlashCmd::Import),
+        MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
+        MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
+        MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
+        MenuItem::new(
+            "/reload",
+            "Reload skills, config, settings",
+            SlashCmd::Reload,
+        ),
+        MenuItem::new("/quit", "Exit the session", SlashCmd::Quit),
+        MenuItem::new("/exit", "Exit the session", SlashCmd::Quit),
     ]
 }
 
@@ -180,6 +200,7 @@ pub async fn run_tui_mode(
     session_id: Option<String>,
     fork_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
+    no_context_files: bool,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -211,7 +232,7 @@ pub async fn run_tui_mode(
         }
     };
 
-    use crate::agent::build::{AgentBuildInputs, print_skill_diagnostics};
+    use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let skill_load_for_rebuilds = skill_load.clone();
     let agent: Agent = if let SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
@@ -225,6 +246,7 @@ pub async fn run_tui_mode(
             base_url.to_string(),
             api_key.to_string(),
             skill_load,
+            no_context_files,
         );
         print_skill_diagnostics(&diags);
         a
@@ -241,6 +263,7 @@ pub async fn run_tui_mode(
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             skill_load,
+            no_context_files,
         });
         print_skill_diagnostics(&diags);
         a
@@ -271,6 +294,7 @@ pub async fn run_tui_mode(
         cwd.clone(),
         api_kind,
         skill_load_for_rebuilds,
+        no_context_files,
     );
     // Prime the skills cache from the just-built agent so the very
     // first `/` palette open includes /skill:<name> entries.
@@ -301,7 +325,9 @@ fn print_startup_banner(model: &str, session_id: &str, skills: &[crate::resource
     // Title line: bold nanopi + dim details.
     println!(
         "\x1b[1mnanopi\x1b[0m \x1b[2mv{}  {}  session {}\x1b[0m",
-        env!("CARGO_PKG_VERSION"), model, sid_short
+        env!("CARGO_PKG_VERSION"),
+        model,
+        sid_short
     );
     // Loaded resources — mirrors PI's `showLoadedResources` startup
     // section (interactive-mode.ts:1480). Skills grouped by source.
@@ -341,10 +367,7 @@ fn print_startup_skills(skills: &[crate::resources::Skill]) {
     // Per-source breakdown, one line each — dim.
     for (src, list) in by_source {
         let names: Vec<String> = list.iter().map(|s| s.name.clone()).collect();
-        println!(
-            "  \x1b[2m{src}:\x1b[0m {}",
-            names.join(", ")
-        );
+        println!("  \x1b[2m{src}:\x1b[0m {}", names.join(", "));
     }
 }
 
@@ -480,6 +503,10 @@ struct App {
     /// `/resume`, and `/model` can rebuild the Agent with the same
     /// discovery rules the user asked for on the command line.
     skill_load: crate::agent::build::SkillLoadPolicy,
+    /// `--no-context-files` policy, remembered from startup so `/new`,
+    /// `/fork`, `/resume`, and `/model` rebuild the Agent with the same
+    /// AGENTS.md/CLAUDE.md discovery rule.
+    no_context_files: bool,
     /// Most recent skill invocation, captured collapsed on scrollback.
     /// Ctrl-O expands it once. `None` outside a skill invocation.
     last_skill_block: Option<CollapsedSkill>,
@@ -496,6 +523,7 @@ impl App {
         cwd: PathBuf,
         api_kind: crate::provider::ApiKind,
         skill_load: crate::agent::build::SkillLoadPolicy,
+        no_context_files: bool,
     ) -> Self {
         Self {
             input: TextBuffer::new(),
@@ -528,6 +556,7 @@ impl App {
             resume_picker: None,
             capture: CaptureMode::None,
             skill_load,
+            no_context_files,
             last_skill_block: None,
             skills_cache: Vec::new(),
         }
@@ -584,7 +613,10 @@ struct PendingFork {
 #[derive(Debug)]
 enum SummarizeOutcome {
     /// Summarization succeeded → carry the summary text into the fork.
-    Ok { summary: Option<String>, fork: PendingFork },
+    Ok {
+        summary: Option<String>,
+        fork: PendingFork,
+    },
     /// Something went wrong assembling the request. Reported to user
     /// but fork proceeds without a summary.
     Err { error: String, fork: PendingFork },
@@ -756,10 +788,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     // ── Esc during a streaming turn = interrupt (PI's app.interrupt,
     // keybindings.ts:66). Cancels the current run; the turn wrap-up
     // will insert an "[Operation aborted]" marker.
-    if k.code == KeyCode::Esc
-        && k.modifiers.is_empty()
-        && app.status == Status::Streaming
-    {
+    if k.code == KeyCode::Esc && k.modifiers.is_empty() && app.status == Status::Streaming {
         return KeyAction::CancelTurn;
     }
 
@@ -818,7 +847,8 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         let claims_nav = matches!(
             k.code,
             KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Tab
-        ) || (k.code == KeyCode::Enter && !k.modifiers.contains(KeyModifiers::SHIFT));
+        ) || (k.code == KeyCode::Enter
+            && !k.modifiers.contains(KeyModifiers::SHIFT));
         if claims_nav {
             let m = app.palette.as_mut().unwrap();
             match m.handle_key(k) {
@@ -1019,7 +1049,10 @@ async fn run_app(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Initial dock draw.
-    term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+    term.draw(|f| {
+        let area = f.area();
+        draw_dock(f.buffer_mut(), area, app);
+    })?;
 
     loop {
         if app.should_exit {
@@ -1219,7 +1252,11 @@ async fn handle_action(
             let items: Vec<MenuItem<String>> = crate::pricing::known_models()
                 .into_iter()
                 .map(|prefix| {
-                    let marker = if current.starts_with(prefix) { "  (current)" } else { "" };
+                    let marker = if current.starts_with(prefix) {
+                        "  (current)"
+                    } else {
+                        ""
+                    };
                     MenuItem::new(
                         prefix.to_string(),
                         format!("Switch to {}{}", prefix, marker),
@@ -1259,40 +1296,38 @@ async fn handle_action(
                 None => "off".to_string(),
                 Some(l) => l.to_string(),
             };
-            let note = if !crate::agent::thinking::supports_thinking(&model)
-                && next.is_some()
-            {
+            let note = if !crate::agent::thinking::supports_thinking(&model) && next.is_some() {
                 "  (not supported by this model)"
             } else {
                 ""
             };
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     format!("[thinking → {}{}]", label, note),
                     Style::default()
                         .fg(Color::Indexed(108))
                         .add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
+                )]),
+            )?;
         }
         KeyAction::SwapModel(new_model) => {
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
-                let new_provider = crate::provider::build(
-                    app.api_kind,
-                    &a.base_url,
-                    &a.api_key,
-                    &new_model,
-                );
+                let new_provider =
+                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model);
                 a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("[model → {}]", new_model),
-                        Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
+                        Style::default()
+                            .fg(Color::Indexed(108))
+                            .add_modifier(Modifier::ITALIC),
+                    )]),
+                )?;
             }
         }
         KeyAction::NewSession => {
@@ -1312,19 +1347,19 @@ async fn handle_action(
                     None => return Ok(()),
                 }
             };
-            let (new_path, new_header) =
-                match session::new_session(&cwd, &model, &base_url) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        insert_line(term, Line::from(vec![
-                            Span::styled(
-                                format!("[/new failed: {e}]"),
-                                Style::default().fg(Color::Red),
-                            ),
-                        ]))?;
-                        return Ok(());
-                    }
-                };
+            let (new_path, new_header) = match session::new_session(&cwd, &model, &base_url) {
+                Ok(t) => t,
+                Err(e) => {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("[/new failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        )]),
+                    )?;
+                    return Ok(());
+                }
+            };
             let _ = session::set_active_session(&cwd, &new_path);
             let registry = crate::tool::ToolRegistry::standard();
             let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
@@ -1339,6 +1374,7 @@ async fn handle_action(
                 base_url,
                 api_key,
                 skill_load: app.skill_load.clone(),
+                no_context_files: app.no_context_files,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
             {
@@ -1360,8 +1396,9 @@ async fn handle_action(
             let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
             let _ = std::io::stdout().flush();
             let _ = term.clear();
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     format!(
                         "✓ New session started ({})",
                         &new_header.id.to_string()[..8]
@@ -1369,8 +1406,8 @@ async fn handle_action(
                     Style::default()
                         .fg(Color::Indexed(108))
                         .add_modifier(Modifier::BOLD),
-                ),
-            ]))?;
+                )]),
+            )?;
             refresh_status(app, &agent_slot).await;
         }
         KeyAction::OpenResumePicker => {
@@ -1383,12 +1420,15 @@ async fn handle_action(
             };
             let items_meta = session::list_sessions_for_cwd(&cwd, Some(&current_path));
             if items_meta.is_empty() {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         "[no other sessions in this cwd]",
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )]),
+                )?;
                 return Ok(());
             }
             let items: Vec<MenuItem<PathBuf>> = items_meta
@@ -1400,11 +1440,7 @@ async fn handle_action(
                     } else {
                         s.preview
                     };
-                    MenuItem::new(
-                        preview,
-                        format!("{} · {}", short, s.header.model),
-                        s.path,
-                    )
+                    MenuItem::new(preview, format!("{} · {}", short, s.header.model), s.path)
                 })
                 .collect();
             app.resume_picker = Some(MenuState::new(items));
@@ -1429,12 +1465,13 @@ async fn handle_action(
             let mut new_agent = match Agent::load_session(&path, &cwd) {
                 Ok(a) => a,
                 Err(e) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[/resume load failed: {e}]"),
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                     return Ok(());
                 }
             };
@@ -1450,6 +1487,7 @@ async fn handle_action(
                 base_url,
                 api_key,
                 app.skill_load.clone(),
+                app.no_context_files,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id;
@@ -1482,21 +1520,20 @@ async fn handle_action(
             let _ = std::io::stdout().flush();
             let _ = term.clear();
             let short = &new_session_id.to_string()[..8];
-            let hdr_name = session::read_session(&path)
-                .ok()
-                .and_then(|(h, _)| h.name);
+            let hdr_name = session::read_session(&path).ok().and_then(|(h, _)| h.name);
             let title = match hdr_name {
                 Some(n) => format!("─── Resumed session {short} · {n} ───"),
                 None => format!("─── Resumed session {short} ───"),
             };
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     title,
                     Style::default()
                         .fg(Color::Indexed(108))
                         .add_modifier(Modifier::BOLD),
-                ),
-            ]))?;
+                )]),
+            )?;
             insert_line(term, Line::from(""))?;
             replay_history(term, app, &entries)?;
         }
@@ -1525,12 +1562,15 @@ async fn handle_action(
             let ctx_pct = crate::render::status_line::context_percent(&model, ctx_chars)
                 .map(|p| format!("{p:.1}%"))
                 .unwrap_or_else(|| "?%".into());
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     "Session info",
-                    Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::BOLD),
-                ),
-            ]))?;
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            )?;
             let dim = Style::default().fg(Color::DarkGray);
             let cyan = Style::default().fg(Color::Cyan);
             let row = |k: &str, v: &str| -> Line {
@@ -1542,23 +1582,32 @@ async fn handle_action(
             if let Some(n) = name.as_ref() {
                 insert_line(term, row("name", n))?;
             }
-            insert_line(term, row("id", &session_id[..std::cmp::min(session_id.len(), 8)]))?;
+            insert_line(
+                term,
+                row("id", &session_id[..std::cmp::min(session_id.len(), 8)]),
+            )?;
             insert_line(term, row("model", &model))?;
             insert_line(term, row("turns", &turn_count.to_string()))?;
-            insert_line(term, row(
-                "tokens",
-                &format!(
-                    "↑{}k ↓{}k (cache R{}k W{}k)",
-                    usage.input_tokens / 1000,
-                    usage.output_tokens / 1000,
-                    usage.cache_read_tokens / 1000,
-                    usage.cache_write_tokens / 1000,
+            insert_line(
+                term,
+                row(
+                    "tokens",
+                    &format!(
+                        "↑{}k ↓{}k (cache R{}k W{}k)",
+                        usage.input_tokens / 1000,
+                        usage.output_tokens / 1000,
+                        usage.cache_read_tokens / 1000,
+                        usage.cache_write_tokens / 1000,
+                    ),
                 ),
-            ))?;
+            )?;
             if !cost_str.is_empty() {
                 insert_line(term, row("cost", &cost_str))?;
             }
-            insert_line(term, row("context", &format!("{ctx_pct} ({ctx_chars} chars)")))?;
+            insert_line(
+                term,
+                row("context", &format!("{ctx_pct} ({ctx_chars} chars)")),
+            )?;
             insert_line(term, Line::from(""))?;
         }
         KeyAction::ShowCurrentName => {
@@ -1574,22 +1623,24 @@ async fn handle_action(
                 None => {
                     // No name set — PI prints a usage warning
                     // (interactive-mode.ts:5701).
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             "Warning: Usage: /name <name>",
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
                 Some(n) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("Session name: {n}"),
                             Style::default().fg(Color::Indexed(108)),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
             }
         }
@@ -1601,7 +1652,11 @@ async fn handle_action(
                     Some(a) => a,
                     None => return Ok(()),
                 };
-                let n = if new_name.is_empty() { None } else { Some(new_name.clone()) };
+                let n = if new_name.is_empty() {
+                    None
+                } else {
+                    Some(new_name.clone())
+                };
                 (a.session_path.clone(), n)
             };
             match session::set_session_name(&path, name_to_write.clone()) {
@@ -1612,20 +1667,22 @@ async fn handle_action(
                         Some(n) => format!("Session name set: {n}"),
                         None => "Session name cleared".to_string(),
                     };
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             text,
                             Style::default().fg(Color::Indexed(108)),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
                 Err(e) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[/name failed: {e}]"),
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
             }
         }
@@ -1646,7 +1703,11 @@ async fn handle_action(
                                 })
                                 .collect::<Vec<_>>()
                                 .join("");
-                            if text.trim().is_empty() { None } else { Some(text) }
+                            if text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(text)
+                            }
                         }
                         _ => None,
                     })
@@ -1673,20 +1734,26 @@ async fn handle_action(
                         .chars()
                         .take(60)
                         .collect();
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[copied last reply ({} bytes) — {}]", text.len(), preview),
-                            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
-                        ),
-                    ]))?;
+                            Style::default()
+                                .fg(Color::Indexed(108))
+                                .add_modifier(Modifier::ITALIC),
+                        )]),
+                    )?;
                 }
                 None => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             "[/copy: no assistant reply to copy yet]",
-                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                        ),
-                    ]))?;
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )]),
+                    )?;
                 }
             }
         }
@@ -1694,11 +1761,7 @@ async fn handle_action(
             let (session_path, session_id, cwd) = {
                 let g = agent_slot.lock().await;
                 match g.as_ref() {
-                    Some(a) => (
-                        a.session_path.clone(),
-                        a.session_id,
-                        a.cwd.clone(),
-                    ),
+                    Some(a) => (a.session_path.clone(), a.session_id, a.cwd.clone()),
                     None => return Ok(()),
                 }
             };
@@ -1712,7 +1775,12 @@ async fn handle_action(
                 cwd.join(format!("nanopi-session-{ts}_{short}.html"))
             } else {
                 let mut p = std::path::PathBuf::from(&typed_path);
-                if p.is_absolute() { p.clone() } else { p = cwd.join(&p); p }
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    p = cwd.join(&p);
+                    p
+                }
             };
             // Extension → format. .jsonl = raw session dump; anything
             // else (including no extension) = HTML (matches PI's default).
@@ -1740,51 +1808,56 @@ async fn handle_action(
                 match session::read_session(&session_path) {
                     Ok((hdr, entries)) => {
                         let html = crate::render::export_html::build(&hdr, &entries);
-                        std::fs::write(&effective_target, &html)
-                            .map(|_| html.len() as u64)
+                        std::fs::write(&effective_target, &html).map(|_| html.len() as u64)
                     }
                     Err(e) => {
-                        insert_line(term, Line::from(vec![
-                            Span::styled(
+                        insert_line(
+                            term,
+                            Line::from(vec![Span::styled(
                                 format!("[/export read failed: {e}]"),
                                 Style::default().fg(Color::Red),
-                            ),
-                        ]))?;
+                            )]),
+                        )?;
                         return Ok(());
                     }
                 }
             };
             match result {
                 Ok(bytes) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!(
                                 "Session exported to: {} ({} bytes)",
                                 effective_target.display(),
                                 bytes
                             ),
                             Style::default().fg(Color::Indexed(108)),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
                 Err(e) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[/export failed: {e}]"),
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
             }
         }
         KeyAction::ApplyImport(typed_path) => {
             if typed_path.is_empty() {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         "Warning: Usage: /import <path.jsonl>",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ),
-                ]))?;
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )]),
+                )?;
                 return Ok(());
             }
             let (cwd, model, base_url, api_key, permission, hooks) = {
@@ -1803,7 +1876,11 @@ async fn handle_action(
             };
             let source: PathBuf = {
                 let p = PathBuf::from(&typed_path);
-                if p.is_absolute() { p } else { cwd.join(p) }
+                if p.is_absolute() {
+                    p
+                } else {
+                    cwd.join(p)
+                }
             };
             // Copy the source into sessions_dir so it participates in
             // /resume + --continue like every other session.
@@ -1814,22 +1891,24 @@ async fn handle_action(
                     dir.join(format!("{new_id}.jsonl"))
                 }
                 None => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             "[/import: cannot locate sessions dir]",
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                     return Ok(());
                 }
             };
             if let Err(e) = std::fs::copy(&source, &dest) {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("[/import copy failed: {e}]"),
                         Style::default().fg(Color::Red),
-                    ),
-                ]))?;
+                    )]),
+                )?;
                 return Ok(());
             }
             // Validate we can load it as a session.
@@ -1837,12 +1916,13 @@ async fn handle_action(
                 Ok(a) => a,
                 Err(e) => {
                     let _ = std::fs::remove_file(&dest);
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[/import load failed: {e}]"),
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                     return Ok(());
                 }
             };
@@ -1858,6 +1938,7 @@ async fn handle_action(
                 base_url,
                 api_key,
                 app.skill_load.clone(),
+                app.no_context_files,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id;
@@ -1873,51 +1954,61 @@ async fn handle_action(
             app.input.clear();
             app.thinking = None;
             refresh_status(app, agent_slot).await;
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     format!(
                         "[imported → new session {} (from {})]",
                         &new_session_id.to_string()[..8],
                         source.display(),
                     ),
-                    Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                )]),
+            )?;
         }
         KeyAction::ShowHotkeys => {
             let hotkey_lines: &[(&str, &str)] = &[
-                ("Enter",       "submit prompt"),
+                ("Enter", "submit prompt"),
                 ("Shift+Enter", "insert newline (multi-line input)"),
-                ("Esc",         "interrupt streaming turn / open fork picker on empty (double-tap)"),
-                ("Ctrl+C",      "same as Esc (interrupt / exit on empty)"),
-                ("Ctrl+D",      "delete char forward, or exit when empty"),
-                ("Ctrl+O",      "expand last tool output into scrollback"),
-                ("Ctrl+A / E",  "cursor to line start / end"),
-                ("Ctrl+K / U",  "kill to line end / start"),
-                ("Ctrl+W",      "kill previous word"),
-                ("Ctrl+Y",      "yank last killed text"),
-                ("Ctrl+Z / -",  "undo (fish-style word-coalesced)"),
-                ("Alt+B / F",   "move cursor by word"),
-                ("↑ / ↓",       "prompt history when editor empty"),
-                ("Shift+Tab",   "cycle thinking level (Off → Minimal → … → Max)"),
-                ("/",           "open slash-command palette"),
+                (
+                    "Esc",
+                    "interrupt streaming turn / open fork picker on empty (double-tap)",
+                ),
+                ("Ctrl+C", "same as Esc (interrupt / exit on empty)"),
+                ("Ctrl+D", "delete char forward, or exit when empty"),
+                ("Ctrl+O", "expand last tool output into scrollback"),
+                ("Ctrl+A / E", "cursor to line start / end"),
+                ("Ctrl+K / U", "kill to line end / start"),
+                ("Ctrl+W", "kill previous word"),
+                ("Ctrl+Y", "yank last killed text"),
+                ("Ctrl+Z / -", "undo (fish-style word-coalesced)"),
+                ("Alt+B / F", "move cursor by word"),
+                ("↑ / ↓", "prompt history when editor empty"),
+                (
+                    "Shift+Tab",
+                    "cycle thinking level (Off → Minimal → … → Max)",
+                ),
+                ("/", "open slash-command palette"),
             ];
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     "Keyboard shortcuts",
                     Style::default()
                         .fg(Color::Indexed(108))
                         .add_modifier(Modifier::BOLD),
-                ),
-            ]))?;
+                )]),
+            )?;
             for (k, desc) in hotkey_lines {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
-                        format!("  {:<15}", k),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
-                ]))?;
+                insert_line(
+                    term,
+                    Line::from(vec![
+                        Span::styled(format!("  {:<15}", k), Style::default().fg(Color::Cyan)),
+                        Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
+                    ]),
+                )?;
             }
             insert_line(term, Line::from(""))?;
         }
@@ -1929,12 +2020,13 @@ async fn handle_action(
                 g.as_ref().map(|a| a.skills.clone()).unwrap_or_default()
             };
             if skills.is_empty() {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         "No skills loaded.".to_string(),
                         Style::default().fg(Color::DarkGray),
-                    ),
-                ]))?;
+                    )]),
+                )?;
                 insert_line(term, Line::from(vec![
                     Span::styled(
                         "  Add SKILL.md files under ~/.nanopi/skills/ or <cwd>/.nanopi/skills/ (project needs `-a` to trust).".to_string(),
@@ -1943,39 +2035,45 @@ async fn handle_action(
                 ]))?;
                 insert_line(term, Line::from(""))?;
             } else {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("Loaded skills ({})", skills.len()),
                         Style::default()
                             .fg(Color::Indexed(108))
                             .add_modifier(Modifier::BOLD),
-                    ),
-                ]))?;
+                    )]),
+                )?;
                 for s in &skills {
                     let src = s.source.label();
-                    let hidden = if s.disable_model_invocation { " (hidden)" } else { "" };
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
-                            format!("  /skill:{:<24}", s.name),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::styled(
-                            format!("[{src}]{hidden} "),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            s.description.clone(),
-                            Style::default().fg(Color::Gray),
-                        ),
-                    ]))?;
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    let hidden = if s.disable_model_invocation {
+                        " (hidden)"
+                    } else {
+                        ""
+                    };
+                    insert_line(
+                        term,
+                        Line::from(vec![
+                            Span::styled(
+                                format!("  /skill:{:<24}", s.name),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::styled(
+                                format!("[{src}]{hidden} "),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(s.description.clone(), Style::default().fg(Color::Gray)),
+                        ]),
+                    )?;
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("      {}", s.file_path.display()),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::DIM),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
                 insert_line(term, Line::from(""))?;
             }
@@ -2010,12 +2108,13 @@ async fn handle_action(
             let entries = match session::read_session(&session_path) {
                 Ok((_, e)) => e,
                 Err(_) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             "[fork: could not read current session]",
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                     return Ok(());
                 }
             };
@@ -2023,12 +2122,15 @@ async fn handle_action(
             let user_rows: Vec<&session::TreeRow> =
                 rows.iter().filter(|r| r.role == "user").collect();
             if user_rows.is_empty() {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         "[fork: no user messages in this session yet]",
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )]),
+                )?;
                 return Ok(());
             }
             let total = user_rows.len();
@@ -2053,12 +2155,13 @@ async fn handle_action(
             let src_entries = match session::read_session(&source_path) {
                 Ok((_, e)) => e,
                 Err(e) => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[fork read failed: {e}]"),
                             Style::default().fg(Color::Red),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                     return Ok(());
                 }
             };
@@ -2118,8 +2221,7 @@ async fn handle_action(
                     // to arrive as RunCustomSummary(text).
                     app.pending_fork = Some(pending);
                     app.capture = CaptureMode::CustomSummary;
-                    app.status_note =
-                        Some("custom summarize prompt — Enter to submit".into());
+                    app.status_note = Some("custom summarize prompt — Enter to submit".into());
                 }
             }
         }
@@ -2138,12 +2240,13 @@ async fn handle_action(
                     execute_fork(fork, summary, app, term, agent_slot).await?;
                 }
                 SummarizeOutcome::Err { error, fork } => {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             format!("[summarize error: {error} — forking without summary]"),
                             Style::default().fg(Color::Yellow),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                     execute_fork(fork, None, app, term, agent_slot).await?;
                 }
             }
@@ -2158,18 +2261,24 @@ async fn handle_action(
         }
         KeyAction::Compact => {
             app.status_note = Some("compacting…".into());
-            term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+            term.draw(|f| {
+                let area = f.area();
+                draw_dock(f.buffer_mut(), area, app);
+            })?;
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let before = a.context.estimate_chars();
                 a.compact_now(None, "manual").await;
                 let after = a.context.estimate_chars();
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("[compacted: {before} → {after} chars]"),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )]),
+                )?;
                 app.context_chars = after;
                 app.usage = a.usage_total.clone();
                 app.turn_count = a.turn_count;
@@ -2243,12 +2352,13 @@ async fn execute_fork(
         match session::fork_session_at(&cwd, &fork.source_path, fork.target_entry_idx) {
             Ok(t) => t,
             Err(e) => {
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("[fork failed: {e}]"),
                         Style::default().fg(Color::Red),
-                    ),
-                ]))?;
+                    )]),
+                )?;
                 return Ok(());
             }
         };
@@ -2270,12 +2380,13 @@ async fn execute_fork(
     let mut new_agent = match Agent::load_session(&new_path, &cwd) {
         Ok(a) => a,
         Err(e) => {
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     format!("[fork load failed: {e}]"),
                     Style::default().fg(Color::Red),
-                ),
-            ]))?;
+                )]),
+            )?;
             return Ok(());
         }
     };
@@ -2291,6 +2402,7 @@ async fn execute_fork(
         base_url,
         api_key,
         app.skill_load.clone(),
+        app.no_context_files,
     );
     crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
@@ -2310,9 +2422,14 @@ async fn execute_fork(
     }
 
     let short = &new_session_id.to_string()[..8];
-    let summary_note = if summary.is_some() { " · with summary" } else { "" };
-    insert_line(term, Line::from(vec![
-        Span::styled(
+    let summary_note = if summary.is_some() {
+        " · with summary"
+    } else {
+        ""
+    };
+    insert_line(
+        term,
+        Line::from(vec![Span::styled(
             format!(
                 "[forked at entry {} → new session {}{}]",
                 fork.target_entry_idx, short, summary_note
@@ -2320,8 +2437,8 @@ async fn execute_fork(
             Style::default()
                 .fg(Color::Indexed(108))
                 .add_modifier(Modifier::ITALIC),
-        ),
-    ]))?;
+        )]),
+    )?;
     Ok(())
 }
 
@@ -2352,7 +2469,10 @@ async fn spawn_summarize_task(
             provider.as_ref(),
         )
         .await;
-        SummarizeOutcome::Ok { summary, fork: pending }
+        SummarizeOutcome::Ok {
+            summary,
+            fork: pending,
+        }
     });
     app.status_note = Some("summarizing branch…".into());
     app.summarize_task = Some(task);
@@ -2407,8 +2527,7 @@ async fn handle_reload(
         };
 
     // ── 3. skills — uses the (possibly refreshed) disabled list ──
-    let skill_result =
-        crate::resources::load_skills(app.skill_load.clone().into_options());
+    let skill_result = crate::resources::load_skills(app.skill_load.clone().into_options());
     let n_skills = skill_result.skills.len();
     let n_diagnostics = skill_result.diagnostics.len();
 
@@ -2425,6 +2544,7 @@ async fn handle_reload(
                 &a.cwd,
                 &tool_names,
                 &a.skills,
+                a.no_context_files,
             ));
             let h = &a.hooks;
             h.pre_tool_use.len()
@@ -2510,14 +2630,15 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
                 let line: String = app.thinking_buf.drain(..=nl).collect();
                 let trimmed = line.trim_end_matches('\n');
                 if !trimmed.is_empty() {
-                    insert_line(term, Line::from(vec![
-                        Span::styled(
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
                             trimmed.to_string(),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::ITALIC),
-                        ),
-                    ]))?;
+                        )]),
+                    )?;
                 }
             }
         }
@@ -2530,48 +2651,72 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             // render a blue running-state strip until ToolResult.
             app.tool_started_at = Some(std::time::Instant::now());
         }
-        AgentEvent::ToolResult { content, is_error, elapsed_ms, .. } => {
+        AgentEvent::ToolResult {
+            content,
+            is_error,
+            elapsed_ms,
+            ..
+        } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             render_tool_card(term, app, &content, is_error, elapsed_ms)?;
             app.tool_started_at = None;
             // Stash full output so Ctrl+O can expand it later — with
             // the outcome flag so expansion uses matching bg.
-            app.last_tool_output = Some(LastTool { content, is_error, expanded: false });
+            app.last_tool_output = Some(LastTool {
+                content,
+                is_error,
+                expanded: false,
+            });
         }
         AgentEvent::Error { error } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            insert_line(term, Line::from(vec![
-                Span::styled(format!("[error: {error}]"), Style::default().fg(Color::Red)),
-            ]))?;
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    format!("[error: {error}]"),
+                    Style::default().fg(Color::Red),
+                )]),
+            )?;
         }
         AgentEvent::CompactionStart { reason } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     format!("[compacting context ({reason})…]"),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
+                )]),
+            )?;
         }
-        AgentEvent::CompactionEnd { replaced_count, used_llm } => {
+        AgentEvent::CompactionEnd {
+            replaced_count,
+            used_llm,
+        } => {
             let via = if used_llm { "summary" } else { "truncation" };
-            insert_line(term, Line::from(vec![
-                Span::styled(
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
                     format!("[compacted {replaced_count} messages via {via}]"),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
-                ),
-            ]))?;
+                )]),
+            )?;
             // Refresh cached context estimate for the status footer.
             app.context_chars = 0; // will be re-populated on next event
         }
-        AgentEvent::SkillInvocation { name, location, base_dir, body, user_message } => {
+        AgentEvent::SkillInvocation {
+            name,
+            location,
+            base_dir,
+            body,
+            user_message,
+        } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             render_skill_card(term, &name)?;
@@ -2615,12 +2760,15 @@ fn flush_stream_buf(term: &mut Term, app: &mut App) -> Result<()> {
 fn flush_thinking_buf(term: &mut Term, app: &mut App) -> Result<()> {
     if !app.thinking_buf.is_empty() {
         let text = std::mem::take(&mut app.thinking_buf);
-        insert_line(term, Line::from(vec![
-            Span::styled(
+        insert_line(
+            term,
+            Line::from(vec![Span::styled(
                 text,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            ),
-        ]))?;
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]),
+        )?;
     }
     Ok(())
 }
@@ -2648,7 +2796,10 @@ fn tool_call_bar_text(name: &str, args: &serde_json::Value) -> (String, String) 
         }
         "grep" | "find" => {
             let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            (format!(" {} ", name_lc), truncate_bar_body(&format!("'{pat}'")))
+            (
+                format!(" {} ", name_lc),
+                truncate_bar_body(&format!("'{pat}'")),
+            )
         }
         _ => {
             let s = args.to_string();
@@ -2715,11 +2866,12 @@ fn render_tool_card(
     } else {
         (Color::Indexed(65), Color::Indexed(230))
     };
-    let bar_style = Style::default().bg(bar_bg).fg(bar_fg).add_modifier(Modifier::BOLD);
-    // Dimmed foreground on the same bg — for output preview + Took.
-    let dim_style = Style::default()
+    let bar_style = Style::default()
         .bg(bar_bg)
-        .fg(Color::Indexed(253));
+        .fg(bar_fg)
+        .add_modifier(Modifier::BOLD);
+    // Dimmed foreground on the same bg — for output preview + Took.
+    let dim_style = Style::default().bg(bar_bg).fg(Color::Indexed(253));
     let hint_style = Style::default()
         .bg(bar_bg)
         .fg(Color::Indexed(250))
@@ -2730,10 +2882,14 @@ fn render_tool_card(
 
     // Row 1: command bar (from stashed pending_tool_call).
     if let Some(pending) = app.pending_tool_call.take() {
-        insert_line_bg(term, Line::from(vec![
-            Span::styled(pending.leading, bar_style),
-            Span::styled(pending.body, bar_style),
-        ]), Some(bar_style))?;
+        insert_line_bg(
+            term,
+            Line::from(vec![
+                Span::styled(pending.leading, bar_style),
+                Span::styled(pending.body, bar_style),
+            ]),
+            Some(bar_style),
+        )?;
     }
 
     // Output preview: last N lines. If more, show a truncation marker.
@@ -2741,25 +2897,35 @@ fn render_tool_card(
     let total = lines.len();
     if total > TOOL_PREVIEW_LINES {
         let hidden = total - TOOL_PREVIEW_LINES;
-        insert_line_bg(term, Line::from(vec![
-            Span::styled(
+        insert_line_bg(
+            term,
+            Line::from(vec![Span::styled(
                 format!("  … ({} earlier lines, ctrl+o to expand)", hidden),
                 hint_style,
-            ),
-        ]), Some(bar_style))?;
+            )]),
+            Some(bar_style),
+        )?;
     }
     let start = total.saturating_sub(TOOL_PREVIEW_LINES);
     for line in &lines[start..] {
         // Prefix with 2 spaces for visual indent inside the card.
         // Expand tabs so the bg doesn't tear open on tab-indented output.
-        insert_line_bg(term, Line::from(vec![
-            Span::styled("  ", dim_style),
-            Span::styled(expand_tabs(line), dim_style),
-        ]), Some(dim_style))?;
+        insert_line_bg(
+            term,
+            Line::from(vec![
+                Span::styled("  ", dim_style),
+                Span::styled(expand_tabs(line), dim_style),
+            ]),
+            Some(dim_style),
+        )?;
     }
 
     // Empty divider row inside the card.
-    insert_line_bg(term, Line::from(vec![Span::styled("", bar_style)]), Some(bar_style))?;
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled("", bar_style)]),
+        Some(bar_style),
+    )?;
 
     // Took Xs (right-side info, italic dim on the card bg).
     let took_str = if elapsed_ms < 50 {
@@ -2767,9 +2933,11 @@ fn render_tool_card(
     } else {
         format!("Took {:.1}s", elapsed_ms as f64 / 1000.0)
     };
-    insert_line_bg(term, Line::from(vec![
-        Span::styled(format!("  {}", took_str), hint_style),
-    ]), Some(bar_style))?;
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled(format!("  {}", took_str), hint_style)]),
+        Some(bar_style),
+    )?;
 
     // Breathing room below.
     insert_line(term, Line::from(""))?;
@@ -2782,7 +2950,9 @@ fn render_tool_card(
 /// expand)`, styled with the same subtle bg used for custom messages.
 /// The expanded body lands in scrollback via `expand_last_skill_block`.
 fn render_skill_card(term: &mut Term, name: &str) -> Result<()> {
-    let bg = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(255));
+    let bg = Style::default()
+        .bg(Color::Indexed(236))
+        .fg(Color::Indexed(255));
     let dim = Style::default().bg(Color::Indexed(236)).fg(Color::DarkGray);
     insert_line(term, Line::from(""))?;
     insert_line_bg(
@@ -2809,14 +2979,26 @@ fn render_user_echo(term: &mut Term, msg: &str) -> Result<()> {
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(255));
     insert_line(term, Line::from(""))?;
-    insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled("", user_bg)]),
+        Some(user_bg),
+    )?;
     for line in msg.lines() {
-        insert_line_bg(term, Line::from(vec![
-            Span::styled("  ", user_bg),
-            Span::styled(expand_tabs(line), user_bg),
-        ]), Some(user_bg))?;
+        insert_line_bg(
+            term,
+            Line::from(vec![
+                Span::styled("  ", user_bg),
+                Span::styled(expand_tabs(line), user_bg),
+            ]),
+            Some(user_bg),
+        )?;
     }
-    insert_line_bg(term, Line::from(vec![Span::styled("", user_bg)]), Some(user_bg))?;
+    insert_line_bg(
+        term,
+        Line::from(vec![Span::styled("", user_bg)]),
+        Some(user_bg),
+    )?;
     insert_line(term, Line::from(""))?;
     Ok(())
 }
@@ -2827,11 +3009,7 @@ fn render_user_echo(term: &mut Term, msg: &str) -> Result<()> {
 /// compaction markers, branch summaries). Called from
 /// KeyAction::ResumeSession so `/resume` shows the full past
 /// conversation, matching PI's behavior.
-fn replay_history(
-    term: &mut Term,
-    app: &mut App,
-    entries: &[session::SessionEntry],
-) -> Result<()> {
+fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEntry]) -> Result<()> {
     // Ensure any live-streaming state is fresh (fenced-block toggle etc).
     app.md_state = crate::render::markdown::MdState::default();
     app.stream_buf.clear();
@@ -2853,14 +3031,22 @@ fn replay_history(
                     on_agent_event(
                         term,
                         app,
-                        AgentEvent::TextDelta { content_index: 0, text },
+                        AgentEvent::TextDelta {
+                            content_index: 0,
+                            text,
+                        },
                     )?;
                     // Blank spacer between assistant reply and next turn.
                     insert_line(term, Line::from(""))?;
                 }
                 _ => {}
             },
-            session::SessionEntry::ToolCall { id, tool_name, arguments, .. } => {
+            session::SessionEntry::ToolCall {
+                id,
+                tool_name,
+                arguments,
+                ..
+            } => {
                 on_agent_event(
                     term,
                     app,
@@ -2874,7 +3060,12 @@ fn replay_history(
                     },
                 )?;
             }
-            session::SessionEntry::ToolResult { tool_call_id, content, is_error, .. } => {
+            session::SessionEntry::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
                 on_agent_event(
                     term,
                     app,
@@ -2887,7 +3078,11 @@ fn replay_history(
                     },
                 )?;
             }
-            session::SessionEntry::Compaction { summary, replaced_count, .. } => {
+            session::SessionEntry::Compaction {
+                summary,
+                replaced_count,
+                ..
+            } => {
                 let preview: String = summary
                     .split_whitespace()
                     .collect::<Vec<_>>()
@@ -2895,14 +3090,15 @@ fn replay_history(
                     .chars()
                     .take(80)
                     .collect();
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("[compaction: {replaced_count} msgs → {preview}]"),
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
+                    )]),
+                )?;
             }
             session::SessionEntry::BranchSummary { summary, .. } => {
                 let preview: String = summary
@@ -2912,14 +3108,15 @@ fn replay_history(
                     .chars()
                     .take(80)
                     .collect();
-                insert_line(term, Line::from(vec![
-                    Span::styled(
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
                         format!("[branch summary: {preview}]"),
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
-                    ),
-                ]))?;
+                    )]),
+                )?;
             }
             session::SessionEntry::SkillInvocation {
                 name,
@@ -2963,15 +3160,11 @@ fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
     // Rough visual-length estimate: char count. Good enough for the
     // ASCII/CJK mix we ship; unicode-width would be marginally better
     // but adds a dep for a display fudge.
-    let total_chars: usize = line
-        .spans
-        .iter()
-        .map(|s| s.content.chars().count())
-        .sum();
+    let total_chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
     let rows_needed = ((total_chars + width as usize - 1) / width as usize).max(1);
     let rows_needed = rows_needed.min(200); // guard against runaway
-    // ratatui Line borrows its spans; hoist into owned strings so the
-    // FnOnce closure can move them into insert_before.
+                                            // ratatui Line borrows its spans; hoist into owned strings so the
+                                            // FnOnce closure can move them into insert_before.
     let owned_spans: Vec<Span<'static>> = line
         .spans
         .iter()
@@ -2980,8 +3173,8 @@ fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
     term.insert_before(rows_needed as u16, move |buf: &mut Buffer| {
         // Paragraph does the actual wrapping. `trim: false` preserves
         // leading whitespace so indented code / markdown stays aligned.
-        let para = Paragraph::new(Line::from(owned_spans))
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let para =
+            Paragraph::new(Line::from(owned_spans)).wrap(ratatui::widgets::Wrap { trim: false });
         para.render(buf.area, buf);
     })?;
     Ok(())
@@ -3068,16 +3261,33 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // rows total (top ─, content, bottom ─).
     let cursor_row = app.input.cursor().0;
     let cursor_col = app.input.cursor().1;
-    let display_row = app.input.lines().get(cursor_row).cloned().unwrap_or_default();
+    let display_row = app
+        .input
+        .lines()
+        .get(cursor_row)
+        .cloned()
+        .unwrap_or_default();
     // Render prefix + text-so-far + cursor block + text-after.
     let (pre, post) = split_at_col(&display_row, cursor_col);
     let mut input_spans: Vec<Span> = vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "> ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(pre.to_string()),
         // Reverse-video block as cursor; either the char under it or space.
         {
-            let cursor_char: String = post.chars().next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
-            Span::styled(cursor_char, Style::default().add_modifier(Modifier::REVERSED))
+            let cursor_char: String = post
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| " ".into());
+            Span::styled(
+                cursor_char,
+                Style::default().add_modifier(Modifier::REVERSED),
+            )
         },
         Span::raw(post.chars().skip(1).collect::<String>()),
     ];
@@ -3085,7 +3295,9 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         input_spans.push(Span::raw("  "));
         input_spans.push(Span::styled(
             format!("({note})"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     // If multi-line, show "(+N more lines)" hint on the right.
@@ -3093,7 +3305,9 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         input_spans.push(Span::raw("  "));
         input_spans.push(Span::styled(
             format!("(line {}/{})", cursor_row + 1, app.input.row_count()),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     let input_para = Paragraph::new(Line::from(input_spans))
@@ -3128,7 +3342,10 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         l2.push(Span::styled(cost, Style::default().fg(Color::Green)));
     }
     l2.push(Span::raw(" · "));
-    l2.push(Span::styled(app.model.clone(), Style::default().fg(Color::LightBlue)));
+    l2.push(Span::styled(
+        app.model.clone(),
+        Style::default().fg(Color::LightBlue),
+    ));
     if let Some(lvl) = app.thinking {
         l2.push(Span::raw(" · "));
         l2.push(Span::styled(
@@ -3141,11 +3358,9 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // Context ratio (`1.4%/205k (auto)`), color-coded by usage.
     // Auto-compact is always on today; if we add a config toggle we
     // can wire it here.
-    if let Some(ratio) = crate::render::status_line::context_ratio(
-        &app.model,
-        app.context_chars,
-        true,
-    ) {
+    if let Some(ratio) =
+        crate::render::status_line::context_ratio(&app.model, app.context_chars, true)
+    {
         let pct = crate::render::status_line::context_percent(&app.model, app.context_chars)
             .unwrap_or(0.0);
         let color = match crate::render::status_line::context_color(pct) {
@@ -3160,7 +3375,9 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         l2.push(Span::raw("  · "));
         l2.push(Span::styled(
             "streaming",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     Paragraph::new(Line::from(l2)).render(chunks[4], buf);
@@ -3220,8 +3437,12 @@ fn render_tool_expansion(term: &mut Term, content: &str, is_error: bool) -> Resu
 /// appear as an italic footer. PI equivalent: expanded
 /// `SkillInvocationMessageComponent`.
 fn render_skill_expansion(term: &mut Term, s: &CollapsedSkill) -> Result<()> {
-    let bg = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(255));
-    let dim = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(250));
+    let bg = Style::default()
+        .bg(Color::Indexed(236))
+        .fg(Color::Indexed(255));
+    let dim = Style::default()
+        .bg(Color::Indexed(236))
+        .fg(Color::Indexed(250));
     insert_line_bg(
         term,
         Line::from(vec![Span::styled(
@@ -3255,11 +3476,7 @@ fn render_skill_expansion(term: &mut Term, s: &CollapsedSkill) -> Result<()> {
             Some(bg),
         )?;
     }
-    insert_line_bg(
-        term,
-        Line::from(vec![Span::styled("", bg)]),
-        Some(bg),
-    )?;
+    insert_line_bg(term, Line::from(vec![Span::styled("", bg)]), Some(bg))?;
     insert_line(term, Line::from(""))?;
     Ok(())
 }
@@ -3270,15 +3487,16 @@ fn render_skill_expansion(term: &mut Term, s: &CollapsedSkill) -> Result<()> {
 /// - streaming with no active tool → `⣷ thinking (X.Xs)` dim
 /// - idle → blank row
 fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
-    const BRAILLE: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+    const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let frame = ((std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis()).unwrap_or(0) / 120) as usize) % BRAILLE.len();
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        / 120) as usize)
+        % BRAILLE.len();
 
     // Tool running has priority.
-    if let (Some(started), Some(bar)) =
-        (app.tool_started_at, app.pending_tool_call.as_ref())
-    {
+    if let (Some(started), Some(bar)) = (app.tool_started_at, app.pending_tool_call.as_ref()) {
         let elapsed = started.elapsed().as_secs_f64();
         let blue_bg = Color::Indexed(24); // muted navy — matches Morandi
         let bar_style = Style::default()
@@ -3317,12 +3535,12 @@ fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
     // Assistant thinking / waiting.
     if let Some(started) = app.turn_started_at {
         let elapsed = started.elapsed().as_secs_f64();
-        let line = Line::from(vec![
-            Span::styled(
-                format!("{} thinking ({:.1}s)", BRAILLE[frame], elapsed),
-                Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
-            ),
-        ]);
+        let line = Line::from(vec![Span::styled(
+            format!("{} thinking ({:.1}s)", BRAILLE[frame], elapsed),
+            Style::default()
+                .fg(Color::Indexed(108))
+                .add_modifier(Modifier::ITALIC),
+        )]);
         buf.set_line(area.x, area.y, &line, area.width);
     }
     // else: leave blank
@@ -3343,7 +3561,9 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
     if vis.is_empty() {
         let msg = Line::from(vec![Span::styled(
             format!("  (no {label} matches)"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )]);
         Paragraph::new(msg).render(area, buf);
         return;
@@ -3362,13 +3582,15 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
     let mut lines: Vec<Line> = Vec::new();
     let total_w = area.width as usize;
     let arrow_w = 2; // "→ " or "  " — both 2 display cols
-    let gap_w = 2;   // gap between label and right-aligned description
+    let gap_w = 2; // gap between label and right-aligned description
     for (i, item) in vis[start..end].iter().enumerate() {
         let absolute = start + i;
         let is_sel = absolute == sel;
         let arrow = if is_sel { "→ " } else { "  " };
         let label_style = if is_sel {
-            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Indexed(108))
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -3405,7 +3627,9 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
         if let Some(last) = lines.last_mut() {
             last.spans.push(Span::styled(
                 format!("   (+{count} more)"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
     }
@@ -3420,7 +3644,9 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
     if vis.is_empty() {
         let msg = Line::from(vec![Span::styled(
             "  (no matches)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )]);
         Paragraph::new(msg).render(area, buf);
         return;
@@ -3454,7 +3680,9 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
         let is_sel = absolute == sel;
         let arrow = if is_sel { "→ " } else { "  " };
         let label_style = if is_sel {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -3471,7 +3699,9 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
         if let Some(last) = lines.last_mut() {
             last.spans.push(Span::styled(
                 format!("   (+{count} more)"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
     }
@@ -3507,6 +3737,7 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
             crate::provider::ApiKind::Openai,
             crate::agent::build::SkillLoadPolicy::default(),
+            false,
         )
     }
 
@@ -3519,7 +3750,10 @@ mod tests {
     fn typing_appends() {
         let mut app = mkapp();
         assert!(matches!(
-            interpret_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            interpret_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
             KeyAction::Nothing
         ));
         assert_eq!(app.input.as_string(), "a");
@@ -3529,7 +3763,10 @@ mod tests {
     fn backspace_pops() {
         let mut app = mkapp();
         seed_input(&mut app, "abc");
-        interpret_key(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        interpret_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
         assert_eq!(app.input.as_string(), "ab");
     }
 
@@ -3597,7 +3834,10 @@ mod tests {
     fn ctrl_d_exits() {
         let mut app = mkapp();
         assert!(matches!(
-            interpret_key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            interpret_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            ),
             KeyAction::Exit
         ));
     }
@@ -3607,7 +3847,10 @@ mod tests {
         let mut app = mkapp();
         app.status = Status::Streaming;
         assert!(matches!(
-            interpret_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            interpret_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
             KeyAction::CancelTurn
         ));
     }
@@ -3616,9 +3859,11 @@ mod tests {
     fn ctrl_c_idle_exits() {
         let mut app = mkapp();
         assert!(matches!(
-            interpret_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            interpret_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
             KeyAction::Exit
         ));
     }
-
 }

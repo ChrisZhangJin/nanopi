@@ -19,7 +19,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -104,9 +104,13 @@ pub struct HookInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutcome {
     Allow,
-    Block { reason: String },
+    Block {
+        reason: String,
+    },
     /// Hook returned a JSON `updated_input` — replace the tool's args.
-    Transform { new_arguments: Value },
+    Transform {
+        new_arguments: Value,
+    },
 }
 
 /// Expand `~`, `$HOME`, `${HOME}` in a hook command. Relative paths
@@ -149,9 +153,8 @@ pub fn matcher_matches(matcher: &str, tool_name: &str) -> bool {
 pub fn validate_hooks(hooks: &[HookConfig]) -> Result<(), String> {
     for (i, h) in hooks.iter().enumerate() {
         if !h.matcher.is_empty() && h.matcher != "*" {
-            regex::Regex::new(&h.matcher).map_err(|e| {
-                format!("hook #{i} matcher {:?} is invalid regex: {e}", h.matcher)
-            })?;
+            regex::Regex::new(&h.matcher)
+                .map_err(|e| format!("hook #{i} matcher {:?} is invalid regex: {e}", h.matcher))?;
         }
     }
     Ok(())
@@ -213,7 +216,11 @@ pub async fn run_hook(
 
     // exit 2 = block (stderr is the reason).
     if exit_code == 2 {
-        let reason = if stderr.trim().is_empty() { "blocked by hook".into() } else { stderr.trim().to_string() };
+        let reason = if stderr.trim().is_empty() {
+            "blocked by hook".into()
+        } else {
+            stderr.trim().to_string()
+        };
         return Ok(HookOutcome::Block { reason });
     }
 
@@ -339,7 +346,10 @@ pub async fn run_session_hooks(
     session_id: &str,
     cwd: &std::path::Path,
 ) {
-    debug_assert!(matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd));
+    debug_assert!(matches!(
+        event,
+        HookEvent::SessionStart | HookEvent::SessionEnd
+    ));
     for h in hooks {
         if h.kind != "command" {
             continue;
@@ -365,7 +375,9 @@ pub async fn run_session_hooks(
 }
 
 #[allow(dead_code)]
-pub(crate) fn _json_used() -> Value { json!({}) }
+pub(crate) fn _json_used() -> Value {
+    json!({})
+}
 
 #[cfg(test)]
 mod tests {
@@ -411,17 +423,30 @@ mod tests {
     #[test]
     fn validate_hooks_accepts_valid() {
         let v = vec![
-            HookConfig { matcher: "bash".into(), kind: "command".into(), command: "x".into(), timeout: 1000 },
-            HookConfig { matcher: "*".into(), kind: "command".into(), command: "y".into(), timeout: 1000 },
+            HookConfig {
+                matcher: "bash".into(),
+                kind: "command".into(),
+                command: "x".into(),
+                timeout: 1000,
+            },
+            HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: "y".into(),
+                timeout: 1000,
+            },
         ];
         assert!(validate_hooks(&v).is_ok());
     }
 
     #[test]
     fn validate_hooks_rejects_invalid_regex() {
-        let v = vec![
-            HookConfig { matcher: "[bad".into(), kind: "command".into(), command: "x".into(), timeout: 1000 },
-        ];
+        let v = vec![HookConfig {
+            matcher: "[bad".into(),
+            kind: "command".into(),
+            command: "x".into(),
+            timeout: 1000,
+        }];
         assert!(validate_hooks(&v).is_err());
     }
 
@@ -532,7 +557,7 @@ mod tests {
         let hook = HookConfig {
             matcher: "*".into(),
             kind: "command".into(),
-            command: "echo allow".into(),  // emits JSON? no — but exit 0 = allow
+            command: "echo allow".into(), // emits JSON? no — but exit 0 = allow
             timeout: 2000,
         };
         let input = HookInput {
@@ -636,7 +661,10 @@ mod tests {
     async fn run_session_hooks_matcher_filters_by_session_id() {
         // Matcher "^prod-" should skip a "dev-*" session.
         let mut marker = std::env::temp_dir();
-        marker.push(format!("nanopi-session-nomatch-{}", crate::util::uuid::v7()));
+        marker.push(format!(
+            "nanopi-session-nomatch-{}",
+            crate::util::uuid::v7()
+        ));
         let hook = HookConfig {
             matcher: "^prod-".into(),
             kind: "command".into(),
@@ -650,33 +678,36 @@ mod tests {
             std::path::Path::new("/tmp"),
         )
         .await;
-        assert!(!marker.exists(), "hook should NOT fire for non-matching session id");
+        assert!(
+            !marker.exists(),
+            "hook should NOT fire for non-matching session id"
+        );
     }
 }
-    /// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
-    /// Round-trip its enum variant and env_var name.
-    #[test]
-    fn user_prompt_submit_event_round_trips() {
-        let v = HookEvent::UserPromptSubmit;
-        assert_eq!(v.env_var(), "UserPromptSubmit");
-        let s = serde_json::to_string(&v).unwrap();
-        let back: HookEvent = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, v);
-    }
+/// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
+/// Round-trip its enum variant and env_var name.
+#[test]
+fn user_prompt_submit_event_round_trips() {
+    let v = HookEvent::UserPromptSubmit;
+    assert_eq!(v.env_var(), "UserPromptSubmit");
+    let s = serde_json::to_string(&v).unwrap();
+    let back: HookEvent = serde_json::from_str(&s).unwrap();
+    assert_eq!(back, v);
+}
 
-    /// `UserPromptSubmit` hooks don't have a tool_name, but the input
-    /// payload still has a `prompt` field carrying the user's text.
-    #[test]
-    fn user_prompt_submit_input_has_event_field() {
-        let input = HookInput {
-            event: HookEvent::UserPromptSubmit,
-            tool_name: None,
-            tool_call_id: None,
-            arguments: serde_json::Value::String("hi".into()),
-            cwd: None,
-            session_id: None,
-        };
-        let s = serde_json::to_string(&input).unwrap();
-        assert!(s.contains("\"event\":\"user_prompt_submit\""), "got {s}");
-        assert!(s.contains("\"hi\""), "got {s}");
-    }
+/// `UserPromptSubmit` hooks don't have a tool_name, but the input
+/// payload still has a `prompt` field carrying the user's text.
+#[test]
+fn user_prompt_submit_input_has_event_field() {
+    let input = HookInput {
+        event: HookEvent::UserPromptSubmit,
+        tool_name: None,
+        tool_call_id: None,
+        arguments: serde_json::Value::String("hi".into()),
+        cwd: None,
+        session_id: None,
+    };
+    let s = serde_json::to_string(&input).unwrap();
+    assert!(s.contains("\"event\":\"user_prompt_submit\""), "got {s}");
+    assert!(s.contains("\"hi\""), "got {s}");
+}

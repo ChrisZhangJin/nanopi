@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::agent::loop_::{Agent, HooksConfig};
@@ -52,6 +52,7 @@ pub async fn run_print_mode(
     session_id: Option<String>,
     fork_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
+    no_context_files: bool,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
@@ -64,7 +65,7 @@ pub async fn run_print_mode(
     )
     .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?;
 
-let (session_path, header) = match &choice {
+    let (session_path, header) = match &choice {
         session::SessionChoice::Resume(p) => {
             // Reuse the existing session. We trust its recorded model /
             // base_url; if those are wrong the user can pass them again
@@ -98,7 +99,7 @@ let (session_path, header) = match &choice {
 
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
-    use crate::agent::build::{AgentBuildInputs, print_skill_diagnostics};
+    use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let mut agent = if let session::SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
@@ -111,6 +112,7 @@ let (session_path, header) = match &choice {
             base_url.to_string(),
             api_key.to_string(),
             skill_load,
+            no_context_files,
         );
         print_skill_diagnostics(&diags);
         a
@@ -127,6 +129,7 @@ let (session_path, header) = match &choice {
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             skill_load,
+            no_context_files,
         });
         print_skill_diagnostics(&diags);
         a
@@ -213,18 +216,27 @@ let (session_path, header) = match &choice {
 /// Read back all SessionEntries from a session file and present the
 /// user/assistant messages in the JSON envelope.
 fn collect_messages(session_path: &std::path::Path) -> Result<Vec<Value>> {
-    let (_header, entries) = session::read_session(session_path)
-        .map_err(|e| anyhow::anyhow!("read session: {e}"))?;
+    let (_header, entries) =
+        session::read_session(session_path).map_err(|e| anyhow::anyhow!("read session: {e}"))?;
     let mut out = Vec::new();
     for e in entries {
         match e {
             SessionEntry::Message { role, content, .. } => {
                 out.push(json!({"role": role, "content": content}));
             }
-            SessionEntry::ToolCall { tool_name, arguments, .. } => {
+            SessionEntry::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
                 out.push(json!({"role": "assistant_tool_call", "tool": tool_name, "arguments": arguments}));
             }
-            SessionEntry::ToolResult { tool_call_id, content, is_error, .. } => {
+            SessionEntry::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
@@ -244,4 +256,6 @@ fn _arc_unused(_: Arc<()>) {}
 
 // time import retained for future usage.
 #[allow(dead_code)]
-fn _time_marker() -> String { time::now_iso8601() }
+fn _time_marker() -> String {
+    time::now_iso8601()
+}

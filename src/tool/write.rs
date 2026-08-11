@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -61,9 +61,8 @@ impl Tool for WriteTool {
             })?;
         }
 
-        std::fs::write(&abs, content).map_err(|e| {
-            ToolError::Execution(format!("cannot write {}: {e}", abs.display()))
-        })?;
+        std::fs::write(&abs, content)
+            .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
 
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {}", content.len(), abs.display()),
@@ -93,7 +92,10 @@ mod tests {
             .execute(json!({"path": "out.txt", "content": "hello"}), &ctx)
             .await
             .unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "hello"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

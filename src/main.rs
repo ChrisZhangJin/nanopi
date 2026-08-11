@@ -105,6 +105,11 @@ struct Args {
     /// still load. Mirrors PI's `--no-skills` / `-ns`.
     #[arg(long = "no-skills", short = 'S')]
     no_skills: bool,
+
+    /// Disable AGENTS.md / CLAUDE.md discovery and loading. Mirrors PI's
+    /// `--no-context-files` / `-nc`.
+    #[arg(long = "no-context-files", short = 'C')]
+    no_context_files: bool,
 }
 
 #[tokio::main]
@@ -131,9 +136,7 @@ async fn main() -> ExitCode {
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
         .or_else(|| cfg.model.clone());
     let Some(model) = model else {
-        eprintln!(
-            "error: no --model / OPENAI_MODEL / model in ~/.nanopi/config.toml"
-        );
+        eprintln!("error: no --model / OPENAI_MODEL / model in ~/.nanopi/config.toml");
         return ExitCode::from(2);
     };
 
@@ -223,15 +226,17 @@ async fn main() -> ExitCode {
     // Resolve wire-protocol kind: CLI --api-kind overrides config's
     // api_kind, which itself defaults to "openai". Announce the choice
     // once at startup so users don't have to guess.
-    let api_kind = provider::ApiKind::from_config(
-        args.api_kind.as_deref().or(cfg.api_kind.as_deref()),
-    );
+    let api_kind =
+        provider::ApiKind::from_config(args.api_kind.as_deref().or(cfg.api_kind.as_deref()));
     if matches!(api_kind, provider::ApiKind::Anthropic) {
         eprintln!("• api_kind = anthropic — talking to {base_url}/v1/messages");
     }
 
     let result = if args.print {
-        let message = args.message.as_deref().or(args.positional_message.as_deref());
+        let message = args
+            .message
+            .as_deref()
+            .or(args.positional_message.as_deref());
         let message = match message {
             Some(m) => m,
             None => {
@@ -253,6 +258,7 @@ async fn main() -> ExitCode {
             args.session_id.clone(),
             args.fork_id.clone(),
             skill_load.clone(),
+            args.no_context_files,
         )
         .await
     } else if should_use_tui(&args) {
@@ -268,6 +274,7 @@ async fn main() -> ExitCode {
             args.session_id.clone(),
             args.fork_id.clone(),
             skill_load.clone(),
+            args.no_context_files,
         )
         .await
     } else {
@@ -285,6 +292,7 @@ async fn main() -> ExitCode {
             args.session_id.clone(),
             args.fork_id.clone(),
             skill_load.clone(),
+            args.no_context_files,
         )
         .await
     };

@@ -90,7 +90,8 @@ impl std::str::FromStr for ThinkingLevel {
 /// text-only models that would 400 on them.
 pub fn supports_vision(model_id: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
-    if m.starts_with("claude-opus-4") || m.starts_with("claude-sonnet-4")
+    if m.starts_with("claude-opus-4")
+        || m.starts_with("claude-sonnet-4")
         || m.starts_with("claude-haiku-4")
     {
         return true;
@@ -162,9 +163,18 @@ mod tests {
 
     #[test]
     fn from_str_accepts_common_aliases() {
-        assert_eq!("MEDIUM".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Medium);
-        assert_eq!("med".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Medium);
-        assert_eq!("x-high".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Xhigh);
+        assert_eq!(
+            "MEDIUM".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(
+            "med".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(
+            "x-high".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::Xhigh
+        );
         assert!("nonsense".parse::<ThinkingLevel>().is_err());
     }
 

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -44,9 +44,8 @@ impl Tool for LsTool {
         let abs = resolve_dir(&ctx.cwd, path_str)?;
 
         let mut entries: Vec<(bool, String)> = Vec::new();
-        let read = std::fs::read_dir(&abs).map_err(|e| {
-            ToolError::Execution(format!("cannot list {}: {e}", abs.display()))
-        })?;
+        let read = std::fs::read_dir(&abs)
+            .map_err(|e| ToolError::Execution(format!("cannot list {}: {e}", abs.display())))?;
         for e in read {
             let e = e.map_err(ToolError::Io)?;
             let name = e.file_name().to_string_lossy().into_owned();
@@ -70,7 +69,11 @@ impl Tool for LsTool {
             .join("\n");
 
         Ok(ToolOutput {
-            content: if out.is_empty() { String::new() } else { out + "\n" },
+            content: if out.is_empty() {
+                String::new()
+            } else {
+                out + "\n"
+            },
             is_error: false,
             images: Vec::new(),
             metadata: Some(json!({

@@ -64,55 +64,247 @@ pub fn context_window(model_id: &str) -> Option<u32> {
 /// so prefix match hits the specific version before a generic one.
 const TABLE: &[(&str, ModelPricing)] = &[
     // Claude 4.x family — Anthropic's list price (USD / 1M tokens).
-    ("claude-opus-4-8", ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-opus-4-7", ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-opus-4-6", ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-opus-4-5", ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-opus-4-1", ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-opus-4",   ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-sonnet-4-6", ModelPricing { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }),
-    ("claude-sonnet-4-5", ModelPricing { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }),
-    ("claude-sonnet-4",   ModelPricing { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }),
-    ("claude-haiku-4-5",  ModelPricing { input: 1.0, output: 5.0,  cache_read: 0.1, cache_write: 1.25 }),
-    ("claude-haiku-4",    ModelPricing { input: 1.0, output: 5.0,  cache_read: 0.1, cache_write: 1.25 }),
+    (
+        "claude-opus-4-8",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-opus-4-7",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-opus-4-6",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-opus-4-5",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-opus-4-1",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-opus-4",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-sonnet-4-6",
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
+        "claude-sonnet-4-5",
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
+        "claude-sonnet-4",
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
+        "claude-haiku-4-5",
+        ModelPricing {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.1,
+            cache_write: 1.25,
+        },
+    ),
+    (
+        "claude-haiku-4",
+        ModelPricing {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.1,
+            cache_write: 1.25,
+        },
+    ),
     // Claude 3.x legacy
-    ("claude-3-5-sonnet", ModelPricing { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }),
-    ("claude-3-5-haiku",  ModelPricing { input: 0.8, output: 4.0,  cache_read: 0.08, cache_write: 1.0 }),
-    ("claude-3-7-sonnet", ModelPricing { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }),
-    ("claude-3-opus",     ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }),
-    ("claude-3-haiku",    ModelPricing { input: 0.25, output: 1.25, cache_read: 0.03, cache_write: 0.3 }),
+    (
+        "claude-3-5-sonnet",
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
+        "claude-3-5-haiku",
+        ModelPricing {
+            input: 0.8,
+            output: 4.0,
+            cache_read: 0.08,
+            cache_write: 1.0,
+        },
+    ),
+    (
+        "claude-3-7-sonnet",
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+    ),
+    (
+        "claude-3-opus",
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        },
+    ),
+    (
+        "claude-3-haiku",
+        ModelPricing {
+            input: 0.25,
+            output: 1.25,
+            cache_read: 0.03,
+            cache_write: 0.3,
+        },
+    ),
     // OpenAI GPT-5 family (list prices as reported at launch).
-    ("gpt-5.4-pro", ModelPricing { input: 15.0, output: 60.0, cache_read: 1.5, cache_write: 0.0 }),
-    ("gpt-5.4",     ModelPricing { input: 5.0,  output: 20.0, cache_read: 0.5, cache_write: 0.0 }),
-    ("gpt-5.3",     ModelPricing { input: 5.0,  output: 20.0, cache_read: 0.5, cache_write: 0.0 }),
-    ("gpt-5.1",     ModelPricing { input: 3.0,  output: 12.0, cache_read: 0.3, cache_write: 0.0 }),
-    ("gpt-5",       ModelPricing { input: 3.0,  output: 12.0, cache_read: 0.3, cache_write: 0.0 }),
+    (
+        "gpt-5.4-pro",
+        ModelPricing {
+            input: 15.0,
+            output: 60.0,
+            cache_read: 1.5,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-5.4",
+        ModelPricing {
+            input: 5.0,
+            output: 20.0,
+            cache_read: 0.5,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-5.3",
+        ModelPricing {
+            input: 5.0,
+            output: 20.0,
+            cache_read: 0.5,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-5.1",
+        ModelPricing {
+            input: 3.0,
+            output: 12.0,
+            cache_read: 0.3,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gpt-5",
+        ModelPricing {
+            input: 3.0,
+            output: 12.0,
+            cache_read: 0.3,
+            cache_write: 0.0,
+        },
+    ),
     // Gemini
-    ("gemini-3",   ModelPricing { input: 2.5,  output: 10.0, cache_read: 0.25, cache_write: 0.0 }),
-    ("gemini-2.5-pro",   ModelPricing { input: 2.5,  output: 10.0, cache_read: 0.25, cache_write: 0.0 }),
-    ("gemini-2.5-flash", ModelPricing { input: 0.15, output: 0.6,  cache_read: 0.015, cache_write: 0.0 }),
+    (
+        "gemini-3",
+        ModelPricing {
+            input: 2.5,
+            output: 10.0,
+            cache_read: 0.25,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gemini-2.5-pro",
+        ModelPricing {
+            input: 2.5,
+            output: 10.0,
+            cache_read: 0.25,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "gemini-2.5-flash",
+        ModelPricing {
+            input: 0.15,
+            output: 0.6,
+            cache_read: 0.015,
+            cache_write: 0.0,
+        },
+    ),
 ];
 
 /// Rough context-window sizes. Not all models are listed; unknown
 /// falls back to hiding the % gauge.
 const CONTEXT_WINDOWS: &[(&str, u32)] = &[
-    ("claude-opus-4-7",   1_000_000),
-    ("claude-opus-4-8",   1_000_000),
-    ("claude-opus-4",       200_000),
-    ("claude-sonnet-4",     200_000),
-    ("claude-haiku-4",      200_000),
-    ("claude-3-5-sonnet",   200_000),
-    ("claude-3-5-haiku",    200_000),
-    ("claude-3-7-sonnet",   200_000),
-    ("claude-3-opus",       200_000),
-    ("claude-3-haiku",      200_000),
-    ("gpt-5",               400_000),
-    ("gpt-5.1",             400_000),
-    ("gpt-5.3",             400_000),
-    ("gpt-5.4",             400_000),
-    ("gemini-2.5-flash",  1_000_000),
-    ("gemini-2.5-pro",    2_000_000),
-    ("gemini-3",          2_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-haiku-4", 200_000),
+    ("claude-3-5-sonnet", 200_000),
+    ("claude-3-5-haiku", 200_000),
+    ("claude-3-7-sonnet", 200_000),
+    ("claude-3-opus", 200_000),
+    ("claude-3-haiku", 200_000),
+    ("gpt-5", 400_000),
+    ("gpt-5.1", 400_000),
+    ("gpt-5.3", 400_000),
+    ("gpt-5.4", 400_000),
+    ("gemini-2.5-flash", 1_000_000),
+    ("gemini-2.5-pro", 2_000_000),
+    ("gemini-3", 2_000_000),
 ];
 
 // ─── Formatting helpers ─────────────────────────────────────────────
@@ -163,8 +355,18 @@ mod tests {
 
     #[test]
     fn cost_computation() {
-        let p = ModelPricing { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 };
-        let u = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0, cache_write_tokens: 0 };
+        let p = ModelPricing {
+            input: 15.0,
+            output: 75.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+        };
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
         assert!((p.cost(&u) - 90.0).abs() < 1e-9);
     }
 

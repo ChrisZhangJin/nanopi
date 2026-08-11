@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::agent::context::Context;
-use crate::agent::hook::{HookConfig, HookEvent, HookOutcome, run_hooks, run_session_hooks};
+use crate::agent::hook::{run_hooks, run_session_hooks, HookConfig, HookEvent, HookOutcome};
 use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
 use crate::provider::openai::OpenAiProvider;
@@ -92,6 +92,11 @@ pub struct Agent {
     /// in `run_turn`. Empty when discovery is disabled and no --skill
     /// paths were passed.
     pub skills: Vec<crate::resources::Skill>,
+    /// When true, AGENTS.md / CLAUDE.md discovery is skipped entirely
+    /// (CLI `--no-context-files` / `-nc`). Stashed here so `/reload` can
+    /// rebuild the system prompt with the same policy. Mirrors PI's
+    /// `noContextFiles`.
+    pub no_context_files: bool,
 }
 
 impl Agent {
@@ -99,23 +104,22 @@ impl Agent {
     /// Replays message entries into the Context so a new turn can build
     /// on prior history. Used by `--continue` and the v0.6 multi-turn
     /// TUI.
-    pub fn load_session(
-        session_path: &Path,
-        cwd: &Path,
-    ) -> Result<Self, AgentError> {
+    pub fn load_session(session_path: &Path, cwd: &Path) -> Result<Self, AgentError> {
         use crate::agent::context::{ContentBlock, ContextMessage};
         let (header, entries) = crate::session::read_session(session_path)?;
         let mut context = Context::default();
         for entry in entries {
             match entry {
-                SessionEntry::Message { role, content, .. } => {
-                    match role.as_str() {
-                        "user" => context.push_user_text(content),
-                        "assistant" => context.push_assistant_text(content),
-                        _ => {}
-                    }
-                }
-                SessionEntry::Compaction { summary, replaced_count, .. } => {
+                SessionEntry::Message { role, content, .. } => match role.as_str() {
+                    "user" => context.push_user_text(content),
+                    "assistant" => context.push_assistant_text(content),
+                    _ => {}
+                },
+                SessionEntry::Compaction {
+                    summary,
+                    replaced_count,
+                    ..
+                } => {
                     // On replay: the first N messages we've pushed so far
                     // are the ones that were summarized. Drop them and
                     // insert the summary at index 0 so the surviving tail
@@ -158,6 +162,7 @@ impl Agent {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         })
     }
 
@@ -212,15 +217,13 @@ impl Agent {
     /// events so the UI can draw a scrollback marker. The manual
     /// `/compact` path passes None and drives its own feedback via
     /// the palette; the auto-trigger passes Some(&turn_tx).
-    pub async fn compact_now(
-        &mut self,
-        tx: Option<&mpsc::Sender<AgentEvent>>,
-        reason: &str,
-    ) {
+    pub async fn compact_now(&mut self, tx: Option<&mpsc::Sender<AgentEvent>>, reason: &str) {
         use crate::agent::compact::compact;
         if let Some(tx) = tx {
             let _ = tx
-                .send(AgentEvent::CompactionStart { reason: reason.to_string() })
+                .send(AgentEvent::CompactionStart {
+                    reason: reason.to_string(),
+                })
                 .await;
         }
         let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
@@ -299,19 +302,16 @@ impl Agent {
             .await;
             match outcome {
                 HookOutcome::Block { reason } => {
-                    let marker = format!(
-                        "[UserPromptSubmit hook blocked the prompt: {reason}]"
-                    );
+                    let marker = format!("[UserPromptSubmit hook blocked the prompt: {reason}]");
                     let _ = tx
-                        .send(AgentEvent::Error { error: marker.clone() })
+                        .send(AgentEvent::Error {
+                            error: marker.clone(),
+                        })
                         .await;
                     return Ok(marker);
                 }
                 HookOutcome::Transform { new_arguments } => {
-                    if let Some(v) = new_arguments
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                    {
+                    if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
                         effective_msg = v.to_string();
                     }
                 }
@@ -414,7 +414,10 @@ impl Agent {
                         AgentEvent::ToolCall { call, .. } => {
                             calls.push(call.clone());
                         }
-                        AgentEvent::Done { finish_reason, usage } => {
+                        AgentEvent::Done {
+                            finish_reason,
+                            usage,
+                        } => {
                             done = Some((*finish_reason, usage.clone()));
                         }
                         _ => {}
@@ -446,7 +449,13 @@ impl Agent {
                     }
                 }
             } else {
-                (false, self.provider.stream_turn(&self.context, forward_tx).await.map(|_| ()))
+                (
+                    false,
+                    self.provider
+                        .stream_turn(&self.context, forward_tx)
+                        .await
+                        .map(|_| ()),
+                )
             };
 
             // Collect whatever the streaming parser managed to
@@ -558,22 +567,18 @@ impl Agent {
                 final_text.push_str(&assistant_text);
                 let mut assistant_blocks = Vec::new();
                 if !assistant_text.is_empty() {
-                    assistant_blocks.push(
-                        crate::agent::context::AssistantBlock::Text {
-                            text: assistant_text.clone(),
-                        },
-                    );
+                    assistant_blocks.push(crate::agent::context::AssistantBlock::Text {
+                        text: assistant_text.clone(),
+                    });
                 }
                 for c in &calls {
-                    assistant_blocks.push(
-                        crate::agent::context::AssistantBlock::ToolCall {
-                            call: crate::agent::context::ToolCallBlock {
-                                id: c.id.clone(),
-                                name: c.name.clone(),
-                                arguments: c.arguments.clone(),
-                            },
+                    assistant_blocks.push(crate::agent::context::AssistantBlock::ToolCall {
+                        call: crate::agent::context::ToolCallBlock {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
                         },
-                    );
+                    });
                 }
                 if !assistant_text.is_empty() {
                     session::append_entry(
@@ -586,11 +591,11 @@ impl Agent {
                         },
                     )?;
                 }
-                self.context.messages.push(
-                    crate::agent::context::ContextMessage::Assistant {
+                self.context
+                    .messages
+                    .push(crate::agent::context::ContextMessage::Assistant {
                         content: assistant_blocks,
-                    },
-                );
+                    });
             }
 
             let Some((finish_reason, usage)) = done else {
@@ -613,10 +618,22 @@ impl Agent {
             };
 
             // Accumulate tokens across every LLM iteration in the session.
-            self.usage_total.input_tokens = self.usage_total.input_tokens.saturating_add(usage.input_tokens);
-            self.usage_total.output_tokens = self.usage_total.output_tokens.saturating_add(usage.output_tokens);
-            self.usage_total.cache_read_tokens = self.usage_total.cache_read_tokens.saturating_add(usage.cache_read_tokens);
-            self.usage_total.cache_write_tokens = self.usage_total.cache_write_tokens.saturating_add(usage.cache_write_tokens);
+            self.usage_total.input_tokens = self
+                .usage_total
+                .input_tokens
+                .saturating_add(usage.input_tokens);
+            self.usage_total.output_tokens = self
+                .usage_total
+                .output_tokens
+                .saturating_add(usage.output_tokens);
+            self.usage_total.cache_read_tokens = self
+                .usage_total
+                .cache_read_tokens
+                .saturating_add(usage.cache_read_tokens);
+            self.usage_total.cache_write_tokens = self
+                .usage_total
+                .cache_write_tokens
+                .saturating_add(usage.cache_write_tokens);
 
             match finish_reason {
                 FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
@@ -629,8 +646,7 @@ impl Agent {
                     }
                     // Pass the cancel token so Esc can kill an in-flight
                     // bash command instead of waiting for it to finish.
-                    self.execute_tool_calls(calls, tx, cancel.clone())
-                        .await?;
+                    self.execute_tool_calls(calls, tx, cancel.clone()).await?;
                     // Loop back to the next LLM turn.
                 }
                 FinishReason::Unknown => {
@@ -721,8 +737,7 @@ impl Agent {
         let results = if cancelled {
             let mut synth = Vec::with_capacity(call_meta.len());
             for (id, name) in call_meta {
-                let content =
-                    "[cancelled by user before tool completed]".to_string();
+                let content = "[cancelled by user before tool completed]".to_string();
                 let _ = session::append_entry(
                     &self.session_path,
                     &SessionEntry::ToolResult {
@@ -980,6 +995,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1006,7 +1022,9 @@ mod tests {
         // Context should now have a tool result with is_error=true.
         let last = agent.context.messages.last().expect("a message");
         match last {
-            crate::agent::context::ContextMessage::Tool { content, is_error, .. } => {
+            crate::agent::context::ContextMessage::Tool {
+                content, is_error, ..
+            } => {
                 assert!(is_error);
                 assert!(content.contains("blocked"));
             }
@@ -1041,11 +1059,7 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(
-            &hook_script,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let post_hook = HookConfig {
             matcher: "*".into(),
@@ -1075,6 +1089,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1093,10 +1108,9 @@ mod tests {
         drop(tx);
         while rx.recv().await.is_some() {}
 
-        let dumped = std::fs::read_to_string(&stdin_dump)
-            .expect("hook must have written its stdin JSON");
-        let v: serde_json::Value =
-            serde_json::from_str(&dumped).expect("stdin was JSON");
+        let dumped =
+            std::fs::read_to_string(&stdin_dump).expect("hook must have written its stdin JSON");
+        let v: serde_json::Value = serde_json::from_str(&dumped).expect("stdin was JSON");
 
         assert_eq!(v["event"], "post_tool_use");
         assert_eq!(v["tool_name"], "bash");
@@ -1104,10 +1118,13 @@ mod tests {
         assert_eq!(v["arguments"]["tool_input"]["command"], "echo hi");
         // tool_response fields must all be present so hooks can react
         // to failures / scrape output / measure durations.
-        assert!(v["arguments"]["tool_response"]["content"]
-            .as_str()
-            .map(|s| s.contains("hi"))
-            .unwrap_or(false), "content missing/wrong: {v}");
+        assert!(
+            v["arguments"]["tool_response"]["content"]
+                .as_str()
+                .map(|s| s.contains("hi"))
+                .unwrap_or(false),
+            "content missing/wrong: {v}"
+        );
         assert_eq!(v["arguments"]["tool_response"]["is_error"], false);
         assert!(v["arguments"]["tool_response"]["duration_ms"].is_u64());
 
@@ -1135,6 +1152,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -1152,7 +1170,9 @@ mod tests {
 
         let last = agent.context.messages.last().unwrap();
         match last {
-            crate::agent::context::ContextMessage::Tool { content, is_error, .. } => {
+            crate::agent::context::ContextMessage::Tool {
+                content, is_error, ..
+            } => {
                 assert!(is_error);
                 assert!(content.contains("unknown tool"));
             }
@@ -1176,7 +1196,9 @@ mod tests {
         struct HangingProvider;
         #[async_trait::async_trait]
         impl Provider for HangingProvider {
-            fn id(&self) -> &'static str { "hanging" }
+            fn id(&self) -> &'static str {
+                "hanging"
+            }
             async fn stream_turn(
                 &self,
                 _ctx: &Context,
@@ -1205,6 +1227,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -1246,9 +1269,19 @@ mod tests {
                         _ => None,
                     })
                     .collect::<String>();
-                assert!(marker_text.contains("aborted by the user"), "got {marker_text:?}");
-                assert!(marker_text.contains("Ignore this turn"), "got {marker_text:?}");
-                assert!(marker_text.len() < 300, "marker should be short; got {} chars", marker_text.len());
+                assert!(
+                    marker_text.contains("aborted by the user"),
+                    "got {marker_text:?}"
+                );
+                assert!(
+                    marker_text.contains("Ignore this turn"),
+                    "got {marker_text:?}"
+                );
+                assert!(
+                    marker_text.len() < 300,
+                    "marker should be short; got {} chars",
+                    marker_text.len()
+                );
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
@@ -1276,7 +1309,9 @@ mod tests {
         std::fs::write(&session_path, "").unwrap();
         let agent = Agent {
             context: Context::default(),
-            provider: Box::new(FakeProvider { response: response.into() }),
+            provider: Box::new(FakeProvider {
+                response: response.into(),
+            }),
             registry: ToolRegistry::standard(),
             session_path,
             session_id: uuid::v7(),
@@ -1289,6 +1324,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
         (agent, dir)
     }
@@ -1311,7 +1347,10 @@ mod tests {
         while let Some(ev) = rx.recv().await {
             match ev {
                 AgentEvent::CompactionStart { reason } => got_start_reason = Some(reason),
-                AgentEvent::CompactionEnd { used_llm, replaced_count } => {
+                AgentEvent::CompactionEnd {
+                    used_llm,
+                    replaced_count,
+                } => {
                     assert!(used_llm, "expected used_llm=true from FakeProvider");
                     assert!(replaced_count > 0);
                     got_end = true;
@@ -1356,7 +1395,9 @@ mod tests {
             tx: mpsc::Sender<AgentEvent>,
         ) -> Result<Usage, String> {
             let _ = tx
-                .send(AgentEvent::Start { message_id: "m".into() })
+                .send(AgentEvent::Start {
+                    message_id: "m".into(),
+                })
                 .await;
             let _ = tx
                 .send(AgentEvent::TextDelta {
@@ -1386,7 +1427,9 @@ mod tests {
         struct SilentProvider;
         #[async_trait::async_trait]
         impl Provider for SilentProvider {
-            fn id(&self) -> &'static str { "silent" }
+            fn id(&self) -> &'static str {
+                "silent"
+            }
             async fn stream_turn(
                 &self,
                 _ctx: &Context,
@@ -1420,6 +1463,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1460,18 +1504,11 @@ mod tests {
         let hook_script = dir.join("hook.sh");
         std::fs::write(
             &hook_script,
-            format!(
-                "#!/usr/bin/env bash\ntouch {}\n",
-                marker.display()
-            ),
+            format!("#!/usr/bin/env bash\ntouch {}\n", marker.display()),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &hook_script,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let session_path = dir.join("noh.jsonl");
         std::fs::write(
@@ -1491,7 +1528,9 @@ mod tests {
         // --no-hooks → permission.hooks_active()==false.
         let agent = Agent {
             context: Context::default(),
-            provider: Box::new(FakeProvider { response: "ok".into() }),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
             registry: ToolRegistry::standard(),
             session_path,
             session_id: uuid::v7(),
@@ -1510,6 +1549,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
         agent.fire_session_start().await;
         agent.fire_session_end().await;
@@ -1558,8 +1598,7 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
 
         let cwd = tmp();
-        let (path, _header) =
-            crate::session::new_session(&cwd, "m", "http://x").expect("new");
+        let (path, _header) = crate::session::new_session(&cwd, "m", "http://x").expect("new");
         crate::session::set_active_session(&cwd, &path).expect("active");
 
         let got = Agent::continue_last_session(&cwd).expect("some");
@@ -1586,8 +1625,7 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
         let cwd = tmp();
 
-        let (path, _hdr) =
-            crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+        let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
         // 4 messages that WILL be compacted, then a Compaction entry, then a
         // trailing message that must survive.
         for i in 1..=4 {
@@ -1678,46 +1716,62 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl Provider for SteppedProvider {
-            fn id(&self) -> &'static str { "stepped" }
+            fn id(&self) -> &'static str {
+                "stepped"
+            }
             async fn stream_turn(
                 &self,
                 _ctx: &Context,
                 tx: mpsc::Sender<AgentEvent>,
             ) -> Result<Usage, String> {
                 let step = self.step.fetch_add(1, Ordering::SeqCst);
-                let _ = tx.send(AgentEvent::Start { message_id: "m".into() }).await;
+                let _ = tx
+                    .send(AgentEvent::Start {
+                        message_id: "m".into(),
+                    })
+                    .await;
                 match step {
                     0 => {
                         // Iteration 1: text + a tool call → provider says
                         // "call tools then come back to me".
-                        let _ = tx.send(AgentEvent::TextDelta {
-                            content_index: 0,
-                            text: "first".into(),
-                        }).await;
-                        let _ = tx.send(AgentEvent::ToolCall {
-                            content_index: 0,
-                            call: ToolCall {
-                                id: "c1".into(),
-                                name: "bash".into(),
-                                arguments: json!({"command": "echo hi"}),
-                            },
-                        }).await;
-                        let _ = tx.send(AgentEvent::Done {
-                            finish_reason: FinishReason::ToolCalls,
-                            usage: Usage::default(),
-                        }).await;
+                        let _ = tx
+                            .send(AgentEvent::TextDelta {
+                                content_index: 0,
+                                text: "first".into(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::ToolCall {
+                                content_index: 0,
+                                call: ToolCall {
+                                    id: "c1".into(),
+                                    name: "bash".into(),
+                                    arguments: json!({"command": "echo hi"}),
+                                },
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::Done {
+                                finish_reason: FinishReason::ToolCalls,
+                                usage: Usage::default(),
+                            })
+                            .await;
                     }
                     1 => {
                         // Iteration 2: fresh text only, then stop. No
                         // cumulative "firstsecond" should appear.
-                        let _ = tx.send(AgentEvent::TextDelta {
-                            content_index: 0,
-                            text: "second".into(),
-                        }).await;
-                        let _ = tx.send(AgentEvent::Done {
-                            finish_reason: FinishReason::Stop,
-                            usage: Usage::default(),
-                        }).await;
+                        let _ = tx
+                            .send(AgentEvent::TextDelta {
+                                content_index: 0,
+                                text: "second".into(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::Done {
+                                finish_reason: FinishReason::Stop,
+                                usage: Usage::default(),
+                            })
+                            .await;
                     }
                     _ => unreachable!("provider called too many times"),
                 }
@@ -1748,6 +1802,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -1769,7 +1824,11 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
             .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .filter_map(|v| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
+            .filter_map(|v| {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
         assert_eq!(
@@ -1791,7 +1850,9 @@ mod tests {
 
         let mut agent = Agent {
             context: Context::default(),
-            provider: Box::new(FakeProvider { response: "ok".into() }),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
             session_id: uuid::v7(),
@@ -1804,6 +1865,7 @@ mod tests {
             usage_total: Usage::default(),
             turn_count: 0,
             skills: Vec::new(),
+            no_context_files: false,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);

@@ -108,10 +108,7 @@ pub enum SessionEntry {
     /// open questions) so the new branch can pick up with context.
     /// Replayed as a synthetic user message on load, like Compaction.
     #[serde(rename = "branch_summary")]
-    BranchSummary {
-        timestamp: String,
-        summary: String,
-    },
+    BranchSummary { timestamp: String, summary: String },
     /// Written when the user invokes `/skill:name [args]`. The
     /// immediately-following Message entry (role=user) holds the
     /// fully-expanded `<skill>...</skill>` block that was sent to
@@ -157,7 +154,11 @@ pub fn sessions_dir() -> Option<PathBuf> {
 
 /// Create a brand-new session file at `sessions_dir()/<id>.jsonl` and
 /// return the path. Writes the header line.
-pub fn new_session(cwd: &Path, model: &str, base_url: &str) -> Result<(PathBuf, SessionHeader), SessionError> {
+pub fn new_session(
+    cwd: &Path,
+    model: &str,
+    base_url: &str,
+) -> Result<(PathBuf, SessionHeader), SessionError> {
     let dir = sessions_dir().ok_or_else(|| SessionError::Io {
         path: PathBuf::from("~/.nanopi/sessions"),
         source: std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir"),
@@ -338,9 +339,7 @@ pub fn fork_session_at(
 
     let copy_until = target_entry_index.min(entries.len());
     let prefill = entries.get(target_entry_index).and_then(|e| match e {
-        SessionEntry::Message { role, content, .. } if role == "user" => {
-            Some(content.clone())
-        }
+        SessionEntry::Message { role, content, .. } if role == "user" => Some(content.clone()),
         _ => None,
     });
 
@@ -434,7 +433,11 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
                     },
                 });
             }
-            SessionEntry::ToolCall { tool_name, arguments, .. } => {
+            SessionEntry::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
                 // For bash render the command; otherwise a compact
                 // JSON one-liner of the args. Users rarely care about
                 // full arg blob at picker time.
@@ -456,7 +459,11 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
                     prefill_text: None,
                 });
             }
-            SessionEntry::Compaction { summary, replaced_count, .. } => {
+            SessionEntry::Compaction {
+                summary,
+                replaced_count,
+                ..
+            } => {
                 out.push(TreeRow {
                     entry_index: i,
                     role: "[compaction]".into(),
@@ -476,7 +483,9 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
                     prefill_text: None,
                 });
             }
-            SessionEntry::SkillInvocation { name, user_message, .. } => {
+            SessionEntry::SkillInvocation {
+                name, user_message, ..
+            } => {
                 let preview = match user_message {
                     Some(u) => format!("{} · {}", name, collapse_ws_truncate(u, 40)),
                     None => name.clone(),
@@ -513,28 +522,40 @@ pub fn set_session_name(path: &Path, name: Option<String>) -> Result<(), Session
     use std::io::Read;
     let mut buf = String::new();
     std::fs::File::open(path)
-        .map_err(|e| SessionError::Io { path: path.to_path_buf(), source: e })?
+        .map_err(|e| SessionError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?
         .read_to_string(&mut buf)
-        .map_err(|e| SessionError::Io { path: path.to_path_buf(), source: e })?;
+        .map_err(|e| SessionError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
     let mut lines: Vec<String> = buf.split('\n').map(|s| s.to_string()).collect();
     // First non-empty line is the header. Rewrite it.
     for line in lines.iter_mut() {
         if line.trim().is_empty() {
             continue;
         }
-        let mut entry: SessionEntry = serde_json::from_str(line).map_err(|e| SessionError::Parse {
-            path: path.to_path_buf(),
-            line: 1,
-            source: e,
-        })?;
-        if let SessionEntry::Header { name: ref mut n, .. } = entry {
+        let mut entry: SessionEntry =
+            serde_json::from_str(line).map_err(|e| SessionError::Parse {
+                path: path.to_path_buf(),
+                line: 1,
+                source: e,
+            })?;
+        if let SessionEntry::Header {
+            name: ref mut n, ..
+        } = entry
+        {
             *n = name.clone();
             *line = serde_json::to_string(&entry).expect("re-serialize header");
         }
         break; // only the first entry is the header
     }
-    std::fs::write(path, lines.join("\n"))
-        .map_err(|e| SessionError::Io { path: path.to_path_buf(), source: e })?;
+    std::fs::write(path, lines.join("\n")).map_err(|e| SessionError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -559,8 +580,12 @@ pub struct SessionListItem {
 /// hide the rest. Excludes `current_path` when Some (so `/resume`
 /// doesn't offer the session you're already in).
 pub fn list_sessions_for_cwd(cwd: &Path, current_path: Option<&Path>) -> Vec<SessionListItem> {
-    let Some(dir) = sessions_dir() else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Some(dir) = sessions_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<SessionListItem> = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
@@ -579,7 +604,9 @@ pub fn list_sessions_for_cwd(cwd: &Path, current_path: Option<&Path>) -> Vec<Ses
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let Ok((header, body)) = read_session(&path) else { continue };
+        let Ok((header, body)) = read_session(&path) else {
+            continue;
+        };
         if header.cwd != cwd {
             continue;
         }
@@ -637,7 +664,16 @@ pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), S
             // First non-empty line is the header. Validate and consume; do
             // NOT push into `entries` (caller wants header separately).
             match &entry {
-                SessionEntry::Header { version, id, parent_id, cwd, model, base_url, name, .. } => {
+                SessionEntry::Header {
+                    version,
+                    id,
+                    parent_id,
+                    cwd,
+                    model,
+                    base_url,
+                    name,
+                    ..
+                } => {
                     if *version != 2 {
                         return Err(SessionError::UnsupportedVersion {
                             found: *version,
@@ -646,9 +682,7 @@ pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), S
                     }
                     header = Some(SessionHeader {
                         id: Uuid::parse_str(id).map_err(|_| SessionError::NotASession)?,
-                        parent_id: parent_id
-                            .as_ref()
-                            .and_then(|s| Uuid::parse_str(s).ok()),
+                        parent_id: parent_id.as_ref().and_then(|s| Uuid::parse_str(s).ok()),
                         cwd: PathBuf::from(cwd),
                         model: model.clone(),
                         base_url: base_url.clone(),
@@ -679,7 +713,10 @@ pub fn set_active_session(cwd: &Path, session_path: &Path) -> Result<(), Session
     let cwd_key = cwd.to_string_lossy().to_string();
     let mut lines: Vec<String> = if active_path.exists() {
         std::fs::read_to_string(&active_path)
-            .map_err(|e| SessionError::Io { path: active_path.clone(), source: e })?
+            .map_err(|e| SessionError::Io {
+                path: active_path.clone(),
+                source: e,
+            })?
             .lines()
             .filter(|l| !l.starts_with(&format!("{cwd_key}\t")))
             .map(|s| s.to_string())
@@ -688,8 +725,10 @@ pub fn set_active_session(cwd: &Path, session_path: &Path) -> Result<(), Session
         Vec::new()
     };
     lines.push(format!("{cwd_key}\t{}", session_path.display()));
-    std::fs::write(&active_path, lines.join("\n") + "\n")
-        .map_err(|e| SessionError::Io { path: active_path, source: e })?;
+    std::fs::write(&active_path, lines.join("\n") + "\n").map_err(|e| SessionError::Io {
+        path: active_path,
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -859,7 +898,10 @@ mod tests {
 
         // Verify only one entry in active file.
         let active_text = std::fs::read_to_string(tmp_home.join("sessions/active")).unwrap();
-        let count = active_text.lines().filter(|l| l.contains(&cwd.to_string_lossy().to_string())).count();
+        let count = active_text
+            .lines()
+            .filter(|l| l.contains(&cwd.to_string_lossy().to_string()))
+            .count();
         assert_eq!(count, 1);
 
         if let Some(h) = prev {
@@ -956,7 +998,8 @@ mod tests {
 
         let (path, header) = new_session(&cwd, "m", "http://x").unwrap();
 
-        let choice = resolve_session(&cwd, false, Some(&header.id.to_string()), None).expect("resolve");
+        let choice =
+            resolve_session(&cwd, false, Some(&header.id.to_string()), None).expect("resolve");
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -1094,28 +1137,39 @@ mod tests {
     fn tree_items_shows_all_display_types_with_role_labels() {
         let entries = vec![
             SessionEntry::Message {
-                id: "1".into(), timestamp: "".into(),
-                role: "user".into(), content: "hi   there  \n friend".into(),
+                id: "1".into(),
+                timestamp: "".into(),
+                role: "user".into(),
+                content: "hi   there  \n friend".into(),
             },
             SessionEntry::Message {
-                id: "2".into(), timestamp: "".into(),
-                role: "assistant".into(), content: "hello".into(),
+                id: "2".into(),
+                timestamp: "".into(),
+                role: "assistant".into(),
+                content: "hello".into(),
             },
             SessionEntry::ToolCall {
-                id: "3".into(), timestamp: "".into(),
+                id: "3".into(),
+                timestamp: "".into(),
                 tool_name: "bash".into(),
                 arguments: serde_json::json!({"command": "ls -la"}),
             },
             SessionEntry::ToolResult {
-                tool_call_id: "3".into(), timestamp: "".into(),
-                content: "output".into(), is_error: false,
+                tool_call_id: "3".into(),
+                timestamp: "".into(),
+                content: "output".into(),
+                is_error: false,
                 images: Vec::new(),
             },
             SessionEntry::ModelChange {
-                timestamp: "".into(), from: "a".into(), to: "b".into(),
+                timestamp: "".into(),
+                from: "a".into(),
+                to: "b".into(),
             },
             SessionEntry::Compaction {
-                timestamp: "".into(), summary: "we discussed X".into(), replaced_count: 12,
+                timestamp: "".into(),
+                summary: "we discussed X".into(),
+                replaced_count: 12,
             },
         ];
         let rows = tree_items(&entries);
@@ -1124,7 +1178,10 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].role, "user");
         assert_eq!(rows[0].preview, "hi there friend"); // whitespace collapsed
-        assert_eq!(rows[0].prefill_text.as_deref(), Some("hi   there  \n friend"));
+        assert_eq!(
+            rows[0].prefill_text.as_deref(),
+            Some("hi   there  \n friend")
+        );
         assert_eq!(rows[0].entry_index, 0);
         assert_eq!(rows[1].role, "assistant");
         assert!(rows[1].prefill_text.is_none());
@@ -1140,13 +1197,22 @@ mod tests {
     fn user_messages_picks_only_user_role() {
         let entries = vec![
             SessionEntry::Message {
-                id: "1".into(), timestamp: "".into(), role: "user".into(), content: "hi".into(),
+                id: "1".into(),
+                timestamp: "".into(),
+                role: "user".into(),
+                content: "hi".into(),
             },
             SessionEntry::Message {
-                id: "2".into(), timestamp: "".into(), role: "assistant".into(), content: "hello".into(),
+                id: "2".into(),
+                timestamp: "".into(),
+                role: "assistant".into(),
+                content: "hello".into(),
             },
             SessionEntry::Message {
-                id: "3".into(), timestamp: "".into(), role: "user".into(), content: "how are you".into(),
+                id: "3".into(),
+                timestamp: "".into(),
+                role: "user".into(),
+                content: "how are you".into(),
             },
         ];
         let out = user_messages(&entries);
@@ -1236,10 +1302,16 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
         let cwd = home_tmp();
         let (path, _hdr) = new_session(&cwd, "m", "http://x").unwrap();
-        append_entry(&path, &SessionEntry::Message {
-            id: "u1".into(), timestamp: "".into(),
-            role: "user".into(), content: "hello".into(),
-        }).unwrap();
+        append_entry(
+            &path,
+            &SessionEntry::Message {
+                id: "u1".into(),
+                timestamp: "".into(),
+                role: "user".into(),
+                content: "hello".into(),
+            },
+        )
+        .unwrap();
 
         // Initially no name.
         let (h, _e) = read_session(&path).unwrap();

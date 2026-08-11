@@ -209,9 +209,7 @@ impl TextBuffer {
     /// movement? PI's rule (editor.ts:824): empty buffer, already in
     /// history mode, or cursor sitting at the very start (row 0, col 0).
     fn history_eligible(&self) -> bool {
-        self.history_index.is_some()
-            || self.buffer_blank()
-            || self.cursor == (0, 0)
+        self.history_index.is_some() || self.buffer_blank() || self.cursor == (0, 0)
     }
 
     /// Called at the start of every content mutation. If the buffer
@@ -519,12 +517,30 @@ impl TextBuffer {
                         return Action::Nothing;
                     }
                 }
-                KeyCode::Char('a') => { self.move_line_start(); return Action::Nothing; }
-                KeyCode::Char('e') => { self.move_line_end();   return Action::Nothing; }
-                KeyCode::Char('k') => { self.kill_to_line_end(); return Action::Nothing; }
-                KeyCode::Char('u') => { self.kill_to_line_start(); return Action::Nothing; }
-                KeyCode::Char('w') => { self.kill_prev_word();  return Action::Nothing; }
-                KeyCode::Char('y') => { self.yank();            return self.slash_or_nothing(); }
+                KeyCode::Char('a') => {
+                    self.move_line_start();
+                    return Action::Nothing;
+                }
+                KeyCode::Char('e') => {
+                    self.move_line_end();
+                    return Action::Nothing;
+                }
+                KeyCode::Char('k') => {
+                    self.kill_to_line_end();
+                    return Action::Nothing;
+                }
+                KeyCode::Char('u') => {
+                    self.kill_to_line_start();
+                    return Action::Nothing;
+                }
+                KeyCode::Char('w') => {
+                    self.kill_prev_word();
+                    return Action::Nothing;
+                }
+                KeyCode::Char('y') => {
+                    self.yank();
+                    return self.slash_or_nothing();
+                }
                 // Undo. PI uses Ctrl+- (Ctrl+Minus); Ctrl+_ is the
                 // Emacs / GNU readline convention; Ctrl+Z is muscle
                 // memory from most modern editors. Accept all three.
@@ -535,7 +551,10 @@ impl TextBuffer {
                 // Some terminals send Backspace as Ctrl+H (0x08) instead
                 // of DEL (0x7f). Handle that here so users don't get a
                 // literal 'h' inserted when pressing Backspace.
-                KeyCode::Char('h') => { self.backspace();       return self.slash_or_nothing(); }
+                KeyCode::Char('h') => {
+                    self.backspace();
+                    return self.slash_or_nothing();
+                }
                 // Ctrl+J = LF (0x0A) — the portable "insert newline"
                 // shortcut. Terminals that don't disambiguate
                 // Shift+Enter from plain Enter (iTerm2, tmux, most
@@ -543,15 +562,27 @@ impl TextBuffer {
                 // only reliable multiline trigger. Matches PI (see
                 // packages/tui/src/keybindings.ts:125 —
                 // "tui.input.newLine": ["shift+enter", "ctrl+j"]).
-                KeyCode::Char('j') => { self.insert_newline();  return Action::Nothing; }
+                KeyCode::Char('j') => {
+                    self.insert_newline();
+                    return Action::Nothing;
+                }
                 _ => {}
             }
         }
         if alt {
             match k.code {
-                KeyCode::Char('b') => { self.move_word_left();  return Action::Nothing; }
-                KeyCode::Char('f') => { self.move_word_right(); return Action::Nothing; }
-                KeyCode::Enter => { self.insert_newline(); return Action::Nothing; }
+                KeyCode::Char('b') => {
+                    self.move_word_left();
+                    return Action::Nothing;
+                }
+                KeyCode::Char('f') => {
+                    self.move_word_right();
+                    return Action::Nothing;
+                }
+                KeyCode::Enter => {
+                    self.insert_newline();
+                    return Action::Nothing;
+                }
                 _ => {}
             }
         }
@@ -571,12 +602,30 @@ impl TextBuffer {
                 self.clear();
                 return Action::Submit(text);
             }
-            KeyCode::Backspace => { self.backspace();     return self.slash_or_nothing(); }
-            KeyCode::Delete    => { self.delete_forward(); return self.slash_or_nothing(); }
-            KeyCode::Left      => { self.move_left();      return Action::Nothing; }
-            KeyCode::Right     => { self.move_right();     return Action::Nothing; }
-            KeyCode::Home      => { self.move_line_start(); return Action::Nothing; }
-            KeyCode::End       => { self.move_line_end();   return Action::Nothing; }
+            KeyCode::Backspace => {
+                self.backspace();
+                return self.slash_or_nothing();
+            }
+            KeyCode::Delete => {
+                self.delete_forward();
+                return self.slash_or_nothing();
+            }
+            KeyCode::Left => {
+                self.move_left();
+                return Action::Nothing;
+            }
+            KeyCode::Right => {
+                self.move_right();
+                return Action::Nothing;
+            }
+            KeyCode::Home => {
+                self.move_line_start();
+                return Action::Nothing;
+            }
+            KeyCode::End => {
+                self.move_line_end();
+                return Action::Nothing;
+            }
             KeyCode::Up => {
                 // History nav only when eligible; else no-op (multi-
                 // line row-up navigation is a future extension).
@@ -591,7 +640,10 @@ impl TextBuffer {
                 }
                 return Action::Nothing;
             }
-            KeyCode::Char(c)   => { self.insert_char(c);   return self.slash_or_nothing(); }
+            KeyCode::Char(c) => {
+                self.insert_char(c);
+                return self.slash_or_nothing();
+            }
             _ => {}
         }
         Action::Nothing
@@ -858,7 +910,7 @@ mod tests {
         // Start typing something, then recall + go back forward.
         type_str(&mut b, "draft");
         b.handle_key(press(KeyCode::Up)); // enter history mode from non-empty at (0,0)? no, cursor not at 0,0.
-        // With text, cursor at (0,5), NOT eligible → no history nav.
+                                          // With text, cursor at (0,5), NOT eligible → no history nav.
         assert_eq!(b.as_string(), "draft");
         // Move to (0, 0) so Up becomes eligible.
         b.handle_key(press_c(KeyCode::Char('a')));

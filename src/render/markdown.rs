@@ -45,7 +45,9 @@ pub fn render_line<'a>(line: &'a str, state: &mut MdState) -> Vec<Span<'a>> {
     if state.in_code {
         return vec![Span::styled(
             line.to_string(),
-            Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(252)),
+            Style::default()
+                .bg(Color::Indexed(236))
+                .fg(Color::Indexed(252)),
         )];
     }
 
@@ -53,19 +55,25 @@ pub fn render_line<'a>(line: &'a str, state: &mut MdState) -> Vec<Span<'a>> {
     if let Some(rest) = trimmed_start.strip_prefix("# ") {
         return vec![Span::styled(
             format!("# {rest}"),
-            Style::default().fg(Color::Indexed(214)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Indexed(214))
+                .add_modifier(Modifier::BOLD),
         )];
     }
     if let Some(rest) = trimmed_start.strip_prefix("## ") {
         return vec![Span::styled(
             format!("## {rest}"),
-            Style::default().fg(Color::Indexed(220)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Indexed(220))
+                .add_modifier(Modifier::BOLD),
         )];
     }
     if let Some(rest) = trimmed_start.strip_prefix("### ") {
         return vec![Span::styled(
             format!("### {rest}"),
-            Style::default().fg(Color::Indexed(228)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Indexed(228))
+                .add_modifier(Modifier::BOLD),
         )];
     }
 
@@ -73,7 +81,9 @@ pub fn render_line<'a>(line: &'a str, state: &mut MdState) -> Vec<Span<'a>> {
     if let Some(rest) = trimmed_start.strip_prefix("> ") {
         return vec![Span::styled(
             format!("> {rest}"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )];
     }
 
@@ -166,9 +176,7 @@ fn render_inline(s: &str) -> Vec<Span<'_>> {
         if bytes[i] == b'*' || bytes[i] == b'_' {
             let delim = bytes[i] as char;
             // Not part of **
-            let is_bold_start = bytes[i] == b'*'
-                && i + 1 < bytes.len()
-                && bytes[i + 1] == b'*';
+            let is_bold_start = bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*';
             if !is_bold_start {
                 if let Some(end_rel) = s[i + 1..].find(delim) {
                     let end = i + 1 + end_rel;
@@ -238,7 +246,11 @@ mod tests {
     use super::*;
 
     fn concat_content(spans: &[Span]) -> String {
-        spans.iter().map(|s| s.content.to_string()).collect::<Vec<_>>().join("")
+        spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     #[test]
@@ -255,7 +267,9 @@ mod tests {
         let mut st = MdState::default();
         let s = render_line("run **npm test** to see `errors`", &mut st);
         // bold + code + others
-        let has_bold = s.iter().any(|sp| sp.style.add_modifier.contains(Modifier::BOLD));
+        let has_bold = s
+            .iter()
+            .any(|sp| sp.style.add_modifier.contains(Modifier::BOLD));
         assert!(has_bold);
         assert!(concat_content(&s).contains("npm test"));
         assert!(concat_content(&s).contains("errors"));
@@ -265,7 +279,9 @@ mod tests {
     fn italic_asterisk() {
         let mut st = MdState::default();
         let s = render_line("this is *very* important", &mut st);
-        assert!(s.iter().any(|sp| sp.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(s
+            .iter()
+            .any(|sp| sp.style.add_modifier.contains(Modifier::ITALIC)));
     }
 
     #[test]

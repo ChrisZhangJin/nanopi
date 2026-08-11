@@ -42,10 +42,7 @@ pub const KEEP_LAST_MESSAGES: usize = 8;
 ///   `estimated_tokens + RESERVE_TOKENS > w`. This matches PI.
 /// - When it's `None` (unknown model): fall back to
 ///   `estimated_chars >= MAX_CONTEXT_CHARS`.
-pub fn should_auto_compact(
-    estimated_chars: usize,
-    context_window: Option<u32>,
-) -> bool {
+pub fn should_auto_compact(estimated_chars: usize, context_window: Option<u32>) -> bool {
     match context_window {
         Some(window) => {
             let est_tokens = (estimated_chars / CHARS_PER_TOKEN_ESTIMATE) as u32;
@@ -150,10 +147,7 @@ pub struct CompactionResult {
 /// A "clean" boundary is a User message — starting the kept segment on a
 /// tool result or an orphaned assistant tool_call would confuse the
 /// provider's message-role validation.
-pub fn find_compact_boundary(
-    messages: &[ContextMessage],
-    keep_last_n: usize,
-) -> Option<usize> {
+pub fn find_compact_boundary(messages: &[ContextMessage], keep_last_n: usize) -> Option<usize> {
     if messages.len() <= keep_last_n + 1 {
         // Not enough to bother — need at least one message to actually
         // compact plus the trailing keep-set.
@@ -187,9 +181,7 @@ pub async fn summarize_via_provider(
     let (system, user_text) = match previous_summary {
         Some(prev) => (
             SUMMARIZER_UPDATE_SYSTEM,
-            format!(
-                "{transcript}\n\n<previous-summary>\n{prev}\n</previous-summary>"
-            ),
+            format!("{transcript}\n\n<previous-summary>\n{prev}\n</previous-summary>"),
         ),
         None => (SUMMARIZER_SYSTEM, transcript.to_string()),
     };
@@ -253,10 +245,7 @@ fn extract_prior_summary(messages: &[ContextMessage]) -> Option<String> {
 /// is detected and passed as `previous_summary` so the LLM MERGES the
 /// new range into the existing summary rather than starting over.
 /// Matches PI's `runSessionCompaction` update path.
-pub async fn compact(
-    ctx: &mut Context,
-    provider: &dyn Provider,
-) -> Option<CompactionResult> {
+pub async fn compact(ctx: &mut Context, provider: &dyn Provider) -> Option<CompactionResult> {
     let cut = find_compact_boundary(&ctx.messages, KEEP_LAST_MESSAGES)?;
 
     // Detect a prior summary at position 0 so we can drive incremental
@@ -271,19 +260,17 @@ pub async fn compact(
     };
     let transcript = ctx.flatten_range(summarize_start, cut);
 
-    let (summary, used_llm) = match summarize_via_provider(
-        provider,
-        &transcript,
-        prior.as_deref(),
-    )
-    .await
-    {
-        Some(s) => (s, true),
-        None => (
-            format!("[{} earlier messages truncated to save tokens]", replaced_count),
-            false,
-        ),
-    };
+    let (summary, used_llm) =
+        match summarize_via_provider(provider, &transcript, prior.as_deref()).await {
+            Some(s) => (s, true),
+            None => (
+                format!(
+                    "[{} earlier messages truncated to save tokens]",
+                    replaced_count
+                ),
+                false,
+            ),
+        };
 
     let kept: Vec<ContextMessage> = ctx.messages.drain(cut..).collect();
     ctx.messages.clear();
@@ -294,7 +281,11 @@ pub async fn compact(
     });
     ctx.messages.extend(kept);
 
-    Some(CompactionResult { summary, replaced_count, used_llm })
+    Some(CompactionResult {
+        summary,
+        replaced_count,
+        used_llm,
+    })
 }
 
 #[cfg(test)]
@@ -369,7 +360,7 @@ mod tests {
             assistant("a2"),
             user("u3"),
             assistant("a3"),
-            user("u4"),   // idx 6 — clean boundary
+            user("u4"), // idx 6 — clean boundary
             assistant("a4"),
             user("u5"),
             assistant("a5"),
@@ -388,7 +379,7 @@ mod tests {
             assistant_tool_call("t1", "bash"),
             tool_result("t1", "ok"),
             assistant("done"),
-            user("u2"),          // idx 4 — first user after hint
+            user("u2"), // idx 4 — first user after hint
             assistant("bye"),
         ];
         let cut = find_compact_boundary(&msgs, 4).unwrap();
@@ -401,20 +392,26 @@ mod tests {
         struct Fake;
         #[async_trait::async_trait]
         impl Provider for Fake {
-            fn id(&self) -> &'static str { "fake" }
+            fn id(&self) -> &'static str {
+                "fake"
+            }
             async fn stream_turn(
                 &self,
                 _ctx: &Context,
                 tx: mpsc::Sender<AgentEvent>,
             ) -> Result<Usage, String> {
-                let _ = tx.send(AgentEvent::TextDelta {
-                    content_index: 0,
-                    text: "SUMMARY".into(),
-                }).await;
-                let _ = tx.send(AgentEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                    usage: Usage::default(),
-                }).await;
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: "SUMMARY".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::Stop,
+                        usage: Usage::default(),
+                    })
+                    .await;
                 Ok(Usage::default())
             }
         }
@@ -456,7 +453,9 @@ mod tests {
         struct Broken;
         #[async_trait::async_trait]
         impl Provider for Broken {
-            fn id(&self) -> &'static str { "broken" }
+            fn id(&self) -> &'static str {
+                "broken"
+            }
             async fn stream_turn(
                 &self,
                 _ctx: &Context,

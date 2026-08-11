@@ -42,7 +42,13 @@ pub fn check_trust_status(cwd: &Path) -> TrustStatus {
 fn encode_cwd_key(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

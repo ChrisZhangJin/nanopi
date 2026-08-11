@@ -188,7 +188,9 @@ mod tests {
             "OAuth access token has expired. Re-authenticate to continue."
         ));
         // Non-retryable trumps retryable
-        assert!(!is_retryable_message("insufficient_quota: your account is out of budget"));
+        assert!(!is_retryable_message(
+            "insufficient_quota: your account is out of budget"
+        ));
         // Bare unrelated
         assert!(!is_retryable_message("invalid_api_key"));
     }

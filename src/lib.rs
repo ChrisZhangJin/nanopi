@@ -3,19 +3,19 @@
 //! `main.rs` is a thin shim that dispatches to `mode::*`. All real logic lives here.
 
 pub mod config;
+pub mod event;
 pub mod paths;
 pub mod pricing;
+pub mod resources;
 pub mod session;
 pub mod settings;
 pub mod trust;
-pub mod resources;
-pub mod event;
 
 pub mod agent;
-pub mod provider;
-pub mod tool;
-pub mod render;
 pub mod mode;
+pub mod provider;
+pub mod render;
+pub mod tool;
 pub mod util;
 
 /// Process-wide test mutex. Tests that mutate `$NANOPI_HOME` (or any

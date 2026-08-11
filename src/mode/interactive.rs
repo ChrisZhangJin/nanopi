@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use crate::agent::context::Context;
 use crate::agent::loop_::{Agent, HooksConfig};
@@ -33,6 +33,7 @@ pub async fn run_interactive_mode(
     session_id: Option<String>,
     fork_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
+    no_context_files: bool,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -69,7 +70,7 @@ pub async fn run_interactive_mode(
     };
 
     // ── Build the Agent (resume or fresh) ───────────────────────────────
-    use crate::agent::build::{AgentBuildInputs, print_skill_diagnostics};
+    use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let agent: Option<Agent> = Some(if let SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
@@ -82,6 +83,7 @@ pub async fn run_interactive_mode(
             base_url.to_string(),
             api_key.to_string(),
             skill_load,
+            no_context_files,
         );
         print_skill_diagnostics(&diags);
         a
@@ -98,6 +100,7 @@ pub async fn run_interactive_mode(
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             skill_load,
+            no_context_files,
         });
         print_skill_diagnostics(&diags);
         a
@@ -144,13 +147,12 @@ pub async fn run_interactive_mode(
 
     // v0.6+: switch to a real line editor with history. Editor lives
     // in a Mutex so each spawn_blocking read can borrow it briefly.
-    use rustyline::Editor;
     use rustyline::history::FileHistory;
+    use rustyline::Editor;
 
     let history_path = crate::paths::history_path();
     let editor: Arc<StdMutex<Editor<(), FileHistory>>> = Arc::new(StdMutex::new({
-        let mut e: Editor<(), FileHistory> = Editor::new()
-            .expect("init editor");
+        let mut e: Editor<(), FileHistory> = Editor::new().expect("init editor");
         if let Some(p) = &history_path {
             let _ = e.load_history(p);
         }
@@ -173,9 +175,7 @@ pub async fn run_interactive_mode(
             Other(String),
         }
         let readline = tokio::task::spawn_blocking(move || -> ReadOutcome {
-            let mut editor = editor_for_task
-                .lock()
-                .expect("editor lock poisoned");
+            let mut editor = editor_for_task.lock().expect("editor lock poisoned");
             let result = editor.readline("> ");
             if let Some(p) = &history_path_for_task {
                 let _ = editor.append_history(p);
@@ -261,10 +261,7 @@ pub async fn run_interactive_mode(
 
     let sid = initial_session_id.to_string();
     let sid_short: String = sid.chars().take(8).collect();
-    eprintln!(
-        "\n\x1b[2m✓ session {} saved\x1b[0m",
-        sid_short,
-    );
+    eprintln!("\n\x1b[2m✓ session {} saved\x1b[0m", sid_short,);
     eprintln!(
         "\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {}\x1b[0m",
         sid,
@@ -284,11 +281,8 @@ pub async fn run_interactive_mode(
 async fn print_pre_turn_status(agent: &Arc<Mutex<Option<Agent>>>) {
     let g = agent.lock().await;
     if let Some(a) = g.as_ref() {
-        let line = crate::render::status_line::classic_status_line(
-            &a.model,
-            &a.usage_total,
-            &a.cwd,
-        );
+        let line =
+            crate::render::status_line::classic_status_line(&a.model, &a.usage_total, &a.cwd);
         // ANSI dim (2) + reset (0) — matches other stderr chatter.
         eprintln!("\x1b[2m{line}\x1b[0m");
     }
@@ -298,10 +292,7 @@ async fn print_pre_turn_status(agent: &Arc<Mutex<Option<Agent>>>) {
 /// turn (approximated as diff between now and pre-turn snapshot is
 /// tricky without extra state; we just show cumulative + turn count
 /// + wall time).
-async fn print_post_turn_status(
-    agent: &Arc<Mutex<Option<Agent>>>,
-    elapsed: std::time::Duration,
-) {
+async fn print_post_turn_status(agent: &Arc<Mutex<Option<Agent>>>, elapsed: std::time::Duration) {
     let g = agent.lock().await;
     if let Some(a) = g.as_ref() {
         eprintln!(
@@ -317,10 +308,7 @@ async fn print_post_turn_status(
 /// Fire session_start (start=true) or session_end (start=false) hooks
 /// on the currently-parked Agent. No-op if the Agent slot is empty
 /// (e.g. a turn is in flight — shouldn't happen at start/end).
-async fn fire_lifecycle_hook(
-    agent: &Arc<Mutex<Option<Agent>>>,
-    start: bool,
-) {
+async fn fire_lifecycle_hook(agent: &Arc<Mutex<Option<Agent>>>, start: bool) {
     let guard = agent.lock().await;
     if let Some(a) = guard.as_ref() {
         if start {
@@ -414,7 +402,6 @@ async fn run_one_turn(
     result.map(|_| 0).map_err(|e| anyhow::anyhow!(e))
 }
 
-
 /// Build a spinner label for a specific tool call, so the user sees
 /// what's actually running. Falls back to `running <tool>` for
 /// unknown tools. Normalizes gateway-mangled names (`Bash_tool` →
@@ -423,9 +410,18 @@ fn tool_spinner_label(name: &str, args: &serde_json::Value) -> String {
     let lower = name.to_ascii_lowercase();
     let canonical = lower.strip_suffix("_tool").unwrap_or(&lower);
     let arg_preview = match canonical {
-        "bash" => args.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        "read" | "write" | "edit" | "ls" => args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        "grep" | "find" => args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        "bash" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        "read" | "write" | "edit" | "ls" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        "grep" | "find" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         _ => None,
     };
     let verb = match canonical {
@@ -455,8 +451,6 @@ fn tool_spinner_label(name: &str, args: &serde_json::Value) -> String {
 fn is_visible_event(ev: &AgentEvent) -> bool {
     matches!(
         ev,
-        AgentEvent::TextDelta { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::Error { .. }
+        AgentEvent::TextDelta { .. } | AgentEvent::ToolCall { .. } | AgentEvent::Error { .. }
     )
 }
