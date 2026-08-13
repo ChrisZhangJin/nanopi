@@ -52,6 +52,8 @@ uuid = { version = "1.10", default-features = false, features = ["v7", "std", "s
 
 # Config + settings files
 toml = "0.8"
+# v0.9.3: comment-preserving TOML writer for settings.toml round-trip.
+toml_edit = "0.22"
 
 # async fn in trait objects
 async-trait = "0.1"

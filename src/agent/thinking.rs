@@ -193,4 +193,20 @@ mod tests {
         assert!(!supports_thinking("gpt-4o"));
         assert!(!supports_thinking("unknown-model"));
     }
+
+    #[test]
+    fn thinking_level_lowercase_roundtrip() {
+        // settings.toml serialises as lowercase — any casing change
+        // would silently break existing user files. Assert both the
+        // exact string and roundtrip integrity.
+        for lvl in ThinkingLevel::all() {
+            let s = serde_json::to_string(lvl).unwrap();
+            let parsed: ThinkingLevel = serde_json::from_str(&s).unwrap();
+            assert_eq!(*lvl, parsed);
+            assert!(
+                s.chars().all(|c| !c.is_ascii_uppercase()),
+                "expected lowercase serialisation, got {s}"
+            );
+        }
+    }
 }
