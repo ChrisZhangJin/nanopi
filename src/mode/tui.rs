@@ -304,6 +304,12 @@ pub async fn run_tui_mode(
         skill_load_for_rebuilds,
         no_context_files,
     );
+    // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
+    let settings_file = crate::settings_toml::load();
+    app.bindings = crate::settings_toml::bindings_from(&settings_file);
+    // v0.9.3: remember vendor pick for footer + future rebuilds.
+    let initial_vendor = crate::vendor::pick_vendor(None, Some(base_url), model);
+    app.vendor_id = Some(initial_vendor.id().to_string());
     // Prime the skills cache from the just-built agent so the very
     // first `/` palette open includes /skill:<name> entries.
     refresh_status(&mut app, &agent_slot).await;
@@ -497,6 +503,8 @@ struct App {
     /// by `/model` swap and fork-agent rebuild so a session that
     /// started on Anthropic stays on Anthropic.
     api_kind: crate::provider::ApiKind,
+    /// v0.9.3: keybindings loaded from settings.toml + defaults.
+    bindings: crate::keys::KeyBindings,
     /// v0.9.3: cached `config.provider` string used by every
     /// `pick_vendor()` call at Agent build. Populated at startup.
     cfg_provider: Option<String>,
@@ -580,6 +588,7 @@ impl App {
             should_exit: false,
             cwd,
             api_kind,
+            bindings: crate::keys::KeyBindings::default(),
             cfg_provider: None,
             vendor_id: None,
             usage: crate::event::Usage::default(),
@@ -777,7 +786,7 @@ enum KeyAction {
 /// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     // Ctrl+O — expand the last tool output (PI's `app.tools.expand`).
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('o') {
+    if app.bindings.matches(crate::keys::ActionId::ExpandLastTool, k) {
         return KeyAction::ExpandLastTool;
     }
 
@@ -867,9 +876,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     // ── Shift+Tab cycles thinking level (PI's app.thinking.cycle). ──
     // Fires regardless of streaming state — advancing the setting is
     // safe mid-turn (next turn picks it up), and PI allows the same.
-    if k.code == KeyCode::BackTab
-        || (k.code == KeyCode::Tab && k.modifiers.contains(KeyModifiers::SHIFT))
-    {
+    if app.bindings.matches(crate::keys::ActionId::ThinkingCycle, k) {
         return KeyAction::CycleThinking;
     }
     // ── Model picker (highest priority when open) ───────────────────
@@ -3499,6 +3506,18 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
                 .fg(Color::Indexed(108))
                 .add_modifier(Modifier::ITALIC),
         ));
+    }
+    // v0.9.3: vendor:<id> segment when a non-fallback vendor was chosen.
+    if let Some(vid) = app.vendor_id.as_deref() {
+        if vid != "fallback" {
+            l2.push(Span::raw(" · "));
+            l2.push(Span::styled(
+                format!("vendor:{}", vid),
+                Style::default()
+                    .fg(Color::Indexed(108))
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
     }
     // Context ratio (`1.4%/205k (auto)`), color-coded by usage.
     // Auto-compact is always on today; if we add a config toggle we
