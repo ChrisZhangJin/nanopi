@@ -112,6 +112,10 @@ enum SlashCmd {
     /// the session. Mirrors PI's `/reload` — new skills installed
     /// mid-session become visible to the model on the next turn.
     Reload,
+    /// v0.9.3: print current interaction settings + path to settings.toml.
+    Settings,
+    /// v0.9.3: print the keybindings submenu (list of ActionId + spec + toml key).
+    Keybindings,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -151,6 +155,16 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/reload",
             "Reload skills, config, settings",
             SlashCmd::Reload,
+        ),
+        MenuItem::new(
+            "/settings",
+            "Show interaction settings + settings.toml path",
+            SlashCmd::Settings,
+        ),
+        MenuItem::new(
+            "/keybindings",
+            "List keybindings + how to override",
+            SlashCmd::Keybindings,
         ),
         MenuItem::new("/quit", "Exit the session", SlashCmd::Quit),
         MenuItem::new("/exit", "Exit the session", SlashCmd::Quit),
@@ -735,6 +749,10 @@ enum KeyAction {
     ResumeSession(PathBuf),
     /// `/hotkeys`: dump keybinding help into scrollback.
     ShowHotkeys,
+    /// v0.9.3: `/settings` — dump interaction settings + toml path.
+    ShowSettings,
+    /// v0.9.3: `/keybindings` — dump keybindings + toml override key.
+    ShowKeybindings,
     /// `/skills`: dump the loaded skill list into scrollback.
     ShowSkills,
     /// `/session`: dump usage / cost / model summary into scrollback.
@@ -1079,6 +1097,8 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             KeyAction::StartTurn(full)
         }
         SlashCmd::Reload => KeyAction::Reload,
+        SlashCmd::Settings => KeyAction::ShowSettings,
+        SlashCmd::Keybindings => KeyAction::ShowKeybindings,
     }
 }
 
@@ -2062,6 +2082,101 @@ async fn handle_action(
                         Span::styled(format!("  {:<15}", k), Style::default().fg(Color::Cyan)),
                         Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
                     ]),
+                )?;
+            }
+            insert_line(term, Line::from(""))?;
+        }
+        KeyAction::ShowSettings => {
+            let sf = crate::settings_toml::load();
+            let path = crate::settings_toml::settings_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".into());
+            insert_line(term, Line::from(""))?;
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    "Interaction settings",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+            insert_line(term, Line::from(format!("  path:            {}", path)))?;
+            insert_line(
+                term,
+                Line::from(format!(
+                    "  thinking_level:  {}",
+                    sf.thinking_level.map(|l| l.to_string()).unwrap_or_else(|| "(default)".into())
+                )),
+            )?;
+            insert_line(
+                term,
+                Line::from(format!(
+                    "  hide_thinking:   {}",
+                    sf.hide_thinking.map(|b| b.to_string()).unwrap_or_else(|| "(default)".into())
+                )),
+            )?;
+            insert_line(
+                term,
+                Line::from(format!(
+                    "  auto_compact:    {}",
+                    sf.auto_compact.map(|b| b.to_string()).unwrap_or_else(|| "(default)".into())
+                )),
+            )?;
+            insert_line(
+                term,
+                Line::from(format!(
+                    "  default_trust:   {:?}",
+                    sf.default_project_trust.unwrap_or(crate::settings_toml::TrustLevelSer::Ask)
+                )),
+            )?;
+            insert_line(
+                term,
+                Line::from(format!(
+                    "  vendor:          {}",
+                    app.vendor_id.as_deref().unwrap_or("(none)")
+                )),
+            )?;
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    "  Edit the file above (see /keybindings for chord overrides).",
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                )]),
+            )?;
+            insert_line(term, Line::from(""))?;
+        }
+        KeyAction::ShowKeybindings => {
+            insert_line(term, Line::from(""))?;
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    "Keybindings (edit under [keybindings] in settings.toml)",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+            for a in crate::keys::ActionId::all() {
+                let spec = app
+                    .bindings
+                    .get(*a)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "(unbound)".into());
+                let toml_key = match a {
+                    crate::keys::ActionId::ThinkingCycle => "thinking_cycle",
+                    crate::keys::ActionId::ToolCancel => "tool_cancel",
+                    crate::keys::ActionId::ExpandLastTool => "expand_last_tool",
+                    crate::keys::ActionId::NewlineInInput => "newline_in_input",
+                    crate::keys::ActionId::OpenSlashPalette => "open_slash_palette",
+                    crate::keys::ActionId::OpenSettings => "open_settings",
+                };
+                insert_line(
+                    term,
+                    Line::from(format!(
+                        "  {:<32} {:<20} # key: {}",
+                        a.label(),
+                        spec,
+                        toml_key
+                    )),
                 )?;
             }
             insert_line(term, Line::from(""))?;
