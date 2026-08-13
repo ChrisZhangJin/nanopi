@@ -201,12 +201,14 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// The OpenAI-compatible provider.
-#[derive(Clone)]
 pub struct OpenAiProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub client: reqwest::Client,
+    /// v0.9.3: optional vendor for reasoning_effort / thinking-block
+    /// emission. If `None`, request body omits reasoning params.
+    pub vendor: Option<Box<dyn crate::vendor::Vendor>>,
 }
 
 impl OpenAiProvider {
@@ -222,7 +224,14 @@ impl OpenAiProvider {
             client: reqwest::Client::builder()
                 .build()
                 .expect("build reqwest client"),
+            vendor: None,
         }
+    }
+
+    /// v0.9.3: attach a vendor.
+    pub fn with_vendor(mut self, vendor: Box<dyn crate::vendor::Vendor>) -> Self {
+        self.vendor = Some(vendor);
+        self
     }
 }
 
@@ -437,7 +446,15 @@ impl OpenAiProvider {
         tx: mpsc::Sender<AgentEvent>,
     ) -> Result<Usage, OpenAiError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = build_request(ctx, &self.model);
+        let body_wire = build_request(ctx, &self.model);
+        // v0.9.3: serialize to Value so a vendor can add
+        // reasoning_effort / thinking / enable_thinking fields.
+        let mut body = serde_json::to_value(&body_wire).unwrap_or(serde_json::Value::Null);
+        if let (Some(vendor), Some(level)) = (self.vendor.as_deref(), ctx.thinking) {
+            if vendor.supports_thinking(&self.model) {
+                vendor.write_thinking(&mut body, level, &self.model);
+            }
+        }
 
         // ── Retry envelope covers BOTH the HTTP open (429 / 5xx / transient
         // network) AND mid-stream errors that arrive before we've emitted

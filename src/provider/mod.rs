@@ -36,10 +36,33 @@ impl ApiKind {
 
 /// Build a Provider trait object for the given wire kind. Callers
 /// hand the returned Box straight to Agent.provider.
-pub fn build(kind: ApiKind, base_url: &str, api_key: &str, model: &str) -> Box<dyn Provider> {
+///
+/// v0.9.3: `vendor` (from `crate::vendor::pick_vendor`) governs
+/// thinking-block / reasoning_effort emission. Pass `None` for the
+/// legacy behavior (Anthropic emits its own thinking; OpenAI omits
+/// reasoning params).
+pub fn build(
+    kind: ApiKind,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    vendor: Option<Box<dyn crate::vendor::Vendor>>,
+) -> Box<dyn Provider> {
     match kind {
-        ApiKind::Openai => Box::new(openai::OpenAiProvider::new(base_url, api_key, model)),
-        ApiKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(base_url, api_key, model)),
+        ApiKind::Openai => {
+            let p = openai::OpenAiProvider::new(base_url, api_key, model);
+            Box::new(match vendor {
+                Some(v) => p.with_vendor(v),
+                None => p,
+            })
+        }
+        ApiKind::Anthropic => {
+            let p = anthropic::AnthropicProvider::new(base_url, api_key, model);
+            Box::new(match vendor {
+                Some(v) => p.with_vendor(v),
+                None => p,
+            })
+        }
     }
 }
 

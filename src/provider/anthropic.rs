@@ -45,12 +45,14 @@ pub enum AnthropicError {
 }
 
 /// The Anthropic provider.
-#[derive(Clone)]
 pub struct AnthropicProvider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub client: reqwest::Client,
+    /// v0.9.3: optional vendor for thinking-block emission. If `None`,
+    /// falls back to the legacy in-`build_request` thinking logic.
+    pub vendor: Option<Box<dyn crate::vendor::Vendor>>,
 }
 
 impl AnthropicProvider {
@@ -66,7 +68,14 @@ impl AnthropicProvider {
             client: reqwest::Client::builder()
                 .build()
                 .expect("build reqwest client"),
+            vendor: None,
         }
+    }
+
+    /// v0.9.3: attach a vendor for thinking-block emission.
+    pub fn with_vendor(mut self, vendor: Box<dyn crate::vendor::Vendor>) -> Self {
+        self.vendor = Some(vendor);
+        self
     }
 }
 
@@ -349,7 +358,24 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
         use futures_util::StreamExt;
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let body = build_request(ctx, &self.model);
+        let mut body = build_request(ctx, &self.model);
+        // v0.9.3: if a vendor is attached and it wants to emit thinking
+        // differently (e.g. Minimax skips the max_tokens bump), let it
+        // overwrite the block built by `build_request`.
+        if let (Some(vendor), Some(level)) = (self.vendor.as_deref(), ctx.thinking) {
+            if vendor.id() != "anthropic" && vendor.supports_thinking(&self.model) {
+                body.as_object_mut().map(|m| {
+                    m.remove("thinking");
+                    m.remove("max_tokens");
+                });
+                vendor.write_thinking(&mut body, level, &self.model);
+                // Some transports still need max_tokens; keep the
+                // default 4096 unless the vendor already added one.
+                if body.get("max_tokens").is_none() {
+                    body["max_tokens"] = serde_json::json!(4096);
+                }
+            }
+        }
 
         // Reqwest has no default send timeout — a gateway that accepts
         // the TCP connection but never sends response headers would

@@ -58,7 +58,7 @@ pub async fn run_interactive_mode(
     // Remember this cwd's active session for next --continue.
     let _ = session::set_active_session(&cwd, &session_path);
 
-    let provider = crate::provider::build(api_kind, base_url, api_key, model);
+    let provider = crate::provider::build(api_kind, base_url, api_key, model, None);
     let registry = ToolRegistry::standard();
 
     let hooks = match settings::load_settings(&cwd) {

@@ -230,7 +230,7 @@ pub async fn run_tui_mode(
     };
     let _ = session::set_active_session(&cwd, &session_path);
 
-    let provider = crate::provider::build(api_kind, base_url, api_key, model);
+    let provider = crate::provider::build(api_kind, base_url, api_key, model, None);
     let registry = ToolRegistry::standard();
     let hooks = match settings::load_settings(&cwd) {
         Ok(h) => h,
@@ -497,6 +497,13 @@ struct App {
     /// by `/model` swap and fork-agent rebuild so a session that
     /// started on Anthropic stays on Anthropic.
     api_kind: crate::provider::ApiKind,
+    /// v0.9.3: cached `config.provider` string used by every
+    /// `pick_vendor()` call at Agent build. Populated at startup.
+    cfg_provider: Option<String>,
+    /// v0.9.3: id from `pick_vendor` at last Agent build. `None`
+    /// before first build; `Some("fallback")` when no signal matched.
+    /// Footer suppresses the fallback string.
+    vendor_id: Option<String>,
     usage: crate::event::Usage,
     context_chars: usize,
     turn_count: u32,
@@ -573,6 +580,8 @@ impl App {
             should_exit: false,
             cwd,
             api_kind,
+            cfg_provider: None,
+            vendor_id: None,
             usage: crate::event::Usage::default(),
             context_chars: 0,
             turn_count: 0,
@@ -1353,7 +1362,7 @@ async fn handle_action(
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let new_provider =
-                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model);
+                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&a.base_url), &new_model)));
                 a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();
@@ -1403,7 +1412,7 @@ async fn handle_action(
             let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
                 cwd: cwd.clone(),
                 registry,
-                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model),
+                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model))),
                 session_path: new_path,
                 session_id: new_header.id,
                 permission,
@@ -1513,7 +1522,7 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
             let registry = crate::tool::ToolRegistry::standard();
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
@@ -1964,7 +1973,7 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
             let registry = crate::tool::ToolRegistry::standard();
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
@@ -2428,7 +2437,7 @@ async fn execute_fork(
             return Ok(());
         }
     };
-    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
     let registry = crate::tool::ToolRegistry::standard();
     new_agent.context.tools = registry.all_specs();
     let diags = new_agent.hydrate_resumed(
@@ -2498,7 +2507,7 @@ async fn spawn_summarize_task(
             None => return,
         }
     };
-    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model);
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
     let cut_off = pending.cut_off.clone();
     let task = tokio::spawn(async move {
         let summary = crate::agent::branch_summary::summarize_branch(

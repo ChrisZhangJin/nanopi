@@ -82,7 +82,7 @@ pub async fn run_print_mode(
     let _ = session::set_active_session(&cwd, &session_path);
 
     // Build the agent.
-    let provider = crate::provider::build(api_kind, base_url, api_key, model);
+    let provider = crate::provider::build(api_kind, base_url, api_key, model, None);
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
     // For v0.5: no hooks loaded yet (settings.toml loader is a separate

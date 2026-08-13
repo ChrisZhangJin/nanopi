@@ -59,6 +59,12 @@ pub struct Config {
     /// CLI flag overrides this per-invocation.
     pub api_kind: Option<String>,
 
+    /// v0.9.3: explicit vendor id (e.g. "deepseek", "anthropic",
+    /// "zai"). Overrides base_url/model sniff in
+    /// `vendor::pick_vendor`. Unknown values fall through to sniff.
+    #[serde(default)]
+    pub provider: Option<String>,
+
     /// Tool whitelist. Empty/absent = all standard tools.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -117,6 +123,7 @@ impl Config {
             api_key_file: None,
             api_key: None,
             api_kind: None,
+            provider: None,
             tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
@@ -199,6 +206,7 @@ fn merge(a: Config, b: Config) -> Config {
         api_key_file: b.api_key_file.or(a.api_key_file),
         api_key: b.api_key.or(a.api_key),
         api_kind: b.api_kind.or(a.api_kind),
+        provider: b.provider.or(a.provider),
         tools,
         trust: TrustConfig {
             default: b.trust.default.or(a.trust.default),
@@ -320,6 +328,13 @@ base_url = "https://project.example/v1"
     }
 
     #[test]
+    fn config_loads_provider_field() {
+        let text = "provider = \"deepseek\"\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(c.provider.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
     fn merge_preserves_unset_fields() {
         let a = Config {
             model: Some("a-model".into()),
@@ -327,6 +342,7 @@ base_url = "https://project.example/v1"
             api_key_file: Some("/tmp/key".into()),
             api_key: None,
             api_kind: None,
+            provider: None,
             tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
@@ -339,6 +355,7 @@ base_url = "https://project.example/v1"
             api_key_file: None,
             api_key: None,
             api_kind: None,
+            provider: None,
             tools: Vec::new(),
             trust: TrustConfig::default(),
             logging: LoggingConfig::default(),
