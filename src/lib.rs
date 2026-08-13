@@ -18,6 +18,7 @@ pub mod provider;
 pub mod render;
 pub mod tool;
 pub mod util;
+pub mod vendor;
 
 /// Process-wide test mutex. Tests that mutate `$NANOPI_HOME` (or any
 /// other global env var) MUST acquire this lock before changing it,

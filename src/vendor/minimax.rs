@@ -1,0 +1,25 @@
+//! Minimax vendor — Anthropic transport, no max_tokens bump.
+
+use super::Vendor;
+use crate::agent::thinking::ThinkingLevel;
+use crate::provider::ApiKind;
+use serde_json::{json, Value};
+
+#[derive(Debug)]
+pub struct MinimaxVendor;
+
+impl Vendor for MinimaxVendor {
+    fn id(&self) -> &'static str { "minimax" }
+    fn transport(&self) -> ApiKind { ApiKind::Anthropic }
+    fn default_base_url(&self) -> Option<&'static str> {
+        Some("https://api.minimax.chat/anthropic")
+    }
+    fn supports_thinking(&self, model: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        m.starts_with("minimax-m")
+    }
+    fn write_thinking(&self, body: &mut Value, level: ThinkingLevel, _model: &str) {
+        let budget = level.budget_tokens();
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    }
+}
