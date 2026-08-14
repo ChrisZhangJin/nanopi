@@ -1332,10 +1332,13 @@ mod tests {
     #[tokio::test]
     async fn compact_now_emits_start_and_end_when_tx_provided() {
         let (mut agent, dir) = agent_for_compact_test("SUMMARY");
-        // Populate enough messages that find_compact_boundary succeeds.
+        // Populate enough messages that find_compact_boundary succeeds
+        // — need > KEEP_RECENT_TOKENS worth of tail so the algorithm
+        // actually cuts. Each message is ~10k tokens.
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
         for i in 1..=10 {
-            agent.context.push_user_text(format!("u{i}"));
-            agent.context.push_assistant_text(format!("a{i}"));
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
         }
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);

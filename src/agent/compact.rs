@@ -12,7 +12,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::agent::context::{ContentBlock, Context, ContextMessage};
+use crate::agent::context::{AssistantBlock, ContentBlock, Context, ContextMessage};
 use crate::agent::loop_::Provider;
 use crate::event::AgentEvent;
 
@@ -32,9 +32,19 @@ pub const RESERVE_TOKENS: u32 = 16_384;
 /// rule of thumb and lands within ~30% for English + code.
 pub const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Keep at least this many trailing messages verbatim after compaction.
-/// Roughly 4 turn pairs.
-pub const KEEP_LAST_MESSAGES: usize = 8;
+/// Approximate token budget for the trailing "keep verbatim" tail.
+/// Matches PI's `keepRecentTokens = 20000`
+/// (`packages/coding-agent/src/core/compaction/compaction.ts:135`). We
+/// walk backwards from the newest message, accumulating estimated
+/// tokens, and cut once we've kept ~this many.
+///
+/// Sizing by tokens (not message count) is what lets us cut in the
+/// middle of a long tool-heavy turn — a fixed message-count tail would
+/// never land on a User message when the last few turns are all
+/// `assistant tool_call → tool result` pairs, and `find_compact_boundary`
+/// would return None (bug #: `/compact` reported `before == after` in
+/// that shape).
+pub const KEEP_RECENT_TOKENS: usize = 20_000;
 
 /// Decide whether an auto-compact should fire.
 ///
@@ -139,30 +149,109 @@ pub struct CompactionResult {
     pub used_llm: bool,
 }
 
+/// Approximate token cost of a single message. Chars/4, matching
+/// `Context::estimate_chars` on the whole context. Used by
+/// `find_compact_boundary` to accumulate a tail budget.
+fn message_tokens(m: &ContextMessage) -> usize {
+    let mut n = 0usize;
+    match m {
+        ContextMessage::User { content } => {
+            for b in content {
+                if let ContentBlock::Text { text } = b {
+                    n += text.len();
+                }
+            }
+        }
+        ContextMessage::Assistant { content } => {
+            for b in content {
+                match b {
+                    AssistantBlock::Text { text } | AssistantBlock::Thinking { text } => {
+                        n += text.len();
+                    }
+                    AssistantBlock::ToolCall { call } => {
+                        n += call.name.len();
+                        n += call.arguments.to_string().len();
+                    }
+                }
+            }
+        }
+        ContextMessage::Tool { content, .. } => n += content.len(),
+    }
+    n / CHARS_PER_TOKEN_ESTIMATE
+}
+
+/// True when it's safe to start the KEPT segment at this message. A
+/// User or Assistant message is a valid cut point; a Tool result is not
+/// (it must follow its Assistant tool_call, so cutting there would
+/// leave the tool_call in the summarized head and its result orphaned
+/// in the kept tail). Ported from PI's `isCutPointMessage`
+/// (`compaction.ts:308-321`).
+fn is_valid_cut_point(m: &ContextMessage) -> bool {
+    !matches!(m, ContextMessage::Tool { .. })
+}
+
 /// Find the boundary index where compaction should split messages.
-/// Returns `Some(i)` such that `messages[0..i]` should be summarized and
-/// `messages[i..]` kept. Returns `None` if no clean boundary is
-/// available (too few messages, or no user message near the tail).
+/// Returns `Some(i)` such that `messages[0..i]` should be summarized
+/// and `messages[i..]` kept. Returns `None` if no clean boundary
+/// exists.
 ///
-/// A "clean" boundary is a User message — starting the kept segment on a
-/// tool result or an orphaned assistant tool_call would confuse the
-/// provider's message-role validation.
-pub fn find_compact_boundary(messages: &[ContextMessage], keep_last_n: usize) -> Option<usize> {
-    if messages.len() <= keep_last_n + 1 {
-        // Not enough to bother — need at least one message to actually
-        // compact plus the trailing keep-set.
+/// Algorithm (matches PI's `findCutPoint`
+/// `compaction.ts:388-448`): walk backwards from the newest message,
+/// accumulating token estimates. Once the accumulated size crosses
+/// `keep_recent_tokens`, snap forward to the nearest valid cut point
+/// (a User or Assistant message — never a Tool result) at or after the
+/// current index. Everything before that becomes the head to
+/// summarize; everything from that index on is kept verbatim.
+///
+/// Note: PI's algorithm can split a turn in the middle. Ours does the
+/// same shape — if the cut lands on an Assistant with a following
+/// tool_result, the result is kept as part of the tail and the
+/// tool_call summary is what future turns reference. The one thing we
+/// preserve is the invariant that the kept segment never STARTS on a
+/// Tool message.
+pub fn find_compact_boundary(
+    messages: &[ContextMessage],
+    keep_recent_tokens: usize,
+) -> Option<usize> {
+    if messages.len() < 2 {
+        // Nothing to compact — need at least one head + one tail message.
         return None;
     }
-    let start_hint = messages.len().saturating_sub(keep_last_n);
-    for i in start_hint..messages.len() {
-        if matches!(messages[i], ContextMessage::User { .. }) {
-            if i == 0 {
-                return None;
-            }
-            return Some(i);
+
+    // Precompute all valid cut-point indices, ascending.
+    let cut_points: Vec<usize> = (0..messages.len())
+        .filter(|&i| is_valid_cut_point(&messages[i]))
+        .collect();
+    if cut_points.is_empty() {
+        return None;
+    }
+
+    // Walk backwards from newest, accumulating tokens. Stop once we've
+    // kept at least `keep_recent_tokens` worth of tail.
+    let mut accumulated = 0usize;
+    let mut cut_at_or_after: Option<usize> = None;
+    for i in (0..messages.len()).rev() {
+        accumulated += message_tokens(&messages[i]);
+        if accumulated >= keep_recent_tokens {
+            cut_at_or_after = Some(i);
+            break;
         }
     }
-    None
+
+    // If we never hit the budget, the whole context fits in the tail —
+    // there's nothing worth compacting.
+    let target = cut_at_or_after?;
+
+    // Snap to the nearest valid cut point at or after `target`. That's
+    // the first message in the KEPT segment.
+    let cut = *cut_points.iter().find(|&&c| c >= target)?;
+
+    // Refuse to compact if the cut leaves nothing in the head (or only
+    // metadata) — the caller has nothing to summarize.
+    if cut == 0 {
+        return None;
+    }
+    Some(cut)
 }
 
 /// Ask `provider` to summarize `transcript`. Returns None on any failure
@@ -246,7 +335,7 @@ fn extract_prior_summary(messages: &[ContextMessage]) -> Option<String> {
 /// new range into the existing summary rather than starting over.
 /// Matches PI's `runSessionCompaction` update path.
 pub async fn compact(ctx: &mut Context, provider: &dyn Provider) -> Option<CompactionResult> {
-    let cut = find_compact_boundary(&ctx.messages, KEEP_LAST_MESSAGES)?;
+    let cut = find_compact_boundary(&ctx.messages, KEEP_RECENT_TOKENS)?;
 
     // Detect a prior summary at position 0 so we can drive incremental
     // merge. If present, the messages being summarized are 1..cut
@@ -343,47 +432,105 @@ mod tests {
         assert!(should_auto_compact(100_001, None));
     }
 
+    /// Build a text message with a target token size (approx). One
+    /// token ≈ 4 chars.
+    fn user_of_tokens(t: usize) -> ContextMessage {
+        user(&"x".repeat(t * CHARS_PER_TOKEN_ESTIMATE))
+    }
+    fn assistant_of_tokens(t: usize) -> ContextMessage {
+        assistant(&"y".repeat(t * CHARS_PER_TOKEN_ESTIMATE))
+    }
+    fn tool_result_of_tokens(id: &str, t: usize) -> ContextMessage {
+        tool_result(id, &"z".repeat(t * CHARS_PER_TOKEN_ESTIMATE))
+    }
+
     #[test]
-    fn boundary_none_when_too_few_messages() {
+    fn boundary_none_when_tail_alone_fits_budget() {
+        // Two tiny messages, budget 100 tokens. Whole context fits in
+        // the tail → nothing to compact.
         let msgs = vec![user("a"), assistant("b")];
-        assert_eq!(find_compact_boundary(&msgs, 8), None);
+        assert_eq!(find_compact_boundary(&msgs, 100), None);
     }
 
     #[test]
-    fn boundary_lands_on_user_message() {
-        // 10 messages, keep_last_n = 4. hint = 6.
-        // We should find a User at index 6+ (or later).
-        let msgs = vec![
-            user("u1"),
-            assistant("a1"),
-            user("u2"),
-            assistant("a2"),
-            user("u3"),
-            assistant("a3"),
-            user("u4"), // idx 6 — clean boundary
-            assistant("a4"),
-            user("u5"),
-            assistant("a5"),
-        ];
-        let cut = find_compact_boundary(&msgs, 4).unwrap();
+    fn boundary_snaps_to_user_after_budget_crossed() {
+        // 10 alternating u/a, each 30 tokens. Budget 100 tokens.
+        // Walking back: a5(30) + u5(30) + a4(30) + u4(30) = 120 → crosses
+        // at index 6 (u4). u4 is a valid cut point → cut at 6.
+        let mut msgs = Vec::new();
+        for _ in 0..5 {
+            msgs.push(user_of_tokens(30));
+            msgs.push(assistant_of_tokens(30));
+        }
+        let cut = find_compact_boundary(&msgs, 100).unwrap();
         assert!(matches!(&msgs[cut], ContextMessage::User { .. }));
-        assert!(cut >= 6);
+        assert_eq!(cut, 6);
     }
 
     #[test]
-    fn boundary_walks_past_orphan_tool_result() {
-        // The natural "keep last 4" starts at index 3, which is a tool
-        // result. Boundary should walk forward until the next user.
+    fn boundary_snaps_forward_off_tool_result() {
+        // Tool result MUST NOT be the first kept message. When the
+        // budget crosses on a tool_result, snap forward to the next
+        // valid cut point.
+        //
+        // Sequence (tokens):
+        //   0: user "u1"           (30)
+        //   1: assistant call t1   (10)
+        //   2: tool_result t1      (30)  ← budget crosses HERE going back
+        //   3: assistant "done"    (10)
+        //   4: user "u2"           (30)
+        //   5: assistant "bye"     (10)
+        //
+        // Budget 40 tokens. Walking back: bye(10)+u2(30)=40 → cross at
+        // idx 4 (u2). u2 is a valid cut point → cut at 4.
+        //
+        // The stronger case: budget 60. Walking back:
+        // bye(10)+u2(30)+done(10)+tr(30) = 80 → cross at idx 2 (tool
+        // result). Must snap forward to next valid cut, which is idx 3
+        // (assistant "done"). NEVER stay at 2.
         let msgs = vec![
-            user("u1"),
+            user_of_tokens(30),
             assistant_tool_call("t1", "bash"),
-            tool_result("t1", "ok"),
-            assistant("done"),
-            user("u2"), // idx 4 — first user after hint
-            assistant("bye"),
+            tool_result_of_tokens("t1", 30),
+            assistant_of_tokens(10),
+            user_of_tokens(30),
+            assistant_of_tokens(10),
         ];
-        let cut = find_compact_boundary(&msgs, 4).unwrap();
-        assert_eq!(cut, 4);
+        let cut = find_compact_boundary(&msgs, 60).unwrap();
+        assert!(
+            !matches!(&msgs[cut], ContextMessage::Tool { .. }),
+            "cut must never land on a tool result"
+        );
+        assert_eq!(cut, 3, "should snap forward to assistant, not the tool");
+    }
+
+    /// Regression for the `/compact` "before == after" bug: when the
+    /// tail is dense with tool_call / tool_result pairs and no User
+    /// message appears near the end, the OLD algorithm returned None
+    /// and compaction silently no-op'd. The new algorithm cuts at the
+    /// nearest Assistant instead.
+    #[test]
+    fn boundary_can_cut_mid_tool_heavy_turn() {
+        // One user turn kicked off, then many tool iterations with no
+        // fresh user message. Total: 1 user + 20 (assistant_call +
+        // tool_result) pairs = 41 messages.
+        let mut msgs = vec![user_of_tokens(50)];
+        for i in 0..20 {
+            msgs.push(assistant_tool_call(&format!("t{i}"), "bash"));
+            msgs.push(tool_result_of_tokens(&format!("t{i}"), 200));
+        }
+        // Tail budget 500 tokens ≈ 2-3 tool_results. No User exists in
+        // the tail — the OLD boundary logic would return None. The NEW
+        // logic must find an Assistant cut point.
+        let cut = find_compact_boundary(&msgs, 500).expect(
+            "tool-heavy tail should still admit a boundary — this is the /compact bug",
+        );
+        assert!(cut > 0);
+        assert!(cut < msgs.len());
+        assert!(
+            !matches!(&msgs[cut], ContextMessage::Tool { .. }),
+            "cut must not start the kept segment on a tool_result"
+        );
     }
 
     #[tokio::test]
@@ -415,12 +562,17 @@ mod tests {
                 Ok(Usage::default())
             }
         }
+        // Each message ~10k tokens (40k chars) so a handful of them
+        // easily exceeds the 20k-token tail budget.
+        let big = "x".repeat(10_000 * CHARS_PER_TOKEN_ESTIMATE);
         let mut ctx = Context::default();
         for i in 1..=10 {
-            ctx.push_user_text(format!("u{i}"));
-            ctx.push_assistant_text(format!("a{i}"));
+            ctx.push_user_text(format!("u{i}-{big}"));
+            ctx.push_assistant_text(format!("a{i}-{big}"));
         }
-        // 20 messages. keep_last_n=8 → boundary somewhere near idx 12.
+        // 20 messages, ~200k tokens total. Boundary should snap
+        // somewhere past the head; tail should keep the newest ~20k
+        // tokens (roughly the last 2-3 messages).
         let res = compact(&mut ctx, &Fake).await;
         let res = res.expect("compaction should occur");
         assert!(res.used_llm);
@@ -441,7 +593,7 @@ mod tests {
         // And the tail must include the very last assistant message.
         match ctx.messages.last().unwrap() {
             ContextMessage::Assistant { content } => match &content[0] {
-                AssistantBlock::Text { text } => assert_eq!(text, "a10"),
+                AssistantBlock::Text { text } => assert!(text.starts_with("a10-")),
                 _ => panic!("expected assistant text"),
             },
             _ => panic!("expected assistant"),
@@ -464,10 +616,11 @@ mod tests {
                 Err("network down".into())
             }
         }
+        let big = "x".repeat(10_000 * CHARS_PER_TOKEN_ESTIMATE);
         let mut ctx = Context::default();
         for i in 1..=10 {
-            ctx.push_user_text(format!("u{i}"));
-            ctx.push_assistant_text(format!("a{i}"));
+            ctx.push_user_text(format!("u{i}-{big}"));
+            ctx.push_assistant_text(format!("a{i}-{big}"));
         }
         let res = compact(&mut ctx, &Broken)
             .await
