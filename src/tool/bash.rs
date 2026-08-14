@@ -69,7 +69,7 @@ impl Tool for BashTool {
         }
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let cmd = args["command"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("command must be a string".into()))?
@@ -78,6 +78,7 @@ impl Tool for BashTool {
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(&cmd)
+            .current_dir(&ctx.cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -259,6 +260,23 @@ mod tests {
             out.content.len() <= 30_000 + 200,
             "got len {}",
             out.content.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn runs_in_ctx_cwd() {
+        let dir = tmp();
+        let ctx = ToolContext { cwd: dir.clone() };
+        let out = BashTool::new()
+            .execute(json!({"command": "pwd"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains(dir.to_str().unwrap()),
+            "bash ran in {} but ctx.cwd was {}",
+            out.content.trim(),
+            dir.display(),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
