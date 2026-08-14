@@ -121,6 +121,61 @@ enum SlashCmd {
     // packages/coding-agent/src/core/keybindings.ts:73-76.
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsRow { Thinking, HideThinking, AutoCompact, DefaultTrust, Keybindings }
+
+fn settings_row_label(sf: &crate::settings_toml::SettingsFile, row: SettingsRow) -> String {
+    match row {
+        SettingsRow::Thinking => format!("Thinking level          {}", sf.thinking_level.map(|l| l.to_string()).unwrap_or_else(|| "off".into())),
+        SettingsRow::HideThinking => format!("Hide thinking output    {}", if sf.hide_thinking.unwrap_or(false) { "on" } else { "off" }),
+        SettingsRow::AutoCompact => format!("Auto-compact            {}", if sf.auto_compact.unwrap_or(true) { "on" } else { "off" }),
+        SettingsRow::DefaultTrust => format!("Default project trust   {}", match sf.default_project_trust.unwrap_or(crate::settings_toml::TrustLevelSer::Ask) {
+            crate::settings_toml::TrustLevelSer::Ask => "ask",
+            crate::settings_toml::TrustLevelSer::Trusted => "trusted",
+            crate::settings_toml::TrustLevelSer::Distrusted => "distrusted",
+        }),
+        SettingsRow::Keybindings => "Keybindings             >".into(),
+    }
+}
+
+fn build_settings_menu(sf: &crate::settings_toml::SettingsFile) -> MenuState<SettingsRow> {
+    let rows = [SettingsRow::Thinking, SettingsRow::HideThinking, SettingsRow::AutoCompact, SettingsRow::DefaultTrust, SettingsRow::Keybindings];
+    MenuState::new(rows.iter().map(|r| MenuItem::new(settings_row_label(sf, *r), "Enter/Space to change", *r)).collect())
+}
+
+fn build_keybindings_menu(bindings: &crate::keys::KeyBindings) -> MenuState<crate::keys::ActionId> {
+    let items: Vec<_> = crate::keys::ActionId::all().iter().map(|a| {
+        let spec = bindings.get(*a).map(|s| s.to_string()).unwrap_or_else(|| "(unbound)".into());
+        MenuItem::new(format!("{:<32} {}", a.label(), spec), "Enter to rebind, Esc to cancel", *a)
+    }).collect();
+    MenuState::new(items)
+}
+
+fn cycle_settings_row(app: &mut App, row: SettingsRow) {
+    use crate::agent::thinking::ThinkingLevel as L;
+    use crate::settings_toml::TrustLevelSer as T;
+    match row {
+        SettingsRow::Thinking => {
+            let next = match app.settings_file.thinking_level {
+                None => Some(L::Minimal), Some(L::Minimal) => Some(L::Low),
+                Some(L::Low) => Some(L::Medium), Some(L::Medium) => Some(L::High),
+                Some(L::High) => Some(L::Xhigh), Some(L::Xhigh) => Some(L::Max),
+                Some(L::Max) => None,
+            };
+            app.settings_file.thinking_level = next;
+            app.thinking = next;
+        }
+        SettingsRow::HideThinking => { let c = app.settings_file.hide_thinking.unwrap_or(false); app.settings_file.hide_thinking = Some(!c); }
+        SettingsRow::AutoCompact => { let c = app.settings_file.auto_compact.unwrap_or(true); app.settings_file.auto_compact = Some(!c); }
+        SettingsRow::DefaultTrust => {
+            let c = app.settings_file.default_project_trust.unwrap_or(T::Ask);
+            app.settings_file.default_project_trust = Some(match c { T::Ask => T::Trusted, T::Trusted => T::Distrusted, T::Distrusted => T::Ask });
+        }
+        SettingsRow::Keybindings => {}
+    }
+    let _ = crate::settings_toml::save(&app.settings_file);
+}
+
 fn slash_items() -> Vec<MenuItem<SlashCmd>> {
     vec![
         MenuItem::new("/model", "Switch to a different model", SlashCmd::Model),
@@ -487,6 +542,10 @@ struct App {
     /// When Some, the `/resume` picker over past sessions in this
     /// cwd is open. Payload is the file path of the chosen session.
     resume_picker: Option<MenuState<PathBuf>>,
+    settings_menu: Option<MenuState<SettingsRow>>,
+    keybindings_menu: Option<MenuState<crate::keys::ActionId>>,
+    capture_key_for: Option<crate::keys::ActionId>,
+    settings_file: crate::settings_toml::SettingsFile,
     /// After picking a fork target: modal asking whether to summarize
     /// the cut-off branch. Three options match PI's UX:
     /// No summary / Summarize (default prompt) / Summarize with custom
@@ -624,6 +683,10 @@ impl App {
             thinking: None,
             turn_was_cancelled: false,
             resume_picker: None,
+            settings_menu: None,
+            keybindings_menu: None,
+            capture_key_for: None,
+            settings_file: crate::settings_toml::SettingsFile::default(),
             capture: CaptureMode::None,
             skill_load,
             no_context_files,
@@ -803,6 +866,45 @@ enum KeyAction {
 /// handled, the palette's open/closed state is re-synced against the
 /// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
+    if let Some(action) = app.capture_key_for {
+        if k.code == KeyCode::Esc {
+            app.capture_key_for = None;
+            app.keybindings_menu = Some(build_keybindings_menu(&app.bindings));
+            return KeyAction::Nothing;
+        }
+        let spec = crate::keys::KeySpec { code: k.code, mods: k.modifiers };
+        app.bindings.set(action, spec);
+        app.settings_file.keybindings = app.bindings.overrides();
+        let _ = crate::settings_toml::save(&app.settings_file);
+        app.capture_key_for = None;
+        app.keybindings_menu = Some(build_keybindings_menu(&app.bindings));
+        return KeyAction::Nothing;
+    }
+    if app.keybindings_menu.is_some() {
+        let m = app.keybindings_menu.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(action) => { app.keybindings_menu = None; app.capture_key_for = Some(action); return KeyAction::Nothing; }
+            MenuAction::Cancel => { app.keybindings_menu = None; app.settings_menu = Some(build_settings_menu(&app.settings_file)); return KeyAction::Nothing; }
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+        }
+    }
+    if app.settings_menu.is_some() {
+        let m = app.settings_menu.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(row) => {
+                if row == SettingsRow::Keybindings {
+                    app.settings_menu = None;
+                    app.keybindings_menu = Some(build_keybindings_menu(&app.bindings));
+                } else {
+                    cycle_settings_row(app, row);
+                    app.settings_menu = Some(build_settings_menu(&app.settings_file));
+                }
+                return KeyAction::Nothing;
+            }
+            MenuAction::Cancel => { app.settings_menu = None; return KeyAction::Nothing; }
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+        }
+    }
     // Ctrl+O — expand the last tool output (PI's `app.tools.expand`).
     if app.bindings.matches(crate::keys::ActionId::ExpandLastTool, k) {
         return KeyAction::ExpandLastTool;
@@ -2087,99 +2189,11 @@ async fn handle_action(
             insert_line(term, Line::from(""))?;
         }
         KeyAction::ShowSettings => {
-            let sf = crate::settings_toml::load();
-            let path = crate::settings_toml::settings_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(unknown)".into());
-            insert_line(term, Line::from(""))?;
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    "Interaction settings",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )]),
-            )?;
-            insert_line(term, Line::from(format!("  path:            {}", path)))?;
-            insert_line(
-                term,
-                Line::from(format!(
-                    "  thinking_level:  {}",
-                    sf.thinking_level.map(|l| l.to_string()).unwrap_or_else(|| "(default)".into())
-                )),
-            )?;
-            insert_line(
-                term,
-                Line::from(format!(
-                    "  hide_thinking:   {}",
-                    sf.hide_thinking.map(|b| b.to_string()).unwrap_or_else(|| "(default)".into())
-                )),
-            )?;
-            insert_line(
-                term,
-                Line::from(format!(
-                    "  auto_compact:    {}",
-                    sf.auto_compact.map(|b| b.to_string()).unwrap_or_else(|| "(default)".into())
-                )),
-            )?;
-            insert_line(
-                term,
-                Line::from(format!(
-                    "  default_trust:   {:?}",
-                    sf.default_project_trust.unwrap_or(crate::settings_toml::TrustLevelSer::Ask)
-                )),
-            )?;
-            insert_line(
-                term,
-                Line::from(format!(
-                    "  vendor:          {}",
-                    app.vendor_id.as_deref().unwrap_or("(none)")
-                )),
-            )?;
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    "  Edit the file above (see /keybindings for chord overrides).",
-                    Style::default()
-                        .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
-                )]),
-            )?;
-            insert_line(term, Line::from(""))?;
+            app.settings_file = crate::settings_toml::load();
+            app.settings_menu = Some(build_settings_menu(&app.settings_file));
         }
         KeyAction::ShowKeybindings => {
-            insert_line(term, Line::from(""))?;
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    "Keybindings (edit under [keybindings] in settings.toml)",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )]),
-            )?;
-            for a in crate::keys::ActionId::all() {
-                let spec = app
-                    .bindings
-                    .get(*a)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "(unbound)".into());
-                let toml_key = match a {
-                    crate::keys::ActionId::ThinkingCycle => "thinking_cycle",
-                    crate::keys::ActionId::ToolCancel => "tool_cancel",
-                    crate::keys::ActionId::ExpandLastTool => "expand_last_tool",
-                    crate::keys::ActionId::NewlineInInput => "newline_in_input",
-                    crate::keys::ActionId::OpenSlashPalette => "open_slash_palette",
-                    crate::keys::ActionId::OpenSettings => "open_settings",
-                };
-                insert_line(
-                    term,
-                    Line::from(format!(
-                        "  {:<32} {:<20} # key: {}",
-                        a.label(),
-                        spec,
-                        toml_key
-                    )),
-                )?;
-            }
-            insert_line(term, Line::from(""))?;
+            app.keybindings_menu = Some(build_keybindings_menu(&app.bindings));
         }
         KeyAction::ShowSkills => {
             // Snapshot skills from the current agent so /new, /resume,
@@ -3481,7 +3495,9 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         || app.resume_picker.is_some()
         || app.fork_picker.is_some()
         || app.model_picker.is_some()
-        || app.palette.is_some();
+        || app.palette.is_some()
+        || app.settings_menu.is_some()
+        || app.keybindings_menu.is_some();
     let max_input_lines = if overlay_open { 1 } else { MAX_INPUT_LINES };
     let input_content_h = app.input.row_count().clamp(1, max_input_lines) as u16;
 
@@ -3504,6 +3520,10 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // summary > resume > fork > model > slash palette.
     if let Some(m) = &app.summary_prompt {
         draw_menu(buf, chunks[0], m, "summarize branch?");
+    } else if let Some(m) = &app.settings_menu {
+        draw_menu(buf, chunks[0], m, "settings");
+    } else if let Some(m) = &app.keybindings_menu {
+        draw_menu(buf, chunks[0], m, "keybindings");
     } else if let Some(m) = &app.resume_picker {
         draw_menu(buf, chunks[0], m, "resume session");
     } else if let Some(m) = &app.fork_picker {
