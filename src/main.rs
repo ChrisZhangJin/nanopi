@@ -10,6 +10,7 @@ use clap::Parser;
 use nanopi::config;
 use nanopi::mode::{interactive, print, tui};
 use nanopi::provider;
+use nanopi::wizard;
 
 /// Minimal CLI — covers the v0.5 acceptance criteria.
 #[derive(Parser, Debug)]
@@ -118,16 +119,62 @@ async fn main() -> ExitCode {
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    // `nanopi init` — explicit invocation of the first-run wizard.
+    // Recognized as a positional message value with no other options
+    // that would imply a real chat turn. Runs BEFORE load_config so
+    // a broken config.toml doesn't block reconfiguration.
+    if is_init_subcommand(&args) {
+        return match wizard::run_wizard(true).await {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
     // Load ~/.nanopi/config.toml + ./.nanopi/config.toml (both optional).
     // Failures here (malformed TOML) are fatal — better to surface early
     // than to silently ignore user intent.
-    let cfg = match config::load_config(&cwd) {
+    let mut cfg = match config::load_config(&cwd) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::from(2);
         }
     };
+
+    // First-run fallthrough: if the user provided no CLI creds, no env
+    // creds, and no on-disk config, launch the wizard and then re-load
+    // the config so the rest of main.rs can pick up the freshly-written
+    // values. Only fires when ALL three axes (model, api_key, base_url)
+    // are simultaneously unresolved — partial-config users get their
+    // existing targeted error message so they know what to fix.
+    let model_missing = args.model.is_none()
+        && std::env::var("OPENAI_MODEL").is_err()
+        && cfg.model.is_none();
+    let key_missing = args.api_key.is_none()
+        && std::env::var("OPENAI_API_KEY").is_err()
+        && cfg.api_key.is_none()
+        && cfg.api_key_file.is_none();
+    let base_missing = args.base_url.is_none()
+        && std::env::var("OPENAI_BASE_URL").is_err()
+        && cfg.base_url.is_none();
+    if model_missing && key_missing && base_missing {
+        eprintln!("nanopi: no config found — launching first-run wizard (Ctrl-C to abort)");
+        if let Err(e) = wizard::run_wizard(false).await {
+            eprintln!("error: {e:#}");
+            return ExitCode::from(2);
+        }
+        // Reload config now that the wizard has (hopefully) written one.
+        cfg = match config::load_config(&cwd) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        };
+    }
 
     // Resolve model: flag > OPENAI_MODEL env > config.toml `model` > error.
     let model = args
@@ -324,6 +371,24 @@ fn should_use_tui(args: &Args) -> bool {
     // Auto: TTY on stdin means an interactive user session.
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
+}
+
+/// Detect `nanopi init`: the positional message is exactly "init" AND
+/// no other flag that would imply a real chat turn is set. Keeping the
+/// check narrow means a user who literally wants to send the word "init"
+/// as a prompt can still do so with `-m init`.
+fn is_init_subcommand(args: &Args) -> bool {
+    if args.positional_message.as_deref() != Some("init") {
+        return false;
+    }
+    args.message.is_none()
+        && !args.print
+        && !args.continue_session
+        && args.session_id.is_none()
+        && args.fork_id.is_none()
+        && args.model.is_none()
+        && args.base_url.is_none()
+        && args.api_key.is_none()
 }
 
 /// Expand a leading `~/` to `$HOME/`. Best-effort — if HOME is unset,
