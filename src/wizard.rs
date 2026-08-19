@@ -149,7 +149,16 @@ pub async fn probe_config(
             let snippet: String = body.chars().take(240).collect();
             Err(format!("HTTP {}: {snippet}", status.as_u16()))
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            use std::error::Error;
+            let mut msg = e.to_string();
+            let mut src: Option<&dyn Error> = e.source();
+            while let Some(s) = src {
+                msg.push_str(&format!(": {s}"));
+                src = s.source();
+            }
+            Err(msg)
+        }
     }
 }
 
