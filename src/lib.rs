@@ -12,6 +12,7 @@ pub mod session;
 pub mod settings;
 pub mod settings_toml;
 pub mod trust;
+pub mod wizard;
 
 pub mod agent;
 pub mod mode;
