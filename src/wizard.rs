@@ -221,9 +221,14 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
     print!("{prompt}");
     io::stdout().flush().ok();
     let mut buf = String::new();
-    io::stdin()
+    let n = io::stdin()
         .read_line(&mut buf)
         .context("read stdin")?;
+    if n == 0 {
+        // EOF — closed stdin (pipe finished, ^D). Bail so callers'
+        // "required" retry loops don't spin forever on empty reads.
+        anyhow::bail!("wizard: stdin closed before input was provided");
+    }
     Ok(buf.trim().to_string())
 }
 
@@ -352,20 +357,16 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
             }
         }
 
-        // Write key file (skip for localhost) then config.toml.
-        let api_key_file_toml: Option<&str> = if localhost {
-            None
-        } else {
-            write_key_file(&key_path, &api_key)?;
-            Some("~/.nanopi/api_key")
-        };
-        write_config_toml(&cfg_path, &model, &base_url, &api_kind, api_key_file_toml)?;
+        // Write key file (empty for localhost) then config.toml.
+        // We always emit api_key_file so subsequent launches load
+        // cleanly — the config loader accepts an empty key file for
+        // no-auth localhost endpoints.
+        write_key_file(&key_path, &api_key)?;
+        write_config_toml(&cfg_path, &model, &base_url, &api_kind, Some("~/.nanopi/api_key"))?;
 
         println!();
         println!("wrote {}", cfg_path.display());
-        if !localhost {
-            println!("wrote {} (mode 0600)", key_path.display());
-        }
+        println!("wrote {} (mode 0600)", key_path.display());
         return Ok(());
     }
 }
@@ -453,7 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn write_config_toml_omits_key_file_for_localhost() {
+    fn write_config_toml_localhost_still_emits_api_key_file() {
+        // Regression: wizard used to omit api_key_file for localhost,
+        // which broke the next `nanopi` launch with "no api_key" error.
+        // Now it always points at the (possibly empty) key file.
         let mut path = std::env::temp_dir();
         path.push(format!(
             "nanopi-wizard-cfg-ollama-{}.toml",
@@ -464,15 +468,17 @@ mod tests {
             "llama3.2",
             "http://localhost:11434/v1",
             "openai",
-            None,
+            Some("~/.nanopi/api_key"),
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("api_key_file"), "got: {text}");
-        assert!(!text.contains("api_key ="), "got: {text}");
+        assert!(text.contains("api_key_file"), "got: {text}");
         let cfg: crate::config::Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg.model.as_deref(), Some("llama3.2"));
-        assert!(cfg.api_key_file.is_none());
+        assert_eq!(
+            cfg.api_key_file.as_deref(),
+            Some(std::path::Path::new("~/.nanopi/api_key"))
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
