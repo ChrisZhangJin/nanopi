@@ -238,7 +238,23 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
         // "required" retry loops don't spin forever on empty reads.
         anyhow::bail!("wizard: stdin closed before input was provided");
     }
-    Ok(buf.trim().to_string())
+    let s = buf.trim();
+    // Strip a single pair of matching surrounding quotes — users often
+    // paste URLs/keys with quotes from docs and Rust would otherwise
+    // treat them as part of the value.
+    let s = if s.len() >= 2 {
+        let b = s.as_bytes();
+        let first = b[0];
+        let last = b[s.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+    Ok(s.to_string())
 }
 
 /// The interactive entry point.
