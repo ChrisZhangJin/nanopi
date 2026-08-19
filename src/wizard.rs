@@ -239,9 +239,6 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
         anyhow::bail!("wizard: stdin closed before input was provided");
     }
     let s = buf.trim();
-    // Strip a single pair of matching surrounding quotes — users often
-    // paste URLs/keys with quotes from docs and Rust would otherwise
-    // treat them as part of the value.
     let s = if s.len() >= 2 {
         let b = s.as_bytes();
         let first = b[0];
@@ -257,6 +254,84 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
     Ok(s.to_string())
 }
 
+/// Prompt with an optional default. Empty input returns the default.
+/// `label` is the bare field name (e.g. "base_url"); we append the
+/// bracketed default and the ": " ourselves.
+fn read_line_default(label: &str, default: Option<&str>) -> anyhow::Result<String> {
+    let p = match default {
+        Some(d) if !d.is_empty() => format!("{label} [{d}]: "),
+        _ => format!("{label}: "),
+    };
+    let v = read_line(&p)?;
+    if v.is_empty() {
+        Ok(default.unwrap_or("").to_string())
+    } else {
+        Ok(v)
+    }
+}
+
+/// A partial wizard attempt, persisted between runs so the user can
+/// resume after a probe failure or Ctrl-C without re-typing long URLs
+/// and API keys.
+#[derive(Debug, Default)]
+struct WizardDraft {
+    base_url: Option<String>,
+    api_kind: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+}
+
+/// Very small TOML reader for the 4 known keys. Missing file → empty draft.
+fn load_draft(path: &Path) -> WizardDraft {
+    let mut d = WizardDraft::default();
+    let Ok(s) = std::fs::read_to_string(path) else { return d };
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let k = k.trim();
+        let v = v.trim().trim_matches('"').to_string();
+        match k {
+            "base_url" => d.base_url = Some(v),
+            "api_kind" => d.api_kind = Some(v),
+            "model" => d.model = Some(v),
+            "api_key" => d.api_key = Some(v),
+            _ => {}
+        }
+    }
+    d
+}
+
+/// Write the draft with 0600 perms (it contains the api key).
+fn save_draft(path: &Path, d: &WizardDraft) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent dir for {}", path.display()))?;
+    }
+    let mut s = String::new();
+    s.push_str("# nanopi wizard draft — deleted on successful config write\n");
+    if let Some(v) = &d.base_url { s.push_str(&format!("base_url = {}\n", toml_escape(v))); }
+    if let Some(v) = &d.api_kind { s.push_str(&format!("api_kind = {}\n", toml_escape(v))); }
+    if let Some(v) = &d.model { s.push_str(&format!("model = {}\n", toml_escape(v))); }
+    if let Some(v) = &d.api_key { s.push_str(&format!("api_key = {}\n", toml_escape(v))); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o600)
+            .open(path)
+            .with_context(|| format!("open {} for write", path.display()))?;
+        f.write_all(s.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, s)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// The interactive entry point.
 ///
 /// `force_overwrite_prompt=true`: coming from `nanopi init`; if
@@ -270,6 +345,8 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("cannot resolve ~/.nanopi (HOME unset and NANOPI_HOME unset)"))?;
     let cfg_path = home.join("config.toml");
     let key_path = home.join("api_key");
+    let draft_path = home.join("wizard_draft.toml");
+    let draft = load_draft(&draft_path);
 
     if force_overwrite_prompt && cfg_path.exists() {
         let ans = read_line(&format!(
@@ -302,22 +379,25 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
         // Fill (base_url, api_kind, model) — for Custom, prompt each.
         let (base_url, api_kind, model) = if preset.is_custom {
             let base_url = loop {
-                let v = read_line("base_url: ")?;
+                let v = read_line_default("base_url", draft.base_url.as_deref())?;
                 if !v.is_empty() {
                     break v;
                 }
                 println!("base_url is required.");
             };
             let api_kind = loop {
-                let v = read_line("api_kind [openai/anthropic] [openai]: ")?;
-                let v = if v.is_empty() { "openai".into() } else { v };
+                let default = draft.api_kind.as_deref().unwrap_or("openai");
+                let v = read_line_default(
+                    "api_kind [openai/anthropic]",
+                    Some(default),
+                )?;
                 if v == "openai" || v == "anthropic" {
                     break v;
                 }
                 println!("api_kind must be `openai` or `anthropic`.");
             };
             let model = loop {
-                let v = read_line("model: ")?;
+                let v = read_line_default("model", draft.model.as_deref())?;
                 if !v.is_empty() {
                     break v;
                 }
@@ -347,13 +427,22 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
             String::new()
         } else {
             loop {
-                let v = read_line("api key: ")?;
+                let v = read_line_default("api key", draft.api_key.as_deref())?;
                 if !v.is_empty() {
                     break v;
                 }
                 println!("api key is required (or pick Ollama/localhost to skip).");
             }
         };
+
+        // Save draft before probing so a Ctrl-C or aborted retry loop
+        // leaves the filled fields on disk for the next run.
+        let _ = save_draft(&draft_path, &WizardDraft {
+            base_url: Some(base_url.clone()),
+            api_kind: Some(api_kind.clone()),
+            model: Some(model.clone()),
+            api_key: if api_key.is_empty() { None } else { Some(api_key.clone()) },
+        });
 
         // Probe.
         'probe: loop {
@@ -388,6 +477,7 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
         // no-auth localhost endpoints.
         write_key_file(&key_path, &api_key)?;
         write_config_toml(&cfg_path, &model, &base_url, &api_kind, Some("~/.nanopi/api_key"))?;
+        let _ = std::fs::remove_file(&draft_path);
 
         println!();
         println!("wrote {}", cfg_path.display());
