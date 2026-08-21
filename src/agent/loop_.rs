@@ -105,21 +105,79 @@ impl Agent {
     /// on prior history. Used by `--continue` and the v0.6 multi-turn
     /// TUI.
     pub fn load_session(session_path: &Path, cwd: &Path) -> Result<Self, AgentError> {
-        use crate::agent::context::{ContentBlock, ContextMessage};
+        use crate::agent::context::{
+            AssistantBlock, ContentBlock, ContextMessage, ToolCallBlock,
+        };
         let (header, entries) = crate::session::read_session(session_path)?;
         let mut context = Context::default();
+
+        // Assistant turns are written to the JSONL in split form:
+        //   Message(assistant, text)? then ToolCall* then ToolResult*
+        // Anthropic requires a single Assistant message per turn that
+        // holds the text AND the tool_use blocks together, so on replay
+        // we hold the assistant "open" and merge ToolCall entries into
+        // it before flushing. Anything else (User / Tool result /
+        // Compaction / BranchSummary) closes the pending block.
+        let mut pending: Option<Vec<AssistantBlock>> = None;
+        let flush = |pending: &mut Option<Vec<AssistantBlock>>, context: &mut Context| {
+            if let Some(blocks) = pending.take() {
+                if !blocks.is_empty() {
+                    context
+                        .messages
+                        .push(ContextMessage::Assistant { content: blocks });
+                }
+            }
+        };
+
         for entry in entries {
             match entry {
                 SessionEntry::Message { role, content, .. } => match role.as_str() {
-                    "user" => context.push_user_text(content),
-                    "assistant" => context.push_assistant_text(content),
+                    "user" => {
+                        flush(&mut pending, &mut context);
+                        context.push_user_text(content);
+                    }
+                    "assistant" => {
+                        flush(&mut pending, &mut context);
+                        pending = Some(vec![AssistantBlock::Text { text: content }]);
+                    }
                     _ => {}
                 },
+                SessionEntry::ToolCall {
+                    id,
+                    tool_name,
+                    arguments,
+                    ..
+                } => {
+                    let blocks = pending.get_or_insert_with(Vec::new);
+                    blocks.push(AssistantBlock::ToolCall {
+                        call: ToolCallBlock {
+                            id,
+                            name: tool_name,
+                            arguments,
+                        },
+                    });
+                }
+                SessionEntry::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                    images,
+                    ..
+                } => {
+                    flush(&mut pending, &mut context);
+                    context.push_tool_result_with_images(
+                        tool_call_id,
+                        content,
+                        is_error,
+                        images,
+                    );
+                }
                 SessionEntry::Compaction {
                     summary,
                     replaced_count,
                     ..
                 } => {
+                    flush(&mut pending, &mut context);
                     // On replay: the first N messages we've pushed so far
                     // are the ones that were summarized. Drop them and
                     // insert the summary at index 0 so the surviving tail
@@ -134,6 +192,7 @@ impl Agent {
                     context.messages.insert(0, summary_msg);
                 }
                 SessionEntry::BranchSummary { summary, .. } => {
+                    flush(&mut pending, &mut context);
                     // Written by the fork picker's "Summarize branch"
                     // action to carry over what happened on the branch
                     // we abandoned. Replayed at its position (in order),
@@ -147,6 +206,7 @@ impl Agent {
                 _ => {}
             }
         }
+        flush(&mut pending, &mut context);
         Ok(Self {
             context,
             provider: Box::new(OpenAiProvider::new("", "", "")),
@@ -1686,6 +1746,168 @@ mod tests {
                 assert_eq!(text, "after");
             }
             _ => panic!("expected trailing user"),
+        }
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Regression: `--continue` used to drop every ToolCall and ToolResult
+    /// entry from the reloaded Context (they hit the `_ => {}` arm), so
+    /// the resumed model saw a text-only chat and stopped calling tools
+    /// — narrating shell commands as prose instead. This pins that a
+    /// text+tool_call assistant turn round-trips through load_session as
+    /// one Assistant message holding both blocks, followed by the Tool
+    /// result and the next assistant text.
+    #[test]
+    fn load_session_replays_tool_calls() {
+        use crate::agent::context::{AssistantBlock, ContextMessage};
+        let _g = lock();
+        let home = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = tmp();
+
+        let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+
+        // User asks → assistant emits text + a bash tool_call → tool result → assistant follow-up text.
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "count folders in /home".into(),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "assistant".into(),
+                content: "checking".into(),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::ToolCall {
+                id: "call_1".into(),
+                timestamp: time::now_iso8601(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({"command": "find /home -maxdepth 1 -type d | wc -l"}),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::ToolResult {
+                tool_call_id: "call_1".into(),
+                timestamp: time::now_iso8601(),
+                content: "44".into(),
+                is_error: false,
+                images: Vec::new(),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "assistant".into(),
+                content: "44 folders".into(),
+            },
+        )
+        .unwrap();
+
+        let agent = Agent::load_session(&path, &cwd).expect("load");
+
+        // Expected: [User, Assistant(Text+ToolCall), Tool(result), Assistant(Text)]
+        assert_eq!(agent.context.messages.len(), 4, "messages: {:#?}", agent.context.messages);
+
+        match &agent.context.messages[1] {
+            ContextMessage::Assistant { content } => {
+                assert_eq!(content.len(), 2, "text + tool_call must be merged");
+                match &content[0] {
+                    AssistantBlock::Text { text } => assert_eq!(text, "checking"),
+                    b => panic!("expected Text first, got {b:?}"),
+                }
+                match &content[1] {
+                    AssistantBlock::ToolCall { call } => {
+                        assert_eq!(call.id, "call_1");
+                        assert_eq!(call.name, "bash");
+                    }
+                    b => panic!("expected ToolCall second, got {b:?}"),
+                }
+            }
+            m => panic!("expected Assistant, got {m:?}"),
+        }
+
+        match &agent.context.messages[2] {
+            ContextMessage::Tool {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_1");
+                assert_eq!(content, "44");
+                assert!(!is_error);
+            }
+            m => panic!("expected Tool result, got {m:?}"),
+        }
+
+        // A pure tool-call iteration (no assistant text) still replays as
+        // an Assistant message carrying just the ToolCall block.
+        let (path2, _hdr2) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+        crate::session::append_entry(
+            &path2,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "run it".into(),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path2,
+            &SessionEntry::ToolCall {
+                id: "call_2".into(),
+                timestamp: time::now_iso8601(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path2,
+            &SessionEntry::ToolResult {
+                tool_call_id: "call_2".into(),
+                timestamp: time::now_iso8601(),
+                content: "a\nb".into(),
+                is_error: false,
+                images: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let agent2 = Agent::load_session(&path2, &cwd).expect("load2");
+        assert_eq!(agent2.context.messages.len(), 3);
+        match &agent2.context.messages[1] {
+            ContextMessage::Assistant { content } => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(content[0], AssistantBlock::ToolCall { .. }));
+            }
+            m => panic!("expected Assistant with lone ToolCall, got {m:?}"),
         }
 
         if let Some(p) = prev {
