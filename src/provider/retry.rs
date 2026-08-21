@@ -124,6 +124,29 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     None
 }
 
+/// Cheap 0..1 pseudo-random from the current nanosecond of the clock.
+/// Good enough for retry jitter — we don't need cryptographic entropy.
+/// Lives here so every provider that reaches for `compute_delay` can also
+/// grab a jitter source without duplicating the same 4 lines.
+pub(crate) fn rand01() -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.subsec_nanos() as f64) / 1_000_000_000.0
+}
+
+/// Truncate a string to at most `n` characters, appending `…` when cut.
+/// Used by retry logging to keep noisy gateway error bodies from wrapping.
+pub(crate) fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(n).collect();
+        t.push('…');
+        t
+    }
+}
+
 /// Compute the delay for attempt `n` (0-indexed): exponential base *
 /// 2^n, then jitter (subtract up to `jitter` fraction), then cap.
 /// A server-provided `Retry-After` always wins (still capped by

@@ -181,24 +181,7 @@ fn normalize_mangled_tool_name(name: &str) -> String {
         .unwrap_or(lower)
 }
 
-/// Cheap 0..1 pseudo-random from the current nanosecond of the clock.
-/// Good enough for retry jitter — we don't need cryptographic entropy.
-fn rand01() -> f64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    (now.subsec_nanos() as f64) / 1_000_000_000.0
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(n).collect();
-        t.push('…');
-        t
-    }
-}
+use crate::provider::retry::{rand01, truncate};
 
 /// The OpenAI-compatible provider.
 pub struct OpenAiProvider {

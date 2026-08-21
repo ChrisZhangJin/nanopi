@@ -377,70 +377,183 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
             }
         }
 
-        // Reqwest has no default send timeout — a gateway that accepts
-        // the TCP connection but never sends response headers would
-        // hang forever. Cap the header-wait at 60s; streaming body
-        // reads afterwards have no cap (LLM streams legitimately run
-        // for minutes). See openai.rs for the same guard.
-        let send_fut = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send();
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(60), send_fut).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(_elapsed) => {
-                return Err("send timeout: no response headers after 60s".into());
-            }
+        // ── Retry envelope: mirrors openai.rs. Covers the HTTP open
+        // (429 / 5xx / transient network / 60s send-timeout on hung
+        // gateways) AND mid-stream errors that arrive before we've
+        // emitted anything to `tx`. Once Start is sent, retrying would
+        // duplicate content — we stop.
+        use crate::provider::retry::{
+            compute_delay, is_retryable_message, is_retryable_status, parse_retry_after, rand01,
+            truncate, RetryConfig,
         };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {}: {}", status.as_u16(), body));
-        }
-
-        let byte_stream = resp.bytes_stream();
-        let mut sse = SseStream::new(byte_stream);
-
-        // Per-block state for accumulating tool_use partial_json.
         use std::collections::HashMap;
-        let mut pending: HashMap<u32, PendingAnthropicTool> = HashMap::new();
-        let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
-        let mut started = false;
-        let mut final_usage = Usage::default();
+        let retry = RetryConfig::default();
+        let mut attempt: u32 = 0;
+        let final_usage;
 
-        while let Some(ev) = sse.next().await {
-            let ev = ev.map_err(|e| e.to_string())?;
-            let chunk: WireEvent = match serde_json::from_str(&ev.data) {
-                Ok(c) => c,
-                Err(_) => {
-                    // Non-Anthropic-shape payload. Before dropping it,
-                    // check for a gateway-wrapped error — several
-                    // proxies (e.g. corporate LiteLLM setups) return
-                    // HTTP 200 with an SSE `event: error` whose data
-                    // uses a schema Anthropic never emits, like
-                    //   {"error":"...","status":401,"details":"..."}
-                    // The SseStream drops the `event:` line, so the
-                    // only clue is that this JSON parses as an object
-                    // with an "error" key. Without this catch, the
-                    // whole stream ended silently — the user saw
-                    // nothing printed at all.
-                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                        if let Some(msg) = extract_gateway_error(&v) {
-                            return Err(format!("gateway: {msg}"));
+        'retry: loop {
+            // Reqwest has no default send timeout — a gateway that
+            // accepts the TCP connection but never sends response
+            // headers would hang forever. Cap the header-wait at 60s;
+            // streaming body reads afterwards have no cap.
+            let send_fut = self
+                .client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send();
+            let send_res =
+                match tokio::time::timeout(std::time::Duration::from_secs(60), send_fut).await {
+                    Ok(res) => res,
+                    Err(_elapsed) => {
+                        if attempt >= retry.max_attempts {
+                            return Err("send timeout: no response headers after 60s".into());
                         }
+                        let delay = compute_delay(attempt, &retry, None, rand01());
+                        eprintln!(
+                            "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
+                            attempt + 1,
+                            retry.max_attempts,
+                            delay.as_secs_f64(),
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry;
                     }
-                    continue;
+                };
+
+            let resp = match send_res {
+                Ok(resp) if resp.status().is_success() => resp,
+                Ok(resp) => {
+                    let status = resp.status();
+                    let hint = parse_retry_after(resp.headers());
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let retryable =
+                        is_retryable_status(status.as_u16()) || is_retryable_message(&body_text);
+                    if attempt >= retry.max_attempts || !retryable {
+                        return Err(format!("HTTP {}: {}", status.as_u16(), body_text));
+                    }
+                    let delay = compute_delay(attempt, &retry, hint, rand01());
+                    eprintln!(
+                        "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                        status.as_u16(),
+                        truncate(&body_text, 100),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let retryable = is_retryable_message(&msg);
+                    if attempt >= retry.max_attempts || !retryable {
+                        return Err(msg);
+                    }
+                    let delay = compute_delay(attempt, &retry, None, rand01());
+                    eprintln!(
+                        "[retrying ({}/{}) after {:.1}s: {}]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                        truncate(&msg, 100),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry;
                 }
             };
-            if let Some(err) = chunk.error {
-                return Err(format!("api: {}", err.message));
-            }
+
+            let byte_stream = resp.bytes_stream();
+            let mut sse = SseStream::new(byte_stream);
+
+            // Per-block state for accumulating tool_use partial_json. Fresh per attempt.
+            let mut pending: HashMap<u32, PendingAnthropicTool> = HashMap::new();
+            let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
+            let mut started = false;
+            let mut usage_local = Usage::default();
+
+            while let Some(ev) = sse.next().await {
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !started
+                            && attempt < retry.max_attempts
+                            && is_retryable_message(&msg)
+                        {
+                            let delay = compute_delay(attempt, &retry, None, rand01());
+                            eprintln!(
+                                "[retrying ({}/{}) after {:.1}s: {}]",
+                                attempt + 1,
+                                retry.max_attempts,
+                                delay.as_secs_f64(),
+                                truncate(&msg, 100),
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue 'retry;
+                        }
+                        return Err(msg);
+                    }
+                };
+                let chunk: WireEvent = match serde_json::from_str(&ev.data) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Non-Anthropic-shape payload. Before dropping
+                        // it, check for a gateway-wrapped error —
+                        // several proxies (e.g. corporate LiteLLM
+                        // setups) return HTTP 200 with an SSE
+                        // `event: error` whose data uses a schema
+                        // Anthropic never emits, like
+                        //   {"error":"...","status":401,"details":"..."}
+                        // Without this catch, the whole stream ends
+                        // silently — the user saw nothing printed.
+                        if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                            if let Some(msg) = extract_gateway_error(&v) {
+                                if !started
+                                    && attempt < retry.max_attempts
+                                    && is_retryable_message(&msg)
+                                {
+                                    let delay = compute_delay(attempt, &retry, None, rand01());
+                                    eprintln!(
+                                        "[retrying ({}/{}) after {:.1}s: {}]",
+                                        attempt + 1,
+                                        retry.max_attempts,
+                                        delay.as_secs_f64(),
+                                        truncate(&msg, 100),
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                    attempt += 1;
+                                    continue 'retry;
+                                }
+                                return Err(format!("gateway: {msg}"));
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if let Some(err) = chunk.error {
+                    let msg = err.message.clone();
+                    if !started && attempt < retry.max_attempts && is_retryable_message(&msg) {
+                        let delay = compute_delay(attempt, &retry, None, rand01());
+                        eprintln!(
+                            "[retrying ({}/{}) after {:.1}s: {}]",
+                            attempt + 1,
+                            retry.max_attempts,
+                            delay.as_secs_f64(),
+                            truncate(&msg, 100),
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry;
+                    }
+                    return Err(format!("api: {msg}"));
+                }
             if !started {
                 if let Some(msg) = chunk.message {
                     started = true;
@@ -541,7 +654,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                                 _ => FinishReason::Unknown,
                             };
                             if let Some(u) = chunk.usage {
-                                final_usage = Usage {
+                                usage_local = Usage {
                                     input_tokens: u.input_tokens,
                                     output_tokens: u.output_tokens,
                                     cache_read_tokens: u.cache_read_input_tokens,
@@ -551,7 +664,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                             let _ = tx
                                 .send(AgentEvent::Done {
                                     finish_reason: finish,
-                                    usage: final_usage.clone(),
+                                    usage: usage_local.clone(),
                                 })
                                 .await;
                         }
@@ -562,6 +675,9 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                 }
                 _ => {}
             }
+            }
+            final_usage = usage_local;
+            break 'retry;
         }
         Ok(final_usage)
     }
