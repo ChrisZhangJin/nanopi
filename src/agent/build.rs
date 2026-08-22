@@ -172,6 +172,17 @@ impl Agent {
         self.api_key = api_key;
         self.no_context_files = no_context_files;
 
+        // load_session rebuilds Context from JSONL messages only — it
+        // never repopulates `tools`. Without this line, the first turn
+        // after `--continue` goes out with `tools: []`. Models that
+        // rely on the request's tool declarations to route into their
+        // native tool-call channel (e.g. minimax-M3, whose sentinel
+        // tokens `<]minimax[>` leak into `content` as scrambled text
+        // when tools are missing) then narrate tool calls instead of
+        // invoking them. TUI resume paths were setting this manually;
+        // interactive/print `--continue` was not.
+        self.context.tools = self.registry.all_specs();
+
         let LoadSkillsResult {
             skills,
             diagnostics,
@@ -285,6 +296,66 @@ mod tests {
         let bare = compose_system_prompt(&cwd, &tools(), &[], true);
         assert!(!bare.contains("<project_context>"));
         assert!(!bare.contains("PROJECT RULES HERE"));
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Regression: `Agent::load_session` returns a Context with empty
+    /// `tools`, so `hydrate_resumed` must repopulate it from the
+    /// registry. If it doesn't, the first request after `--continue`
+    /// goes out with `tools: []` and models like minimax-M3 emit their
+    /// native tool-call sentinel tokens as visible text instead of
+    /// invoking tools.
+    ///
+    /// This test drives the full resume pipeline through the wire-format
+    /// builder — load_session → hydrate_resumed → build_request — and
+    /// asserts the outgoing JSON body carries a non-empty `tools` array,
+    /// which is what the buggy path was omitting.
+    #[test]
+    fn hydrate_resumed_repopulates_tools() {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+
+        let _g = crate::TEST_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NANOPI_HOME");
+        let home = tmpdir("home");
+        std::env::set_var("NANOPI_HOME", &home);
+
+        let cwd = tmpdir("cwd");
+        let (path, _hdr) =
+            crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+        let mut agent = Agent::load_session(&path, &cwd).expect("load");
+        assert!(
+            agent.context.tools.is_empty(),
+            "load_session should leave tools empty — hydrate is what repopulates them"
+        );
+
+        let registry = ToolRegistry::standard();
+        let expected = registry.all_specs().len();
+        let _ = agent.hydrate_resumed(
+            Box::new(OpenAiProvider::new("", "", "")),
+            registry,
+            PermissionGate::from_cli(false, None),
+            HooksConfig::default(),
+            "m".into(),
+            "http://x".into(),
+            "".into(),
+            SkillLoadPolicy::default(),
+            true,
+        );
+
+        assert_eq!(
+            agent.context.tools.len(),
+            expected,
+            "hydrate_resumed must repopulate ctx.tools from the registry"
+        );
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);

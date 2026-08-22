@@ -879,6 +879,122 @@ mod tests {
         assert_eq!(req.tools[0].function.name, "bash");
     }
 
+    /// End-to-end wire-format regression for the `--continue` bug:
+    ///
+    ///   load_session (drops tools) → hydrate_resumed (must repopulate)
+    ///   → build_request (must emit non-empty `tools`)
+    ///
+    /// Under the bug, `hydrate_resumed` left `ctx.tools` empty, so
+    /// `WireRequest.tools` was `[]` — and because the field is marked
+    /// `skip_serializing_if = Vec::is_empty`, the `tools` key was
+    /// omitted from the outgoing JSON entirely. That's what made
+    /// minimax-M3 leak its native tool-call sentinel tokens
+    /// (`<]minimax[>`) into `content` as visible text after resume.
+    #[test]
+    fn resumed_session_outgoing_request_has_tools() {
+        use crate::agent::build::SkillLoadPolicy;
+        use crate::agent::loop_::{Agent, HooksConfig};
+        use crate::agent::permission::PermissionGate;
+        use crate::session::SessionEntry;
+        use crate::tool::ToolRegistry;
+        use crate::util::{time, uuid};
+
+        let _g = crate::TEST_LOCK.lock().unwrap();
+        let prev_home = std::env::var_os("NANOPI_HOME");
+        let home = std::env::temp_dir().join(format!("nanopi-resume-tools-{}", uuid::v7()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NANOPI_HOME", &home);
+
+        let cwd = std::env::temp_dir().join(format!("nanopi-resume-cwd-{}", uuid::v7()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Mint a session that already exercised a tool — this mirrors the
+        // real 3.jsonl repro: prior turn made a tool_call, tool_result
+        // returned, then the user asks a new question and hits --continue.
+        let (path, _hdr) =
+            crate::session::new_session(&cwd, "minimax-M3", "https://api.minimaxi.com/v1")
+                .expect("new session");
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::Message {
+                id: uuid::v7().to_string(),
+                timestamp: time::now_iso8601(),
+                role: "user".into(),
+                content: "list this folder".into(),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::ToolCall {
+                id: "call_prior".into(),
+                timestamp: time::now_iso8601(),
+                tool_name: "ls".into(),
+                arguments: json!({"path": "."}),
+            },
+        )
+        .unwrap();
+        crate::session::append_entry(
+            &path,
+            &SessionEntry::ToolResult {
+                tool_call_id: "call_prior".into(),
+                timestamp: time::now_iso8601(),
+                content: "".into(),
+                is_error: false,
+                images: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // Full --continue pipeline: load + hydrate.
+        let mut agent = Agent::load_session(&path, &cwd).expect("load");
+        let registry = ToolRegistry::standard();
+        let expected_tools = registry.all_specs().len();
+        let _ = agent.hydrate_resumed(
+            Box::new(OpenAiProvider::new(
+                "https://api.minimaxi.com/v1",
+                "",
+                "minimax-M3",
+            )),
+            registry,
+            PermissionGate::from_cli(false, None),
+            HooksConfig::default(),
+            "minimax-M3".into(),
+            "https://api.minimaxi.com/v1".into(),
+            "".into(),
+            SkillLoadPolicy::default(),
+            true,
+        );
+
+        // Wire body — serialize to JSON to actually exercise the
+        // `skip_serializing_if` path that hid the bug.
+        let req = build_request(&agent.context, "minimax-M3");
+        let body = serde_json::to_value(&req).expect("serialize wire body");
+        let tools = body.get("tools").expect(
+            "outgoing request after --continue must include a `tools` key \
+             (empty Vec is dropped by skip_serializing_if, which caused \
+             minimax-M3 to leak sentinel tokens into content)",
+        );
+        let arr = tools.as_array().expect("`tools` must be a JSON array");
+        assert_eq!(arr.len(), expected_tools);
+        for t in arr {
+            assert_eq!(t.get("type").and_then(|v| v.as_str()), Some("function"));
+            assert!(t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .is_some());
+        }
+
+        if let Some(p) = prev_home {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
     #[test]
     fn build_request_includes_tool_messages() {
         let mut ctx = Context::default();
