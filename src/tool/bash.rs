@@ -6,6 +6,10 @@
 //!   - overflow is stored at `os::tmpdir()/nanopi-bash-<id>.log` and the
 //!     tool output references the path so the model can read it.
 //!
+//! An overflow file is written ONLY when one of those caps actually
+//! fires. Output that fits is returned verbatim and leaves nothing
+//! behind in the tmpdir.
+//!
 //! Timeout: 30 seconds (configurable). On timeout, returns partial output
 //! with `is_error: true`.
 //!
@@ -147,18 +151,41 @@ impl Tool for BashTool {
             combined.push_str(&err);
         }
 
-        // Truncate by lines first, then by bytes.
-        let truncated_lines = combined
-            .lines()
-            .take(max_lines)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut truncated = truncated_lines;
-        if truncated.len() > max_bytes {
-            truncated.truncate(max_bytes);
+        // Truncate by lines first, then by bytes, tracking whether
+        // either cap actually fired.
+        //
+        // Do NOT infer truncation by rebuilding the string and comparing
+        // lengths against `combined`. `lines()` drops the trailing
+        // newline that virtually every command emits, so `join("\n")`
+        // comes back at least one byte short even when nothing was
+        // dropped — which made `echo hi` report itself as truncated,
+        // spill a 3-byte `nanopi-bash-*.log` into the tmpdir, and tell
+        // the model to go read a file holding the output it already had.
+        let mut lines_iter = combined.lines();
+        let head: Vec<&str> = lines_iter.by_ref().take(max_lines).collect();
+        let line_capped = lines_iter.next().is_some();
+
+        let mut truncated = if line_capped {
+            head.join("\n")
+        } else {
+            // Nothing dropped — hand back the output verbatim so the
+            // trailing newline and any \r\n survive intact.
+            combined.clone()
+        };
+
+        let byte_capped = truncated.len() > max_bytes;
+        if byte_capped {
+            // Walk back to a char boundary first: `String::truncate`
+            // panics when the index splits a multi-byte character, so
+            // >30 KB of CJK or emoji output would take down the agent.
+            let mut cut = max_bytes;
+            while cut > 0 && !truncated.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            truncated.truncate(cut);
         }
 
-        let overflow_path = if truncated.len() < combined.len() {
+        let overflow_path = if line_capped || byte_capped {
             Some(write_overflow(&combined).await)
         } else {
             None
@@ -261,6 +288,61 @@ mod tests {
             "got len {}",
             out.content.len()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Small output must NOT spill an overflow file, and must not tell
+    /// the model its output was truncated. Regression for the tmpdir
+    /// filling up with 3-byte `nanopi-bash-*.log` files.
+    #[tokio::test]
+    async fn small_output_writes_no_overflow_file() {
+        let dir = tmp();
+        let ctx = ToolContext { cwd: dir.clone() };
+        for cmd in ["echo hi", "printf 'no trailing newline'", "echo 你好世界"] {
+            let out = BashTool::new()
+                .execute(json!({ "command": cmd }), &ctx)
+                .await
+                .unwrap();
+            let overflow = out
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("overflow_path").cloned())
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                overflow,
+                Value::Null,
+                "{cmd:?} spilled an overflow file: {overflow:?}"
+            );
+            assert!(
+                !out.content.contains("[output truncated"),
+                "{cmd:?} claimed truncation: {:?}",
+                out.content
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Byte-capping must not split a multi-byte character. `String::
+    /// truncate` panics when the index is not on a char boundary, so
+    /// >30 KB of non-ASCII output could take the whole agent down.
+    #[tokio::test]
+    async fn byte_cap_does_not_split_utf8() {
+        let dir = tmp();
+        let ctx = ToolContext { cwd: dir.clone() };
+        // One ASCII byte then 20k x 3-byte chars = 60 KB on a single
+        // line: blows the byte cap without hitting the line cap. The
+        // leading byte shifts the 30_000 cut off a char boundary — with
+        // no offset it lands exactly on one (30000 = 3 x 10000) and the
+        // bug hides.
+        let out = BashTool::new()
+            .execute(
+                json!({"command": "printf x; printf '\u{4f60}%.0s' $(seq 1 20000)"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.len() <= 30_000 + 200);
+        assert!(!out.content.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
