@@ -316,7 +316,7 @@ impl Agent {
     pub async fn maybe_compact(&mut self, tx: &mpsc::Sender<AgentEvent>) -> bool {
         use crate::agent::compact::should_auto_compact;
         let est_chars = self.context.estimate_chars();
-        let window = crate::pricing::context_window(&self.model);
+        let window = crate::models::context_window(&self.model);
         if !should_auto_compact(est_chars, window) {
             return false;
         }

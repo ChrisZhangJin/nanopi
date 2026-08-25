@@ -44,6 +44,11 @@ pub enum MenuAction<T> {
     /// so the user can type args and hit Enter, matching typical
     /// shell-style tab completion (readline / zsh / fish).
     Filled(String),
+    /// User pressed Enter while the filter matched nothing, on a menu
+    /// built with `with_free_text`. Carries the raw filter text so the
+    /// caller can use a value that isn't in the list — the escape hatch
+    /// for a model the catalogue hasn't caught up with yet.
+    ChosenRaw(String),
     /// User pressed Esc — outer loop should close the menu.
     Cancel,
 }
@@ -52,6 +57,12 @@ pub struct MenuState<T: Clone> {
     all: Vec<MenuItem<T>>,
     filter: String,
     cursor: usize, // index into filtered view
+    /// When set, the menu owns its own filter (typing edits it in
+    /// place) and Enter on an empty result set yields `ChosenRaw`.
+    /// Off by default: the slash palette has its filter driven
+    /// externally from the input buffer by `sync_palette`, and must
+    /// not also consume keystrokes here.
+    free_text: bool,
 }
 
 impl<T: Clone> MenuState<T> {
@@ -60,7 +71,28 @@ impl<T: Clone> MenuState<T> {
             all: items,
             filter: String::new(),
             cursor: 0,
+            free_text: false,
         }
+    }
+
+    /// Opt this menu into owning its own filter: typed characters edit
+    /// it, and Enter with no match returns `ChosenRaw` instead of doing
+    /// nothing. Used by the `/model` picker so an unlisted model id is
+    /// still reachable.
+    pub fn with_free_text(mut self) -> Self {
+        self.free_text = true;
+        self
+    }
+
+    /// Whether this menu owns its filter and accepts unlisted values.
+    pub fn is_free_text(&self) -> bool {
+        self.free_text
+    }
+
+    /// Current filter text. Only meaningful for `with_free_text` menus,
+    /// where the menu owns it; otherwise the caller set it.
+    pub fn filter(&self) -> &str {
+        &self.filter
     }
 
     /// Relevance tier for one item against the lowercased query, lower
@@ -188,12 +220,27 @@ impl<T: Clone> MenuState<T> {
             }
             KeyCode::Enter => match self.selected() {
                 Some(it) => MenuAction::Chosen(it.payload),
+                // Nothing matched. On a free-text menu the filter IS the
+                // answer; elsewhere Enter is a no-op as before.
+                None if self.free_text && !self.filter.trim().is_empty() => {
+                    MenuAction::ChosenRaw(self.filter.trim().to_string())
+                }
                 None => MenuAction::Nothing,
             },
             KeyCode::Tab => match self.selected() {
                 Some(it) => MenuAction::Filled(it.label),
                 None => MenuAction::Nothing,
             },
+            KeyCode::Char(c) if self.free_text => {
+                self.filter.push(c);
+                self.cursor = 0;
+                MenuAction::Nothing
+            }
+            KeyCode::Backspace if self.free_text => {
+                self.filter.pop();
+                self.cursor = 0;
+                MenuAction::Nothing
+            }
             _ => MenuAction::Nothing,
         }
     }
@@ -328,5 +375,61 @@ mod tests {
         m.set_filter("zzz-nonexistent");
         assert!(m.is_empty());
         assert!(m.selected().is_none());
+    }
+
+    // ─── free-text menus (the /model picker) ────────────────────────
+
+    /// A normal menu must ignore typed characters — the slash palette's
+    /// filter is driven externally, and swallowing keystrokes here would
+    /// desync it from the input buffer.
+    #[test]
+    fn typing_only_edits_the_filter_in_free_text_mode() {
+        let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+        let mut plain = MenuState::new(items());
+        plain.handle_key(press('q'));
+        assert_eq!(plain.filter(), "", "plain menu must not capture typing");
+        assert_eq!(plain.visible().len(), 4);
+
+        let mut free = MenuState::new(items()).with_free_text();
+        free.handle_key(press('q'));
+        assert_eq!(free.filter(), "q");
+        assert_eq!(free.visible().len(), 1);
+        assert_eq!(free.visible()[0].label, "quit");
+
+        free.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(free.filter(), "");
+        assert_eq!(free.visible().len(), 4);
+    }
+
+    /// Enter on a filter that matches nothing yields the raw text, so an
+    /// id missing from the catalogue is still reachable. This is the
+    /// escape hatch the old closed-set picker lacked.
+    #[test]
+    fn enter_with_no_match_returns_raw_filter() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        let mut free = MenuState::new(items()).with_free_text();
+        for c in "MiniMax-M9".chars() {
+            free.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(free.visible().is_empty());
+        match free.handle_key(enter) {
+            MenuAction::ChosenRaw(s) => assert_eq!(s, "MiniMax-M9"),
+            other => panic!("expected ChosenRaw, got {other:?}"),
+        }
+
+        // A match still wins over the raw filter.
+        let mut free = MenuState::new(items()).with_free_text();
+        free.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        match free.handle_key(enter) {
+            MenuAction::Chosen(p) => assert_eq!(p, "/quit"),
+            other => panic!("expected Chosen, got {other:?}"),
+        }
+
+        // Without free-text, Enter on no match stays a no-op.
+        let mut plain = MenuState::new(items());
+        plain.set_filter("zzz");
+        assert!(matches!(plain.handle_key(enter), MenuAction::Nothing));
     }
 }

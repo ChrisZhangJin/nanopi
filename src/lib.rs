@@ -6,7 +6,7 @@ pub mod config;
 pub mod event;
 pub mod keys;
 pub mod paths;
-pub mod pricing;
+pub mod models;
 pub mod resources;
 pub mod session;
 pub mod settings;

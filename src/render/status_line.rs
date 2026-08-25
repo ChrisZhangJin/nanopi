@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::event::Usage;
-use crate::pricing::{self, ModelPricing};
+use crate::models;
 
 /// Human-readable current-directory string, with `$HOME` folded to `~`.
 pub fn cwd_display(cwd: &Path) -> String {
@@ -39,14 +39,14 @@ pub fn short_session_id(id: &str) -> String {
 /// least one cache read.
 pub fn tokens_summary(u: &Usage) -> String {
     let mut parts = vec![
-        format!("↑{}", pricing::fmt_tokens(u.input_tokens)),
-        format!("↓{}", pricing::fmt_tokens(u.output_tokens)),
+        format!("↑{}", models::fmt_tokens(u.input_tokens)),
+        format!("↓{}", models::fmt_tokens(u.output_tokens)),
     ];
     if u.cache_read_tokens > 0 {
-        parts.push(format!("R{}", pricing::fmt_tokens(u.cache_read_tokens)));
+        parts.push(format!("R{}", models::fmt_tokens(u.cache_read_tokens)));
     }
     if u.cache_write_tokens > 0 {
-        parts.push(format!("W{}", pricing::fmt_tokens(u.cache_write_tokens)));
+        parts.push(format!("W{}", models::fmt_tokens(u.cache_write_tokens)));
     }
     // Cache-hit rate = cache_read / (cache_read + input) — proportion of
     // tokens served from cache rather than freshly billed as input.
@@ -58,21 +58,12 @@ pub fn tokens_summary(u: &Usage) -> String {
     parts.join(" ")
 }
 
-/// USD cost of `usage` at `model`'s list price. Empty string if the
-/// model isn't in the price table.
-pub fn cost_string(model: &str, u: &Usage) -> String {
-    match pricing::lookup(model) {
-        Some(p) => pricing::fmt_cost(p.cost(u)),
-        None => String::new(),
-    }
-}
-
 /// Context usage as a fraction of the model's window. Returns None if
 /// the window isn't known. `chars` is the current
 /// `Context::estimate_chars` value; we approximate tokens = chars/4.
 /// Full precision so callers can format `.1f` — PI-style.
 pub fn context_percent(model: &str, chars: usize) -> Option<f64> {
-    let window = pricing::context_window(model)? as usize;
+    let window = models::context_window(model)? as usize;
     let est_tokens = chars / 4;
     let pct = (est_tokens as f64 / window as f64) * 100.0;
     Some(pct.clamp(0.0, 999.0))
@@ -83,8 +74,8 @@ pub fn context_percent(model: &str, chars: usize) -> Option<f64> {
 /// table. `(auto)` suffix appended when auto_compact is on.
 pub fn context_ratio(model: &str, chars: usize, auto_compact: bool) -> Option<String> {
     let pct = context_percent(model, chars)?;
-    let window = pricing::context_window(model)?;
-    let base = format!("{:.1}%/{}", pct, pricing::fmt_tokens(window));
+    let window = models::context_window(model)?;
+    let base = format!("{:.1}%/{}", pct, models::fmt_tokens(window));
     if auto_compact {
         Some(format!("{} (auto)", base))
     } else {
@@ -102,11 +93,6 @@ pub fn context_color(pct: f64) -> &'static str {
     } else {
         "green"
     }
-}
-
-/// Ad-hoc pricing lookup for callers that just want the struct.
-pub fn pricing_for(model: &str) -> Option<ModelPricing> {
-    pricing::lookup(model)
 }
 
 #[cfg(test)]
@@ -161,17 +147,6 @@ mod tests {
     fn tokens_summary_no_ch_without_cache_read() {
         let s = tokens_summary(&u(500, 200));
         assert!(!s.contains("CH"));
-    }
-
-    #[test]
-    fn cost_falls_back_to_empty_for_unknown_model() {
-        assert!(cost_string("unknown-xyz", &u(1000, 1000)).is_empty());
-    }
-
-    #[test]
-    fn cost_computed_for_known_model() {
-        let s = cost_string("claude-opus-4-7", &u(1_000_000, 1_000_000));
-        assert_eq!(s, "$90.00");
     }
 
     #[test]

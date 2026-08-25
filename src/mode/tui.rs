@@ -907,7 +907,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         match m.handle_key(k) {
             MenuAction::Chosen(action) => { app.keybindings_menu = None; app.capture_key_for = Some(action); return KeyAction::Nothing; }
             MenuAction::Cancel => { app.keybindings_menu = None; app.settings_menu = Some(build_settings_menu(&app.settings_file)); return KeyAction::Nothing; }
-            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
         }
     }
     if app.settings_menu.is_some() {
@@ -924,7 +926,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 return KeyAction::Nothing;
             }
             MenuAction::Cancel => { app.settings_menu = None; return KeyAction::Nothing; }
-            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
         }
     }
     // Ctrl+O — expand the last tool output (PI's `app.tools.expand`).
@@ -946,7 +950,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
             }
             // Tab in a modal picker is a no-op — nothing to autocomplete
             // when the user is choosing one of a fixed short list.
-            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
         }
     }
     // ── Resume picker ───────────────────────────────────────────────
@@ -963,7 +969,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.input.clear();
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
         }
     }
     // ── Fork picker (opens summary modal on Chosen) ─────────────────
@@ -979,7 +987,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.fork_picker = None;
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
         }
     }
 
@@ -1030,12 +1040,23 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.input.clear();
                 return KeyAction::SwapModel(model_id);
             }
+            // Typed an id the catalogue doesn't have — take it at face
+            // value. The catalogue always trails new model releases, and
+            // being unable to name a model your key can serve is the
+            // exact problem this picker had.
+            MenuAction::ChosenRaw(typed) => {
+                app.model_picker = None;
+                app.input.clear();
+                return KeyAction::SwapModel(typed);
+            }
             MenuAction::Cancel => {
                 app.model_picker = None;
                 app.input.clear();
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
         }
     }
     // ── Palette owns navigation keys when open. ─────────────────────
@@ -1082,7 +1103,9 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     app.input.clear();
                     return KeyAction::Nothing;
                 }
-                MenuAction::Nothing => {
+                // The palette's filter is driven externally by
+                // sync_palette, so it is never a free-text menu.
+                MenuAction::Nothing | MenuAction::ChosenRaw(_) => {
                     return KeyAction::Nothing;
                 }
             }
@@ -1441,28 +1464,36 @@ async fn handle_action(
             }
         }
         KeyAction::OpenModelPicker => {
-            // Populate the picker with pricing-known models. Highlight
-            // the current one so users see where they're switching from.
-            let current = {
+            // Offer the models the ACTIVE vendor serves. Listing every
+            // model we know about would mostly offer things the current
+            // API key can't reach, which just turns into a 401 after the
+            // switch. PI scopes its picker the same way ("Only showing
+            // models from configured providers").
+            let (current, base_url) = {
                 let g = agent_slot.lock().await;
-                g.as_ref().map(|a| a.model.clone()).unwrap_or_default()
+                match g.as_ref() {
+                    Some(a) => (a.model.clone(), a.base_url.clone()),
+                    None => (String::new(), String::new()),
+                }
             };
-            let items: Vec<MenuItem<String>> = crate::pricing::known_models()
+            let vendor =
+                crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &current);
+            let items: Vec<MenuItem<String>> = crate::models::models_for_vendor(vendor.id())
                 .into_iter()
-                .map(|prefix| {
-                    let marker = if current.starts_with(prefix) {
-                        "  (current)"
-                    } else {
-                        ""
-                    };
+                .map(|m| {
+                    let marker = if current == m.id { "  (current)" } else { "" };
                     MenuItem::new(
-                        prefix.to_string(),
-                        format!("Switch to {}{}", prefix, marker),
-                        prefix.to_string(),
+                        m.id.to_string(),
+                        format!(
+                            "{} ctx{}",
+                            crate::models::fmt_tokens(m.context_window),
+                            marker
+                        ),
+                        m.id.to_string(),
                     )
                 })
                 .collect();
-            app.model_picker = Some(MenuState::new(items));
+            app.model_picker = Some(MenuState::new(items).with_free_text());
         }
         KeyAction::CycleThinking => {
             use crate::agent::thinking::ThinkingLevel;
@@ -1757,7 +1788,6 @@ async fn handle_action(
                     None => return Ok(()),
                 }
             };
-            let cost_str = crate::render::status_line::cost_string(&model, &usage);
             let ctx_pct = crate::render::status_line::context_percent(&model, ctx_chars)
                 .map(|p| format!("{p:.1}%"))
                 .unwrap_or_else(|| "?%".into());
@@ -1800,9 +1830,6 @@ async fn handle_action(
                     ),
                 ),
             )?;
-            if !cost_str.is_empty() {
-                insert_line(term, row("cost", &cost_str))?;
-            }
             insert_line(
                 term,
                 row("context", &format!("{ctx_pct} ({ctx_chars} chars)")),
@@ -3671,11 +3698,6 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         crate::render::status_line::tokens_summary(&app.usage),
         Style::default().fg(Color::White),
     ));
-    let cost = crate::render::status_line::cost_string(&app.model, &app.usage);
-    if !cost.is_empty() {
-        l2.push(Span::raw(" · "));
-        l2.push(Span::styled(cost, Style::default().fg(Color::Green)));
-    }
     l2.push(Span::raw(" · "));
     l2.push(Span::styled(
         app.model.clone(),
@@ -3905,17 +3927,44 @@ fn split_at_col(s: &str, col: usize) -> (&str, &str) {
 fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &str) {
     let vis = m.visible();
     let sel = m.cursor();
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+
+    // Free-text menus own their filter, so echo it — otherwise the user
+    // is typing blind (the input box isn't receiving these keystrokes).
+    let mut lines: Vec<Line> = Vec::new();
+    let typed = m.is_free_text().then(|| m.filter()).unwrap_or("");
+    if !typed.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label}: "), dim),
+            Span::styled(
+                typed.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
     if vis.is_empty() {
-        let msg = Line::from(vec![Span::styled(
-            format!("  (no {label} matches)"),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )]);
-        Paragraph::new(msg).render(area, buf);
+        // On a free-text menu "no match" is not a dead end: Enter takes
+        // the typed id verbatim. Say so, or the user assumes they're stuck.
+        lines.push(if m.is_free_text() && !typed.is_empty() {
+            Line::from(vec![
+                Span::styled("  (no match)  ", dim),
+                Span::styled(
+                    format!("⏎ use \"{typed}\""),
+                    Style::default().fg(Color::Indexed(108)),
+                ),
+            ])
+        } else {
+            Line::from(vec![Span::styled(format!("  (no {label} matches)"), dim)])
+        });
+        Paragraph::new(lines).render(area, buf);
         return;
     }
-    let max_rows = area.height as usize;
+    let max_rows = (area.height as usize).saturating_sub(lines.len()).max(1);
     let start = if vis.len() <= max_rows {
         0
     } else if sel < max_rows / 2 {
@@ -3926,7 +3975,6 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
         sel - max_rows / 2
     };
     let end = (start + max_rows).min(vis.len());
-    let mut lines: Vec<Line> = Vec::new();
     let total_w = area.width as usize;
     let arrow_w = 2; // "→ " or "  " — both 2 display cols
     let gap_w = 2; // gap between label and right-aligned description
