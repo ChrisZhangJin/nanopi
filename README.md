@@ -114,6 +114,9 @@ nanopi --fork <id>
 | `-N`, `--distrust` | false | Distrust project resources |
 | `--skill <path>` | — | Load a skill file/dir (repeatable) |
 | `-S`, `--no-skills` | false | Disable skill discovery |
+| `-C`, `--no-context-files` | false | Disable AGENTS.md / CLAUDE.md discovery |
+| `--system-prompt <text\|path>` | — | Replace the built-in system prompt |
+| `--append-system-prompt <text\|path>` | — | Append to the system prompt (repeatable) |
 
 ## Skills
 
@@ -138,6 +141,16 @@ Invoke explicitly, or let the model discover it via the auto-appended `<availabl
 - User: `~/.nanopi/skills/`
 - Project: `<cwd>/.nanopi/skills/` (only when trusted via `-a` or persisted decision)
 - CLI: `--skill <path>` (files or dirs; loads even with `--no-skills`)
+
+## Custom system prompt
+
+`--system-prompt <text|path>` replaces the built-in identity/guidelines prompt; `--append-system-prompt <text|path>` (repeatable, values joined by a blank line) adds text after it. Both accept literal text OR a path to an existing file. Either flag suppresses the matching file discovery below entirely — no merge.
+
+Without a flag, nanopi discovers:
+- `<cwd>/.nanopi/SYSTEM.md` (only when the project is trusted via `-a` or a persisted decision), then `~/.nanopi/SYSTEM.md` — for `--system-prompt`.
+- `<cwd>/.nanopi/APPEND_SYSTEM.md` (same trust rule), then `~/.nanopi/APPEND_SYSTEM.md` — for `--append-system-prompt`.
+
+Project beats global; the global file needs no trust gate (it's your own machine, not a cloned repo). Context files, skills, and the "Current working directory: …" line still apply on top of a custom prompt — only the identity/tools/guidelines section is replaced. Caveat: a replaced prompt drops the auto-generated "Available tools: …" line, and some models skip tool calls without it, so mention the tools you expect the model to use.
 
 ## Hooks
 

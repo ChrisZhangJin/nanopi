@@ -116,6 +116,17 @@ struct Args {
     /// `--no-context-files` / `-nc`.
     #[arg(long = "no-context-files", short = 'C')]
     no_context_files: bool,
+
+    /// Replace the built-in system prompt. Accepts literal text or a path
+    /// to a file. Suppresses `.nanopi/SYSTEM.md` discovery.
+    #[arg(long = "system-prompt", value_name = "TEXT_OR_PATH")]
+    system_prompt: Option<String>,
+
+    /// Append to the system prompt (repeatable; values joined by a blank
+    /// line). Accepts literal text or a path. Suppresses
+    /// `.nanopi/APPEND_SYSTEM.md` discovery.
+    #[arg(long = "append-system-prompt", value_name = "TEXT_OR_PATH")]
+    append_system_prompt: Vec<String>,
 }
 
 #[tokio::main]
@@ -268,6 +279,11 @@ async fn main() -> ExitCode {
         project_trusted,
         cfg.skills.disabled.clone(),
     );
+    let prompt_overrides = nanopi::agent::prompt_override::PromptOverrides::from_cli(
+        args.system_prompt.clone(),
+        args.append_system_prompt.clone(),
+        project_trusted,
+    );
 
     let output_format = if args.output == "json" {
         print::OutputFormat::Json
@@ -374,6 +390,7 @@ async fn main() -> ExitCode {
             args.exact_session_id.clone(),
             skill_load.clone(),
             args.no_context_files,
+            prompt_overrides.clone(),
         )
         .await
     } else {
@@ -392,6 +409,7 @@ async fn main() -> ExitCode {
             args.exact_session_id.clone(),
             skill_load.clone(),
             args.no_context_files,
+            prompt_overrides.clone(),
         )
         .await
     };
@@ -421,6 +439,8 @@ fn is_init_subcommand(args: &Args) -> bool {
         && args.model.is_none()
         && args.base_url.is_none()
         && args.api_key.is_none()
+        && args.system_prompt.is_none()
+        && args.append_system_prompt.is_empty()
 }
 
 /// Expand a leading `~/` to `$HOME/`. Best-effort — if HOME is unset,

@@ -98,6 +98,14 @@ pub struct Agent {
     /// rebuild the system prompt with the same policy. Mirrors PI's
     /// `noContextFiles`.
     pub no_context_files: bool,
+    /// The `--system-prompt` / `--append-system-prompt` policy, stored
+    /// UNRESOLVED (not the resolved text). `/reload` and the TUI's
+    /// `/new`, `/fork`, `/model`, `/resume` rebuilds recompose the
+    /// system prompt via `compose_system_prompt`, and reusing this same
+    /// policy — rather than caching resolved text — is what lets
+    /// `/reload` re-read an edited `SYSTEM.md` from disk, which is the
+    /// whole point of `/reload`.
+    pub prompt_overrides: crate::agent::prompt_override::PromptOverrides,
 }
 
 impl Agent {
@@ -224,6 +232,7 @@ impl Agent {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         })
     }
 
@@ -1095,6 +1104,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1189,6 +1199,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1252,6 +1263,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -1327,6 +1339,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -1424,6 +1437,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         (agent, dir)
     }
@@ -1566,6 +1580,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1652,6 +1667,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         agent.fire_session_start().await;
         agent.fire_session_end().await;
@@ -2067,6 +2083,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -2130,6 +2147,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -2246,6 +2264,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);

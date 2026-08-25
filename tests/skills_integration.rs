@@ -57,6 +57,7 @@ fn stub_agent_inputs(
         api_key: String::new(),
         skill_load,
         no_context_files: false,
+        prompt_overrides: nanopi::agent::prompt_override::PromptOverrides::default(),
     }
 }
 
