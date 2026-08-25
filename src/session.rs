@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::util::{time, uuid};
 
@@ -40,6 +39,19 @@ pub enum SessionError {
     NotASession,
     #[error("session version {found} not supported (need {expected})")]
     UnsupportedVersion { found: u32, expected: u32 },
+    #[error(
+        "invalid session id {id:?}: must be non-empty, contain only \
+         alphanumerics, '-', '_' and '.', and start and end with an \
+         alphanumeric character"
+    )]
+    InvalidId { id: String },
+    #[error(
+        "session id {id:?} already exists but belongs to another project \
+         ({cwd}); session ids are unique per machine, pick a different one"
+    )]
+    IdInUseElsewhere { id: String, cwd: String },
+    #[error("session id {id:?} already exists; --fork must create a new session")]
+    IdAlreadyExists { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,8 +143,12 @@ pub enum SessionEntry {
 /// Metadata extracted from the session header.
 #[derive(Debug, Clone)]
 pub struct SessionHeader {
-    pub id: Uuid,
-    pub parent_id: Option<Uuid>,
+    /// Session identifier. Normally a UUIDv7, but `--session-id` lets a
+    /// caller pick their own (see `validate_session_id`), so this is a
+    /// free-form String rather than a `Uuid`. The on-disk header has
+    /// always stored it as a string, so old sessions still load.
+    pub id: String,
+    pub parent_id: Option<String>,
     pub cwd: PathBuf,
     pub model: String,
     pub base_url: String,
@@ -152,12 +168,61 @@ pub fn sessions_dir() -> Option<PathBuf> {
     Some(home.join(".nanopi").join("sessions"))
 }
 
+/// Reject session ids that can't safely be a file stem.
+///
+/// Mirrors PI's `assertValidSessionId`
+/// (`packages/coding-agent/src/core/session-manager.ts`):
+/// `^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$` — alphanumerics plus
+/// `.`, `-`, `_`, and it must start and end alphanumeric.
+///
+/// This is a security boundary, not just a tidiness check: the id
+/// becomes the session filename, so it must not contain a path
+/// separator or be able to spell `..`. Requiring an alphanumeric first
+/// character rules out `..` and dotfiles; rejecting `/` and `\` (they
+/// simply aren't in the allowed set) rules out traversal.
+pub fn validate_session_id(id: &str) -> Result<(), SessionError> {
+    let ok = |c: char| c.is_ascii_alphanumeric();
+    let mut chars = id.chars();
+    let valid = match chars.next() {
+        None => false,
+        Some(first) if !ok(first) => false,
+        Some(_) => {
+            let rest: Vec<char> = chars.collect();
+            match rest.last() {
+                // Single character: already checked it's alphanumeric.
+                None => true,
+                Some(&last) if !ok(last) => false,
+                Some(_) => rest
+                    .iter()
+                    .all(|&c| ok(c) || c == '.' || c == '-' || c == '_'),
+            }
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidId { id: id.to_string() })
+    }
+}
+
 /// Create a brand-new session file at `sessions_dir()/<id>.jsonl` and
-/// return the path. Writes the header line.
+/// return the path. Writes the header line. The id is a fresh UUIDv7.
 pub fn new_session(
     cwd: &Path,
     model: &str,
     base_url: &str,
+) -> Result<(PathBuf, SessionHeader), SessionError> {
+    new_session_with_id(cwd, model, base_url, None)
+}
+
+/// As `new_session`, but with a caller-chosen id when `id` is `Some`.
+/// Backs `--session-id`; the id is validated before it reaches the
+/// filesystem.
+pub fn new_session_with_id(
+    cwd: &Path,
+    model: &str,
+    base_url: &str,
+    id: Option<&str>,
 ) -> Result<(PathBuf, SessionHeader), SessionError> {
     let dir = sessions_dir().ok_or_else(|| SessionError::Io {
         path: PathBuf::from("~/.nanopi/sessions"),
@@ -167,10 +232,16 @@ pub fn new_session(
         path: dir.clone(),
         source: e,
     })?;
-    let id = uuid::v7();
+    let id: String = match id {
+        Some(explicit) => {
+            validate_session_id(explicit)?;
+            explicit.to_string()
+        }
+        None => uuid::v7().to_string(),
+    };
     let path = dir.join(format!("{id}.jsonl"));
     let header = SessionHeader {
-        id,
+        id: id.clone(),
         parent_id: None,
         cwd: cwd.to_path_buf(),
         model: model.to_string(),
@@ -179,7 +250,7 @@ pub fn new_session(
     };
     let entry = SessionEntry::Header {
         version: 2,
-        id: id.to_string(),
+        id,
         parent_id: None,
         timestamp: time::now_iso8601(),
         cwd: cwd.display().to_string(),
@@ -234,16 +305,22 @@ pub fn session_by_id(id: &str) -> Option<PathBuf> {
 /// Which session file to use for this invocation.
 #[derive(Debug)]
 pub enum SessionChoice {
-    /// Brand-new session, create one.
+    /// Brand-new session, create one with a fresh UUIDv7.
     New,
+    /// Brand-new session, but with this caller-supplied id
+    /// (`--session-id` naming a session that doesn't exist yet).
+    NewWithId(String),
     /// Existing session, resume from this file.
     Resume(PathBuf),
 }
 
 /// Resolve which session to use:
 ///   - `--fork <id>`: copy the session with that id into a new file (with
-///     parent_id set to the source), then Resume the new file
+///     parent_id set to the source), then Resume the new file. When
+///     `exact_id` is also set it names the *destination*, which must not
+///     already exist.
 ///   - `--session <id>`: the session with that id (must exist)
+///   - `--session-id <id>`: that exact session, created if missing
 ///   - `--continue`: most recently used session for this cwd (if any)
 ///   - none: create a new session
 ///
@@ -254,15 +331,50 @@ pub fn resolve_session(
     continue_flag: bool,
     session_id: Option<&str>,
     fork_id: Option<&str>,
+    exact_id: Option<&str>,
 ) -> Result<SessionChoice, SessionError> {
+    if let Some(id) = exact_id {
+        validate_session_id(id)?;
+    }
     if let Some(id) = fork_id {
         let src = session_by_id(id).ok_or(SessionError::NotASession)?;
-        let (new_path, _hdr) = fork_session(cwd, &src)?;
+        // With --fork the semantics invert: --session-id names the
+        // destination, so an existing one is a hard error rather than
+        // something to resume. Matches PI (`main.ts:322-330`) — a fork
+        // must create, so upsert would be wrong here.
+        if let Some(dest) = exact_id {
+            if session_by_id(dest).is_some() {
+                return Err(SessionError::IdAlreadyExists {
+                    id: dest.to_string(),
+                });
+            }
+        }
+        let (new_path, _hdr) = fork_session_with_id(cwd, &src, exact_id)?;
         return Ok(SessionChoice::Resume(new_path));
     }
     if let Some(id) = session_id {
         let p = session_by_id(id).ok_or(SessionError::NotASession)?;
         return Ok(SessionChoice::Resume(p));
+    }
+    if let Some(id) = exact_id {
+        // Upsert by exact id, scoped to this project. PI stores sessions
+        // per-project so the same id can exist under two checkouts; our
+        // store is one flat directory keyed by id, so an id already held
+        // by a different cwd is a conflict we refuse rather than silently
+        // cross-wiring two projects' conversations.
+        match session_by_id(id) {
+            Some(p) => {
+                let (hdr, _) = read_session(&p)?;
+                if hdr.cwd != cwd {
+                    return Err(SessionError::IdInUseElsewhere {
+                        id: id.to_string(),
+                        cwd: hdr.cwd.display().to_string(),
+                    });
+                }
+                return Ok(SessionChoice::Resume(p));
+            }
+            None => return Ok(SessionChoice::NewWithId(id.to_string())),
+        }
     }
     if continue_flag {
         if let Some(p) = active_session(cwd) {
@@ -280,6 +392,16 @@ pub fn resolve_session(
 /// (which may differ from the source cwd — e.g. forking someone else's
 /// session into your own project).
 pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader), SessionError> {
+    fork_session_with_id(cwd, source, None)
+}
+
+/// As `fork_session`, but with a caller-chosen id for the *destination*
+/// when `new_id` is `Some` — this is `--fork X --session-id Y`.
+pub fn fork_session_with_id(
+    cwd: &Path,
+    source: &Path,
+    new_id: Option<&str>,
+) -> Result<(PathBuf, SessionHeader), SessionError> {
     let (src_hdr, entries) = read_session(source)?;
 
     let dir = sessions_dir().ok_or_else(|| SessionError::Io {
@@ -291,11 +413,17 @@ pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader
         source: e,
     })?;
 
-    let new_id = uuid::v7();
+    let new_id: String = match new_id {
+        Some(explicit) => {
+            validate_session_id(explicit)?;
+            explicit.to_string()
+        }
+        None => uuid::v7().to_string(),
+    };
     let path = dir.join(format!("{new_id}.jsonl"));
     let header = SessionHeader {
-        id: new_id,
-        parent_id: Some(src_hdr.id),
+        id: new_id.clone(),
+        parent_id: Some(src_hdr.id.clone()),
         cwd: cwd.to_path_buf(),
         model: src_hdr.model.clone(),
         base_url: src_hdr.base_url.clone(),
@@ -303,8 +431,8 @@ pub fn fork_session(cwd: &Path, source: &Path) -> Result<(PathBuf, SessionHeader
     };
     let header_entry = SessionEntry::Header {
         version: 2,
-        id: new_id.to_string(),
-        parent_id: Some(src_hdr.id.to_string()),
+        id: new_id,
+        parent_id: Some(src_hdr.id.clone()),
         timestamp: time::now_iso8601(),
         cwd: cwd.display().to_string(),
         model: src_hdr.model.clone(),
@@ -352,11 +480,11 @@ pub fn fork_session_at(
         source: e,
     })?;
 
-    let new_id = uuid::v7();
+    let new_id = uuid::v7().to_string();
     let path = dir.join(format!("{new_id}.jsonl"));
     let header = SessionHeader {
-        id: new_id,
-        parent_id: Some(src_hdr.id),
+        id: new_id.clone(),
+        parent_id: Some(src_hdr.id.clone()),
         cwd: cwd.to_path_buf(),
         model: src_hdr.model.clone(),
         base_url: src_hdr.base_url.clone(),
@@ -681,8 +809,8 @@ pub fn read_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>), S
                         });
                     }
                     header = Some(SessionHeader {
-                        id: Uuid::parse_str(id).map_err(|_| SessionError::NotASession)?,
-                        parent_id: parent_id.as_ref().and_then(|s| Uuid::parse_str(s).ok()),
+                        id: id.clone(),
+                        parent_id: parent_id.clone(),
                         cwd: PathBuf::from(cwd),
                         model: model.clone(),
                         base_url: base_url.clone(),
@@ -933,7 +1061,7 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
         let cwd = home_tmp();
 
-        let choice = resolve_session(&cwd, false, None, None).expect("resolve");
+        let choice = resolve_session(&cwd, false, None, None, None).expect("resolve");
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -952,7 +1080,7 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
         let cwd = home_tmp();
 
-        let choice = resolve_session(&cwd, true, None, None).expect("resolve");
+        let choice = resolve_session(&cwd, true, None, None, None).expect("resolve");
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -974,7 +1102,7 @@ mod tests {
         let (path, _h) = new_session(&cwd, "m", "http://x").unwrap();
         set_active_session(&cwd, &path).unwrap();
 
-        let choice = resolve_session(&cwd, true, None, None).expect("resolve");
+        let choice = resolve_session(&cwd, true, None, None, None).expect("resolve");
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -998,8 +1126,7 @@ mod tests {
 
         let (path, header) = new_session(&cwd, "m", "http://x").unwrap();
 
-        let choice =
-            resolve_session(&cwd, false, Some(&header.id.to_string()), None).expect("resolve");
+        let choice = resolve_session(&cwd, false, Some(&header.id), None, None).expect("resolve");
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -1232,8 +1359,8 @@ mod tests {
         let cwd = home_tmp();
 
         let (_src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
-        let choice = resolve_session(&cwd, false, None, Some(&src_hdr.id.to_string()))
-            .expect("resolve fork");
+        let choice =
+            resolve_session(&cwd, false, None, Some(&src_hdr.id), None).expect("resolve fork");
         let new_path = match choice {
             SessionChoice::Resume(p) => p,
             other => {
@@ -1246,7 +1373,7 @@ mod tests {
             }
         };
         let (new_hdr, _) = read_session(&new_path).unwrap();
-        assert_eq!(new_hdr.parent_id, Some(src_hdr.id));
+        assert_eq!(new_hdr.parent_id, Some(src_hdr.id.clone()));
         assert_ne!(new_hdr.id, src_hdr.id);
 
         if let Some(p) = prev {
@@ -1267,7 +1394,7 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
         let cwd = home_tmp();
 
-        let r = resolve_session(&cwd, false, None, Some("does-not-exist"));
+        let r = resolve_session(&cwd, false, None, Some("does-not-exist"), None);
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -1377,7 +1504,7 @@ mod tests {
         std::env::set_var("NANOPI_HOME", &home);
         let cwd = home_tmp();
 
-        let r = resolve_session(&cwd, false, Some("does-not-exist"), None);
+        let r = resolve_session(&cwd, false, Some("does-not-exist"), None, None);
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
         } else {
@@ -1385,5 +1512,174 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&cwd);
         assert!(r.is_err(), "expected error for missing id, got {r:?}");
+    }
+
+    // ─── --session-id (PI parity) ───────────────────────────────────
+
+    /// Mirrors PI's `assertValidSessionId` regex. The traversal cases
+    /// are the ones that matter: the id becomes a filename.
+    #[test]
+    fn validate_session_id_matches_pi_rules() {
+        for good in [
+            "a",
+            "A1",
+            "ci-pr-1234",
+            "release_2026.08",
+            "0195f2c1-7a3b-7000-8000-000000000000",
+        ] {
+            assert!(
+                validate_session_id(good).is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
+        for bad in [
+            "",             // empty
+            "-lead",        // must start alphanumeric
+            "trail-",       // must end alphanumeric
+            ".hidden",      // dotfile
+            "..",           // parent dir
+            "../../etc/pw", // traversal
+            "a/b",          // path separator
+            "a\\b",         // windows separator
+            "has space",
+            "emoji\u{1f600}",
+        ] {
+            assert!(
+                matches!(
+                    validate_session_id(bad),
+                    Err(SessionError::InvalidId { .. })
+                ),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// An id nothing has claimed yet resolves to NewWithId, and creating
+    /// it lands at `<id>.jsonl` so a later run finds it by exact name.
+    #[test]
+    fn session_id_creates_then_resumes_same_session() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let first = resolve_session(&cwd, false, None, None, Some("ci-pr-1234"));
+        let created = match &first {
+            Ok(SessionChoice::NewWithId(id)) => id.clone(),
+            other => panic!("expected NewWithId, got {other:?}"),
+        };
+        assert_eq!(created, "ci-pr-1234");
+
+        let (path, hdr) =
+            new_session_with_id(&cwd, "m", "http://x", Some(&created)).expect("create");
+        assert_eq!(path.file_name().unwrap(), "ci-pr-1234.jsonl");
+        assert_eq!(hdr.id, "ci-pr-1234");
+
+        // Second run with the same id resumes rather than recreating.
+        let second = resolve_session(&cwd, false, None, None, Some("ci-pr-1234"));
+        match &second {
+            Ok(SessionChoice::Resume(p)) => assert_eq!(p, &path),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Our session store is one flat directory keyed by id, so unlike PI
+    /// (which scopes per project) an id already held by another cwd is a
+    /// conflict. Refuse it rather than hand project B project A's history.
+    #[test]
+    fn session_id_held_by_another_cwd_is_refused() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd_a = home_tmp();
+        let cwd_b = home_tmp();
+
+        new_session_with_id(&cwd_a, "m", "http://x", Some("shared")).expect("create");
+        let r = resolve_session(&cwd_b, false, None, None, Some("shared"));
+        assert!(
+            matches!(r, Err(SessionError::IdInUseElsewhere { .. })),
+            "expected IdInUseElsewhere, got {r:?}"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd_a);
+        let _ = std::fs::remove_dir_all(&cwd_b);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// With --fork the flag names the DESTINATION: it must be created,
+    /// and an existing id is fatal rather than resumed (PI main.ts:322).
+    #[test]
+    fn fork_with_session_id_names_the_destination() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let (_src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
+        let choice = resolve_session(&cwd, false, None, Some(&src_hdr.id), Some("fork-dest"))
+            .expect("fork with id");
+        let new_path = match choice {
+            SessionChoice::Resume(p) => p,
+            other => panic!("expected Resume of the fork, got {other:?}"),
+        };
+        assert_eq!(new_path.file_name().unwrap(), "fork-dest.jsonl");
+        let (new_hdr, _) = read_session(&new_path).unwrap();
+        assert_eq!(new_hdr.id, "fork-dest");
+        assert_eq!(new_hdr.parent_id, Some(src_hdr.id.clone()));
+
+        // Re-forking onto the same destination id must fail, not clobber.
+        let again = resolve_session(&cwd, false, None, Some(&src_hdr.id), Some("fork-dest"));
+        assert!(
+            matches!(again, Err(SessionError::IdAlreadyExists { .. })),
+            "expected IdAlreadyExists, got {again:?}"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A malformed id is rejected before it can reach the filesystem.
+    #[test]
+    fn resolve_session_rejects_invalid_session_id() {
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = home_tmp();
+
+        let r = resolve_session(&cwd, false, None, None, Some("../escape"));
+        assert!(
+            matches!(r, Err(SessionError::InvalidId { .. })),
+            "expected InvalidId, got {r:?}"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

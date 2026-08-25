@@ -49,7 +49,7 @@ fn stub_agent_inputs(
         registry: ToolRegistry::standard(),
         provider: Box::new(OpenAiProvider::new("", "", "")),
         session_path,
-        session_id: uuid::v7(),
+        session_id: uuid::v7().to_string(),
         permission: PermissionGate::from_cli(true, None),
         hooks: HooksConfig::default(),
         model: "test-model".into(),

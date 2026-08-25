@@ -51,6 +51,8 @@ pub async fn run_print_mode(
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
+    // `--session-id`: use this exact session, creating it if missing.
+    exact_session_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
 ) -> Result<i32> {
@@ -62,6 +64,7 @@ pub async fn run_print_mode(
         continue_session,
         session_id.as_deref(),
         fork_id.as_deref(),
+        exact_session_id.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?;
 
@@ -76,6 +79,17 @@ pub async fn run_print_mode(
         }
         session::SessionChoice::New => session::new_session(&cwd, model, base_url)
             .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
+        session::SessionChoice::NewWithId(id) => {
+            // PI warns here too — a typo'd --session-id silently starting
+            // a fresh conversation instead of resuming is worth a line on
+            // stderr (main.ts:390-399).
+            eprintln!(
+                "nanopi: no session found with id '{id}' for this directory; \
+                 creating a new one with that id"
+            );
+            session::new_session_with_id(&cwd, model, base_url, Some(id))
+                .map_err(|e| anyhow::anyhow!("create session: {e}"))?
+        }
     };
 
     // Register this cwd's active session pointer (used by next --continue).
@@ -128,7 +142,7 @@ pub async fn run_print_mode(
             registry,
             provider,
             session_path: session_path.clone(),
-            session_id: header.id,
+            session_id: header.id.clone(),
             permission,
             hooks,
             model: model.to_string(),
@@ -201,7 +215,7 @@ pub async fn run_print_mode(
         }
         OutputFormat::Json => {
             let envelope = JsonEnvelope {
-                session_id: header.id.to_string(),
+                session_id: header.id.clone(),
                 model: model.to_string(),
                 finish_reason: "stop".into(),
                 duration_ms,

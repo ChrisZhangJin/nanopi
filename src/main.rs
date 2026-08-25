@@ -73,6 +73,16 @@ struct Args {
     #[arg(long = "fork", value_name = "SESSION_ID", conflicts_with_all = ["continue_session"])]
     fork_id: Option<String>,
 
+    /// Use this exact session id, creating the session if it doesn't
+    /// exist. For scripts that want a stable, self-chosen session to
+    /// resume across runs without looking up a generated UUID.
+    ///
+    /// With `--fork` this names the NEW session instead, and must not
+    /// already exist. Mutually exclusive with `--session`/`--continue`,
+    /// which select an already-existing session.
+    #[arg(long = "session-id", value_name = "ID", conflicts_with_all = ["continue_session", "session_id"])]
+    exact_session_id: Option<String>,
+
     /// Force the full ratatui TUI (alt-screen) even if stdin isn't a
     /// TTY. Without this or `--no-tui`, the mode is auto-selected:
     /// TTY → TUI, pipe/non-TTY → rustyline classic mode.
@@ -304,6 +314,7 @@ async fn main() -> ExitCode {
             args.continue_session,
             args.session_id.clone(),
             args.fork_id.clone(),
+            args.exact_session_id.clone(),
             skill_load.clone(),
             args.no_context_files,
         )
@@ -320,6 +331,7 @@ async fn main() -> ExitCode {
             args.continue_session,
             args.session_id.clone(),
             args.fork_id.clone(),
+            args.exact_session_id.clone(),
             skill_load.clone(),
             args.no_context_files,
         )
@@ -338,6 +350,7 @@ async fn main() -> ExitCode {
             args.continue_session,
             args.session_id.clone(),
             args.fork_id.clone(),
+            args.exact_session_id.clone(),
             skill_load.clone(),
             args.no_context_files,
         )

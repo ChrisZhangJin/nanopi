@@ -226,7 +226,7 @@ mod tests {
 
     fn hdr() -> SessionHeader {
         SessionHeader {
-            id: crate::util::uuid::v7(),
+            id: crate::util::uuid::v7().to_string(),
             parent_id: None,
             cwd: std::path::PathBuf::from("/tmp/proj"),
             model: "claude-opus-4-7".into(),

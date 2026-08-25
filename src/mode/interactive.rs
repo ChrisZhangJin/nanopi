@@ -32,6 +32,8 @@ pub async fn run_interactive_mode(
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
+    // `--session-id`: use this exact session, creating it if missing.
+    exact_session_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
 ) -> Result<i32> {
@@ -43,6 +45,7 @@ pub async fn run_interactive_mode(
         continue_session,
         session_id.as_deref(),
         fork_id.as_deref(),
+        exact_session_id.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?;
 
@@ -54,6 +57,17 @@ pub async fn run_interactive_mode(
         }
         SessionChoice::New => session::new_session(&cwd, model, base_url)
             .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
+        SessionChoice::NewWithId(id) => {
+            // PI warns here too — a typo'd --session-id silently starting
+            // a fresh conversation instead of resuming is worth a line on
+            // stderr (main.ts:390-399).
+            eprintln!(
+                "nanopi: no session found with id '{id}' for this directory; \
+                 creating a new one with that id"
+            );
+            session::new_session_with_id(&cwd, model, base_url, Some(id))
+                .map_err(|e| anyhow::anyhow!("create session: {e}"))?
+        }
     };
     // Remember this cwd's active session for next --continue.
     let _ = session::set_active_session(&cwd, &session_path);
@@ -127,7 +141,7 @@ pub async fn run_interactive_mode(
     // ── Multi-turn event loop ───────────────────────────────────────────
     let initial_session_id = {
         let g = agent_slot.lock().await;
-        g.as_ref().map(|a| a.session_id).unwrap()
+        g.as_ref().map(|a| a.session_id.clone()).unwrap()
     };
     eprintln!(
         "nanopi v0.6 interactive — session {}\n\

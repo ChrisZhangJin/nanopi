@@ -276,6 +276,8 @@ pub async fn run_tui_mode(
     continue_session: bool,
     session_id: Option<String>,
     fork_id: Option<String>,
+    // `--session-id`: use this exact session, creating it if missing.
+    exact_session_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
 ) -> Result<i32> {
@@ -286,6 +288,7 @@ pub async fn run_tui_mode(
         continue_session,
         session_id.as_deref(),
         fork_id.as_deref(),
+        exact_session_id.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?;
     let (session_path, header) = match &choice {
@@ -296,6 +299,17 @@ pub async fn run_tui_mode(
         }
         SessionChoice::New => session::new_session(&cwd, model, base_url)
             .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
+        SessionChoice::NewWithId(id) => {
+            // PI warns here too — a typo'd --session-id silently starting
+            // a fresh conversation instead of resuming is worth a line on
+            // stderr (main.ts:390-399).
+            eprintln!(
+                "nanopi: no session found with id '{id}' for this directory; \
+                 creating a new one with that id"
+            );
+            session::new_session_with_id(&cwd, model, base_url, Some(id))
+                .map_err(|e| anyhow::anyhow!("create session: {e}"))?
+        }
     };
     let _ = session::set_active_session(&cwd, &session_path);
 
@@ -339,7 +353,7 @@ pub async fn run_tui_mode(
             registry,
             provider,
             session_path: session_path.clone(),
-            session_id: header.id,
+            session_id: header.id.clone(),
             permission,
             hooks,
             model: model.to_string(),
@@ -368,7 +382,7 @@ pub async fn run_tui_mode(
         let g = agent_slot.lock().await;
         g.as_ref().map(|a| a.skills.clone()).unwrap_or_default()
     };
-    print_startup_banner(model, &header.id.to_string(), &loaded_skills);
+    print_startup_banner(model, &header.id, &loaded_skills);
 
     let mut terminal = setup_terminal()?;
     let mut app = App::new(
@@ -1551,7 +1565,7 @@ async fn handle_action(
                 registry,
                 provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model))),
                 session_path: new_path,
-                session_id: new_header.id,
+                session_id: new_header.id.clone(),
                 permission,
                 hooks,
                 model: model.clone(),
@@ -1565,7 +1579,7 @@ async fn handle_action(
                 let mut g = agent_slot.lock().await;
                 *g = Some(new_agent);
             }
-            app.session_id = new_header.id.to_string();
+            app.session_id = new_header.id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
             app.turn_count = 0;
@@ -1674,13 +1688,13 @@ async fn handle_action(
                 app.no_context_files,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
-            let new_session_id = new_agent.session_id;
+            let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &path);
             {
                 let mut g = agent_slot.lock().await;
                 *g = Some(new_agent);
             }
-            app.session_id = new_session_id.to_string();
+            app.session_id = new_session_id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
             app.turn_count = 0;
@@ -1703,7 +1717,8 @@ async fn handle_action(
             let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
             let _ = std::io::stdout().flush();
             let _ = term.clear();
-            let short = &new_session_id.to_string()[..8];
+            let short = crate::render::status_line::short_session_id(&new_session_id);
+            let short = short.as_str();
             let hdr_name = session::read_session(&path).ok().and_then(|(h, _)| h.name);
             let title = match hdr_name {
                 Some(n) => format!("─── Resumed session {short} · {n} ───"),
@@ -1945,7 +1960,7 @@ async fn handle_action(
             let (session_path, session_id, cwd) = {
                 let g = agent_slot.lock().await;
                 match g.as_ref() {
-                    Some(a) => (a.session_path.clone(), a.session_id, a.cwd.clone()),
+                    Some(a) => (a.session_path.clone(), a.session_id.clone(), a.cwd.clone()),
                     None => return Ok(()),
                 }
             };
@@ -2125,13 +2140,13 @@ async fn handle_action(
                 app.no_context_files,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
-            let new_session_id = new_agent.session_id;
+            let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &dest);
             {
                 let mut g = agent_slot.lock().await;
                 *g = Some(new_agent);
             }
-            app.session_id = new_session_id.to_string();
+            app.session_id = new_session_id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
             app.turn_count = 0;
@@ -2143,7 +2158,7 @@ async fn handle_action(
                 Line::from(vec![Span::styled(
                     format!(
                         "[imported → new session {} (from {})]",
-                        &new_session_id.to_string()[..8],
+                        crate::render::status_line::short_session_id(&new_session_id),
                         source.display(),
                     ),
                     Style::default()

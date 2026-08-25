@@ -66,7 +66,9 @@ pub struct Agent {
     pub provider: Box<dyn Provider>,
     pub registry: ToolRegistry,
     pub session_path: PathBuf,
-    pub session_id: uuid::Uuid,
+    /// Session identifier from the header. Free-form String, not a
+    /// `Uuid`, because `--session-id` lets callers pick their own.
+    pub session_id: String,
     pub cwd: PathBuf,
     pub permission: PermissionGate,
     pub hooks: HooksConfig,
@@ -787,7 +789,7 @@ impl Agent {
         let cwd = self.cwd.clone();
         let registry = self.registry.clone();
         let session_path = self.session_path.clone();
-        let session_id = self.session_id;
+        let session_id = self.session_id.clone();
         let permission = self.permission.clone();
         let hooks = self.hooks.clone();
 
@@ -805,7 +807,7 @@ impl Agent {
                 let cwd = cwd.clone();
                 let registry = registry.clone();
                 let session_path = session_path.clone();
-                let session_id = session_id;
+                let session_id = session_id.clone();
                 let permission = permission.clone();
                 let hooks = hooks.clone();
                 let tx = tx.clone();
@@ -912,7 +914,7 @@ async fn run_one_tool(
     call: ToolCall,
     registry: ToolRegistry,
     session_path: PathBuf,
-    session_id: uuid::Uuid,
+    session_id: String,
     cwd: PathBuf,
     permission: PermissionGate,
     hooks: HooksConfig,
@@ -1097,7 +1099,7 @@ mod tests {
             provider: Box::new(fake_provider()),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks,
@@ -1191,7 +1193,7 @@ mod tests {
             provider: Box::new(fake_provider()),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks,
@@ -1254,7 +1256,7 @@ mod tests {
             provider: Box::new(fake_provider()),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),
@@ -1329,7 +1331,7 @@ mod tests {
             provider: Box::new(HangingProvider),
             registry: ToolRegistry::standard(),
             session_path,
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),
@@ -1426,7 +1428,7 @@ mod tests {
             }),
             registry: ToolRegistry::standard(),
             session_path,
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),
@@ -1568,7 +1570,7 @@ mod tests {
             provider: Box::new(SilentProvider),
             registry: ToolRegistry::standard(),
             session_path,
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),
@@ -1648,7 +1650,7 @@ mod tests {
             }),
             registry: ToolRegistry::standard(),
             session_path,
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(true /*no_hooks*/, None),
             hooks: HooksConfig {
@@ -2069,7 +2071,7 @@ mod tests {
             provider: Box::new(SteppedProvider { step: step.clone() }),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),
@@ -2132,7 +2134,7 @@ mod tests {
             }),
             registry: ToolRegistry::standard(),
             session_path: session_path.clone(),
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),
@@ -2248,7 +2250,7 @@ mod tests {
             }),
             registry: ToolRegistry::standard(),
             session_path,
-            session_id: uuid::v7(),
+            session_id: uuid::v7().to_string(),
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(false, None),
             hooks: HooksConfig::default(),

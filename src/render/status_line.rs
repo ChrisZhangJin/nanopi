@@ -30,9 +30,8 @@ pub fn git_branch(cwd: &Path) -> String {
 
 /// First 8 chars of a session UUID — enough to disambiguate visually
 /// without overwhelming the status line.
-pub fn short_session_id(uuid: &uuid::Uuid) -> String {
-    let s = uuid.to_string();
-    s.chars().take(8).collect()
+pub fn short_session_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 /// Tokens summary: `↑1.2k ↓340 R89 W12 CH27.4%`. Cache figures are

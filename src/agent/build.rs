@@ -76,7 +76,7 @@ pub struct AgentBuildInputs {
     pub registry: ToolRegistry,
     pub provider: Box<dyn Provider>,
     pub session_path: PathBuf,
-    pub session_id: uuid::Uuid,
+    pub session_id: String,
     pub permission: PermissionGate,
     pub hooks: HooksConfig,
     pub model: String,
