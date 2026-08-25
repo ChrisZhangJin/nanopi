@@ -350,6 +350,7 @@ pub async fn run_tui_mode(
             api_key.to_string(),
             skill_load,
             no_context_files,
+            crate::agent::prompt_override::PromptOverrides::default(),
         );
         print_skill_diagnostics(&diags);
         a
@@ -367,6 +368,7 @@ pub async fn run_tui_mode(
             api_key: api_key.to_string(),
             skill_load,
             no_context_files,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         });
         print_skill_diagnostics(&diags);
         a
@@ -1615,6 +1617,7 @@ async fn handle_action(
                 api_key,
                 skill_load: app.skill_load.clone(),
                 no_context_files: app.no_context_files,
+                prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             });
             crate::agent::build::print_skill_diagnostics(&diags);
             {
@@ -1728,6 +1731,7 @@ async fn handle_action(
                 api_key,
                 app.skill_load.clone(),
                 app.no_context_files,
+                crate::agent::prompt_override::PromptOverrides::default(),
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
@@ -2176,6 +2180,7 @@ async fn handle_action(
                 api_key,
                 app.skill_load.clone(),
                 app.no_context_files,
+                crate::agent::prompt_override::PromptOverrides::default(),
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
@@ -2647,6 +2652,7 @@ async fn execute_fork(
         api_key,
         app.skill_load.clone(),
         app.no_context_files,
+        crate::agent::prompt_override::PromptOverrides::default(),
     );
     crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
@@ -2795,6 +2801,7 @@ async fn handle_reload(
                 &tool_names,
                 &a.skills,
                 a.no_context_files,
+                &a.prompt_overrides,
             ));
             let h = &a.hooks;
             h.pre_tool_use.len()

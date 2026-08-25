@@ -138,6 +138,7 @@ pub async fn run_print_mode(
             api_key.to_string(),
             skill_load,
             no_context_files,
+            crate::agent::prompt_override::PromptOverrides::default(),
         );
         print_skill_diagnostics(&diags);
         a
@@ -155,6 +156,7 @@ pub async fn run_print_mode(
             api_key: api_key.to_string(),
             skill_load,
             no_context_files,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         });
         print_skill_diagnostics(&diags);
         a

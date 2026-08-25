@@ -50,7 +50,7 @@ const APPEND_FILE: &str = "APPEND_SYSTEM.md";
 /// from the same policy rather than a stale resolved string — storing
 /// the UNRESOLVED policy is what lets `/reload` pick up edits to an
 /// on-disk `SYSTEM.md`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptOverrides {
     system_prompt: Option<String>,
     append_system_prompt: Vec<String>,

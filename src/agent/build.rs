@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::agent::context::Context;
 use crate::agent::loop_::{Agent, HooksConfig, Provider};
 use crate::agent::permission::PermissionGate;
+use crate::agent::prompt_override::PromptOverrides;
 use crate::event::Usage;
 use crate::resources::{
     format_skills_for_prompt, load_skills, LoadSkillsOptions, LoadSkillsResult, Skill,
@@ -83,6 +84,8 @@ pub struct AgentBuildInputs {
     pub skill_load: SkillLoadPolicy,
     /// CLI `--no-context-files` — skip AGENTS.md / CLAUDE.md discovery.
     pub no_context_files: bool,
+    /// `--system-prompt` / `--append-system-prompt` policy.
+    pub prompt_overrides: PromptOverrides,
 }
 
 impl Agent {
@@ -104,6 +107,7 @@ impl Agent {
             api_key,
             skill_load,
             no_context_files,
+            prompt_overrides,
         } = inputs;
 
         let tool_names = registry.names();
@@ -111,7 +115,13 @@ impl Agent {
             skills,
             diagnostics,
         } = load_skills(skill_load.into_options());
-        let prompt = compose_system_prompt(&cwd, &tool_names, &skills, no_context_files);
+        let prompt = compose_system_prompt(
+            &cwd,
+            &tool_names,
+            &skills,
+            no_context_files,
+            &prompt_overrides,
+        );
 
         let agent = Agent {
             context: Context {
@@ -134,6 +144,7 @@ impl Agent {
             turn_count: 0,
             skills,
             no_context_files,
+            prompt_overrides,
         };
         (agent, diagnostics)
     }
@@ -160,6 +171,7 @@ impl Agent {
         api_key: String,
         skill_load: SkillLoadPolicy,
         no_context_files: bool,
+        prompt_overrides: PromptOverrides,
     ) -> Vec<SkillDiagnostic> {
         self.provider = provider;
         self.registry = registry;
@@ -169,6 +181,7 @@ impl Agent {
         self.base_url = base_url;
         self.api_key = api_key;
         self.no_context_files = no_context_files;
+        self.prompt_overrides = prompt_overrides;
 
         // load_session rebuilds Context from JSONL messages only — it
         // never repopulates `tools`. Without this line, the first turn
@@ -194,6 +207,7 @@ impl Agent {
                 &tool_names,
                 &self.skills,
                 self.no_context_files,
+                &self.prompt_overrides,
             ));
         }
 
@@ -210,13 +224,43 @@ impl Agent {
 /// `no_context_files` skips context-file discovery entirely (CLI
 /// `--no-context-files`). Context files, unlike skills, are injected
 /// regardless of which tools are available — PI does the same.
+///
+/// `overrides` resolves `--system-prompt` / `--append-system-prompt`
+/// (flags or discovered `SYSTEM.md` / `APPEND_SYSTEM.md`) against `cwd`.
+/// Two invariants hold regardless of whether a custom prompt is in
+/// play:
+/// (a) a custom prompt replaces ONLY the identity/tools/guidelines
+///     section produced by `system_prompt::build` — context files,
+///     skills and the cwd line still apply, matching PI's
+///     `system-prompt.ts:44-71`.
+/// (b) the base section always ends with the
+///     "Current working directory: …" line, whether it came from
+///     `system_prompt::build` or from a custom prompt, so the
+///     append/context/skills tail is byte-identical across both
+///     branches.
+/// Consequence the user must know: a custom prompt drops the
+/// "Available tools: …" line that `system_prompt::build` generates, and
+/// some models skip tool calls without it (see the note at the top of
+/// `system_prompt.rs`) — worth mentioning tools explicitly in a custom
+/// prompt.
 pub fn compose_system_prompt(
     cwd: &Path,
     tool_names: &[String],
     skills: &[Skill],
     no_context_files: bool,
+    overrides: &PromptOverrides,
 ) -> String {
-    let mut prompt = crate::agent::system_prompt::build(cwd, tool_names);
+    let resolved = overrides.resolve(cwd);
+
+    let mut prompt = match resolved.custom {
+        Some(text) => format!("{text}\n\nCurrent working directory: {}", cwd.display()),
+        None => crate::agent::system_prompt::build(cwd, tool_names),
+    };
+
+    if let Some(append) = resolved.append {
+        prompt.push_str("\n\n");
+        prompt.push_str(&append);
+    }
 
     if !no_context_files {
         let files = crate::agent::context_files::load_project_context_files(
@@ -276,7 +320,8 @@ mod tests {
         let cwd = tmpdir("cwd");
         std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES HERE").unwrap();
 
-        let prompt = compose_system_prompt(&cwd, &tools(), &[], false);
+        let prompt =
+            compose_system_prompt(&cwd, &tools(), &[], false, &PromptOverrides::default());
         assert!(
             prompt.contains("<project_context>"),
             "missing block: {prompt}"
@@ -285,7 +330,8 @@ mod tests {
         assert!(prompt.contains("AGENTS.md"));
 
         // --no-context-files suppresses it entirely.
-        let bare = compose_system_prompt(&cwd, &tools(), &[], true);
+        let bare =
+            compose_system_prompt(&cwd, &tools(), &[], true, &PromptOverrides::default());
         assert!(!bare.contains("<project_context>"));
         assert!(!bare.contains("PROJECT RULES HERE"));
 
@@ -341,6 +387,7 @@ mod tests {
             "".into(),
             SkillLoadPolicy::default(),
             true,
+            PromptOverrides::default(),
         );
 
         assert_eq!(
@@ -356,5 +403,205 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    fn one_skill() -> Skill {
+        Skill {
+            name: "demo".into(),
+            description: "a demo skill".into(),
+            file_path: PathBuf::from("/tmp/demo/SKILL.md"),
+            base_dir: PathBuf::from("/tmp/demo"),
+            source: crate::resources::SkillSource::User,
+            disable_model_invocation: false,
+        }
+    }
+
+    /// Run `f` with `NANOPI_HOME` pointed at a fresh empty temp dir,
+    /// restoring the previous value afterward. Mirrors the pattern used
+    /// throughout this module's existing tests.
+    fn with_empty_global_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _g = crate::TEST_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NANOPI_HOME");
+        let home = tmpdir("home");
+        std::env::set_var("NANOPI_HOME", &home);
+
+        let result = f(&home);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        result
+    }
+
+    /// Regression guard: with no override policy and no discoverable
+    /// files, the composed prompt is byte-for-byte identical to today's
+    /// (must-have: "with neither flag nor file present ... identical to
+    /// today's").
+    #[test]
+    fn compose_default_policy_is_unchanged_from_todays_prompt() {
+        with_empty_global_home(|_home| {
+            let cwd = tmpdir("cwd");
+            let prompt = compose_system_prompt(
+                &cwd,
+                &tools(),
+                &[],
+                false,
+                &PromptOverrides::default(),
+            );
+            assert!(prompt.starts_with("You are nanopi"), "{prompt}");
+            assert!(prompt.contains("Guidelines:"), "{prompt}");
+            std::fs::remove_dir_all(&cwd).ok();
+        });
+    }
+
+    /// A custom prompt replaces only the identity/guidelines section:
+    /// context files and the skills block still apply, and the base
+    /// section still ends with the cwd line.
+    #[test]
+    fn compose_custom_prompt_keeps_context_files_and_skills() {
+        with_empty_global_home(|_home| {
+            let cwd = tmpdir("cwd");
+            std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES").unwrap();
+
+            let overrides =
+                PromptOverrides::from_cli(Some("You are Bob".to_string()), vec![], true);
+            let prompt = compose_system_prompt(&cwd, &tools(), &[one_skill()], false, &overrides);
+
+            assert!(prompt.starts_with("You are Bob"), "{prompt}");
+            assert!(!prompt.contains("You are nanopi"), "{prompt}");
+            assert!(
+                prompt.contains(&format!("Current working directory: {}", cwd.display())),
+                "{prompt}"
+            );
+            assert!(prompt.contains("<project_context>"), "{prompt}");
+            assert!(prompt.contains("PROJECT RULES"), "{prompt}");
+            assert!(prompt.contains("<available_skills>"), "{prompt}");
+
+            std::fs::remove_dir_all(&cwd).ok();
+        });
+    }
+
+    /// Append-only: default base, then the append text (blank-line
+    /// separated), then `<project_context>` after it.
+    #[test]
+    fn compose_append_only_lands_after_base_before_context() {
+        with_empty_global_home(|_home| {
+            let cwd = tmpdir("cwd");
+            std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES").unwrap();
+
+            let overrides = PromptOverrides::from_cli(None, vec!["EXTRA TEXT".to_string()], true);
+            let prompt = compose_system_prompt(&cwd, &tools(), &[], false, &overrides);
+
+            assert!(prompt.contains("You are nanopi"), "{prompt}");
+            let cwd_line = format!("Current working directory: {}", cwd.display());
+            let base_end = prompt.find(&cwd_line).expect("cwd line present");
+            let append_pos = prompt.find("EXTRA TEXT").expect("append text present");
+            let context_pos = prompt
+                .find("<project_context>")
+                .expect("project context present");
+            assert!(base_end < append_pos, "{prompt}");
+            assert!(append_pos < context_pos, "{prompt}");
+            assert!(
+                prompt.contains(&format!("{cwd_line}\n\nEXTRA TEXT")),
+                "append must be blank-line separated from the base: {prompt}"
+            );
+
+            std::fs::remove_dir_all(&cwd).ok();
+        });
+    }
+
+    /// Custom + append: custom text, then the cwd line, then append
+    /// text, then context files.
+    #[test]
+    fn compose_custom_and_append_order() {
+        with_empty_global_home(|_home| {
+            let cwd = tmpdir("cwd");
+            std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES").unwrap();
+
+            let overrides = PromptOverrides::from_cli(
+                Some("You are Bob".to_string()),
+                vec!["EXTRA TEXT".to_string()],
+                true,
+            );
+            let prompt = compose_system_prompt(&cwd, &tools(), &[], false, &overrides);
+
+            let custom_pos = prompt.find("You are Bob").expect("custom text present");
+            let cwd_pos = prompt
+                .find(&format!("Current working directory: {}", cwd.display()))
+                .expect("cwd line present");
+            let append_pos = prompt.find("EXTRA TEXT").expect("append text present");
+            let context_pos = prompt
+                .find("<project_context>")
+                .expect("project context present");
+
+            assert!(custom_pos < cwd_pos, "{prompt}");
+            assert!(cwd_pos < append_pos, "{prompt}");
+            assert!(append_pos < context_pos, "{prompt}");
+
+            std::fs::remove_dir_all(&cwd).ok();
+        });
+    }
+
+    /// `--no-context-files` still suppresses `<project_context>` when a
+    /// custom prompt is also in play.
+    #[test]
+    fn compose_no_context_files_suppressed_with_custom_prompt() {
+        with_empty_global_home(|_home| {
+            let cwd = tmpdir("cwd");
+            std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES").unwrap();
+
+            let overrides =
+                PromptOverrides::from_cli(Some("You are Bob".to_string()), vec![], true);
+            let prompt = compose_system_prompt(&cwd, &tools(), &[], true, &overrides);
+
+            assert!(prompt.starts_with("You are Bob"), "{prompt}");
+            assert!(!prompt.contains("<project_context>"), "{prompt}");
+            assert!(!prompt.contains("PROJECT RULES"), "{prompt}");
+
+            std::fs::remove_dir_all(&cwd).ok();
+        });
+    }
+
+    /// `Agent.prompt_overrides` survives `hydrate_resumed` — the exact
+    /// value passed in is what ends up stored on the agent, so `/reload`
+    /// recomposes from the same policy.
+    #[test]
+    fn hydrate_resumed_stores_prompt_overrides_on_agent() {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+
+        with_empty_global_home(|_home| {
+            let cwd = tmpdir("cwd");
+            let (path, _hdr) =
+                crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+            let mut agent = Agent::load_session(&path, &cwd).expect("load");
+
+            let overrides =
+                PromptOverrides::from_cli(Some("You are Bob".to_string()), vec![], true);
+
+            let _ = agent.hydrate_resumed(
+                Box::new(OpenAiProvider::new("", "", "")),
+                ToolRegistry::standard(),
+                PermissionGate::from_cli(false, None),
+                HooksConfig::default(),
+                "m".into(),
+                "http://x".into(),
+                "".into(),
+                SkillLoadPolicy::default(),
+                false,
+                overrides.clone(),
+            );
+
+            assert_eq!(
+                agent.prompt_overrides, overrides,
+                "hydrate_resumed must store the passed-in prompt_overrides on the agent"
+            );
+
+            std::fs::remove_dir_all(&cwd).ok();
+        });
     }
 }
