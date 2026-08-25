@@ -449,6 +449,20 @@ impl Agent {
         // SessionEntry::Message content that also went out in v0.9.1.
         const MAX_ITERATIONS: u32 = 50;
 
+        // Tripwire for "stuck retrying the same failing tool_call" —
+        // observed in the wild with minimax-M3 through an OpenAI-compat
+        // gateway that streamed tool_calls with an empty `name` field:
+        // every iteration got an "unknown tool: unknown" tool_result,
+        // the model responded with the identical empty-name call, and
+        // MAX_ITERATIONS would let it burn ~50 rounds before quitting.
+        // Break out after `STUCK_LIMIT` consecutive rounds where the
+        // tool_call fingerprints match AND every call errored. Args
+        // are stringified so `{"command":"ls"}` compares byte-for-byte
+        // regardless of internal Value ordering.
+        const STUCK_LIMIT: u32 = 3;
+        let mut stuck_streak: u32 = 0;
+        let mut last_error_sig: Option<Vec<(String, String)>> = None;
+
         for _ in 0..MAX_ITERATIONS {
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
@@ -704,9 +718,45 @@ impl Agent {
                         // LLM said "tool calls" but emitted none — done.
                         break;
                     }
+                    // Fingerprint BEFORE `calls` is moved into
+                    // `execute_tool_calls`, so we can compare against
+                    // the previous iteration once it returns.
+                    let sig: Vec<(String, String)> = calls
+                        .iter()
+                        .map(|c| (c.name.clone(), c.arguments.to_string()))
+                        .collect();
+
                     // Pass the cancel token so Esc can kill an in-flight
                     // bash command instead of waiting for it to finish.
-                    self.execute_tool_calls(calls, tx, cancel.clone()).await?;
+                    let is_errors = self
+                        .execute_tool_calls(calls, tx, cancel.clone())
+                        .await?;
+
+                    let all_error = !is_errors.is_empty()
+                        && is_errors.iter().all(|e| *e);
+                    if all_error && last_error_sig.as_ref() == Some(&sig) {
+                        stuck_streak += 1;
+                    } else {
+                        stuck_streak = if all_error { 1 } else { 0 };
+                        last_error_sig = if all_error { Some(sig.clone()) } else { None };
+                    }
+                    if stuck_streak >= STUCK_LIMIT {
+                        let (name, args) = sig
+                            .first()
+                            .map(|(n, a)| (n.as_str(), a.as_str()))
+                            .unwrap_or(("<none>", "{}"));
+                        let msg = format!(
+                            "aborting turn: assistant made the same failing \
+                             tool_call {STUCK_LIMIT} times in a row (tool={name}, \
+                             args={args}). This usually indicates the upstream \
+                             provider/gateway is emitting malformed tool_calls \
+                             (e.g. empty tool name). Rather than burn the \
+                             iteration budget, ending the turn so you can \
+                             intervene."
+                        );
+                        let _ = tx.send(AgentEvent::Error { error: msg.clone() }).await;
+                        return Err(AgentError::Provider(msg));
+                    }
                     // Loop back to the next LLM turn.
                 }
                 FinishReason::Unknown => {
@@ -730,7 +780,7 @@ impl Agent {
         calls: Vec<ToolCall>,
         tx: &mpsc::Sender<AgentEvent>,
         cancel: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<Vec<bool>, AgentError> {
         // Phase 1: Run all tool executions CONCURRENTLY via join_all.
         // Each future resolves to (ToolCall, Result<ToolOutput, ToolError>).
         // Hooks, persistence, and context mutation happen in phase 2.
@@ -825,7 +875,9 @@ impl Agent {
         // Phase 2: Push ToolResult messages into context in call order
         // so the next LLM turn sees them. Persistence already happened
         // during phase 1 (in run_one_tool).
+        let mut errors = Vec::with_capacity(results.len());
         for outcome in results {
+            errors.push(outcome.is_error);
             self.context.push_tool_result_with_images(
                 outcome.call_id,
                 outcome.content,
@@ -834,7 +886,7 @@ impl Agent {
             );
         }
 
-        Ok(())
+        Ok(errors)
     }
 }
 
@@ -2122,5 +2174,128 @@ mod tests {
             elapsed < std::time::Duration::from_millis(1800),
             "expected parallel execution (<1.8s), got {elapsed:?}"
         );
+    }
+
+    /// Regression: the minimax-M3 empty-tool-name bug trapped nanopi
+    /// in a ~10-round retry loop where the
+    /// gateway streamed tool_calls with `function.name = ""`, the
+    /// router rejected each as "unknown tool: ", and the model
+    /// re-emitted the identical call every turn until the user hit
+    /// Esc. The parser fix (in `provider::openai::PendingToolCall`)
+    /// stops the empty name from being emitted downstream, but as a
+    /// belt-and-suspenders defense the agent loop also detects the
+    /// "same failing tool_call K rounds in a row" pattern and aborts
+    /// the turn with a visible error — otherwise a future upstream
+    /// glitch could produce a similar loop and burn 50 iterations
+    /// (`MAX_ITERATIONS`) before self-terminating.
+    #[tokio::test]
+    async fn identical_failing_tool_calls_break_the_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Provider that emits the same unknown-tool call every turn.
+        struct StuckProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for StuckProvider {
+            fn id(&self) -> &'static str {
+                "stuck"
+            }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = tx
+                    .send(AgentEvent::Start {
+                        message_id: "m".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::ToolCall {
+                        content_index: 0,
+                        call: ToolCall {
+                            id: format!("call_{}", uuid::v7()),
+                            name: "nosuchtool".into(),
+                            arguments: json!({"command": "ls"}),
+                        },
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Usage::default(),
+                    })
+                    .await;
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("stuck.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"stuck\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(StuckProvider {
+                calls: call_counter.clone(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "stuck".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move {
+            let mut got_error = false;
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, AgentEvent::Error { .. }) {
+                    got_error = true;
+                }
+            }
+            got_error
+        });
+
+        let r = agent.run_turn("hi", &tx, None).await;
+        drop(tx);
+        let got_error_event = drain.await.unwrap();
+
+        // Must abort with a Provider error — not silently exhaust
+        // MAX_ITERATIONS (50).
+        assert!(
+            matches!(r, Err(AgentError::Provider(_))),
+            "expected stuck-loop tripwire to fire, got {r:?}"
+        );
+        // And the renderer must have seen the Error event.
+        assert!(got_error_event, "renderer must receive an Error event");
+        // Streak trips at 3 identical rounds — must fire well before
+        // MAX_ITERATIONS. Give a little slack for future tweaks: 5.
+        let calls = call_counter.load(Ordering::SeqCst);
+        assert!(
+            calls <= 5,
+            "tripwire should fire in ≤5 rounds, got {calls}"
+        );
+        assert!(
+            calls >= 3,
+            "tripwire should require ≥3 identical rounds before firing, got {calls}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
