@@ -48,7 +48,14 @@ pub fn build(
     model: &str,
     vendor: Option<Box<dyn crate::vendor::Vendor>>,
 ) -> Box<dyn Provider> {
-    match kind {
+    // Vendor's declared transport overrides the config-derived kind
+    // so that e.g. MinimaxVendor (transport = Anthropic) routes through
+    // the Anthropic wire protocol even when config didn't set api_kind.
+    let effective = match &vendor {
+        Some(v) if v.transport() != kind => v.transport(),
+        _ => kind,
+    };
+    match effective {
         ApiKind::Openai => {
             let p = openai::OpenAiProvider::new(base_url, api_key, model);
             Box::new(match vendor {
@@ -84,5 +91,29 @@ mod tests {
         assert_eq!(ApiKind::from_config(Some("anthropic")), ApiKind::Anthropic);
         assert_eq!(ApiKind::from_config(Some("Anthropic")), ApiKind::Anthropic);
         assert_eq!(ApiKind::from_config(Some("claude")), ApiKind::Anthropic);
+    }
+
+    /// When a vendor declares a different transport than the config
+    /// kind, the vendor wins. Regression for the MiniMax 401: the
+    /// Minimax vendor exposes the Anthropic protocol
+    /// (`api.minimax.chat/anthropic`), so even with `api_kind = "openai"`
+    /// (the default) we must build an AnthropicProvider — otherwise
+    /// the gateway rejects the request with "Please carry the API
+    /// secret key in the 'X-Api-Key' field of the request header".
+    #[test]
+    fn vendor_transport_overrides_config_kind() {
+        // Minimax vendor says Anthropic, config says Openai → Anthropic.
+        let v: Box<dyn crate::vendor::Vendor> = Box::new(crate::vendor::MinimaxVendor);
+        let p = build(ApiKind::Openai, "https://x", "k", "minimax-M3", Some(v));
+        assert_eq!(p.id(), "anthropic");
+
+        // Vendor agrees with config → no surprise, still Anthropic.
+        let v: Box<dyn crate::vendor::Vendor> = Box::new(crate::vendor::MinimaxVendor);
+        let p = build(ApiKind::Anthropic, "https://x", "k", "minimax-M3", Some(v));
+        assert_eq!(p.id(), "anthropic");
+
+        // No vendor → honor config as before.
+        let p = build(ApiKind::Openai, "https://x", "k", "gpt-4o", None);
+        assert_eq!(p.id(), "openai");
     }
 }

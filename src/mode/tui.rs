@@ -299,7 +299,13 @@ pub async fn run_tui_mode(
     };
     let _ = session::set_active_session(&cwd, &session_path);
 
-    let provider = crate::provider::build(api_kind, base_url, api_key, model, None);
+    let provider = crate::provider::build(
+        api_kind,
+        base_url,
+        api_key,
+        model,
+        Some(crate::vendor::pick_vendor(None, Some(base_url), model)),
+    );
     let registry = ToolRegistry::standard();
     let hooks = match settings::load_settings(&cwd) {
         Ok(h) => h,
