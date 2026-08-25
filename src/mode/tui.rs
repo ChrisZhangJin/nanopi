@@ -378,6 +378,7 @@ pub async fn run_tui_mode(
         api_kind,
         skill_load_for_rebuilds,
         no_context_files,
+        session_path.with_extension("history.txt"),
     );
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
     let settings_file = crate::settings_toml::load();
@@ -656,9 +657,10 @@ impl App {
         api_kind: crate::provider::ApiKind,
         skill_load: crate::agent::build::SkillLoadPolicy,
         no_context_files: bool,
+        history_path: PathBuf,
     ) -> Self {
         Self {
-            input: TextBuffer::new(),
+            input: TextBuffer::with_history(history_path),
             palette: None,
             model_picker: None,
             status: Status::Idle,
@@ -4110,6 +4112,7 @@ mod tests {
             crate::provider::ApiKind::Openai,
             crate::agent::build::SkillLoadPolicy::default(),
             false,
+            std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
         )
     }
 

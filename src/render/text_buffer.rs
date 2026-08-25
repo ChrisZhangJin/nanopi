@@ -29,6 +29,8 @@
 //!
 //! Non-goals: multi-slot kill ring, redo, search, IME.
 
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What the outer event loop should do after handling a key.
@@ -74,6 +76,9 @@ pub struct TextBuffer {
     /// entered history mode, so Down past the newest entry restores
     /// it. PI calls this `historyDraft`.
     history_draft: String,
+    /// When set, history is persisted to this file (one entry per
+    /// line). Loaded on construction, saved after each submit.
+    history_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +113,29 @@ impl TextBuffer {
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            history_path: None,
         }
+    }
+
+    /// Create a TextBuffer with per-session history persistence.
+    /// Loads existing history from `path` on creation; saves after
+    /// each submit.
+    pub fn with_history(path: PathBuf) -> Self {
+        let mut buf = Self::new();
+        buf.history_path = Some(path.clone());
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    buf.history.push(trimmed.to_string());
+                }
+            }
+            if buf.history.len() > HISTORY_CAP {
+                let excess = buf.history.len() - HISTORY_CAP;
+                buf.history.drain(0..excess);
+            }
+        }
+        buf
     }
 
     /// Full buffer joined with `\n`.
@@ -182,6 +209,15 @@ impl TextBuffer {
         if self.history.len() > HISTORY_CAP {
             let excess = self.history.len() - HISTORY_CAP;
             self.history.drain(0..excess);
+        }
+        self.save_history();
+    }
+
+    /// Persist the in-memory history ring to disk (if a path is set).
+    fn save_history(&self) {
+        if let Some(path) = &self.history_path {
+            let content = self.history.join("\n");
+            let _ = std::fs::write(path, content);
         }
     }
 
@@ -970,5 +1006,37 @@ mod tests {
         assert!(matches!(a, Action::SlashChanged(ref s) if s == "/"));
         let a = b.handle_key(press(KeyCode::Char('c')));
         assert!(matches!(a, Action::SlashChanged(ref s) if s == "/c"));
+    }
+
+    #[test]
+    fn history_persists_to_disk() {
+        let dir = std::env::temp_dir().join("nanopi-textbuffer-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-history.txt");
+        let _ = std::fs::remove_file(&path);
+
+        // Submit entries — should persist to disk.
+        let mut b = TextBuffer::with_history(path.clone());
+        submit(&mut b, "alpha");
+        submit(&mut b, "beta");
+        submit(&mut b, "gamma");
+
+        // Verify the file was written.
+        let contents = std::fs::read_to_string(&path).expect("history file should exist");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines, vec!["alpha", "beta", "gamma"]);
+
+        // Load a fresh buffer from the same path — should recall history.
+        let mut b2 = TextBuffer::with_history(path.clone());
+        b2.handle_key(press(KeyCode::Up));
+        assert_eq!(b2.as_string(), "gamma");
+        b2.handle_key(press(KeyCode::Up));
+        assert_eq!(b2.as_string(), "beta");
+        b2.handle_key(press(KeyCode::Up));
+        assert_eq!(b2.as_string(), "alpha");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
