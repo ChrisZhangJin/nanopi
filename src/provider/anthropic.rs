@@ -15,9 +15,7 @@
 //!
 //! See `docs/v0.5-research.md` §1 for the wire-format comparison.
 
-use std::fmt;
 
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -274,8 +272,6 @@ struct WireContentBlock {
 struct WireMessage {
     #[serde(default)]
     id: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

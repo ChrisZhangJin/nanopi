@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
 
 use futures_util::future::join_all;
 use thiserror::Error;
@@ -848,7 +847,7 @@ impl Agent {
 
         let results = if cancelled {
             let mut synth = Vec::with_capacity(call_meta.len());
-            for (id, name) in call_meta {
+            for (id, _name) in call_meta {
                 let content = "[cancelled by user before tool completed]".to_string();
                 let _ = session::append_entry(
                     &self.session_path,
@@ -862,8 +861,6 @@ impl Agent {
                 );
                 synth.push(ToolCallOutcome {
                     call_id: id,
-                    tool_name: name,
-                    args: Value::Null,
                     content,
                     is_error: true,
                     images: Vec::new(),
@@ -893,12 +890,11 @@ impl Agent {
 }
 
 /// Result of running one tool — what `run_one_tool` returns to the
-/// caller's join_all. We carry enough info so the caller can persist
-/// and update context in any order (in our case, in call order).
+/// caller's join_all. Only what the caller actually needs to push a
+/// tool result into context; persistence already happened inside
+/// `run_one_tool`.
 struct ToolCallOutcome {
     call_id: String,
-    tool_name: String,
-    args: Value,
     content: String,
     is_error: bool,
     /// Multimodal image attachments from the tool (empty for text-only
@@ -954,8 +950,6 @@ async fn run_one_tool(
                     .await;
                 return ToolCallOutcome {
                     call_id: call.id,
-                    tool_name: call.name,
-                    args: effective_args,
                     content: result_text,
                     is_error: true,
                     images: Vec::new(),
@@ -1048,8 +1042,6 @@ async fn run_one_tool(
 
     ToolCallOutcome {
         call_id: call.id,
-        tool_name: call.name,
-        args: effective_args,
         content,
         is_error,
         images,

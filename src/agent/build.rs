@@ -21,7 +21,6 @@ use crate::resources::{
     SkillDiagnostic,
 };
 use crate::tool::ToolRegistry;
-use crate::util::uuid;
 
 /// Where skills should be loaded from for a given run. Callers derive
 /// this from CLI flags + trust decision and hand it to the factory.

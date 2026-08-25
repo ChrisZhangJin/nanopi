@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::AgentEvent;
-use crate::provider::openai::OpenAiProvider;
 use crate::render::stdout::StdoutRenderer;
 use crate::session::{self, SessionEntry};
 use crate::settings;
@@ -120,7 +119,7 @@ pub async fn run_print_mode(
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
-    let mut agent = if let session::SessionChoice::Resume(_) = &choice {
+    let agent = if let session::SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
         let diags = a.hydrate_resumed(

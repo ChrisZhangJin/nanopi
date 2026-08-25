@@ -186,8 +186,8 @@ mod tests {
         for v in &variants {
             let s = serde_json::to_string(v).unwrap();
             let back: AgentEvent = serde_json::from_str(&s).unwrap();
-            // Re-serialize and compare for roundtrip equality.
-            let s2 = serde_json::to_string(&back).unwrap();
+            // Compare as Values, not strings: a roundtrip may reorder
+            // keys, which is not a difference we care about.
             assert_eq!(
                 serde_json::to_value(v).unwrap(),
                 serde_json::to_value(&back).unwrap(),

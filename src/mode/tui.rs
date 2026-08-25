@@ -31,7 +31,7 @@
 //!
 //! MVP: single-line input; multi-line + Emacs keys come in v0.7 S2.
 
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -52,11 +52,9 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::context::Context;
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::AgentEvent;
-use crate::provider::openai::OpenAiProvider;
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
@@ -1054,9 +1052,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.input.clear();
                 return KeyAction::Nothing;
             }
-            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
-                return KeyAction::Nothing
-            }
+            MenuAction::Nothing | MenuAction::Filled(_) => return KeyAction::Nothing,
         }
     }
     // ── Palette owns navigation keys when open. ─────────────────────
@@ -2696,15 +2692,21 @@ async fn spawn_summarize_task(
     let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
     let cut_off = pending.cut_off.clone();
     let task = tokio::spawn(async move {
-        let summary = crate::agent::branch_summary::summarize_branch(
+        match crate::agent::branch_summary::summarize_branch(
             &cut_off,
             custom.as_deref(),
             provider.as_ref(),
         )
-        .await;
-        SummarizeOutcome::Ok {
-            summary,
-            fork: pending,
+        .await
+        {
+            Ok(summary) => SummarizeOutcome::Ok {
+                summary,
+                fork: pending,
+            },
+            Err(error) => SummarizeOutcome::Err {
+                error,
+                fork: pending,
+            },
         }
     });
     app.status_note = Some("summarizing branch…".into());

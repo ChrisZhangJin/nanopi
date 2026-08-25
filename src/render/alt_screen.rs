@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 
-use crossterm::{cursor, queue, terminal, ExecutableCommand, QueueableCommand};
+use crossterm::{cursor, terminal, ExecutableCommand, QueueableCommand};
 
 /// RAII guard that puts the terminal into alt-screen on construction
 /// and restores it on drop (or explicit `leave()`).

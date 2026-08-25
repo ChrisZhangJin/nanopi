@@ -6,9 +6,7 @@
 //!
 //! See `docs/v0.5-research.md` §1 for the wire format comparison.
 
-use std::fmt;
 
-use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -63,8 +61,6 @@ struct WireChoice {
 
 #[derive(Debug, Deserialize, Default)]
 struct WireDelta {
-    #[serde(default)]
-    role: Option<String>,
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
@@ -271,7 +267,7 @@ struct WireToolFunction {
 }
 
 /// Translate a `Context` into the wire-format OpenAI request body.
-pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
+fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
     let mut messages: Vec<WireMessage> = Vec::new();
 
     // OpenAI puts system in the messages array as role:system.
@@ -777,10 +773,6 @@ mod tests {
     use super::*;
     use crate::agent::context::{ContextMessage, ToolSpec};
     use crate::event::AgentEvent;
-
-    fn collect_events(events: Vec<Result<AgentEvent, ()>>) -> Vec<AgentEvent> {
-        events.into_iter().map(|r| r.unwrap()).collect()
-    }
 
     #[test]
     fn extract_error_from_plain_json() {

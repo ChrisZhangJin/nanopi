@@ -80,13 +80,19 @@ fn flatten_entries(entries: &[SessionEntry]) -> String {
 /// `replaceInstructions` flag). Returns None on any provider error
 /// or empty response — the caller can decide whether to fall back
 /// to a placeholder or skip the summary insertion.
+/// Summarize an abandoned branch.
+///
+/// `Ok(None)` means "nothing worth summarizing" — no entries, or the
+/// model returned only whitespace. `Err` means the request itself
+/// failed; the caller reports it and forks without a summary rather
+/// than silently pretending there was nothing to say.
 pub async fn summarize_branch(
     entries: &[SessionEntry],
     custom_instructions: Option<&str>,
     provider: &dyn Provider,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
     let transcript = flatten_entries(entries);
     let system = custom_instructions.unwrap_or(DEFAULT_SUMMARIZER_SYSTEM);
@@ -112,13 +118,15 @@ pub async fn summarize_branch(
     });
 
     let stream_res = provider.stream_turn(&ctx, tx).await;
-    let text = collect.await.ok()?;
-    stream_res.ok()?;
+    let text = collect
+        .await
+        .map_err(|e| format!("summarizer task failed: {e}"))?;
+    stream_res?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(trimmed.to_string())
+        Ok(Some(trimmed.to_string()))
     }
 }
 
@@ -171,7 +179,7 @@ mod tests {
         let p = FakeProvider {
             response: "  they said hi twice  ".into(),
         };
-        let out = summarize_branch(&entries, None, &p).await;
+        let out = summarize_branch(&entries, None, &p).await.expect("ok");
         assert_eq!(out.as_deref(), Some("they said hi twice"));
     }
 
@@ -180,7 +188,7 @@ mod tests {
         let p = FakeProvider {
             response: "unused".into(),
         };
-        assert!(summarize_branch(&[], None, &p).await.is_none());
+        assert!(summarize_branch(&[], None, &p).await.expect("ok").is_none());
     }
 
     #[tokio::test]
@@ -200,7 +208,9 @@ mod tests {
             }
         }
         let entries = vec![user("x")];
-        assert!(summarize_branch(&entries, None, &Broken).await.is_none());
+        // A provider failure must now surface as Err, not be swallowed
+        // as "nothing to summarize".
+        assert!(summarize_branch(&entries, None, &Broken).await.is_err());
     }
 
     #[tokio::test]
@@ -210,7 +220,9 @@ mod tests {
             response: "answer".into(),
         };
         let custom = "Summarize in exactly 10 words. No preamble.";
-        let out = summarize_branch(&entries, Some(custom), &p).await;
+        let out = summarize_branch(&entries, Some(custom), &p)
+            .await
+            .expect("ok");
         // We can't inspect the system prompt directly via FakeProvider,
         // but we can verify the call goes through with custom set.
         assert_eq!(out.as_deref(), Some("answer"));

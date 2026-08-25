@@ -338,10 +338,6 @@ impl TextBuffer {
         &self.lines[self.cursor.0]
     }
 
-    fn line_mut(&mut self) -> &mut String {
-        &mut self.lines[self.cursor.0]
-    }
-
     /// True for chars that merge into contiguous undo runs. Matches
     /// the word-motion definition used by Ctrl-W / Alt-B / Alt-F.
     fn is_word_char(c: char) -> bool {
