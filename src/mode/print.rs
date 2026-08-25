@@ -56,6 +56,7 @@ pub async fn run_print_mode(
     exact_session_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
+    prompt_overrides: crate::agent::prompt_override::PromptOverrides,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
@@ -138,7 +139,7 @@ pub async fn run_print_mode(
             api_key.to_string(),
             skill_load,
             no_context_files,
-            crate::agent::prompt_override::PromptOverrides::default(),
+            prompt_overrides,
         );
         print_skill_diagnostics(&diags);
         a
@@ -156,7 +157,7 @@ pub async fn run_print_mode(
             api_key: api_key.to_string(),
             skill_load,
             no_context_files,
-            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            prompt_overrides,
         });
         print_skill_diagnostics(&diags);
         a

@@ -282,6 +282,7 @@ pub async fn run_tui_mode(
     exact_session_id: Option<String>,
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
+    prompt_overrides: crate::agent::prompt_override::PromptOverrides,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -337,6 +338,7 @@ pub async fn run_tui_mode(
 
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let skill_load_for_rebuilds = skill_load.clone();
+    let prompt_overrides_for_rebuilds = prompt_overrides.clone();
     let agent: Agent = if let SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
@@ -350,7 +352,7 @@ pub async fn run_tui_mode(
             api_key.to_string(),
             skill_load,
             no_context_files,
-            crate::agent::prompt_override::PromptOverrides::default(),
+            prompt_overrides,
         );
         print_skill_diagnostics(&diags);
         a
@@ -368,7 +370,7 @@ pub async fn run_tui_mode(
             api_key: api_key.to_string(),
             skill_load,
             no_context_files,
-            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            prompt_overrides,
         });
         print_skill_diagnostics(&diags);
         a
@@ -400,6 +402,7 @@ pub async fn run_tui_mode(
         api_kind,
         skill_load_for_rebuilds,
         no_context_files,
+        prompt_overrides_for_rebuilds,
         session_path.with_extension("history.txt"),
     );
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
@@ -669,6 +672,11 @@ struct App {
     /// `/fork`, `/resume`, and `/model` rebuild the Agent with the same
     /// AGENTS.md/CLAUDE.md discovery rule.
     no_context_files: bool,
+    /// `--system-prompt` / `--append-system-prompt` policy, remembered
+    /// from startup so `/new`, `/fork`, `/resume`, and `/model` rebuild
+    /// the Agent with the same prompt policy the user asked for on the
+    /// command line.
+    prompt_overrides: crate::agent::prompt_override::PromptOverrides,
     /// Most recent skill invocation, captured collapsed on scrollback.
     /// Ctrl-O expands it once. `None` outside a skill invocation.
     last_skill_block: Option<CollapsedSkill>,
@@ -686,6 +694,7 @@ impl App {
         api_kind: Option<crate::provider::ApiKind>,
         skill_load: crate::agent::build::SkillLoadPolicy,
         no_context_files: bool,
+        prompt_overrides: crate::agent::prompt_override::PromptOverrides,
         history_path: PathBuf,
     ) -> Self {
         Self {
@@ -727,6 +736,7 @@ impl App {
             capture: CaptureMode::None,
             skill_load,
             no_context_files,
+            prompt_overrides,
             last_skill_block: None,
             skills_cache: Vec::new(),
         }
@@ -1617,7 +1627,7 @@ async fn handle_action(
                 api_key,
                 skill_load: app.skill_load.clone(),
                 no_context_files: app.no_context_files,
-                prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+                prompt_overrides: app.prompt_overrides.clone(),
             });
             crate::agent::build::print_skill_diagnostics(&diags);
             {
@@ -1731,7 +1741,7 @@ async fn handle_action(
                 api_key,
                 app.skill_load.clone(),
                 app.no_context_files,
-                crate::agent::prompt_override::PromptOverrides::default(),
+                app.prompt_overrides.clone(),
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
@@ -2180,7 +2190,7 @@ async fn handle_action(
                 api_key,
                 app.skill_load.clone(),
                 app.no_context_files,
-                crate::agent::prompt_override::PromptOverrides::default(),
+                app.prompt_overrides.clone(),
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
@@ -2652,7 +2662,7 @@ async fn execute_fork(
         api_key,
         app.skill_load.clone(),
         app.no_context_files,
-        crate::agent::prompt_override::PromptOverrides::default(),
+        app.prompt_overrides.clone(),
     );
     crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
@@ -4224,6 +4234,7 @@ mod tests {
             Some(crate::provider::ApiKind::Openai),
             crate::agent::build::SkillLoadPolicy::default(),
             false,
+            crate::agent::prompt_override::PromptOverrides::from_cli(None, Vec::new(), false),
             std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
         )
     }
