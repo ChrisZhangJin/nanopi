@@ -121,11 +121,24 @@ code=${code:-0}
 [ "$code" -ne 0 ] || fail "expected non-zero exit code on invalid model, got 0"
 pass "invalid model returns non-zero exit code ($code)"
 
-# Test 9: stdin message in interactive mode (single-shot).
-echo "=== Test 9: stdin message in interactive mode ==="
+# Test 9: message piped on stdin, no -m and no -p. A pipe implies
+# non-interactive; this used to go through the removed rustyline mode.
+echo "=== Test 9: stdin message, no -p ==="
 out=$(echo "what is 2+2? one number" | $BIN --model "$MODEL" --base-url "$BASE" --api-key "$KEY" 2>&1)
 echo "$out" | grep -q '4' || fail "stdin-driven turn did not produce 4"
 pass "stdin-driven turn works"
+
+# Test 9b: explicit -p with a piped message.
+echo "=== Test 9b: stdin message with -p ==="
+out=$(echo "what is 3+3? one number" | $BIN -p --model "$MODEL" --base-url "$BASE" --api-key "$KEY" 2>&1)
+echo "$out" | grep -q '6' || fail "-p stdin turn did not produce 6"
+pass "-p reads the message from stdin"
+
+# Test 9c: no message anywhere is a usage error, not a crash.
+echo "=== Test 9c: no message ==="
+out=$($BIN -p --model "$MODEL" --base-url "$BASE" --api-key "$KEY" </dev/null 2>&1) && fail "expected non-zero exit"
+echo "$out" | grep -q 'no message' || fail "missing usage error, got: $out"
+pass "missing message errors cleanly"
 
 # Test 10: --output json contains messages array with user/assistant entries.
 echo "=== Test 10: JSON messages array ==="
@@ -154,11 +167,19 @@ fi
 # Test 12: v0.6+ flags are documented in --help.
 echo "=== Test 12: v0.6+ flags in --help ==="
 help_out=$($BIN --help 2>&1)
-for flag in -- '--continue' '--session' '--fork' '--tui'; do
+for flag in -- '--continue' '--session' '--fork' '--session-id'; do
     [ "$flag" = "--" ] && continue
     echo "$help_out" | grep -q -- "$flag" || fail "flag $flag missing from --help"
 done
-pass "--continue / --session / --fork / --tui all documented"
+pass "--continue / --session / --fork / --session-id all documented"
+
+# Test 12b: the removed TUI-toggle flags are really gone.
+echo "=== Test 12b: --tui / --no-tui removed ==="
+for gone in '--no-tui' '--tui'; do
+    echo "$help_out" | grep -q -- "$gone" && fail "flag $gone should have been removed"
+done
+$BIN --no-tui --help >/dev/null 2>&1 && fail "--no-tui should be rejected"
+pass "--tui / --no-tui removed"
 
 # Test 13: --continue reuses the same session file for the cwd.
 echo "=== Test 13: --continue reuses session ==="

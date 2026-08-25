@@ -2,13 +2,14 @@
 //!
 //! Parses args with clap, dispatches to `mode::print` or `mode::interactive`.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 
 use nanopi::config;
-use nanopi::mode::{interactive, print, tui};
+use nanopi::mode::{print, tui};
 use nanopi::provider;
 use nanopi::wizard;
 
@@ -30,7 +31,7 @@ struct Args {
     #[arg(long)]
     api_key: Option<String>,
 
-    /// User message. If absent, read from stdin (interactive mode only).
+    /// User message. If absent in `-p` mode, read from piped stdin.
     /// Can also be passed as the first positional argument.
     #[arg(short = 'm', long)]
     message: Option<String>,
@@ -82,18 +83,6 @@ struct Args {
     /// which select an already-existing session.
     #[arg(long = "session-id", value_name = "ID", conflicts_with_all = ["continue_session", "session_id"])]
     exact_session_id: Option<String>,
-
-    /// Force the full ratatui TUI (alt-screen) even if stdin isn't a
-    /// TTY. Without this or `--no-tui`, the mode is auto-selected:
-    /// TTY → TUI, pipe/non-TTY → rustyline classic mode.
-    #[arg(long, conflicts_with = "no_tui")]
-    tui: bool,
-
-    /// Force the rustyline classic mode (line-oriented, pipe-friendly)
-    /// even in a TTY. Useful for scripts, CI, and users who prefer to
-    /// keep terminal scrollback.
-    #[arg(long = "no-tui")]
-    no_tui: bool,
 
     /// Tool whitelist (comma-separated names). Default: all standard tools.
     #[arg(long, value_delimiter = ',')]
@@ -289,15 +278,40 @@ async fn main() -> ExitCode {
         eprintln!("• api_kind = anthropic — talking to {base_url}/v1/messages");
     }
 
-    let result = if args.print {
-        let message = args
+    // The TUI needs a real terminal. `-p` is the explicit non-interactive
+    // mode, but a piped invocation (`echo "..." | nanopi`) implies the
+    // same thing — before, that case fell through to the rustyline mode;
+    // now it routes here rather than letting ratatui fail against a pipe
+    // with a bare "No such device or address".
+    let non_interactive = args.print || !std::io::stdin().is_terminal();
+
+    let result = if non_interactive {
+        let from_stdin: Option<String>;
+        let message = match args
             .message
             .as_deref()
-            .or(args.positional_message.as_deref());
-        let message = match message {
+            .or(args.positional_message.as_deref())
+        {
             Some(m) => m,
+            // No message argument: read the prompt from stdin, so
+            // `echo "..." | nanopi -p` works. Only when stdin is
+            // actually piped — on a TTY this would silently block
+            // waiting for input the user doesn't know we want.
+            None if !std::io::stdin().is_terminal() => {
+                let mut buf = String::new();
+                if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                    eprintln!("error: reading message from stdin: {e}");
+                    return ExitCode::from(2);
+                }
+                if buf.trim().is_empty() {
+                    eprintln!("error: no message (pass one as an argument or pipe it on stdin)");
+                    return ExitCode::from(2);
+                }
+                from_stdin = Some(buf.trim_end().to_string());
+                from_stdin.as_deref().unwrap()
+            }
             None => {
-                eprintln!("error: -p mode requires --message");
+                eprintln!("error: no message (pass one as an argument or pipe it on stdin)");
                 return ExitCode::from(2);
             }
         };
@@ -319,31 +333,12 @@ async fn main() -> ExitCode {
             args.no_context_files,
         )
         .await
-    } else if should_use_tui(&args) {
+    } else {
         tui::run_tui_mode(
             api_kind,
             &base_url,
             &model,
             &api_key,
-            cwd,
-            args.no_hooks,
-            approve,
-            args.continue_session,
-            args.session_id.clone(),
-            args.fork_id.clone(),
-            args.exact_session_id.clone(),
-            skill_load.clone(),
-            args.no_context_files,
-        )
-        .await
-    } else {
-        let message = args.message.clone().or(args.positional_message.clone());
-        interactive::run_interactive_mode(
-            api_kind,
-            &base_url,
-            &model,
-            &api_key,
-            message,
             cwd,
             args.no_hooks,
             approve,
@@ -364,26 +359,6 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-/// Decide whether to enter the full ratatui TUI. Priority:
-///   --tui explicit    →  TUI
-///   --no-tui explicit →  rustyline (classic)
-///   stdin is a TTY    →  TUI  (nanopi's PI-style default)
-///   otherwise         →  rustyline (pipe/CI-friendly, single-shot)
-///
-/// The `-p` (print) branch is decided elsewhere in main and never
-/// reaches this function, so we don't need to handle it here.
-fn should_use_tui(args: &Args) -> bool {
-    if args.tui {
-        return true;
-    }
-    if args.no_tui {
-        return false;
-    }
-    // Auto: TTY on stdin means an interactive user session.
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
 }
 
 /// Detect `nanopi init`: the positional message is exactly "init" AND

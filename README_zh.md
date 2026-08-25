@@ -87,6 +87,9 @@ nanopi -p "读一下 /etc/hostname 告诉我内容"
 # JSON 输出，便于脚本调用
 nanopi -p --output json "say hi"
 
+# 从 stdin 读取 prompt
+echo "explain this error" | nanopi -p
+
 # 恢复：最近一次会话 / 指定 id / fork
 nanopi --continue
 nanopi --session <id>
@@ -100,7 +103,7 @@ nanopi --fork <id>
 | `--base-url` | `https://api.openai.com/v1` | OpenAI 兼容 API 根地址 |
 | `--model` | （必填） | 模型 id |
 | `--api-key` | `$OPENAI_API_KEY` | Bearer token |
-| `-m`, `--message` | （stdin） | 用户消息；第一个位置参数也可 |
+| `-m`, `--message` | （管道 stdin） | 用户消息；第一个位置参数也可。`-p` 模式下可从管道 stdin 读取 |
 | `-p`, `--print` | false | 非交互模式 |
 | `--output` | `text` | `-p` 输出格式：`text` \| `json` |
 | `--continue` | false | 恢复最近一次会话 |

@@ -87,6 +87,9 @@ nanopi -p "read /etc/hostname and tell me what you see"
 # JSON output for scripting
 nanopi -p --output json "say hi"
 
+# Prompt piped on stdin
+echo "explain this error" | nanopi -p
+
 # Resume: last session / by id / fork
 nanopi --continue
 nanopi --session <id>
@@ -100,7 +103,7 @@ nanopi --fork <id>
 | `--base-url` | `https://api.openai.com/v1` | OpenAI-compatible API root |
 | `--model` | (required) | Model id |
 | `--api-key` | `$OPENAI_API_KEY` | Bearer token |
-| `-m`, `--message` | (stdin) | User message; first positional arg also accepted |
+| `-m`, `--message` | (piped stdin) | User message; first positional arg also accepted. In `-p` mode, falls back to piped stdin |
 | `-p`, `--print` | false | Non-interactive mode |
 | `--output` | `text` | `-p` output: `text` \| `json` |
 | `--continue` | false | Resume the most recent session |

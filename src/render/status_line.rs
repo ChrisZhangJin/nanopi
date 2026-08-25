@@ -1,5 +1,5 @@
 //! Status-line component builders shared by both the `--tui` footer
-//! and the rustyline pre-/post-turn dim status line.
+//! and the print-mode pre-/post-turn dim status line.
 //!
 //! Each function returns a `String` (or an `Option<String>`) of a
 //! single info fragment. The caller assembles them with the separator
@@ -104,26 +104,6 @@ pub fn context_color(pct: f64) -> &'static str {
     }
 }
 
-/// Full pre-turn status assembled for the rustyline / classic mode.
-/// Each piece dim-gray, separated by ` · `. Optional pieces (empty
-/// branch, absent cost) are dropped.
-///
-/// Example output:
-///   `claude-opus-4-7 · ↑1.2k ↓340 · $0.05 · ~/nanopi · main`
-pub fn classic_status_line(model: &str, usage: &Usage, cwd: &Path) -> String {
-    let mut parts = vec![model.to_string(), tokens_summary(usage)];
-    let cost = cost_string(model, usage);
-    if !cost.is_empty() {
-        parts.push(cost);
-    }
-    parts.push(cwd_display(cwd));
-    let br = git_branch(cwd);
-    if !br.is_empty() {
-        parts.push(br);
-    }
-    parts.join(" · ")
-}
-
 /// Ad-hoc pricing lookup for callers that just want the struct.
 pub fn pricing_for(model: &str) -> Option<ModelPricing> {
     pricing::lookup(model)
@@ -221,15 +201,5 @@ mod tests {
         assert_eq!(context_color(70.0), "yellow");
         assert_eq!(context_color(89.9), "yellow");
         assert_eq!(context_color(90.0), "red");
-    }
-
-    #[test]
-    fn classic_status_line_builds() {
-        let cwd = std::path::PathBuf::from("/nonexistent");
-        let line = classic_status_line("claude-opus-4-7", &u(1000, 500), &cwd);
-        assert!(line.contains("claude-opus-4-7"));
-        assert!(line.contains("↑1.0k"));
-        assert!(line.contains("↓500"));
-        assert!(line.contains("$")); // known model → cost present
     }
 }
