@@ -1,6 +1,10 @@
 ---
-project: nanopi
-updated: 2026-08-19
+gsd_state_version: 1.0
+milestone: v0.9.3
+milestone_name: milestone
+status: unknown
+last_updated: "2026-08-22T17:08:06.847Z"
+last_activity: "2026-08-19 - Completed quick task 260819-ayr: first-run wizard."
 ---
 
 # Project State
