@@ -17,7 +17,7 @@
 //!   writing the key file entirely.
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, Context as _};
 use serde_json::json;
@@ -596,9 +596,4 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
-}
-
-#[allow(dead_code)]
-fn _keep_path_type_used() -> Option<PathBuf> {
-    None
 }

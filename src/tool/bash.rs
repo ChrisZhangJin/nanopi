@@ -16,7 +16,6 @@
 //! v0.5: bash output goes through stdout+stderr (merged). The full cmd
 //! is `bash -c "<command>"` with no shell expansion safeguards.
 
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -223,8 +222,6 @@ async fn write_overflow(content: &str) -> String {
 }
 
 // Ensure Path import doesn't go stale.
-#[allow(dead_code)]
-fn _path_marker(_: &Path) {}
 
 #[cfg(test)]
 mod tests {

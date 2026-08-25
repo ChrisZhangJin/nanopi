@@ -39,14 +39,6 @@ base_url = "https://api.openai.com/v1"
 # at startup so you don't accidentally commit this file with the key.
 # api_key = "sk-..."
 
-# ─── Tool whitelist (optional) ──────────────────────────────────────
-
-# Comma-list of standard tools the agent is allowed to invoke.
-# Empty or absent = all standard tools available.
-# Valid names: read, write, edit, bash, grep, find, ls
-# tools = ["read", "grep", "find", "ls"]     # safe read-only preset
-# tools = ["read", "write", "edit", "bash"]  # full dev preset
-
 # ─── Trust default (optional) ───────────────────────────────────────
 
 # Overrides the interactive trust prompt for project-local resources.

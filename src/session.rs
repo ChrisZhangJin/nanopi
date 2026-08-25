@@ -507,22 +507,6 @@ pub fn fork_session_at(
     Ok((path, header, prefill))
 }
 
-/// Extract user Message texts from a session, in file order. Used to
-/// populate the fork picker. Returns (index-in-user-list, content).
-pub fn user_messages(entries: &[SessionEntry]) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    let mut n = 0usize;
-    for e in entries {
-        if let SessionEntry::Message { role, content, .. } = e {
-            if role == "user" {
-                out.push((n, content.clone()));
-                n += 1;
-            }
-        }
-    }
-    out
-}
-
 /// One displayable row in the fork tree picker. Matches PI's
 /// default tree filter (see `tree-selector.ts:345-386`): show user,
 /// assistant, tool calls, and compaction; hide bookkeeping (model
@@ -1318,34 +1302,6 @@ mod tests {
         assert_eq!(rows[3].role, "[compaction]");
         assert!(rows[3].preview.contains("12 msgs"));
         assert_eq!(rows[3].entry_index, 5);
-    }
-
-    #[test]
-    fn user_messages_picks_only_user_role() {
-        let entries = vec![
-            SessionEntry::Message {
-                id: "1".into(),
-                timestamp: "".into(),
-                role: "user".into(),
-                content: "hi".into(),
-            },
-            SessionEntry::Message {
-                id: "2".into(),
-                timestamp: "".into(),
-                role: "assistant".into(),
-                content: "hello".into(),
-            },
-            SessionEntry::Message {
-                id: "3".into(),
-                timestamp: "".into(),
-                role: "user".into(),
-                content: "how are you".into(),
-            },
-        ];
-        let out = user_messages(&entries);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], (0, "hi".into()));
-        assert_eq!(out[1], (1, "how are you".into()));
     }
 
     /// resolve_session with --fork returns Resume(new_path) and the new file

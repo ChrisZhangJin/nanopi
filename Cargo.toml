@@ -12,10 +12,6 @@ readme = "README.md"
 name = "nanopi"
 path = "src/main.rs"
 
-[[bin]]
-name = "nanopi_v0_1"
-path = "src/v0.1_main.rs"
-
 [lib]
 name = "nanopi"
 path = "src/lib.rs"
@@ -63,9 +59,6 @@ regex = { version = "1.10", default-features = false, features = ["std"] }
 # Date/time (RFC3339 for sessions)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
-# Structured logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # v0.8: image base64 encoding for the read tool's vision path.
 base64 = { version = "0.22", default-features = false, features = ["std"] }

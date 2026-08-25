@@ -3,7 +3,6 @@
 //! See `docs/v0.5-research.md` §5 for the design.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,7 +16,6 @@ use crate::render::stdout::StdoutRenderer;
 use crate::session::{self, SessionEntry};
 use crate::settings;
 use crate::tool::ToolRegistry;
-use crate::util::time;
 
 /// What to print on stdout in `-p` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,11 +268,5 @@ fn collect_messages(session_path: &std::path::Path) -> Result<Vec<Value>> {
 }
 
 // Arc import used by future extensions (TUI mode).
-#[allow(dead_code)]
-fn _arc_unused(_: Arc<()>) {}
 
 // time import retained for future usage.
-#[allow(dead_code)]
-fn _time_marker() -> String {
-    time::now_iso8601()
-}

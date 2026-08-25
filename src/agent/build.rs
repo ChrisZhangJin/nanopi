@@ -12,8 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::context::Context;
-use crate::agent::hook::HookConfig;
-use crate::agent::loop_::{Agent, AgentError, HooksConfig, Provider};
+use crate::agent::loop_::{Agent, HooksConfig, Provider};
 use crate::agent::permission::PermissionGate;
 use crate::event::Usage;
 use crate::resources::{
@@ -248,12 +247,6 @@ pub fn print_skill_diagnostics(diags: &[SkillDiagnostic]) {
 }
 
 // Prevent unused-import lints if a future refactor drops fields.
-#[allow(dead_code)]
-fn _keep_types_in_scope(_: HookConfig) {}
-#[allow(dead_code)]
-fn _keep_error_in_scope(e: AgentError) -> AgentError {
-    e
-}
 
 #[cfg(test)]
 mod tests {

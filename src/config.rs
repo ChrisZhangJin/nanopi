@@ -65,15 +65,8 @@ pub struct Config {
     #[serde(default)]
     pub provider: Option<String>,
 
-    /// Tool whitelist. Empty/absent = all standard tools.
-    #[serde(default)]
-    pub tools: Vec<String>,
-
     #[serde(default)]
     pub trust: TrustConfig,
-
-    #[serde(default)]
-    pub logging: LoggingConfig,
 
     /// v0.6+: hooks live in the same config.toml so users have one file
     /// to edit. Same shape as `~/.nanopi/settings.toml` (which is still
@@ -107,13 +100,6 @@ pub struct TrustConfig {
     pub default: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct LoggingConfig {
-    pub level: Option<String>,
-    pub file: Option<PathBuf>,
-}
-
 impl Config {
     /// Built-in defaults when no config files exist.
     pub fn builtin_defaults() -> Self {
@@ -124,9 +110,7 @@ impl Config {
             api_key: None,
             api_kind: None,
             provider: None,
-            tools: Vec::new(),
             trust: TrustConfig::default(),
-            logging: LoggingConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
         }
@@ -191,8 +175,6 @@ fn merge(a: Config, b: Config) -> Config {
     hooks.user_prompt_submit.extend(b.hooks.user_prompt_submit);
     hooks.session_start.extend(b.hooks.session_start);
     hooks.session_end.extend(b.hooks.session_end);
-    // tools whitelist: `b` (project) wins if it declares any; else keep `a`.
-    let tools = if b.tools.is_empty() { a.tools } else { b.tools };
     // skills: disabled + extra_dirs concatenate (both sides additive).
     let mut skills = SkillsConfig {
         disabled: a.skills.disabled,
@@ -207,13 +189,8 @@ fn merge(a: Config, b: Config) -> Config {
         api_key: b.api_key.or(a.api_key),
         api_kind: b.api_kind.or(a.api_kind),
         provider: b.provider.or(a.provider),
-        tools,
         trust: TrustConfig {
             default: b.trust.default.or(a.trust.default),
-        },
-        logging: LoggingConfig {
-            level: b.logging.level.or(a.logging.level),
-            file: b.logging.file.or(a.logging.file),
         },
         hooks,
         skills,
@@ -288,7 +265,6 @@ mod tests {
         let c = Config::builtin_defaults();
         assert_eq!(c.model, None);
         assert_eq!(c.base_url, None);
-        assert!(c.tools.is_empty());
     }
 
     #[test]
@@ -343,9 +319,7 @@ base_url = "https://project.example/v1"
             api_key: None,
             api_kind: None,
             provider: None,
-            tools: Vec::new(),
             trust: TrustConfig::default(),
-            logging: LoggingConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
         };
@@ -356,9 +330,7 @@ base_url = "https://project.example/v1"
             api_key: None,
             api_kind: None,
             provider: None,
-            tools: Vec::new(),
             trust: TrustConfig::default(),
-            logging: LoggingConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
         };
@@ -379,7 +351,6 @@ base_url = "https://project.example/v1"
 model = "cfg-model"
 base_url = "https://cfg.example/v1"
 api_key = "sk-inline-secret"
-tools = ["read", "write", "grep"]
 
 [[hooks.pre_tool_use]]
 matcher = "bash"
@@ -396,7 +367,6 @@ command = "/bin/true"
         let c = load_config(tmp.path()).unwrap();
         assert_eq!(c.model.as_deref(), Some("cfg-model"));
         assert_eq!(c.api_key.as_deref(), Some("sk-inline-secret"));
-        assert_eq!(c.tools, vec!["read", "write", "grep"]);
         assert_eq!(c.hooks.pre_tool_use.len(), 1);
         assert_eq!(c.hooks.pre_tool_use[0].matcher, "bash");
         assert_eq!(c.hooks.session_start.len(), 1);

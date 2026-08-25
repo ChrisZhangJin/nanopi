@@ -18,7 +18,6 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::agent::context::Context;
@@ -27,20 +26,6 @@ use crate::provider::sse::SseStream;
 
 /// Provider identifier constant.
 pub const ANTHROPIC_ID: &str = "anthropic";
-
-#[derive(Debug, Error)]
-pub enum AnthropicError {
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("provider returned status {status}: {body}")]
-    Status { status: u16, body: String },
-    #[error("SSE parse error: {0}")]
-    Sse(String),
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("API error in stream: {0}")]
-    Api(String),
-}
 
 /// The Anthropic provider.
 pub struct AnthropicProvider {

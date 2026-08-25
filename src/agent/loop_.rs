@@ -227,13 +227,6 @@ impl Agent {
         })
     }
 
-    /// Find the most recently used session path for the given cwd.
-    /// Returns None if no session has ever been recorded for it. Used
-    /// by `--continue` and the multi-turn TUI to resume.
-    pub fn continue_last_session(cwd: &Path) -> Option<PathBuf> {
-        crate::session::active_session(cwd)
-    }
-
     /// Fire all `session_start` hooks. Advisory — outcome is not enforced.
     /// Call once, after Agent construction, before the first turn.
     ///
@@ -1670,7 +1663,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ─────── v0.6: --continue / continue_last_session ───────
+    // ─────── v0.6: --continue / active_session ───────
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -1678,14 +1671,14 @@ mod tests {
 
     /// No active session registered for this cwd → returns None.
     #[test]
-    fn continue_last_session_returns_none_when_no_history() {
+    fn active_session_returns_none_when_no_history() {
         let _g = lock();
         let home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", &home);
 
         let cwd = tmp();
-        let got = Agent::continue_last_session(&cwd);
+        let got = crate::session::active_session(&cwd);
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
@@ -1700,7 +1693,7 @@ mod tests {
     /// After creating a session and registering it as active, returns
     /// that session's path.
     #[test]
-    fn continue_last_session_returns_active_path_after_use() {
+    fn active_session_returns_path_after_use() {
         let _g = lock();
         let home = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
@@ -1710,7 +1703,7 @@ mod tests {
         let (path, _header) = crate::session::new_session(&cwd, "m", "http://x").expect("new");
         crate::session::set_active_session(&cwd, &path).expect("active");
 
-        let got = Agent::continue_last_session(&cwd).expect("some");
+        let got = crate::session::active_session(&cwd).expect("some");
         assert_eq!(got, path);
 
         if let Some(p) = prev {

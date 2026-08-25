@@ -31,9 +31,6 @@ pub enum OpenAiError {
     Api(String),
 }
 
-/// Provider identifier constant.
-pub const OPENAI_ID: &str = "openai";
-
 /// One chunk from the OpenAI streaming response. We only model the fields
 /// we actually use; the rest is left as `serde_json::Value`.
 #[derive(Debug, Deserialize)]

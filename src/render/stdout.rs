@@ -105,12 +105,6 @@ impl StdoutRenderer {
         }
         Ok(())
     }
-
-    /// Drain buffered text (the assistant's full message).
-    pub fn finalize(&mut self) -> String {
-        let s = std::mem::take(&mut self.buffer);
-        s
-    }
 }
 
 impl Default for StdoutRenderer {
@@ -153,16 +147,5 @@ mod tests {
             },
         })
         .unwrap();
-    }
-
-    #[test]
-    fn finalize_returns_buffer_and_clears() {
-        let mut r = StdoutRenderer::new();
-        let _ = r.render(&AgentEvent::TextDelta {
-            content_index: 0,
-            text: "abc".into(),
-        });
-        assert_eq!(r.finalize(), "abc");
-        assert!(r.buffer.is_empty());
     }
 }

@@ -84,10 +84,6 @@ struct Args {
     #[arg(long = "session-id", value_name = "ID", conflicts_with_all = ["continue_session", "session_id"])]
     exact_session_id: Option<String>,
 
-    /// Tool whitelist (comma-separated names). Default: all standard tools.
-    #[arg(long, value_delimiter = ',')]
-    tools: Vec<String>,
-
     /// Which wire protocol to use against `base_url`. Overrides
     /// `api_kind` in config.toml. `openai` (default) talks to
     /// `/chat/completions`; `anthropic` talks to `/v1/messages`.

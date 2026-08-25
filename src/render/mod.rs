@@ -1,8 +1,8 @@
 //! Output renderers — turn AgentEvent streams into terminal output.
 //!
-//! v0.5 ships `StdoutRenderer` (ANSI-colored, no TUI) for both
-//! interactive and `-p` modes. `TuiRenderer` (crossterm alt-screen)
-//! is a v0.6+ concern.
+//! `StdoutRenderer` (ANSI-colored, no TUI) serves `-p` / piped mode.
+//! The interactive TUI renders itself in `mode::tui` against ratatui,
+//! using the widgets here (`menu`, `panel`, `text_buffer`, `markdown`).
 
 pub mod alt_screen;
 pub mod export_html;
@@ -13,4 +13,3 @@ pub mod spinner;
 pub mod status_line;
 pub mod stdout;
 pub mod text_buffer;
-pub mod tui;

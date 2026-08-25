@@ -25,7 +25,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Where the skill was discovered — used for autocomplete labels and
@@ -82,61 +81,6 @@ pub struct SkillDiagnostic {
 pub struct LoadSkillsResult {
     pub skills: Vec<Skill>,
     pub diagnostics: Vec<SkillDiagnostic>,
-}
-
-// -- prompt templates (unchanged from v0.5) --
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptTemplate {
-    pub name: String,
-    pub description: String,
-    pub args: Vec<String>,
-    pub body: String,
-    pub location: PathBuf,
-}
-
-/// Load prompt templates from a directory. Missing dir → Ok(empty).
-pub fn load_prompts_from_dir(dir: &Path) -> Result<Vec<PromptTemplate>> {
-    let mut out = Vec::new();
-    if !dir.exists() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        if let Some(p) = parse_prompt_file(&path)? {
-            out.push(p);
-        }
-    }
-    Ok(out)
-}
-
-fn parse_prompt_file(path: &Path) -> Result<Option<PromptTemplate>> {
-    let content = std::fs::read_to_string(path)?;
-    let (fm_text, body) = split_frontmatter(&content);
-    let fm = parse_flat_frontmatter(&fm_text);
-    let name = match fm.get("name") {
-        Some(n) if !n.trim().is_empty() => n.clone(),
-        _ => return Ok(None),
-    };
-    let description = match fm.get("description") {
-        Some(d) if !d.trim().is_empty() => d.clone(),
-        _ => return Ok(None),
-    };
-    let args = fm
-        .get("args")
-        .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_default();
-    Ok(Some(PromptTemplate {
-        name,
-        description,
-        args,
-        body,
-        location: path.to_path_buf(),
-    }))
 }
 
 // -- skills --
@@ -632,11 +576,6 @@ pub(crate) fn split_frontmatter(content: &str) -> (String, String) {
     (fm, body)
 }
 
-#[allow(dead_code)]
-fn _ensure_context_in_scope(r: Result<()>) -> Result<()> {
-    r.context("shim to keep anyhow import used")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,20 +952,6 @@ mod tests {
         let r = load_skills_from_dir(&dir, SkillSource::User);
         assert_eq!(r.skills.len(), 1);
         assert!(r.skills[0].disable_model_invocation);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn loads_prompts_with_args() {
-        let dir = tmp();
-        std::fs::write(
-            dir.join("explain.md"),
-            "---\nname: explain\ndescription: explain code\nargs: code\n---\nExplain {code}\n",
-        )
-        .unwrap();
-        let v = load_prompts_from_dir(&dir).unwrap();
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].args, vec!["code"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

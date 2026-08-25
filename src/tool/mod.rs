@@ -94,7 +94,7 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+    fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.spec().name.clone();
         self.tools.insert(name, tool);
     }
@@ -161,26 +161,6 @@ impl ToolRegistry {
     }
 }
 
-/// Names of all standard tools. Useful for the `--tools` whitelist filter.
-pub const STANDARD_TOOL_NAMES: &[&str] = &["read", "write", "edit", "bash", "grep", "find", "ls"];
-
-/// Parse the `--tools` comma-separated whitelist and return the set of
-/// tool names the agent is allowed to invoke. Unknown names are an error.
-pub fn parse_tools_whitelist(s: &str) -> Result<Vec<String>, ToolError> {
-    let mut out = Vec::new();
-    for name in s.split(',') {
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        if !STANDARD_TOOL_NAMES.contains(&name) {
-            return Err(ToolError::NotFound(name.to_string()));
-        }
-        out.push(name.to_string());
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,22 +225,16 @@ mod tests {
         assert_eq!(r.all_specs().len(), 1);
     }
 
+    /// `standard()` must expose exactly the documented tool set. Guards
+    /// against a tool being added to the enum-ish list but not wired
+    /// into the registry (or vice versa).
     #[test]
-    fn parse_tools_whitelist_basic() {
-        let v = parse_tools_whitelist("read,bash").unwrap();
-        assert_eq!(v, vec!["read".to_string(), "bash".to_string()]);
-    }
-
-    #[test]
-    fn parse_tools_whitelist_trims_and_skips_empty() {
-        let v = parse_tools_whitelist(" read , ,bash , ").unwrap();
-        assert_eq!(v, vec!["read".to_string(), "bash".to_string()]);
-    }
-
-    #[test]
-    fn parse_tools_whitelist_rejects_unknown() {
-        let r = parse_tools_whitelist("read,nope");
-        assert!(matches!(r, Err(ToolError::NotFound(_))));
+    fn standard_registry_has_all_tools() {
+        let names = ToolRegistry::standard().names();
+        assert_eq!(
+            names,
+            vec!["bash", "edit", "find", "grep", "ls", "read", "write"]
+        );
     }
 
     #[tokio::test]
@@ -272,14 +246,5 @@ mod tests {
         let out = tool.execute(json!({"text":"hi"}), &ctx).await.unwrap();
         assert_eq!(out.content, "hi");
         assert!(!out.is_error);
-    }
-
-    #[test]
-    fn standard_registry_has_all_tools() {
-        let r = ToolRegistry::standard();
-        for n in STANDARD_TOOL_NAMES {
-            assert!(r.get(n).is_some(), "missing standard tool: {n}");
-        }
-        assert_eq!(r.names().len(), STANDARD_TOOL_NAMES.len());
     }
 }

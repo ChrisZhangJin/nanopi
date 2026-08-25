@@ -114,25 +114,7 @@ pub struct Usage {
     pub cache_write_tokens: u32,
 }
 
-impl AgentEvent {
-    /// Convenience for SSE/JSON parsing: the variant name as it appears
-    /// in the wire format. (Currently unused but kept for symmetry.)
-    #[allow(dead_code)]
-    pub fn wire_name(&self) -> &'static str {
-        match self {
-            AgentEvent::Start { .. } => "start",
-            AgentEvent::TextDelta { .. } => "text_delta",
-            AgentEvent::ThinkingDelta { .. } => "thinking_delta",
-            AgentEvent::ToolCall { .. } => "tool_call",
-            AgentEvent::ToolResult { .. } => "tool_result",
-            AgentEvent::Done { .. } => "done",
-            AgentEvent::Error { .. } => "error",
-            AgentEvent::CompactionStart { .. } => "compaction_start",
-            AgentEvent::CompactionEnd { .. } => "compaction_end",
-            AgentEvent::SkillInvocation { .. } => "skill_invocation",
-        }
-    }
-}
+impl AgentEvent {}
 
 #[cfg(test)]
 mod tests {

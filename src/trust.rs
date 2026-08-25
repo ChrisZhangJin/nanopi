@@ -9,8 +9,6 @@
 
 use std::path::Path;
 
-use crate::agent::permission::TrustChoice;
-
 /// Outcome of checking trust for a cwd.
 pub enum TrustStatus {
     AlreadyTrusted,
@@ -54,6 +52,3 @@ fn encode_cwd_key(cwd: &Path) -> String {
 
 /// Re-export for backward compatibility with permission.rs callers.
 pub use crate::agent::permission::persist_trust_choice;
-
-#[allow(dead_code)]
-pub(crate) fn _ensure_choice_in_scope(_: TrustChoice) {}
