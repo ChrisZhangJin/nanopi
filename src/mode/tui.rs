@@ -3140,22 +3140,47 @@ fn render_tool_card(
 /// in its collapsed state: a single row with `[skill] name (Ctrl+O to
 /// expand)`, styled with the same subtle bg used for custom messages.
 /// The expanded body lands in scrollback via `expand_last_skill_block`.
-fn render_skill_card(term: &mut Term, name: &str) -> Result<()> {
+/// Rows of the collapsed skill card as `(line, row_background)` pairs.
+///
+/// Split out from `render_skill_card` so the card's shape is testable
+/// without a live terminal — `insert_before` needs a real `Term`.
+///
+/// The two padded rows carrying `bg` are what make this read as a
+/// block rather than a lone tinted line. PI gets them from
+/// `SkillInvocationMessageComponent extends Box(1, 1, customMessageBg)`
+/// — a padding of 1 whose rows are painted with the background. Our
+/// `render_user_echo` already builds the same pad/content/pad shape
+/// for user messages; the skill card was emitting unstyled blanks
+/// instead, so an invoked skill barely announced itself.
+fn skill_card_rows(name: &str) -> Vec<(Line<'static>, Option<Style>)> {
     let bg = Style::default()
         .bg(Color::Indexed(236))
         .fg(Color::Indexed(255));
     let dim = Style::default().bg(Color::Indexed(236)).fg(Color::DarkGray);
-    insert_line(term, Line::from(""))?;
-    insert_line_bg(
-        term,
-        Line::from(vec![
-            Span::styled("  [skill] ".to_string(), bg.add_modifier(Modifier::BOLD)),
-            Span::styled(name.to_string(), bg),
-            Span::styled(" (Ctrl+O to expand)".to_string(), dim),
-        ]),
-        Some(bg),
-    )?;
-    insert_line(term, Line::from(""))?;
+    let pad = || (Line::from(vec![Span::styled("", bg)]), Some(bg));
+    vec![
+        (Line::from(""), None),
+        pad(),
+        (
+            Line::from(vec![
+                Span::styled("  [skill] ".to_string(), bg.add_modifier(Modifier::BOLD)),
+                Span::styled(name.to_string(), bg),
+                Span::styled(" (Ctrl+O to expand)".to_string(), dim),
+            ]),
+            Some(bg),
+        ),
+        pad(),
+        (Line::from(""), None),
+    ]
+}
+
+fn render_skill_card(term: &mut Term, name: &str) -> Result<()> {
+    for (line, bg) in skill_card_rows(name) {
+        match bg {
+            Some(b) => insert_line_bg(term, line, Some(b))?,
+            None => insert_line(term, line)?,
+        }
+    }
     Ok(())
 }
 
@@ -4288,6 +4313,44 @@ mod tests {
                 rows.len()
             );
         }
+    }
+
+    /// The collapsed skill card must be a solid block — background on
+    /// the pad rows above and below the label, matching PI's
+    /// `Box(1, 1, customMessageBg)` and our own `render_user_echo`.
+    /// Without the padding it renders as one thin tinted line and an
+    /// invoked skill is easy to miss in scrollback.
+    #[test]
+    fn skill_card_is_a_padded_block() {
+        let rows = skill_card_rows("wiz-system-prompt-njoffice");
+
+        // Three consecutive background rows: pad, label, pad.
+        let bg_run: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, bg))| bg.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(bg_run.len(), 3, "want pad+label+pad on background");
+        assert_eq!(
+            bg_run,
+            vec![bg_run[0], bg_run[0] + 1, bg_run[0] + 2],
+            "background rows must be contiguous"
+        );
+
+        // The label sits in the middle row and names the skill.
+        let mid: String = rows[bg_run[1]]
+            .0
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(mid.contains("[skill]"), "middle row: {mid:?}");
+        assert!(mid.contains("wiz-system-prompt-njoffice"), "middle row: {mid:?}");
+
+        // The rows flanking the block are unstyled separators.
+        assert!(rows.first().unwrap().1.is_none());
+        assert!(rows.last().unwrap().1.is_none());
     }
 
     /// Typing a command name in full must preselect that command.
