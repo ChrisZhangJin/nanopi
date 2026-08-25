@@ -291,12 +291,32 @@ impl TextBuffer {
         }
     }
 
+    /// Normalize text for buffer storage: CRLF and bare CR both become
+    /// LF, and tabs expand to four spaces.
+    ///
+    /// Bare CR is the load-bearing case. A terminal in raw mode encodes
+    /// line breaks inside a bracketed paste as CR, not LF, and crossterm
+    /// hands `Event::Paste` the payload bytes verbatim — it does no
+    /// newline translation. Without this, a pasted paragraph collapses
+    /// into one row holding literal CR control characters: unreadable in
+    /// the input box, and sent to the model with the CRs still in it.
+    ///
+    /// Mirrors PI's `Editor.normalizeText` in
+    /// `packages/tui/src/components/editor.ts`, which applies the same
+    /// three rewrites on its insertion path.
+    fn normalize_pasted(s: &str) -> String {
+        s.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ")
+    }
+
     /// Insert a string at the cursor. Newlines break into new lines.
     /// Used by bracketed-paste to inject clipboard content — treated as
     /// an atomic op (one snapshot, does not coalesce with typing).
     pub fn insert_str(&mut self, s: &str) {
         self.exit_history_mode();
         self.snapshot();
+        let s = Self::normalize_pasted(s);
         for c in s.chars() {
             if c == '\n' {
                 let (row, col) = self.cursor;
@@ -1038,5 +1058,32 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Regression: a bracketed paste arrives with the terminal's own
+    /// line endings, and in raw mode that means bare CR. All three
+    /// encodings must produce the same rows, with no stray control
+    /// characters left behind.
+    #[test]
+    fn paste_normalizes_line_endings_and_tabs() {
+        for src in ["a\nb\nc", "a\r\nb\r\nc", "a\rb\rc", "a\r\nb\rc"] {
+            let mut b = TextBuffer::new();
+            b.insert_str(src);
+            assert_eq!(
+                b.lines(),
+                &["a".to_string(), "b".into(), "c".into()],
+                "paste of {src:?} produced wrong rows"
+            );
+        }
+
+        // Tabs expand to four spaces, matching PI's normalizeText.
+        let mut b = TextBuffer::new();
+        b.insert_str("a\tb");
+        assert_eq!(b.as_string(), "a    b");
+
+        // Cursor lands after the last inserted char, not mid-CR.
+        let mut b = TextBuffer::new();
+        b.insert_str("ab\rcd");
+        assert_eq!(b.cursor(), (1, 2));
     }
 }
