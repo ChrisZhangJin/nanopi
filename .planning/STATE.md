@@ -9,7 +9,7 @@ last_activity: "2026-08-19 - Completed quick task 260819-ayr: first-run wizard."
 
 # Project State
 
-Last activity: 2026-08-19 - Completed quick task 260819-ayr: first-run wizard.
+Last activity: 2026-08-25 - Completed quick task 260825-kft: --system-prompt / --append-system-prompt flags + SYSTEM.md discovery.
 
 ## Current Focus
 
@@ -36,3 +36,4 @@ None currently tracked.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260819-ayr | First-run wizard for config bootstrap | 2026-08-19 | d977c94 | [260819-ayr-add-a-first-run-wizard-to-nanopi-console](./quick/260819-ayr-add-a-first-run-wizard-to-nanopi-console/) |
+| 260825-kft | `--system-prompt` / `--append-system-prompt` flags + `SYSTEM.md` / `APPEND_SYSTEM.md` discovery | 2026-08-25 | 885b0a7 | [260825-kft-add-system-prompt-append-system-prompt-c](./quick/260825-kft-add-system-prompt-append-system-prompt-c/) |
