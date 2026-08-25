@@ -27,3 +27,24 @@ tests/*.tmp
 # Local debug logs (created with NANOPI_DEBUG or verbose flags)
 *.log
 !docs/**/*.log
+
+# Local `make pack` output (musl + UPX release binary)
+/dist/
+
+# Scratch notes staged for `gh release create --notes-file`
+/.release-notes-*.md
+
+# Credentials — never commit. `api_key_file` in config.toml points here.
+/api_key
+
+# Local runtime state: project-local config, skills, and TUI input
+# history live under .nanopi/ and are per-machine.
+/.nanopi/
+
+# Dogfooding scratch: session transcripts dumped at the repo root and
+# throwaway fixtures from manual TUI runs.
+/*.jsonl
+/.fake-home/
+/calculator.html
+/config.toml
+/MEMORY.md
