@@ -614,27 +614,8 @@ impl OpenAiProvider {
                     // Tool call deltas.
                     for tc in &delta.tool_calls {
                         let idx = tc.index.unwrap_or(0);
-                        let entry = pending.entry(idx).or_insert_with(|| PendingToolCall {
-                            id: None,
-                            name: None,
-                            args_buf: String::new(),
-                        });
-                        if let Some(id) = &tc.id {
-                            entry.id = Some(id.clone());
-                        }
-                        // Either `tc.arguments` directly (DeepSeek / some others)
-                        // or `tc.function.arguments` (OpenAI proper).
-                        if let Some(args) = &tc.arguments {
-                            entry.args_buf.push_str(args);
-                        }
-                        if let Some(func) = &tc.function {
-                            if let Some(name) = &func.name {
-                                entry.name = Some(name.clone());
-                            }
-                            if let Some(args) = &func.arguments {
-                                entry.args_buf.push_str(args);
-                            }
-                        }
+                        let entry = pending.entry(idx).or_default();
+                        entry.apply_delta(tc);
                     }
                     // Flush completed tool calls on finish_reason.
                     if let Some(fr) = &choice.finish_reason {
@@ -712,6 +693,40 @@ struct PendingToolCall {
     args_buf: String,
 }
 
+impl PendingToolCall {
+    /// Merge one streaming `tool_calls[]` delta into this pending call.
+    /// Two subtleties worth calling out:
+    ///
+    /// * Some gateways (observed: minimax M3 through its OpenAI-compat
+    ///   shim) stream a later delta carrying `function: { name: "" }`
+    ///   as a continuation marker after the real name was set in the
+    ///   first delta. Overwriting would leave the flushed call with an
+    ///   empty name, which the router rejects as `"unknown tool: "` and
+    ///   the model then retries verbatim in a tight loop. So an empty
+    ///   `name` never clobbers an existing non-empty one.
+    /// * Arguments can arrive either directly on the tool_call
+    ///   (DeepSeek and some proxies) or nested under `function`
+    ///   (OpenAI proper). Both paths append to `args_buf`.
+    fn apply_delta(&mut self, tc: &WireToolCall) {
+        if let Some(id) = &tc.id {
+            self.id = Some(id.clone());
+        }
+        if let Some(args) = &tc.arguments {
+            self.args_buf.push_str(args);
+        }
+        if let Some(func) = &tc.function {
+            if let Some(name) = &func.name {
+                if !name.is_empty() || self.name.is_none() {
+                    self.name = Some(name.clone());
+                }
+            }
+            if let Some(args) = &func.arguments {
+                self.args_buf.push_str(args);
+            }
+        }
+    }
+}
+
 async fn flush_pending_tool_calls(
     pending: &mut std::collections::HashMap<u32, PendingToolCall>,
     emitted: &mut std::collections::HashSet<String>,
@@ -735,7 +750,14 @@ async fn flush_pending_tool_calls(
         // TUI tool bar, session persistence, next-turn context — sees
         // the canonical form. Rule matches `ToolRegistry::canonical_name`
         // but stateless (no registry lookup needed here).
-        let raw = p.name.unwrap_or_else(|| "unknown".into());
+        // `""` and `None` are treated the same — a nameless tool_call
+        // from the gateway can't be dispatched, so surface it under the
+        // literal "unknown" so the resulting error reads
+        // `"unknown tool: unknown"` instead of `"unknown tool: "`.
+        let raw = p
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "unknown".into());
         let name = normalize_mangled_tool_name(&raw);
         let _ = tx
             .send(AgentEvent::ToolCall {
@@ -1030,6 +1052,73 @@ mod tests {
             tc.function.as_ref().unwrap().arguments.as_deref(),
             Some("{\"comma")
         );
+    }
+
+    /// Regression: a gateway that streams the tool name only in the
+    /// first delta, then keeps sending `function.arguments` chunks
+    /// (some also carrying `function: { name: "" }` as a continuation
+    /// marker), must not have its final name clobbered to "" and end
+    /// up as `"unknown tool: "` at the router. Repro of the
+    /// minimax-M3 empty-tool-name retry loop observed in the wild.
+    #[test]
+    fn pending_tool_call_preserves_name_across_deltas() {
+        let mut p = PendingToolCall::default();
+
+        // Chunk 1: id + name + start of args
+        let d1: WireToolCall = serde_json::from_str(
+            r#"{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"co"}}"#,
+        )
+        .unwrap();
+        p.apply_delta(&d1);
+
+        // Chunk 2: continuation delta — name reappears as empty string
+        // (this is what triggered the bug). Must NOT overwrite "bash".
+        let d2: WireToolCall = serde_json::from_str(
+            r#"{"index":0,"function":{"name":"","arguments":"mmand"}}"#,
+        )
+        .unwrap();
+        p.apply_delta(&d2);
+
+        // Chunk 3: more args, no name field at all
+        let d3: WireToolCall =
+            serde_json::from_str(r#"{"index":0,"function":{"arguments":"\":\"ls\"}"}}"#).unwrap();
+        p.apply_delta(&d3);
+
+        assert_eq!(p.name.as_deref(), Some("bash"));
+        assert_eq!(p.id.as_deref(), Some("call_1"));
+        assert_eq!(p.args_buf, r#"{"command":"ls"}"#);
+    }
+
+    /// If the gateway never sends a non-empty name AT ALL (also
+    /// observed on minimax when args-only tool_calls arrive without a
+    /// leading name delta), the flush path must not emit an empty
+    /// name — replace it with "unknown" so the downstream error is
+    /// legible as `"unknown tool: unknown"` and downstream loop-cap
+    /// logic has a real name to fingerprint on.
+    #[tokio::test]
+    async fn flush_replaces_empty_name_with_unknown() {
+        let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
+        pending.insert(
+            0,
+            PendingToolCall {
+                id: Some("call_x".into()),
+                name: Some(String::new()),
+                args_buf: r#"{"command":"ls"}"#.into(),
+            },
+        );
+        let mut emitted: std::collections::HashSet<String> = Default::default();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+        flush_pending_tool_calls(&mut pending, &mut emitted, &tx, 0).await;
+        drop(tx);
+        let ev = rx.recv().await.expect("expected a ToolCall event");
+        match ev {
+            AgentEvent::ToolCall { call, .. } => {
+                assert_eq!(call.name, "unknown");
+                assert_eq!(call.id, "call_x");
+                assert_eq!(call.arguments, serde_json::json!({"command": "ls"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]
