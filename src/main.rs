@@ -11,7 +11,17 @@ use clap::Parser;
 use nanopi::config;
 use nanopi::mode::{print, tui};
 use nanopi::provider;
+use nanopi::vendor;
 use nanopi::wizard;
+
+/// Display name for an `ApiKind`, matching the strings accepted in
+/// `api_kind` so a warning can be pasted straight back into config.
+fn kind_str(k: provider::ApiKind) -> &'static str {
+    match k {
+        provider::ApiKind::Openai => "openai",
+        provider::ApiKind::Anthropic => "anthropic",
+    }
+}
 
 /// Minimal CLI — covers the v0.5 acceptance criteria.
 #[derive(Parser, Debug)]
@@ -266,12 +276,48 @@ async fn main() -> ExitCode {
     };
 
     // Resolve wire-protocol kind: CLI --api-kind overrides config's
-    // api_kind, which itself defaults to "openai". Announce the choice
-    // once at startup so users don't have to guess.
-    let api_kind =
-        provider::ApiKind::from_config(args.api_kind.as_deref().or(cfg.api_kind.as_deref()));
-    if matches!(api_kind, provider::ApiKind::Anthropic) {
-        eprintln!("• api_kind = anthropic — talking to {base_url}/v1/messages");
+    // api_kind. `None` = the user didn't say, so the vendor sniff gets
+    // to decide (see provider::build).
+    let api_kind_raw = args.api_kind.as_deref().or(cfg.api_kind.as_deref());
+    let api_kind = provider::ApiKind::from_config_opt(api_kind_raw);
+    if let Some(raw) = api_kind_raw {
+        if api_kind.is_none() && !raw.trim().is_empty() {
+            eprintln!(
+                "nanopi: unknown api_kind `{raw}` (expected `openai` or `anthropic`) \
+                 — falling through to vendor sniff"
+            );
+        }
+    }
+
+    // Announce the protocol we will ACTUALLY speak, resolved the same
+    // way provider::build resolves it. Announcing the configured kind
+    // instead used to print `/v1/messages` while the vendor sniff
+    // quietly rerouted the request to `/chat/completions`.
+    let startup_vendor = vendor::pick_vendor(cfg.provider.as_deref(), Some(&base_url), &model);
+    let effective_kind =
+        provider::effective_kind(api_kind, Some(startup_vendor.as_ref()), &base_url);
+    if matches!(effective_kind, provider::ApiKind::Anthropic) {
+        eprintln!(
+            "• api_kind = anthropic — talking to {}/v1/messages",
+            base_url.trim_end_matches('/')
+        );
+    }
+    // An explicit api_kind that contradicts the vendor's own surface is
+    // usually a mistake (e.g. `api_kind = "openai"` against a
+    // `/anthropic` base_url). We honor the config — it's explicit — but
+    // say so, because the failure mode downstream is a bare 404.
+    if let Some(k) = api_kind {
+        let vendor_says = startup_vendor.transport_for(&base_url);
+        if vendor_says != k {
+            eprintln!(
+                "nanopi: warning: api_kind = `{}` but vendor `{}` expects `{}` for {} \
+                 — honoring your api_kind",
+                kind_str(k),
+                startup_vendor.id(),
+                kind_str(vendor_says),
+                base_url.trim_end_matches('/'),
+            );
+        }
     }
 
     // The TUI needs a real terminal. `-p` is the explicit non-interactive
@@ -313,6 +359,7 @@ async fn main() -> ExitCode {
         };
         print::run_print_mode(
             api_kind,
+            cfg.provider.clone(),
             &base_url,
             &model,
             &api_key,
@@ -332,6 +379,7 @@ async fn main() -> ExitCode {
     } else {
         tui::run_tui_mode(
             api_kind,
+            cfg.provider.clone(),
             &base_url,
             &model,
             &api_key,

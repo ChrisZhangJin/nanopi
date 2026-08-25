@@ -62,8 +62,22 @@ struct WireDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
-    #[serde(default)]
+    /// `deserialize_with` rather than a bare `default`: some gateways
+    /// (Xiaomi MiMo, notably) send an explicit `"tool_calls": null` on
+    /// every text-only chunk. `default` only covers an *absent* field,
+    /// so a literal null aborted the whole stream with "invalid type:
+    /// null, expected a sequence".
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<WireToolCall>,
+}
+
+/// Treat `null` as an empty list. See `WireDelta::tool_calls`.
+fn null_as_empty_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1041,6 +1055,25 @@ mod tests {
             tc.function.as_ref().unwrap().arguments.as_deref(),
             Some("{\"comma")
         );
+    }
+
+    /// Regression: Xiaomi MiMo's OpenAI-compat endpoint sends an
+    /// explicit `"tool_calls": null` (and `"content": null`) on chunks
+    /// that carry only reasoning text. That used to kill the stream with
+    /// `JSON parse error: invalid type: null, expected a sequence`.
+    #[test]
+    fn wire_chunk_tolerates_explicit_null_tool_calls() {
+        let json = r#"{"id":"x","choices":[{"delta":{"content":null,"role":null,"tool_calls":null,"reasoning_content":"Hmm"},"finish_reason":null,"index":0}]}"#;
+        let chunk: WireChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert!(delta.tool_calls.is_empty());
+        assert_eq!(delta.content, None);
+        assert_eq!(delta.reasoning_content.as_deref(), Some("Hmm"));
+
+        // An absent field must still work (the `default` path).
+        let chunk: WireChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"},"index":0}]}"#).unwrap();
+        assert!(chunk.choices[0].delta.tool_calls.is_empty());
     }
 
     /// Regression: a gateway that streams the tool name only in the

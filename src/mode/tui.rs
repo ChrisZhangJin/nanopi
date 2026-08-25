@@ -264,7 +264,11 @@ const MAX_INPUT_LINES: usize = 5;
 // ─────────────────────────────────────────────────────────────────────
 
 pub async fn run_tui_mode(
-    api_kind: crate::provider::ApiKind,
+    // `None` = no explicit `api_kind`; the vendor picks the transport.
+    api_kind: Option<crate::provider::ApiKind>,
+    // `config.provider` — explicit vendor id overriding the
+    // base_url/model sniff.
+    cfg_provider: Option<String>,
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -316,7 +320,11 @@ pub async fn run_tui_mode(
         base_url,
         api_key,
         model,
-        Some(crate::vendor::pick_vendor(None, Some(base_url), model)),
+        Some(crate::vendor::pick_vendor(
+            cfg_provider.as_deref(),
+            Some(base_url),
+            model,
+        )),
     );
     let registry = ToolRegistry::standard();
     let hooks = match settings::load_settings(&cwd) {
@@ -395,8 +403,12 @@ pub async fn run_tui_mode(
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
     let settings_file = crate::settings_toml::load();
     app.bindings = crate::settings_toml::bindings_from(&settings_file);
-    // v0.9.3: remember vendor pick for footer + future rebuilds.
-    let initial_vendor = crate::vendor::pick_vendor(None, Some(base_url), model);
+    // v0.9.3: remember vendor pick for footer + future rebuilds. The
+    // `config.provider` override has to be stashed on App too — every
+    // later pick_vendor() (model swap, /new, /fork) reads it from there,
+    // and it used to sit at None forever, silently ignoring the field.
+    app.cfg_provider = cfg_provider.clone();
+    let initial_vendor = crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), model);
     app.vendor_id = Some(initial_vendor.id().to_string());
     // Prime the skills cache from the just-built agent so the very
     // first `/` palette open includes /skill:<name> entries.
@@ -593,8 +605,11 @@ struct App {
     cwd: PathBuf,
     /// Which wire protocol to build follow-up Providers with — used
     /// by `/model` swap and fork-agent rebuild so a session that
-    /// started on Anthropic stays on Anthropic.
-    api_kind: crate::provider::ApiKind,
+    /// started on Anthropic stays on Anthropic. `None` = unspecified,
+    /// let the vendor decide per base_url (a `/model` swap can change
+    /// the answer, so this stays an Option rather than being resolved
+    /// once at startup).
+    api_kind: Option<crate::provider::ApiKind>,
     /// v0.9.3: keybindings loaded from settings.toml + defaults.
     bindings: crate::keys::KeyBindings,
     /// v0.9.3: cached `config.provider` string used by every
@@ -666,7 +681,7 @@ impl App {
         session_id: String,
         model: String,
         cwd: PathBuf,
-        api_kind: crate::provider::ApiKind,
+        api_kind: Option<crate::provider::ApiKind>,
         skill_load: crate::agent::build::SkillLoadPolicy,
         no_context_files: bool,
         history_path: PathBuf,
@@ -4199,7 +4214,7 @@ mod tests {
             "s".into(),
             "m".into(),
             std::path::PathBuf::from("/tmp"),
-            crate::provider::ApiKind::Openai,
+            Some(crate::provider::ApiKind::Openai),
             crate::agent::build::SkillLoadPolicy::default(),
             false,
             std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),

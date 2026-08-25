@@ -36,7 +36,11 @@ pub struct JsonEnvelope {
 }
 
 pub async fn run_print_mode(
-    api_kind: crate::provider::ApiKind,
+    // `None` = no explicit `api_kind`; the vendor picks the transport.
+    api_kind: Option<crate::provider::ApiKind>,
+    // `config.provider` — explicit vendor id overriding the
+    // base_url/model sniff.
+    cfg_provider: Option<String>,
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -98,7 +102,11 @@ pub async fn run_print_mode(
         base_url,
         api_key,
         model,
-        Some(crate::vendor::pick_vendor(None, Some(base_url), model)),
+        Some(crate::vendor::pick_vendor(
+            cfg_provider.as_deref(),
+            Some(base_url),
+            model,
+        )),
     );
     let permission = PermissionGate::from_cli(no_hooks, approve);
 

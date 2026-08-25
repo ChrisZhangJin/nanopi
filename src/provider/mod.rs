@@ -27,10 +27,48 @@ impl ApiKind {
     /// Best-effort parse from a config string. `None` and unknown
     /// values → `Openai` so an empty config stays working.
     pub fn from_config(s: Option<&str>) -> Self {
+        Self::from_config_opt(s).unwrap_or(ApiKind::Openai)
+    }
+
+    /// Like `from_config`, but preserves "the user didn't say" as
+    /// `None` instead of collapsing it to `Openai`.
+    ///
+    /// That distinction is load-bearing: `build` only lets a vendor
+    /// override the wire protocol when the user was silent. Absent it,
+    /// an explicit `api_kind = "anthropic"` was indistinguishable from
+    /// the default and got discarded by the vendor sniff — which is how
+    /// `base_url = ".../anthropic"` ended up POSTing to
+    /// `.../anthropic/chat/completions` and 404ing.
+    ///
+    /// Unknown strings are *not* explicit (they're typos), so they also
+    /// yield `None` and fall through to the vendor.
+    pub fn from_config_opt(s: Option<&str>) -> Option<Self> {
         match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-            Some("anthropic") | Some("claude") => ApiKind::Anthropic,
-            _ => ApiKind::Openai,
+            Some("anthropic") | Some("claude") => Some(ApiKind::Anthropic),
+            Some("openai") | Some("gpt") => Some(ApiKind::Openai),
+            _ => None,
         }
+    }
+}
+
+/// Resolve the wire protocol a request will actually use.
+///
+/// Precedence: an explicit `api_kind` (config or `--api-kind`) wins
+/// outright; otherwise the vendor picks, given the base_url; with no
+/// vendor at all we default to OpenAI-compat.
+///
+/// Exposed separately from `build` so the startup banner can announce
+/// the protocol we're *really* about to speak rather than the one the
+/// config asked for.
+pub fn effective_kind(
+    configured: Option<ApiKind>,
+    vendor: Option<&dyn crate::vendor::Vendor>,
+    base_url: &str,
+) -> ApiKind {
+    match (configured, vendor) {
+        (Some(k), _) => k,
+        (None, Some(v)) => v.transport_for(base_url),
+        (None, None) => ApiKind::Openai,
     }
 }
 
@@ -41,20 +79,19 @@ impl ApiKind {
 /// thinking-block / reasoning_effort emission. Pass `None` for the
 /// legacy behavior (Anthropic emits its own thinking; OpenAI omits
 /// reasoning params).
+///
+/// `kind` is `None` when neither config nor CLI named a protocol — only
+/// then does the vendor get to choose the transport (that's what keeps
+/// MinimaxVendor's Anthropic-only gateway working out of the box, while
+/// still honoring an explicit `api_kind`).
 pub fn build(
-    kind: ApiKind,
+    kind: Option<ApiKind>,
     base_url: &str,
     api_key: &str,
     model: &str,
     vendor: Option<Box<dyn crate::vendor::Vendor>>,
 ) -> Box<dyn Provider> {
-    // Vendor's declared transport overrides the config-derived kind
-    // so that e.g. MinimaxVendor (transport = Anthropic) routes through
-    // the Anthropic wire protocol even when config didn't set api_kind.
-    let effective = match &vendor {
-        Some(v) if v.transport() != kind => v.transport(),
-        _ => kind,
-    };
+    let effective = effective_kind(kind, vendor.as_deref(), base_url);
     match effective {
         ApiKind::Openai => {
             let p = openai::OpenAiProvider::new(base_url, api_key, model);
@@ -93,27 +130,81 @@ mod tests {
         assert_eq!(ApiKind::from_config(Some("claude")), ApiKind::Anthropic);
     }
 
-    /// When a vendor declares a different transport than the config
-    /// kind, the vendor wins. Regression for the MiniMax 401: the
-    /// Minimax vendor exposes the Anthropic protocol
-    /// (`api.minimax.chat/anthropic`), so even with `api_kind = "openai"`
-    /// (the default) we must build an AnthropicProvider — otherwise
-    /// the gateway rejects the request with "Please carry the API
-    /// secret key in the 'X-Api-Key' field of the request header".
     #[test]
-    fn vendor_transport_overrides_config_kind() {
-        // Minimax vendor says Anthropic, config says Openai → Anthropic.
+    fn from_config_opt_preserves_unset_and_rejects_typos() {
+        assert_eq!(ApiKind::from_config_opt(None), None);
+        assert_eq!(ApiKind::from_config_opt(Some("")), None);
+        assert_eq!(ApiKind::from_config_opt(Some("anthropik")), None);
+        assert_eq!(
+            ApiKind::from_config_opt(Some(" Anthropic ")),
+            Some(ApiKind::Anthropic)
+        );
+        assert_eq!(ApiKind::from_config_opt(Some("openai")), Some(ApiKind::Openai));
+    }
+
+    /// When config is SILENT, a vendor's transport wins. Regression for
+    /// the MiniMax 401: the Minimax vendor exposes the Anthropic
+    /// protocol (`api.minimax.chat/anthropic`), so with no `api_kind`
+    /// set we must still build an AnthropicProvider — otherwise the
+    /// gateway rejects the request with "Please carry the API secret key
+    /// in the 'X-Api-Key' field of the request header".
+    #[test]
+    fn vendor_transport_wins_when_config_is_silent() {
         let v: Box<dyn crate::vendor::Vendor> = Box::new(crate::vendor::MinimaxVendor);
-        let p = build(ApiKind::Openai, "https://x", "k", "minimax-M3", Some(v));
+        let p = build(None, "https://x", "k", "minimax-M3", Some(v));
         assert_eq!(p.id(), "anthropic");
 
         // Vendor agrees with config → no surprise, still Anthropic.
         let v: Box<dyn crate::vendor::Vendor> = Box::new(crate::vendor::MinimaxVendor);
-        let p = build(ApiKind::Anthropic, "https://x", "k", "minimax-M3", Some(v));
+        let p = build(Some(ApiKind::Anthropic), "https://x", "k", "minimax-M3", Some(v));
         assert_eq!(p.id(), "anthropic");
 
-        // No vendor → honor config as before.
-        let p = build(ApiKind::Openai, "https://x", "k", "gpt-4o", None);
+        // No vendor, no config → OpenAI-compat default.
+        let p = build(None, "https://x", "k", "gpt-4o", None);
+        assert_eq!(p.id(), "openai");
+    }
+
+    /// The MiMo 404. `api_kind = "anthropic"` + a `/anthropic` base_url
+    /// used to be overridden by XiaomiVendor's OpenAI transport, sending
+    /// the request to `…/anthropic/chat/completions` (openresty 404)
+    /// while the startup banner advertised `…/anthropic/v1/messages`.
+    #[test]
+    fn explicit_api_kind_survives_the_vendor_sniff() {
+        let base = "https://token-plan-cn.xiaomimimo.com/anthropic";
+        let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5");
+        assert_eq!(v.id(), "xiaomi", "base_url sniff still picks Xiaomi");
+        let p = build(Some(ApiKind::Anthropic), base, "k", "mimo-v2.5", Some(v));
+        assert_eq!(p.id(), "anthropic");
+    }
+
+    /// Same endpoint with NO api_kind at all: the vendor must notice the
+    /// `/anthropic` surface on its own rather than defaulting to
+    /// `/chat/completions`.
+    #[test]
+    fn anthropic_surface_url_switches_transport_without_config() {
+        for base in [
+            "https://token-plan-cn.xiaomimimo.com/anthropic",
+            "https://token-plan-sgp.xiaomimimo.com/anthropic/",
+        ] {
+            let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5-pro");
+            let p = build(None, base, "k", "mimo-v2.5-pro", Some(v));
+            assert_eq!(p.id(), "anthropic", "{base} should route Anthropic-native");
+        }
+
+        // The OpenAI-compat surface on the same host stays OpenAI.
+        let base = "https://token-plan-cn.xiaomimimo.com/v1";
+        let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5-pro");
+        let p = build(None, base, "k", "mimo-v2.5-pro", Some(v));
+        assert_eq!(p.id(), "openai");
+    }
+
+    /// An explicit `openai` is honored even when it contradicts the
+    /// URL — the user gets what they asked for (main.rs warns).
+    #[test]
+    fn explicit_openai_overrides_anthropic_surface_url() {
+        let base = "https://token-plan-cn.xiaomimimo.com/anthropic";
+        let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5");
+        let p = build(Some(ApiKind::Openai), base, "k", "mimo-v2.5", Some(v));
         assert_eq!(p.id(), "openai");
     }
 }

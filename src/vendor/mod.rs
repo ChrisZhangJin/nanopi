@@ -24,12 +24,41 @@ pub use zai::ZaiVendor;
 
 pub trait Vendor: Send + Sync + std::fmt::Debug {
     fn id(&self) -> &'static str;
+    /// The vendor's native/primary wire protocol, independent of URL.
     fn transport(&self) -> ApiKind;
+    /// The protocol to actually speak to `base_url`.
+    ///
+    /// Several vendors (Xiaomi MiMo, z.ai, DeepSeek, dashscope) serve
+    /// both protocols off one host and split them by path: `/v1` for
+    /// OpenAI-compat, `/anthropic` for Anthropic-native. An
+    /// OpenAI-transport vendor pointed at the `/anthropic` surface must
+    /// switch, or every request lands on `/anthropic/chat/completions`
+    /// and the gateway answers 404. Anthropic-transport vendors are
+    /// unaffected — they're already on the right wire.
+    fn transport_for(&self, base_url: &str) -> ApiKind {
+        match self.transport() {
+            ApiKind::Openai if url_is_anthropic_surface(base_url) => ApiKind::Anthropic,
+            native => native,
+        }
+    }
     fn default_base_url(&self) -> Option<&'static str> { None }
     fn supports_thinking(&self, _model: &str) -> bool { false }
     fn write_thinking(&self, body: &mut Value, level: ThinkingLevel, _model: &str) {
         body["reasoning_effort"] = json!(openai_effort_string(level));
     }
+}
+
+/// True when a base_url addresses a gateway's Anthropic-protocol
+/// surface, i.e. the path component is (or contains) `/anthropic`:
+/// `token-plan-cn.xiaomimimo.com/anthropic`, `api.z.ai/api/anthropic`,
+/// `api.minimax.chat/anthropic`.
+///
+/// Host-only URLs like `https://api.anthropic.com` deliberately do NOT
+/// match — the name is in the host, not the path, and those vendors
+/// already declare an Anthropic transport.
+pub fn url_is_anthropic_surface(base_url: &str) -> bool {
+    let u = base_url.trim_end_matches('/').to_ascii_lowercase();
+    u.ends_with("/anthropic") || u.contains("/anthropic/")
 }
 
 pub fn openai_effort_string(level: ThinkingLevel) -> &'static str {
@@ -89,6 +118,51 @@ mod tests {
         assert_eq!(v.id(), "fallback");
         assert_eq!(v.transport(), ApiKind::Openai);
         assert!(!v.supports_thinking("anything"));
+    }
+
+    #[test]
+    fn url_is_anthropic_surface_matches_path_not_host() {
+        // Path-based dual-protocol gateways.
+        assert!(url_is_anthropic_surface(
+            "https://token-plan-cn.xiaomimimo.com/anthropic"
+        ));
+        assert!(url_is_anthropic_surface(
+            "https://token-plan-sgp.xiaomimimo.com/anthropic/"
+        ));
+        assert!(url_is_anthropic_surface("https://api.z.ai/api/anthropic"));
+        assert!(url_is_anthropic_surface("HTTPS://X/ANTHROPIC"));
+        // Host-only: the vendor already declares Anthropic transport,
+        // and matching here would be a coincidence of the domain name.
+        assert!(!url_is_anthropic_surface("https://api.anthropic.com"));
+        assert!(!url_is_anthropic_surface("https://api.anthropic.com/"));
+        // OpenAI-compat surfaces.
+        assert!(!url_is_anthropic_surface(
+            "https://token-plan-cn.xiaomimimo.com/v1"
+        ));
+        assert!(!url_is_anthropic_surface("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn transport_for_switches_openai_vendors_on_anthropic_surface() {
+        let v = XiaomiVendor;
+        assert_eq!(v.transport(), ApiKind::Openai, "native transport unchanged");
+        assert_eq!(
+            v.transport_for("https://token-plan-cn.xiaomimimo.com/anthropic"),
+            ApiKind::Anthropic
+        );
+        assert_eq!(
+            v.transport_for("https://token-plan-cn.xiaomimimo.com/v1"),
+            ApiKind::Openai
+        );
+        // Anthropic-native vendors are unaffected either way.
+        assert_eq!(
+            MinimaxVendor.transport_for("https://api.minimax.chat/v1"),
+            ApiKind::Anthropic
+        );
+        assert_eq!(
+            AnthropicVendor.transport_for("https://api.anthropic.com"),
+            ApiKind::Anthropic
+        );
     }
 
     #[test]

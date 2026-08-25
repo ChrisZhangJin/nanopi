@@ -55,8 +55,14 @@ pub struct Config {
     /// format — Anthropic direct, or a proxy that exposes the
     /// Anthropic API).
     ///
-    /// Unrecognized values fall back to `"openai"`. The `--api-kind`
-    /// CLI flag overrides this per-invocation.
+    /// Setting this explicitly is final: it overrides the vendor sniff,
+    /// so `api_kind = "anthropic"` with a `/anthropic` base_url is
+    /// honored even for a vendor whose primary transport is OpenAI.
+    /// Leaving it unset lets the vendor choose from the base_url, which
+    /// is the right default for dual-protocol gateways.
+    ///
+    /// Unrecognized values warn on stderr and are treated as unset. The
+    /// `--api-kind` CLI flag overrides this per-invocation.
     pub api_kind: Option<String>,
 
     /// v0.9.3: explicit vendor id (e.g. "deepseek", "anthropic",

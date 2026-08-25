@@ -26,8 +26,31 @@ base_url = "https://api.openai.com/v1"
 # suffix `/v1/messages`) — e.g. Anthropic direct, or a vendor's
 # Anthropic-compat surface like `https://api.minimaxi.com/anthropic`.
 # Wrong choice here means requests hit the wrong path → 404.
-# api_kind = "openai"      # default
+#
+# Leaving it unset is usually best: the vendor infers the protocol from
+# base_url, and a `…/anthropic` path selects the Anthropic wire
+# automatically. Setting it explicitly overrides that inference.
+# api_kind = "openai"      # default when nothing can be inferred
 # api_kind = "anthropic"
+
+# Vendor id, normally inferred from base_url/model. Set it only to
+# override a wrong guess — it selects thinking-parameter shape and the
+# default transport. One of: openai, anthropic, deepseek, zai, qwen,
+# minimax, xiaomi, fallback.
+# provider = "xiaomi"
+
+# ─── Xiaomi MiMo (Token Plan) — both surfaces work ──────────────────
+#
+# Anthropic-native:
+#   model = "mimo-v2.5-pro"
+#   base_url = "https://token-plan-cn.xiaomimimo.com/anthropic"
+# OpenAI-compat:
+#   model = "mimo-v2.5-pro"
+#   base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+#
+# Use the `-sgp` host instead of `-cn` for a Singapore Token Plan. Note
+# MiMo ignores `cache_control` and `thinking.budget_tokens` on its
+# Anthropic surface, so thinking budgets there are advisory only.
 
 # ─── API key: pick ONE of the two below ─────────────────────────────
 
