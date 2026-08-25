@@ -5,7 +5,9 @@
 //! user-provided query string (typically the input buffer's contents
 //! after the leading `/`). Filter is case-insensitive substring on
 //! `label` first, `description` second — no fuzzy scoring (keeps
-//! behavior predictable, matches PI's UX).
+//! behavior predictable, matches PI's UX). Matches are ordered by
+//! relevance tier, so an exact label hit always outranks an incidental
+//! mention in some other item's description; see `MenuState::rank`.
 //!
 //! Rendering is done by the caller against a ratatui Rect: this
 //! module owns state (items, filter, cursor), not draw code, so it's
@@ -61,20 +63,54 @@ impl<T: Clone> MenuState<T> {
         }
     }
 
-    /// Filtered slice — recomputed on demand from `self.filter`. Slow
-    /// path is fine; menu size stays small.
+    /// Relevance tier for one item against the lowercased query, lower
+    /// being better. `None` means no match at all.
+    ///
+    /// Ordering by tier is what makes the palette preselect the command
+    /// the user actually typed. Matching alone is not enough: with a
+    /// plain "label or description contains" test, `/settings` matches
+    /// both `/settings` (label) and `/reload` (whose description reads
+    /// "Reload skills, config, settings"), and whichever happens to sit
+    /// earlier in the item list wins the cursor.
+    ///
+    /// Tiers mirror what PI does for its slash palette in
+    /// `packages/tui/src/fuzzy.ts` — an exact hit gets a large bonus and
+    /// word-boundary hits outrank mid-string ones — but stay substring-
+    /// based rather than fuzzy-subsequence, so the *set* of visible items
+    /// is unchanged and only their order improves.
+    fn rank(it: &MenuItem<T>, f: &str) -> Option<u8> {
+        let label = it.label.to_ascii_lowercase();
+        // Compare against the label with any leading sigil removed, so
+        // "settings" ranks against "settings" rather than "/settings".
+        let bare = label.trim_start_matches('/');
+        if bare == f {
+            Some(0)
+        } else if bare.starts_with(f) {
+            Some(1)
+        } else if label.contains(f) {
+            Some(2)
+        } else if it.description.to_ascii_lowercase().contains(f) {
+            Some(3)
+        } else {
+            None
+        }
+    }
+
+    /// Filtered slice — recomputed on demand from `self.filter`, best
+    /// match first. Slow path is fine; menu size stays small.
     pub fn visible(&self) -> Vec<&MenuItem<T>> {
         if self.filter.is_empty() {
             return self.all.iter().collect();
         }
         let f = self.filter.to_ascii_lowercase();
-        self.all
+        let mut hits: Vec<(u8, &MenuItem<T>)> = self
+            .all
             .iter()
-            .filter(|it| {
-                it.label.to_ascii_lowercase().contains(&f)
-                    || it.description.to_ascii_lowercase().contains(&f)
-            })
-            .collect()
+            .filter_map(|it| Self::rank(it, &f).map(|r| (r, it)))
+            .collect();
+        // Stable, so items sharing a tier keep their declared order.
+        hits.sort_by_key(|(r, _)| *r);
+        hits.into_iter().map(|(_, it)| it).collect()
     }
 
     pub fn cursor(&self) -> usize {
@@ -197,6 +233,41 @@ mod tests {
     fn empty_filter_shows_all() {
         let m = MenuState::new(items());
         assert_eq!(m.visible().len(), 4);
+    }
+
+    /// Regression: an exact label hit must outrank another item that
+    /// merely mentions the query in its description, no matter which
+    /// one was declared first. This is the `/settings` bug — typing it
+    /// preselected `/reload`, because "Reload skills, config, settings"
+    /// contains "settings" and `/reload` is declared earlier.
+    #[test]
+    fn exact_label_outranks_description_mention() {
+        let m = |f: &str| {
+            let mut m = MenuState::new(vec![
+                MenuItem::new("/reload", "Reload skills, config, settings", "r"),
+                MenuItem::new("/settings", "Show interaction settings", "s"),
+            ]);
+            m.set_filter(f);
+            m.selected().unwrap().label
+        };
+        assert_eq!(m("settings"), "/settings");
+        // Still finds the description-only match when nothing else does.
+        assert_eq!(m("config"), "/reload");
+    }
+
+    /// A prefix hit beats a mid-string hit, which beats a description
+    /// hit — regardless of declaration order.
+    #[test]
+    fn ranks_prefix_above_substring_above_description() {
+        let mut m = MenuState::new(vec![
+            MenuItem::new("/unrelated", "mentions new in passing", "d"),
+            MenuItem::new("/renew", "mid-string hit", "s"),
+            MenuItem::new("/new", "exact hit", "e"),
+            MenuItem::new("/newer", "prefix hit", "p"),
+        ]);
+        m.set_filter("new");
+        let order: Vec<&str> = m.visible().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(order, ["/new", "/newer", "/renew", "/unrelated"]);
     }
 
     #[test]

@@ -4241,4 +4241,75 @@ mod tests {
             KeyAction::Exit
         ));
     }
+
+    /// Render the dock into an 80x24 buffer and return the non-blank
+    /// rows of the input box, marker included, as plain strings.
+    fn render_input_rows(app: &App) -> Vec<String> {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, app);
+        let mut out = Vec::new();
+        for y in 0..area.height {
+            let row: String = (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            let body = row.trim_start_matches('│').trim();
+            if body.starts_with('>') || (!body.is_empty() && out.last().is_some()) {
+                out.push(row);
+            }
+        }
+        out
+    }
+
+    /// A multi-line paste must occupy multiple rows in the input box.
+    /// Terminals in raw mode send bare CR for line breaks inside a
+    /// bracketed paste, so all three encodings must land the same way.
+    #[test]
+    fn multiline_paste_renders_on_multiple_rows() {
+        for (name, pasted) in [
+            ("LF", "alpha\nbravo\ncharlie"),
+            ("CRLF", "alpha\r\nbravo\r\ncharlie"),
+            ("CR", "alpha\rbravo\rcharlie"),
+            ("mixed", "alpha\r\nbravo\rcharlie"),
+        ] {
+            let mut app = mkapp();
+            app.input.insert_str(pasted);
+            assert_eq!(
+                app.input.lines(),
+                &["alpha".to_string(), "bravo".into(), "charlie".into()],
+                "{name}: wrong buffer rows"
+            );
+            let rows = render_input_rows(&app);
+            assert!(
+                rows.len() >= 3,
+                "{name}: input box rendered {} row(s), want >=3: {rows:#?}",
+                rows.len()
+            );
+        }
+    }
+
+    /// Typing a command name in full must preselect that command.
+    #[test]
+    fn typing_a_command_name_preselects_it() {
+        for cmd in [
+            "/settings",
+            "/skills",
+            "/model",
+            "/compact",
+            "/name",
+            "/export",
+        ] {
+            let mut app = mkapp();
+            seed_input(&mut app, cmd);
+            let sel = app.palette.as_ref().unwrap().selected().unwrap();
+            assert_eq!(
+                sel.label, cmd,
+                "typing {cmd:?} preselected {:?} instead",
+                sel.label
+            );
+        }
+    }
 }
+
