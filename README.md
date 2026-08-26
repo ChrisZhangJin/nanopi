@@ -168,11 +168,16 @@ Keys are `snake_case` (`pre_tool_use`, not `PreToolUse`). Full protocol in [`doc
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.9.1** | current | ~3.9 MB | Fixes v0.9.0 tool-loop bugs; `MAX_ITERATIONS` 16 → 50 for research-heavy prompts |
+| **v0.10.0** | current | 1.6 MB | Custom system prompt (`--system-prompt`, `SYSTEM.md`); explicit `api_kind` beats the vendor sniff; readable tool failures in `-p`; UPX-packed release |
+| v0.9.x | released | ~3.9 MB | First-run wizard, `/settings` + `/keybindings`, 8-vendor dispatch, retry envelope (0.9.2–0.9.3); v0.9.1 fixed the v0.9.0 tool loop |
 | v0.9.0 | released | ~4.0 MB | Skills (PI-parity), `--skill`/`--no-skills`, folded TUI card, `UserPromptSubmit` hook |
 | v0.8.x | released | ~3.9 MB | Full ratatui TUI, `/fork`, `--continue`/`--session`, hooks, JSONL sessions |
 | v0.5.0 | released | ~3.0 MB | Tools (read/write/edit/bash), `-p` mode, JSON output, hooks |
 | v0.1.0 | released | 2.4 MB | Single-file OpenAI streaming demo (kept as `nanopi_v0_1` binary) |
+
+Sizes are the published musl artifact. From v0.10.0 that artifact is
+UPX-packed (`make`), so 1.6 MB is not comparable to the unpacked figures
+above it — the same build is 4.4 MB before packing.
 
 ## Roadmap
 
