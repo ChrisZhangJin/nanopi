@@ -141,6 +141,9 @@ nanopi --fork <id>
 | `-N`, `--distrust` | false | 本次运行不信任项目资源 |
 | `--skill <path>` | — | 加载指定 skill 文件/目录（可重复） |
 | `-S`, `--no-skills` | false | 关闭 skill 发现 |
+| `-C`, `--no-context-files` | false | 关闭 AGENTS.md / CLAUDE.md 自动发现 |
+| `--system-prompt <文本\|路径>` | — | 替换内置 system prompt |
+| `--append-system-prompt <文本\|路径>` | — | 追加到 system prompt 末尾（可重复） |
 
 ## Skills
 
@@ -165,6 +168,16 @@ description: 亲切地和用户打招呼。用于问候场景。
 - 用户级：`~/.nanopi/skills/`
 - 项目级：`<cwd>/.nanopi/skills/`（需通过 `-a` 或已持久化的信任决策授权）
 - 命令行：`--skill <path>`（文件或目录；即便 `--no-skills` 也会加载）
+
+## 自定义系统提示
+
+`--system-prompt <文本|路径>` 会替换内置的 identity/guidelines 提示；`--append-system-prompt <文本|路径>`（可重复，多个值之间用一个空行连接）会在它后面追加内容。两个参数都接受字面文本**或**指向已有文件的路径。一旦指定任一参数，对应的文件自动发现就完全关闭 —— 不做任何合并。
+
+不带这些参数时，nanopi 会自动发现：
+- `<cwd>/.nanopi/SYSTEM.md`（仅当项目已被 `-a` 或持久化的信任决策授权），否则读 `~/.nanopi/SYSTEM.md` —— 对应 `--system-prompt`。
+- `<cwd>/.nanopi/APPEND_SYSTEM.md`（同样的信任规则），否则读 `~/.nanopi/APPEND_SYSTEM.md` —— 对应 `--append-system-prompt`。
+
+项目级覆盖全局级；全局文件不需要信任门（这是你自己的机器，不是克隆下来的仓库）。Context 文件、skills 和「Current working directory: …」这一行仍会在自定义提示之上叠加 —— 只替换 identity/tools/guidelines 那一段。注意：被替换的提示会丢掉自动生成的「Available tools: …」行，部分模型在这一行缺失时会跳过工具调用，所以请在提示里明确写出你期望模型使用的工具。
 
 ## Hooks
 
