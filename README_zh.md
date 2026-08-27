@@ -2,23 +2,24 @@
 
 # nanopi
 
-**[Pi](https://github.com/earendil-works/pi) 的 Rust 迷你移植 —— 一个 ~4 MB 的编码 Agent CLI，专为老旧 / 低配 Linux 主机而生。**
+**不装 Node，不装 Python，没有 `node_modules`。**
+
+一个可以直接 `scp` 到没有任何运行时的机器上跑的编码 Agent CLI ——
+单文件 ~4 MB 静态 Rust 二进制，移植自 [Pi](https://github.com/earendil-works/pi)。
+Alpine 能跑，CentOS 6 能跑，`npm install` 跑不通的地方它也能跑。
 
 [![Release](https://img.shields.io/github/v/release/ChrisZhangJin/nanopi?style=flat-square&color=blue)](https://github.com/ChrisZhangJin/nanopi/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/ChrisZhangJin/nanopi/total?style=flat-square)](https://github.com/ChrisZhangJin/nanopi/releases)
-[![Stars](https://img.shields.io/github/stars/ChrisZhangJin/nanopi?style=flat-square)](https://github.com/ChrisZhangJin/nanopi/stargazers)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 ![Binary](https://img.shields.io/badge/binary-~4%20MB-brightgreen?style=flat-square)
-![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey?style=flat-square)
 ![Static musl](https://img.shields.io/badge/static-musl-informational?style=flat-square)
+![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust&logoColor=white)
 [![CI](https://img.shields.io/github/actions/workflow/status/ChrisZhangJin/nanopi/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/ChrisZhangJin/nanopi/actions/workflows/ci.yml)
 
 [English](README.md) · **简体中文**
 
 <br>
 
-<img src="img/tui.png" alt="nanopi TUI 截图" width="760">
+<img src="https://raw.githubusercontent.com/ChrisZhangJin/nanopi/main/img/tui.png" alt="nanopi TUI 截图" width="760">
 
 </div>
 
@@ -26,13 +27,39 @@
 
 ## 为什么用 nanopi？
 
-- 🪶 **~4 MB 静态二进制** —— musl + LTO + strip，零运行时依赖
-- 🖥 **能塞进老机器** —— glibc 2.12+（CentOS 6）或纯静态 musl
+- 🚫 **零运行时依赖** —— 不装 Node、不装 Python、不用包管理器。
+  下载一个文件，`chmod +x`，直接跑
+- 🖥 **能塞进老机器** —— glibc 2.12+（CentOS 6），或者用纯静态 musl 版跑
+  Alpine 和其他一切环境
+- 🪶 **~4 MB 静态二进制** —— musl + LTO + strip（下载体积 1.6 MB，UPX 压缩后）
 - 🧬 **PI-parity** —— 对齐 [Pi](https://github.com/earendil-works/pi) 的用户界面：JSONL 会话、hooks、skills、`-p`、`/fork`、`/resume`
 - 🔌 **多 provider** —— 任何 OpenAI 兼容端点（DeepSeek、ollama、vLLM …）以及原生 Anthropic
 - 🛠 **流式工具调用** —— `read` / `write` / `edit` / `bash`，在 ratatui TUI 里实时渲染
 - 🪝 **Claude Code 风格 hooks** —— `PreToolUse` / `PostToolUse` / `UserPromptSubmit` shell 钩子
 - 🧠 **Agent Skills** —— 遵循 [官方规范](https://agentskills.io/specification) 的 `SKILL.md` 发现 + `/skill:name` 展开
+
+## 设计初衷 —— 为什么要做 nanopi
+
+Pi 是个好用的编码 agent,但上游选择不支持一些真实用户切实需要的场景:
+
+| 上游 issue | 用户诉求 | 上游状态 |
+|---|---|---|
+| [pi#8591](https://github.com/earendil-works/pi/issues/8591) | 为 Alpine 提供 musl 静态构建 | not planned |
+| [pi#6546](https://github.com/earendil-works/pi/issues/6546) | 解决老 Linux 上的 glibc 版本不匹配 | not planned |
+| [pi#6075](https://github.com/earendil-works/pi/issues/6075) | 启动太慢 | not planned |
+
+三个互不相识的人分别要求 musl 构建、老 glibc 兼容和更轻的启动,上游把这三条
+都关闭为 *not planned*。这对上游是合理的取舍 —— Pi 面向的是现代机器 —— 但老硬件
+这一块就没人管了。**nanopi 正是为这个场景做的 Rust 重写版:**
+
+- **musl 静态构建** —— 零运行时依赖,能在 Alpine 容器里跑
+  (CI 矩阵见 [`release.yml`](https://github.com/ChrisZhangJin/nanopi/blob/main/.github/workflows/release.yml))
+- **glibc 2.12+(CentOS 6)** —— 动态版覆盖老服务器,musl 版覆盖其余环境
+- **~4 MB** —— Rust + LTO + `opt-level = "z"` + `panic = abort` + strip;
+  发布的二进制经 UPX 压缩到 1.6 MB
+- **预编译覆盖** `linux-x86_64`、`linux-x86_64-musl`、`macos-aarch64`、
+  `windows-x86_64`。Linux ARM 暂无预编译,需自行编译:
+  `cargo build --release --target aarch64-unknown-linux-musl`
 
 ## 安装
 
@@ -149,22 +176,26 @@ matcher = "^bash$"
 command = "logger 'nanopi 即将执行 shell'"
 ```
 
-TOML key 是 snake_case（`pre_tool_use`，不是 `PreToolUse`）。完整协议见 [`docs/v0.5-research.md`](docs/v0.5-research.md) 第 6 节。
+TOML key 是 snake_case（`pre_tool_use`，不是 `PreToolUse`）。完整协议见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 第 6 节。
 
 ## 版本
 
 | 版本 | 状态 | 体积 | 说明 |
 |---|---|---|---|
-| **v0.9.1** | 当前 | ~3.9 MB | 修 v0.9.0 tool-loop bug；`MAX_ITERATIONS` 从 16 提到 50 |
+| **v0.10.0** | 当前 | 1.6 MB | 自定义 system prompt（`--system-prompt`、`SYSTEM.md`）；显式 `api_kind` 优先于 vendor 嗅探；`-p` 模式工具失败可读；发布产物 UPX 压缩 |
+| v0.9.x | 已发布 | ~3.9 MB | 首次运行向导，`/settings` + `/keybindings`，8 个 vendor 分发，重试封装（0.9.2–0.9.3）；v0.9.1 修了 v0.9.0 的 tool-loop bug |
 | v0.9.0 | 已发布 | ~4.0 MB | Skills（PI-parity），`--skill`/`--no-skills`，折叠 TUI 卡片，`UserPromptSubmit` hook |
 | v0.8.x | 已发布 | ~3.9 MB | 完整 ratatui TUI、`/fork`、`--continue`/`--session`、hooks、JSONL 会话 |
 | v0.5.0 | 已发布 | ~3.0 MB | 工具（read/write/edit/bash）、`-p` 模式、JSON 输出、hooks |
 | v0.1.0 | 已发布 | 2.4 MB | 单文件 OpenAI 流式演示（保留为 `nanopi_v0_1` 二进制） |
 
+体积都是发布的 musl 产物。从 v0.10.0 起，这个产物经过 UPX 压缩（`make`），所以 1.6 MB
+无法和上面几行未压缩的数字直接对比 —— 同一次编译在压缩前是 4.4 MB。
+
 ## 路线图
 
 - **v1.0** —— 完整 PI parity：themes、compaction、扩展系统
-- Linux aarch64 预编译（当前只有 x86_64）
+- Linux aarch64 暂未加入 CI 矩阵（背景段落里有自编指令：见上方）
 
 ## Cargo 国内镜像
 
@@ -188,7 +219,7 @@ linker = "musl-gcc"
 - **JSONL 而非 JSON** —— append-only 文件在写入过程中崩溃也能存活
 - **Provider 抽象** 在 v0.6 落地：原生 Anthropic + 任意 OpenAI 兼容端点
 
-设计与实现笔记见 [`docs/v0.5-research.md`](docs/v0.5-research.md) 与 [`docs/PLAN.md`](docs/PLAN.md)。
+设计与实现笔记见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 与 [`docs/PLAN.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/PLAN.md)。
 
 ## 致谢
 

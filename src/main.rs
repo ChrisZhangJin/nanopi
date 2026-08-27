@@ -23,9 +23,16 @@ fn kind_str(k: provider::ApiKind) -> &'static str {
     }
 }
 
+/// Version string baked in at compile time from the repo-root `VERSION`
+/// file. Single source of truth so `nanopi -V` can't drift from what
+/// CI ships.
+fn nanopi_version() -> &'static str {
+    include_str!("../VERSION").trim()
+}
+
 /// Minimal CLI — covers the v0.5 acceptance criteria.
 #[derive(Parser, Debug)]
-#[command(name = "nanopi", version, about = "minimal Pi port in Rust")]
+#[command(name = "nanopi", version = nanopi_version(), about = "minimal Pi port in Rust")]
 struct Args {
     /// OpenAI-compatible API base URL. Falls back to OPENAI_BASE_URL
     /// env var, then to https://api.openai.com/v1.

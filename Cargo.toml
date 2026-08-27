@@ -2,10 +2,31 @@
 name = "nanopi"
 version = "0.10.0"
 edition = "2021"
-description = "A minimal Rust port of Pi agent"
+# `description` 是 crates.io 搜索结果里显示的那一行 —— 把差异点写进去，
+# 别写「a minimal port」这种谁都能说的话。参照：同类的 pi_agent_rust
+# 是 23-32 MB，nanopi 的卖点就是体积和零运行时依赖。
+description = "Tiny Rust port of Pi: a ~4 MB static coding-agent CLI with zero runtime deps, for old and low-resource Linux"
 license = "MIT"
 repository = "https://github.com/ChrisZhangJin/nanopi"
+homepage = "https://github.com/ChrisZhangJin/nanopi"
 readme = "README.md"
+# 上限 5 个，每个 ≤20 字符，须以字母数字开头
+keywords = ["agent", "llm", "cli", "tui", "coding-agent"]
+# 必须是 crates.io 固定分类表里的 slug
+categories = ["command-line-utilities", "development-tools"]
+
+# 打包排除项。`cargo package --list` 是唯一可信的核对方式 —— 发布不可逆，
+# yank 之后 tarball 仍可下载，所以每次发版前跑一遍。
+exclude = [
+    ".planning/",      # 内部规划笔记，不该永久公开
+    ".cargo/",         # 国内镜像配置，对境外用户是干扰项
+    ".github/",        # CI 定义，消费者用不到
+    "docs/",           # 设计文档，GitHub 上看就够
+    "img/",            # crates.io 不解析 README 的相对图片路径，纯压舱物
+    "dist/",
+    "Makefile",
+    "tests/smoke.sh",
+]
 
 [[bin]]
 name = "nanopi"

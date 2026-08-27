@@ -2,23 +2,24 @@
 
 # nanopi
 
-**Tiny Rust port of [Pi](https://github.com/earendil-works/pi) — a ~4 MB coding-agent CLI for old / low-resource Linux boxes.**
+**No Node. No Python. No `node_modules`.**
+
+A coding-agent CLI you can `scp` onto a box that has no runtime —
+a single ~4 MB static Rust binary, ported from [Pi](https://github.com/earendil-works/pi).
+Runs on Alpine, on CentOS 6, and anywhere `npm install` isn't an option.
 
 [![Release](https://img.shields.io/github/v/release/ChrisZhangJin/nanopi?style=flat-square&color=blue)](https://github.com/ChrisZhangJin/nanopi/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/ChrisZhangJin/nanopi/total?style=flat-square)](https://github.com/ChrisZhangJin/nanopi/releases)
-[![Stars](https://img.shields.io/github/stars/ChrisZhangJin/nanopi?style=flat-square)](https://github.com/ChrisZhangJin/nanopi/stargazers)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 ![Binary](https://img.shields.io/badge/binary-~4%20MB-brightgreen?style=flat-square)
-![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey?style=flat-square)
 ![Static musl](https://img.shields.io/badge/static-musl-informational?style=flat-square)
+![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust&logoColor=white)
 [![CI](https://img.shields.io/github/actions/workflow/status/ChrisZhangJin/nanopi/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/ChrisZhangJin/nanopi/actions/workflows/ci.yml)
 
 **English** · [简体中文](README_zh.md)
 
 <br>
 
-<img src="img/tui.png" alt="nanopi TUI screenshot" width="760">
+<img src="https://raw.githubusercontent.com/ChrisZhangJin/nanopi/main/img/tui.png" alt="nanopi TUI screenshot" width="760">
 
 </div>
 
@@ -26,13 +27,44 @@
 
 ## Why nanopi?
 
-- 🪶 **~4 MB static binary** — musl + LTO + strip, zero runtime deps
-- 🖥 **Runs on ancient boxes** — glibc 2.12+ (CentOS 6) or fully static musl
+- 🚫 **Zero runtime dependencies** — no Node, no Python, no package manager.
+  Download one file, `chmod +x`, run.
+- 🖥 **Runs on ancient boxes** — glibc 2.12+ (CentOS 6), or the fully static
+  musl build on Alpine and anything else
+- 🪶 **~4 MB static binary** — musl + LTO + strip (the download is 1.6 MB,
+  UPX-packed)
 - 🧬 **PI-parity** — mirrors [Pi](https://github.com/earendil-works/pi)'s surface: JSONL sessions, hooks, skills, `-p`, `/fork`, `/resume`
 - 🔌 **Multi-provider** — any OpenAI-compatible endpoint (DeepSeek, ollama, vLLM, …) plus native Anthropic
 - 🛠 **Streaming tool calls** — `read` / `write` / `edit` / `bash`, rendered live in a ratatui TUI
 - 🪝 **Claude Code hooks** — `PreToolUse` / `PostToolUse` / `UserPromptSubmit` shell hooks
 - 🧠 **Agent Skills** — [spec-compliant](https://agentskills.io/specification) `SKILL.md` discovery + `/skill:name` expansion
+
+## Background — why nanopi exists
+
+Pi is a great coding agent, but its upstream chose not to support
+certain environments that real users need:
+
+| Upstream issue | User request | Upstream status |
+|---|---|---|
+| [pi#8591](https://github.com/earendil-works/pi/issues/8591) | musl-linked builds for Alpine | not planned |
+| [pi#6546](https://github.com/earendil-works/pi/issues/6546) | Avoid glibc version mismatch on older Linux | not planned |
+| [pi#6075](https://github.com/earendil-works/pi/issues/6075) | Startup time is too slow | not planned |
+
+Three separate people asked for musl builds, old-glibc compatibility and
+a lighter startup; upstream closed all three as *not planned*. That is a
+reasonable call for them — Pi targets modern machines — but it leaves the
+old-hardware case unserved. **nanopi is a Rust rewrite for exactly that
+case:**
+
+- **Static musl build** — zero runtime deps, runs in Alpine containers
+  (see [`release.yml`](https://github.com/ChrisZhangJin/nanopi/blob/main/.github/workflows/release.yml) for the CI matrix)
+- **glibc 2.12+ (CentOS 6)** — the dynamic build covers old servers;
+  the musl build covers everything else
+- **~4 MB** — Rust + LTO + `opt-level = "z"` + `panic = abort` + strip;
+  the published binary is UPX-packed down to 1.6 MB
+- **Prebuilt for** `linux-x86_64`, `linux-x86_64-musl`, `macos-aarch64`
+  and `windows-x86_64`. Linux ARM is not prebuilt yet — build from source
+  with `cargo build --release --target aarch64-unknown-linux-musl`.
 
 ## Install
 
@@ -162,7 +194,7 @@ matcher = "^bash$"
 command = "logger 'nanopi about to shell out'"
 ```
 
-Keys are `snake_case` (`pre_tool_use`, not `PreToolUse`). Full protocol in [`docs/v0.5-research.md`](docs/v0.5-research.md) §6.
+Keys are `snake_case` (`pre_tool_use`, not `PreToolUse`). Full protocol in [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) §6.
 
 ## Versions
 
@@ -182,7 +214,7 @@ above it — the same build is 4.4 MB before packing.
 ## Roadmap
 
 - **v1.0** — full PI parity: themes, compaction, extension system
-- Linux aarch64 prebuilt binary (only x86_64 today)
+- Linux aarch64 not yet in the CI matrix (see `cargo build --release --target aarch64-unknown-linux-musl` above)
 
 ## Cargo mirror (China)
 
@@ -206,7 +238,7 @@ linker = "musl-gcc"
 - **JSONL over JSON** — append-only files survive crashes mid-write.
 - **Provider abstraction** landed in v0.6; native Anthropic + any OpenAI-compatible endpoint.
 
-See [`docs/v0.5-research.md`](docs/v0.5-research.md) and [`docs/PLAN.md`](docs/PLAN.md) for design + implementation notes.
+See [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) and [`docs/PLAN.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/PLAN.md) for design + implementation notes.
 
 ## Credits
 

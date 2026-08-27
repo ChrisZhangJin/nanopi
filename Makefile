@@ -2,7 +2,7 @@
 # Mirrors the linux-x86_64-musl matrix in .github/workflows/release.yml.
 # Produces dist/nanopi-v<version>-linux-x86_64-musl.
 
-VERSION  := $(shell grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+VERSION  := $(shell cat VERSION 2>/dev/null || grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
 TARGET   := x86_64-unknown-linux-musl
 NAME     := nanopi-v$(VERSION)-linux-x86_64-musl
 BIN_SRC  := target/$(TARGET)/release/nanopi
@@ -72,6 +72,18 @@ pack: build ensure-tools
 		echo "WARNING: upx unavailable; $(BIN_OUT) is UNPACKED (~2.7x larger)"; \
 	fi
 	@ls -lh $(BIN_OUT)
+
+# Usage: make bump VERSION=x.y.z
+# Updates the VERSION file and the Cargo.toml `version` line.
+bump:
+ifndef VERSION
+	@echo "Usage: make bump VERSION=x.y.z"
+	@exit 1
+endif
+	@echo -n "$(VERSION)" > VERSION
+	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
+	@echo "Updated VERSION and Cargo.toml to $(VERSION)."
+	@echo "Next: git commit -am 'chore: bump to v$(VERSION)' && git tag v$(VERSION) && git push && git push --tags"
 
 clean:
 	cargo clean

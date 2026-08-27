@@ -83,6 +83,19 @@ jobs:
           # workflow_dispatch: pull the given tag; push event: default HEAD.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - name: validate VERSION against tag
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -eux
+          TAG="${{ github.ref_name }}"
+          FILE_V="$(cat VERSION 2>/dev/null || grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
+          EXPECTED="v${FILE_V}"
+          if [ "$TAG" != "$EXPECTED" ]; then
+            echo "::error::git tag ($TAG) does not match VERSION file (v$FILE_V)."
+            exit 1
+          fi
+
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
