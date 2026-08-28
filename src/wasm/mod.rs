@@ -14,7 +14,6 @@
 //! What it does not yet do:
 //!   - WIT interface (phase 2)
 //!   - Tool dispatch / command routing (phase 3)
-//!   - Network + filesystem host functions (phase 4)
 
 use std::path::Path;
 
@@ -81,6 +80,7 @@ impl PluginHost {
                     cfg.url_allowlist.clone(),
                     cwd.to_path_buf(),
                     cfg.allow_fs,
+                    cfg.allow_network,
                 ) {
                     Ok((bridge, specs)) => {
                         let plugin_name: std::sync::Arc<str> = path

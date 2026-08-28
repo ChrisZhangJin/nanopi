@@ -43,7 +43,7 @@ fn fixture() -> PathBuf {
 fn loads_real_component_and_executes_its_tools() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, specs) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false)
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false)
         .expect("example component must load");
 
     // list-tools reached the host intact.
@@ -78,7 +78,7 @@ fn loads_real_component_and_executes_its_tools() {
 #[test]
 fn repeated_calls_stay_correct() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false).expect("load");
 
     for _ in 0..20 {
         let out = bridge
@@ -93,7 +93,7 @@ fn repeated_calls_stay_correct() {
 #[test]
 fn unknown_tool_name_is_rejected() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false).expect("load");
 
     let err = bridge
         .execute_tool("definitely_not_a_tool", "{}")
@@ -106,7 +106,7 @@ fn unknown_tool_name_is_rejected() {
 #[test]
 fn plugin_reports_bad_arguments_as_tool_error() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false).expect("load");
 
     // `text` missing entirely.
     let out = bridge.execute_tool("rot13", r#"{}"#).expect("no trap");
@@ -130,7 +130,7 @@ fn core_module_is_rejected_with_a_useful_message() {
     // Smallest valid core module: magic + version.
     std::fs::write(&p, [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]).unwrap();
 
-    match engine.load(&p, Vec::new(), std::env::temp_dir(), false) {
+    match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false) {
         Ok(_) => panic!("a core module is not a component and must be refused"),
         Err(e) => assert!(e.contains("compile") || e.contains("list-tools"), "{e}"),
     }
@@ -155,7 +155,7 @@ fn fs_read_denied_without_allow_fs() {
 
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), false)
+        .load(&fixture(), Vec::new(), dir.clone(), false, false)
         .expect("load");
 
     let out = bridge
@@ -175,7 +175,7 @@ fn fs_read_allowed_inside_cwd() {
 
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), true)
+        .load(&fixture(), Vec::new(), dir.clone(), true, false)
         .expect("load");
 
     let out = bridge
@@ -196,7 +196,7 @@ fn fs_read_refuses_traversal_out_of_cwd() {
     let dir = scratch_dir("traversal");
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), true)
+        .load(&fixture(), Vec::new(), dir.clone(), true, false)
         .expect("load");
 
     for probe in [
@@ -228,7 +228,7 @@ fn fs_read_refuses_symlink_escape() {
 
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), true)
+        .load(&fixture(), Vec::new(), dir.clone(), true, false)
         .expect("load");
 
     let out = bridge

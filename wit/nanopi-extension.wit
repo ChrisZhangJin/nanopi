@@ -35,6 +35,27 @@ world extension {
     /// `../` sequences and symlinks pointing outward are both refused.
     import host-fs-read: func(path: string) -> string;
 
+    /// Fetch a URL over HTTP(S) and return the response body, or an
+    /// error string prefixed with `error: `.
+    ///
+    /// Gated on `allow_network = true` in the plugin's
+    /// `[[extensions]]` entry — without it every call is refused
+    /// before any request is made.
+    ///
+    /// Even with the gate open, the URL's host must appear in
+    /// `url_allowlist`. An empty allowlist denies everything: the
+    /// capability is opt-in twice over, once for the plugin and once
+    /// per host. Matching is on the parsed host, so an entry also
+    /// covers its subdomains and any port, but not a host that merely
+    /// contains or ends with the entry's text.
+    ///
+    /// Only `http` and `https` are accepted. Requests time out after
+    /// 10 seconds, so a plugin cannot hang a turn on a black-holed
+    /// connection. Redirects are NOT followed — a 3xx comes back as
+    /// `error: HTTP 30x` rather than walking the fetch onto a host the
+    /// allowlist never approved.
+    import host-http-get: func(url: string) -> string;
+
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [
