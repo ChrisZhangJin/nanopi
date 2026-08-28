@@ -1,57 +1,55 @@
 /// nanopi WASM extension interface (v0.11.0).
 ///
-/// Plugins implement the `plugin` interface; the host provides the
-/// `host` interface (network/fs gated at load time).
+/// Plugins export `list-tools` and `execute-tool`; the host provides
+/// `host-log`. Structured payloads cross the boundary as JSON strings
+/// rather than WIT records — that keeps the ABI to one primitive type,
+/// which is what lets the host bind these by hand with
+/// `Instance::get_typed_func` instead of pulling in a wit-bindgen
+/// build step. If this interface grows, switch to wit-bindgen.
 ///
-/// The canonical ABI is WIT Component Model v2 (wasmtime 19+).
+/// Canonical ABI: WIT Component Model (wasmtime 19+).
 
 package nanopi:extension;
 
-/// Host-provided functions. All are safe — the plugin cannot escape
-/// the sandbox via these; each is gated by the load-time config.
+/// Host-provided functions, imported at the component root.
 interface host {
-    /// Log a message. Level: 0 = trace, 1 = info, 2 = warn, 3 = error.
+    /// Log a message to nanopi's stderr.
+    /// Level: 0 = trace, 1 = info, 2 = warn, 3 = error.
     host-log: func(level: u8, message: string);
 }
 
-/// Data types shared between host and guest.
-interface types {
-    /// A tool the plugin wants the LLM to be able to call.
-    record tool-spec {
-        name: string,
-        description: string,
-        /// JSON Schema for the tool's parameters, as a JSON string.
-        parameters-json: string,
-    }
-
-    /// Result of a tool execution returned to the host.
-    record tool-output {
-        content: string,
-        is-error: bool,
-    }
-}
-
-/// The guest (plugin) interface — what the host calls.
+/// Guest exports — what the host calls.
 interface tool-api {
-    use types.{tool-spec, tool-output};
+    /// Return the tools this plugin provides, as a JSON array:
+    ///
+    ///   [
+    ///     {
+    ///       "name": "query",
+    ///       "description": "Run a read-only SQL query",
+    ///       "parameters": { "type": "object", "properties": { ... } }
+    ///     }
+    ///   ]
+    ///
+    /// `parameters` is a JSON Schema object, passed to the LLM
+    /// verbatim as the tool's parameter schema. Called once at load
+    /// time. A component that does not export this is rejected as
+    /// "not a nanopi extension".
+    list-tools: func() -> string;
 
-    /// Called once after the module is instantiated. Register any
-    /// tools via the host-provided `register-tool` (not yet — that's
-    /// a host interface, so the guest can't call it directly in WIT
-    /// v2; instead the host pre-declares the tool names here and
-    /// calls `execute-tool` when the LLM invokes one).
-    init: func();
-
-    /// List the tools this plugin provides. Called by the host after
-    /// `init()` so it can register them into `ToolRegistry`.
-    list-tools: func() -> list<tool-spec>;
-
-    /// Execute a tool registered by this plugin. `args-json` is a
-    /// JSON string matching the tool's `parameters-json` schema.
-    execute-tool: func(name: string, args-json: string) -> tool-output;
+    /// Execute one of the tools from `list-tools`.
+    ///
+    /// `args-json` is a JSON object matching that tool's `parameters`
+    /// schema. Returns a JSON object:
+    ///
+    ///   { "content": "...", "is_error": false }
+    ///
+    /// `is_error` is optional and defaults to false. A trap here is
+    /// reported to the model as a failed tool call; it does not take
+    /// down nanopi.
+    execute-tool: func(name: string, args-json: string) -> string;
 }
 
-/// Top-level world — the host plugs this WASM into the component.
+/// Top-level world the host instantiates.
 world extension {
     import host;
     export tool-api;

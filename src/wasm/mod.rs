@@ -22,18 +22,82 @@ use crate::config::ExtensionConfig;
 
 /// Outcome of a `PluginHost::load_all(...)` call.
 pub struct PluginLoadSummary {
+    /// Tools ready to register into `ToolRegistry`. Already wrapped
+    /// so the agent loop can call them like any built-in tool.
+    pub tools: Vec<std::sync::Arc<dyn crate::tool::Tool>>,
+    /// How many `.wasm` files instantiated cleanly.
     pub loaded: usize,
-    pub skipped: usize,
+    /// Per-file failures — path plus the reason. Non-fatal: a broken
+    /// plugin is reported and skipped, it does not stop startup.
+    pub errors: Vec<(std::path::PathBuf, String)>,
 }
 
-/// Placeholder loader — Phase 1 just validates that each declared
-/// extension path resolves to an existing file. wasmtime instantiation
-/// lands in phase 2 once the WIT interface ships.
+/// Loads `.wasm` components declared in `[[extensions]]` and turns the
+/// tools they export into registry-ready `Tool` impls.
 pub struct PluginHost;
 
 impl PluginHost {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Resolve, compile, instantiate, and wrap every declared
+    /// extension. Errors are collected per-file rather than
+    /// short-circuiting: one malformed `.wasm` must not stop nanopi
+    /// from starting with the rest.
+    pub fn load_all(&self, configs: &[ExtensionConfig]) -> PluginLoadSummary {
+        let mut tools: Vec<std::sync::Arc<dyn crate::tool::Tool>> = Vec::new();
+        let mut errors = Vec::new();
+        let mut loaded = 0usize;
+
+        // One engine shared by every plugin — compiled code caches
+        // inside it, and it's internally Arc-refcounted.
+        let engine = match loader::PluginEngine::new() {
+            Ok(e) => e,
+            Err(e) => {
+                // No engine means no plugins at all; report once
+                // against the first configured path so the message
+                // has somewhere to anchor.
+                let anchor = configs
+                    .first()
+                    .map(|c| c.path.clone())
+                    .unwrap_or_default();
+                return PluginLoadSummary {
+                    tools,
+                    loaded: 0,
+                    errors: vec![(anchor, e)],
+                };
+            }
+        };
+
+        for cfg in configs {
+            for path in self.resolve_paths(std::slice::from_ref(cfg)) {
+                match engine.load(&path, cfg.url_allowlist.clone()) {
+                    Ok((bridge, specs)) => {
+                        let plugin_name: std::sync::Arc<str> = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("wasm-plugin")
+                            .into();
+                        for spec in specs {
+                            tools.push(std::sync::Arc::new(host::WasmTool::new(
+                                spec,
+                                plugin_name.clone(),
+                                bridge.clone(),
+                            )));
+                        }
+                        loaded += 1;
+                    }
+                    Err(e) => errors.push((path, e)),
+                }
+            }
+        }
+
+        PluginLoadSummary {
+            tools,
+            loaded,
+            errors,
+        }
     }
 
     /// Resolve every `[[extensions]]` entry into a list of `.wasm`
