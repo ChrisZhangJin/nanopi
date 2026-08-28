@@ -843,6 +843,11 @@ struct CollapsedSkill {
 enum KeyAction {
     Nothing,
     StartTurn(String),
+    /// v0.11.0: user typed + hit Enter WHILE the agent was streaming.
+    /// The text is routed into the running turn's steer channel as a
+    /// `SteerMessage::Steering` instead of starting a new turn.
+    /// Matches Pi's behavior (type mid-stream → steer the agent).
+    SteerTurn(String),
     CancelTurn,
     Exit,
     Compact,
@@ -1179,7 +1184,15 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
 /// own branches.
 fn submit_or_chat(app: &App, text: String) -> KeyAction {
     if app.status == Status::Streaming {
-        return KeyAction::Nothing;
+        // v0.11.0: mid-stream Enter steers the running turn instead of
+        // silently doing nothing. Slash commands are NOT steered —
+        // they'd be meaningless as a user message to the model, and
+        // the old no-op behavior is the safer default for them.
+        let t = text.trim();
+        if t.is_empty() || t.starts_with('/') {
+            return KeyAction::Nothing;
+        }
+        return KeyAction::SteerTurn(t.to_string());
     }
     let t = text.trim();
     if t.is_empty() {
@@ -2576,6 +2589,21 @@ async fn handle_action(
             *turn_task = Some(task);
             app.status = Status::Streaming;
             app.turn_started_at = Some(std::time::Instant::now());
+        }
+        KeyAction::SteerTurn(msg) => {
+            // v0.11.0: user typed mid-stream. Route into the running
+            // turn's steer channel so the agent picks it up at the
+            // next iteration boundary. Matches Pi's mid-stream typing.
+            //
+            // If the channel is gone (turn finished between keypress
+            // and dispatch), fall through silently — the message is
+            // dropped rather than starting a surprise new turn.
+            if let Some(stx) = steer_tx.as_ref() {
+                // Echo it so the user sees their steer landed, with a
+                // marker distinguishing it from a normal turn.
+                render_user_echo(term, &format!("[steer] {msg}"))?;
+                let _ = stx.send(SteerMessage::Steering { text: msg }).await;
+            }
         }
     }
     Ok(())
@@ -4293,6 +4321,35 @@ mod tests {
             interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             KeyAction::Nothing
         ));
+    }
+
+    /// v0.11.0: typing + Enter WHILE the agent is streaming steers the
+    /// running turn instead of doing nothing (the pre-v0.11 behavior).
+    /// Mirrors Pi — mid-stream typing injects a steering message.
+    #[test]
+    fn enter_while_streaming_steers() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "also check the logs");
+        match interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            KeyAction::SteerTurn(s) => assert_eq!(s, "also check the logs"),
+            other => panic!("expected SteerTurn, got {other:?}"),
+        }
+    }
+
+    /// Slash commands mid-stream stay a no-op — steering the model
+    /// with "/compact" as a user message would be nonsense, and the
+    /// old behavior is the safer default there.
+    #[test]
+    fn slash_command_while_streaming_is_still_noop() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "/compact");
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !matches!(got, KeyAction::SteerTurn(_)),
+            "slash commands must not be routed into the steer channel, got {got:?}"
+        );
     }
 
     #[test]
