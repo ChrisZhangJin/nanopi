@@ -1084,7 +1084,7 @@ async fn run_one_tool(
     // Resolve and execute. Wall-clock timed so the TUI can show
     // "Took 0.3s" next to the marker.
     let started = std::time::Instant::now();
-    let (content, is_error, images) = match registry.get(&call.name) {
+    let (mut content, mut is_error, images) = match registry.get(&call.name) {
         Some(tool) => {
             let ctx = ToolContext { cwd: cwd.clone() };
             match tool.execute(effective_args.clone(), &ctx).await {
@@ -1108,6 +1108,62 @@ async fn run_one_tool(
         },
     );
 
+    // PostToolUse hooks. Payload mirrors Claude Code's PostToolUse
+    // wire schema so hooks can inspect what actually happened —
+    // `tool_input` (final args after any PreToolUse transform) and
+    // `tool_response` (content + is_error + duration_ms).
+    //
+    // v0.9.1 fix: previously passed `Value::Object(Default::default())`
+    // (empty `{}`), so hooks could see tool_name and session_id but
+    // nothing about the call itself — no way to log outputs, react
+    // to failures, or scrape secrets from stdout. Everything the
+    // hook actually needs to be useful was missing.
+    //
+    // P1 ordering: hooks fire BEFORE the ToolResult event is emitted,
+    // so the post-hook content/is_error is what the renderer sees
+    // (and what the next LLM turn sees in the context).
+    if permission.hooks_active() && !hooks.post_tool_use.is_empty() {
+        let post_payload = serde_json::json!({
+            "tool_input": effective_args,
+            "tool_response": {
+                "content": content,
+                "is_error": is_error,
+                "duration_ms": elapsed.as_millis() as u64,
+            },
+        });
+        let (_outcome, new_args) = run_hooks(
+            &hooks.post_tool_use,
+            HookEvent::PostToolUse,
+            &call.name,
+            post_payload,
+            &cwd,
+            Some(&session_id.to_string()),
+        )
+        .await;
+        // P1: post_tool_use Transform replaces the tool result content.
+        //
+        // `run_hooks` always returns `HookOutcome::Allow` — transforms
+        // are accumulated into `current_args` which becomes `new_args`.
+        // So we just look at whether `new_args` was rewritten, not at
+        // the outcome enum.
+        //
+        // Hook emits
+        //   {"decision":"allow","updated_input":{"content":"...","is_error":true}}
+        // → `run_hooks` replaces the whole `current_args` with
+        //   `{"content":"...","is_error":true}` → `new_args` holds that.
+        if let Some(v) = new_args.as_ref() {
+            // Only apply if the rewrite is structurally different from
+            // the original payload — it must have a `content` key at
+            // the top level (not nested under `tool_response`).
+            if let Some(new_content) = v.get("content").and_then(|v| v.as_str()) {
+                content = new_content.to_string();
+            }
+            if let Some(new_is_error) = v.get("is_error").and_then(|v| v.as_bool()) {
+                is_error = new_is_error;
+            }
+        }
+    }
+
     // Stream a structured ToolResult so the TUI can render one green
     // (or red) card containing command + output preview + timing.
     // Rustyline mode picks the same event apart and prints a compact
@@ -1121,36 +1177,6 @@ async fn run_one_tool(
             elapsed_ms: elapsed.as_millis() as u64,
         })
         .await;
-
-    // PostToolUse hooks. Payload mirrors Claude Code's PostToolUse
-    // wire schema so hooks can inspect what actually happened —
-    // `tool_input` (final args after any PreToolUse transform) and
-    // `tool_response` (content + is_error + duration_ms).
-    //
-    // v0.9.1 fix: previously passed `Value::Object(Default::default())`
-    // (empty `{}`), so hooks could see tool_name and session_id but
-    // nothing about the call itself — no way to log outputs, react
-    // to failures, or scrape secrets from stdout. Everything the
-    // hook actually needs to be useful was missing.
-    if permission.hooks_active() && !hooks.post_tool_use.is_empty() {
-        let post_payload = serde_json::json!({
-            "tool_input": effective_args,
-            "tool_response": {
-                "content": content,
-                "is_error": is_error,
-                "duration_ms": elapsed.as_millis() as u64,
-            },
-        });
-        let _ = run_hooks(
-            &hooks.post_tool_use,
-            HookEvent::PostToolUse,
-            &call.name,
-            post_payload,
-            &cwd,
-            Some(&session_id.to_string()),
-        )
-        .await;
-    }
 
     ToolCallOutcome {
         call_id: call.id,
@@ -1341,6 +1367,106 @@ mod tests {
         );
         assert_eq!(v["arguments"]["tool_response"]["is_error"], false);
         assert!(v["arguments"]["tool_response"]["duration_ms"].is_u64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1 regression: post_tool_use hook can rewrite the tool's output
+    /// content via `{"updated_input":{"content":"..."}}`. Previously
+    /// the hook's return was discarded (`let _ = run_hooks(...)`),
+    /// so redact / log-scrubbing / result-truncation plugins were
+    /// inert. Fix: capture the outcome and apply Transform to the
+    /// result `content` and `is_error` (image attachments keep their
+    /// original handling).
+    #[tokio::test]
+    async fn post_tool_use_hook_can_transform_result() {
+        let dir = tmp();
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let post_hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            // Replace content with a redacted marker. Mirror Claude
+            // Code's protocol — `decision:"allow"` + `updated_input`.
+            command: r#"echo '{"decision":"allow","updated_input":{"content":"[REDACTED]","is_error":true}}'"#.into(),
+            timeout: 2000,
+        };
+        let hooks = HooksConfig {
+            post_tool_use: vec![post_hook],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .execute_tool_calls(
+                vec![ToolCall {
+                    id: "call_xform".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "echo SECRET=abc123"}),
+                }],
+                &tx,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(tx);
+
+        let last = agent.context.messages.last().expect("message in context");
+        match last {
+            crate::agent::context::ContextMessage::Tool {
+                content,
+                is_error,
+                ..
+            } => {
+                assert!(
+                    content.contains("[REDACTED]"),
+                    "expected hook to rewrite content, got {content:?}"
+                );
+                assert!(
+                    !content.contains("SECRET"),
+                    "raw tool output leaked into context: {content:?}"
+                );
+                assert!(
+                    *is_error,
+                    "hook should be able to flip is_error via updated_input"
+                );
+            }
+            other => panic!("expected Tool message, got {other:?}"),
+        }
+
+        // Drain channel — the renderer also gets the rewritten content.
+        let mut found_redacted = false;
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::ToolResult { content, is_error, .. } = &ev {
+                if content.contains("[REDACTED]") {
+                    found_redacted = true;
+                    assert!(is_error, "renderer event should reflect is_error flip");
+                }
+            }
+        }
+        assert!(
+            found_redacted,
+            "renderer must receive the post-hook rewritten content"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
