@@ -410,3 +410,90 @@ fn http_get_allowed_host_reaches_server() {
         out.content
     );
 }
+
+/// Serve a single `302` pointing at `location`, forever. Same
+/// never-joined-thread shape as `spawn_test_server`.
+fn spawn_redirect_server(location: String) -> u16 {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    port
+}
+
+/// A `3xx` must not walk the fetch off the allowlist.
+///
+/// The allowlist covers `127.0.0.1`, which permits the *first* hop. That
+/// server then redirects to `localhost` — a different host string, and so
+/// NOT allowlisted, even though it resolves to the same loopback interface.
+/// That asymmetry is what makes this test both hermetic and sharp: the
+/// redirect target is a real, reachable, in-process server, so if
+/// `redirect::Policy::none()` were ever dropped the client would follow the
+/// hop, succeed, and hand the guest a body it was never allowed to see —
+/// failing this test immediately and by name rather than hanging on an
+/// unroutable address until the 10s timeout.
+///
+/// The allowlist is checked once, against the URL the guest supplied. Nothing
+/// re-checks the `Location` header, which is precisely why not following it is
+/// the control.
+#[test]
+fn http_get_does_not_follow_redirect_off_the_allowlist() {
+    let target_port = spawn_test_server("SERVED-BODY-REDIRECT-TARGET");
+    let redirect_port = spawn_redirect_server(format!("http://localhost:{target_port}/"));
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["127.0.0.1".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool(
+            "fetch",
+            &format!(r#"{{"url":"http://127.0.0.1:{redirect_port}/"}}"#),
+        )
+        .expect("no trap");
+
+    assert!(out.is_error, "an unfollowed 3xx must surface as an error");
+    assert!(
+        out.content.contains("302"),
+        "the redirect should be reported as its status: {}",
+        out.content
+    );
+    // The load-bearing assertion: the body behind the redirect must never
+    // reach the guest.
+    assert!(
+        !out.content.contains("SERVED-BODY-REDIRECT-TARGET"),
+        "redirect was followed off the allowlist: {}",
+        out.content
+    );
+}
