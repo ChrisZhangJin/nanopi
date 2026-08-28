@@ -104,7 +104,7 @@ WASM support`, the binary was built without `--features wasm`.
 
 ## What the host expects
 
-Two exports, two optional imports. Full definitions in
+Two exports, three optional imports. Full definitions in
 [`../../wit/nanopi-extension.wit`](../../wit/nanopi-extension.wit).
 
 | Direction | Function | Signature |
@@ -113,11 +113,21 @@ Two exports, two optional imports. Full definitions in
 | export | `execute-tool` | `(name: string, args-json: string) -> string` |
 | import | `host-log` | `(level: u8, message: string)` |
 | import | `host-fs-read` | `(path: string) -> string` |
+| import | `host-http-get` | `(url: string) -> string` |
 
 Note the asymmetry: an **export** returning a string returns a pointer
 to a `(ptr, len)` pair, while an **import** returning one takes the
 return area as a trailing out-param. Getting it backwards fails at
 `wasm-tools component new` with a type mismatch, not at runtime.
+
+Both string-returning imports therefore declare a trailing `ret_area`:
+
+```rust
+#[link_name = "host-fs-read"]
+fn host_fs_read_raw(ptr: *const u8, len: usize, ret_area: *mut u8);
+#[link_name = "host-http-get"]
+fn host_http_get_raw(ptr: *const u8, len: usize, ret_area: *mut u8);
+```
 
 `list-tools` returns a JSON array read once at load:
 
@@ -177,8 +187,32 @@ outside only through host functions the user opts into.
 To try it, add `allow_fs = true` to the `[[extensions]]` entry and ask
 the model to read a file in the project.
 
-Network access (`allow_network` / `url_allowlist` → `host-http-get`)
-is **not implemented yet** — those config fields are plumbed but inert.
+`fetch` demonstrates the other gate. It calls `host-http-get`, which:
+
+- returns `error: network access denied ...` unless the plugin's
+  `[[extensions]]` entry sets `allow_network = true`;
+- then returns `error: url_allowlist does not permit <url> ...` unless
+  the URL's host is covered by `url_allowlist`. An **empty allowlist
+  denies everything**, so the switch alone reaches nothing;
+- matches on the URL's *host*, not a substring, so an entry covers its
+  subdomains and any port while `https://evil.com/?x=api.github.com`
+  and `https://api.github.com@evil.com/` are refused;
+- accepts only `http`/`https`, times out at 10s, and does not follow
+  redirects — a 3xx would otherwise walk the fetch onto a host the
+  allowlist never approved.
+
+To try it:
+
+```toml
+[[extensions]]
+path = "~/.nanopi/extensions/nanopi-example-plugin.component.wasm"
+allow_network = true
+url_allowlist = ["api.github.com"]
+```
+
+then ask the model to fetch `https://api.github.com/zen`. Point it at
+any other host and the tool call comes back as an error naming
+`url_allowlist`.
 
 A trap inside a plugin surfaces to the model as a failed tool call
 rather than taking nanopi down, and a `.wasm` that fails to load is

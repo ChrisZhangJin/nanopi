@@ -140,7 +140,9 @@ impl Default for ToolExecMode {
 /// level) is loaded as an extension. When `allow_network` /
 /// `allow_fs` are true, the plugin's `host-http-get` / `host-fs-read`
 /// calls are forwarded to the host's actual network / filesystem;
-/// otherwise those host functions return `Err` (defense in depth).
+/// otherwise those host functions return an in-band `error: `-prefixed
+/// string. In-band rather than a trap so a plugin can handle a denied
+/// capability as an ordinary failure instead of dying.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ExtensionConfig {
@@ -156,8 +158,10 @@ pub struct ExtensionConfig {
     /// Enable the `host-fs-read` host function (read-only).
     /// Default: `false`.
     pub allow_fs: bool,
-    /// Comma-separated URL allowlist for `host-http-get`. Empty =
-    /// allowlist disabled (any URL is denied). Effective only when
+    /// Hosts `host-http-get` may reach. Empty denies every URL, so
+    /// `allow_network = true` alone reaches nothing. Compared against
+    /// the URL's parsed host, which means an entry also covers its
+    /// subdomains and any port. Effective only when
     /// `allow_network = true`.
     pub url_allowlist: Vec<String>,
 }

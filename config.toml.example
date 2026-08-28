@@ -82,8 +82,17 @@ base_url = "https://api.openai.com/v1"
 #                   Even when true, reads are confined to the working
 #                   directory: paths are canonicalized first, so `../`
 #                   and outward-pointing symlinks are refused.
-#   allow_network   Reserved — host-http-get is not implemented yet.
-#   url_allowlist   Reserved — see allow_network.
+#   allow_network   Let the plugin call host-http-get. Default false.
+#                   Only http/https; requests time out after 10s, and
+#                   redirects are not followed, so a 3xx cannot walk a
+#                   fetch onto a host you did not approve.
+#   url_allowlist   Hosts host-http-get may reach. EMPTY DENIES
+#                   EVERYTHING — allow_network alone reaches nothing.
+#                   Matching is on the URL's host, so an entry covers
+#                   its subdomains and any port ("github.com" allows
+#                   api.github.com:8443) but not a host that merely
+#                   ends with it ("evilgithub.com" is refused).
+#                   Effective only when allow_network = true.
 #
 # See docs/pi-vs-nanopi.md §4.3 and wit/nanopi-extension.wit for the
 # guest interface a plugin must export.

@@ -239,3 +239,174 @@ fn fs_read_refuses_symlink_escape() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── host-http-get capability gate ───────────────────────────────────
+
+/// A throwaway HTTP server on an ephemeral loopback port.
+///
+/// The tests need a real socket — the gate is only meaningfully tested
+/// by watching a request either arrive or not — but they must not need
+/// the internet. A test that depends on `api.github.com` being
+/// reachable fails for reasons that have nothing to do with nanopi,
+/// and on a machine behind a filtering firewall it hangs rather than
+/// failing fast.
+///
+/// Accepts in a loop rather than once, so a retried or probing request
+/// does not leave a later one hanging on a dead listener. The thread
+/// is deliberately never joined: it dies with the test process, and
+/// shutdown plumbing would be more machinery than the fixture is
+/// worth.
+fn spawn_test_server(body: &'static str) -> u16 {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Drain the request head. Without this the client can see
+            // a reset instead of the response.
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                 Content-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    port
+}
+
+/// With `allow_network = false` (the default), the host refuses before
+/// it opens a socket — and names the knob to turn.
+///
+/// The allowlist is deliberately NON-empty and *would* permit this
+/// URL, so the refusal can only have come from the `allow_network`
+/// gate. With an empty allowlist this test would pass even if the
+/// first gate were deleted.
+#[test]
+fn http_get_denied_without_allow_network() {
+    let port = spawn_test_server("SERVED-BODY-DENIED-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["127.0.0.1".to_string()],
+            std::env::temp_dir(),
+            false,
+            false,
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(out.is_error, "denied fetch must be a tool error");
+    assert!(out.content.contains("allow_network"), "{}", out.content);
+    // Cheapest proof no request was made: the server's distinctive
+    // body never appears.
+    assert!(
+        !out.content.contains("SERVED-BODY-DENIED-CASE"),
+        "the request should never have been sent: {}",
+        out.content
+    );
+}
+
+/// Gate open, but the URL's host is not covered by the allowlist.
+#[test]
+fn http_get_denied_when_host_not_in_allowlist() {
+    let port = spawn_test_server("SERVED-BODY-ALLOWLIST-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["api.github.com".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(out.is_error, "unlisted host must be refused");
+    assert!(out.content.contains("url_allowlist"), "{}", out.content);
+    assert!(
+        !out.content.contains("SERVED-BODY-ALLOWLIST-CASE"),
+        "the request should never have been sent: {}",
+        out.content
+    );
+}
+
+/// An empty allowlist denies everything, even with the capability
+/// switched on. This is what `config.toml.example` promises, and it is
+/// what makes the capability opt-in per host rather than only per
+/// plugin — do not "fix" empty to mean allow-all.
+#[test]
+fn http_get_empty_allowlist_denies_everything() {
+    let port = spawn_test_server("SERVED-BODY-EMPTY-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, true)
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(
+        out.is_error,
+        "empty allowlist must deny, got: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("SERVED-BODY-EMPTY-CASE"),
+        "the request should never have been sent: {}",
+        out.content
+    );
+}
+
+/// Both gates open: the body reaches the guest verbatim.
+///
+/// The allowlist entry is a bare `127.0.0.1` while the server is on an
+/// ephemeral port — matching is on the host, so the port is
+/// irrelevant, which is exactly why the entry can be written without
+/// knowing the port ahead of time.
+#[test]
+fn http_get_allowed_host_reaches_server() {
+    let port = spawn_test_server("SERVED-BODY-ALLOWED-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["127.0.0.1".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(!out.is_error, "allowed fetch failed: {}", out.content);
+    assert!(
+        out.content.contains("SERVED-BODY-ALLOWED-CASE"),
+        "body did not reach the guest: {}",
+        out.content
+    );
+}

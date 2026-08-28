@@ -236,6 +236,7 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 |---|---|---|---|
 | `host-log` | `(level: u8, message: string)` | 始终可用 | 写 nanopi 的 stderr。`0`=trace `1`=info `2`=warn `3`=error。 |
 | `host-fs-read` | `(path: string) -> string` | `allow_fs` | 读工作目录内的 UTF-8 文件。返回内容，或以 `error: ` 开头的字符串。 |
+| `host-http-get` | `(url: string) -> string` | `allow_network` + `url_allowlist` | 抓取 `http`/`https` URL。返回响应体，或以 `error: ` 开头的字符串。 |
 
 数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
 
@@ -245,7 +246,7 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 `host-fs-read` 由 `allow_fs = true` 门控，且路径必须解析到工作目录**内部**。检查前会先 canonicalize，所以 `../` 穿越和指向外部的符号链接都会被拒。（内置 `read` 工具刻意没有这道检查，理由是模型反正能 shell out —— 但插件没有 shell，所以这里的边界是真约束而非安全剧场。）
 
-网络访问（`allow_network` / `url_allowlist` → `host-http-get`）**尚未实现**；这些配置字段已接通但当前无效。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
+`host-http-get` 有两道门：先是 `allow_network = true`，然后 URL 的 host 必须出现在 `url_allowlist` 里。**空 allowlist 拒绝一切**，所以只把开关打开本身还是什么都访问不到。匹配比对的是解析出的 host 而不是子串 —— allowlist 为 `api.github.com` 时，`https://evil.com/?x=api.github.com` 和 `https://api.github.com@evil.com/` 都会被拒；而一条 entry 会覆盖它的子域名和任意端口。只接受 `http`/`https`；请求 10 秒超时，插件因此没法把一轮对话挂死；重定向**不会**跟随 —— 否则一个 3xx 就能把这次抓取带到你从没批准过的 host 上。拒绝和失败都以 `error: ` 前缀的字符串在带内返回给插件，而不是 trap。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
 
 **同名冲突。** 插件不能注册已存在的工具名。冲突会被报告并跳过，所以插件无法悄悄替换 `bash`。
 

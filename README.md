@@ -241,6 +241,7 @@ And may import these host functions:
 |---|---|---|---|
 | `host-log` | `(level: u8, message: string)` | always | Write to nanopi's stderr. `0`=trace `1`=info `2`=warn `3`=error. |
 | `host-fs-read` | `(path: string) -> string` | `allow_fs` | Read a UTF-8 file inside the working directory. Returns contents, or a string starting with `error: `. |
+| `host-http-get` | `(url: string) -> string` | `allow_network` + `url_allowlist` | Fetch an `http`/`https` URL. Returns the response body, or a string starting with `error: `. |
 
 Payloads cross the boundary as JSON strings rather than WIT records — one primitive type keeps the ABI small enough that neither side needs a codegen step.
 
@@ -250,7 +251,7 @@ A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhan
 
 `host-fs-read` is gated on `allow_fs = true`, and even then the path must resolve *inside* the working directory. Paths are canonicalized before that check, so `../` traversal and symlinks pointing outward are both refused. (The built-in `read` tool deliberately has no such guard, on the reasoning that the model can shell out anyway — but a plugin has no shell, so here the boundary is real rather than theater.)
 
-Network access (`allow_network` / `url_allowlist` → `host-http-get`) is **not implemented yet**; those config fields are plumbed but inert. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
+`host-http-get` is gated twice: on `allow_network = true`, and then on the URL's host appearing in `url_allowlist`. An **empty allowlist denies everything**, so switching the capability on does not by itself reach anything. Matching is on the parsed host, not a substring — `https://evil.com/?x=api.github.com` and `https://api.github.com@evil.com/` are both refused against an allowlist of `api.github.com`, while an entry covers its subdomains and any port. Only `http`/`https`; requests time out at 10s so a plugin cannot hang a turn; redirects are **not** followed, since a 3xx would otherwise walk the fetch onto a host you never approved. Refusals and failures come back to the plugin in-band as `error: `-prefixed strings rather than as traps. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
 
 **Name collisions.** A plugin may not register a tool whose name already exists. Collisions are reported and skipped, so a plugin cannot quietly replace `bash`.
 
