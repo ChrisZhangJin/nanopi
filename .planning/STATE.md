@@ -1,6 +1,6 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.9.3
+milestone: v0.11.0
 milestone_name: milestone
 status: unknown
 last_updated: "2026-08-22T17:08:06.847Z"
@@ -13,7 +13,9 @@ Last activity: 2026-08-25 - Completed quick task 260825-kft: --system-prompt / -
 
 ## Current Focus
 
-M1 · UX Polish — next quick task TBD.
+M2 · Extensions (v0.11.0) — P0: expand shell-hook event coverage to
+`before_agent_start` / `turn_start` / `turn_end` / `message_end`.
+No new dependencies, pure `src/agent/` change.
 
 ## What's Built
 
