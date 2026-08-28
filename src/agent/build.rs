@@ -86,6 +86,10 @@ pub struct AgentBuildInputs {
     pub no_context_files: bool,
     /// `--system-prompt` / `--append-system-prompt` policy.
     pub prompt_overrides: PromptOverrides,
+    /// v0.11.0: optional injected follow-up message from a prior
+    /// turn's pending_follow_up queue. None in `build_fresh`; set
+    /// for `hydrate_resumed` when the previous turn queued one.
+    pub initial_follow_up: Option<String>,
 }
 
 impl Agent {
@@ -108,6 +112,7 @@ impl Agent {
             skill_load,
             no_context_files,
             prompt_overrides,
+            initial_follow_up,
         } = inputs;
 
         let tool_names = registry.names();
@@ -145,6 +150,7 @@ impl Agent {
             skills,
             no_context_files,
             prompt_overrides,
+            pending_follow_up: initial_follow_up,
         };
         (agent, diagnostics)
     }

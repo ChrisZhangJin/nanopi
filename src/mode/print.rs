@@ -158,6 +158,7 @@ pub async fn run_print_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            initial_follow_up: None,
         });
         print_skill_diagnostics(&diags);
         a
@@ -171,7 +172,7 @@ pub async fn run_print_mode(
     let agent_task = {
         let mut agent = agent; // move
         tokio::spawn(async move {
-            let r = agent.run_turn(message_owned.as_str(), &tx, None).await;
+            let r = agent.run_turn(message_owned.as_str(), &tx, None, None).await;
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
             agent.fire_session_end().await;

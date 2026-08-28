@@ -54,7 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, SteerMessage};
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
@@ -371,6 +371,7 @@ pub async fn run_tui_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            initial_follow_up: None,
         });
         print_skill_diagnostics(&diags);
         a
@@ -1283,6 +1284,7 @@ async fn run_app(
 ) -> Result<i32> {
     let mut key_events = EventStream::new();
     let mut ag_rx: Option<mpsc::Receiver<AgentEvent>> = None;
+    let mut steer_tx_slot: Option<mpsc::Sender<SteerMessage>> = None;
     let mut turn_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut cancel: Option<CancellationToken> = None;
     // 120ms ticker keeps the "Elapsed X.Xs" / spinner glyph moving
@@ -1315,7 +1317,7 @@ async fn run_app(
                                 handle_action(
                                     KeyAction::SummaryFinished(outcome),
                                     app, term, &agent_slot,
-                                    &mut ag_rx, &mut cancel, &mut turn_task,
+                                    &mut ag_rx, &mut steer_tx_slot, &mut cancel, &mut turn_task,
                                 ).await?;
                             }
                             Err(_join_err) => {
@@ -1346,7 +1348,7 @@ async fn run_app(
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                         let action = interpret_key(app, k);
                         handle_action(action, app, term, &agent_slot,
-                                      &mut ag_rx, &mut cancel, &mut turn_task).await?;
+                                      &mut ag_rx, &mut steer_tx_slot, &mut cancel, &mut turn_task).await?;
                     }
                     Some(Ok(Event::Paste(s))) => {
                         app.input.insert_str(&s);
@@ -1443,6 +1445,7 @@ async fn handle_action(
     term: &mut Term,
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     ag_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
+    steer_tx: &mut Option<mpsc::Sender<SteerMessage>>,
     cancel: &mut Option<CancellationToken>,
     turn_task: &mut Option<tokio::task::JoinHandle<Result<String, String>>>,
 ) -> Result<()> {
@@ -1628,6 +1631,7 @@ async fn handle_action(
                 skill_load: app.skill_load.clone(),
                 no_context_files: app.no_context_files,
                 prompt_overrides: app.prompt_overrides.clone(),
+                initial_follow_up: None,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
             {
@@ -2551,6 +2555,7 @@ async fn handle_action(
             // Echo user message into scrollback, PI-style gray card.
             render_user_echo(term, &msg)?;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
+            let (steer_tx_inner, steer_rx) = mpsc::channel::<SteerMessage>(32);
             let ct = CancellationToken::new();
             let ct_task = ct.clone();
             let agent_task_slot = agent_slot.clone();
@@ -2558,11 +2563,12 @@ async fn handle_action(
                 let mut guard = agent_task_slot.lock().await;
                 let mut a = guard.take().ok_or_else(|| "agent slot empty".to_string())?;
                 drop(guard);
-                let result = a.run_turn(&msg, &tx, Some(ct_task)).await;
+                let result = a.run_turn(&msg, &tx, Some(ct_task), Some(steer_rx)).await;
                 let mut guard = agent_task_slot.lock().await;
                 *guard = Some(a);
                 result.map_err(|e| e.to_string())
             });
+            *steer_tx = Some(steer_tx_inner);
             *ag_rx = Some(rx);
             *cancel = Some(ct);
             *turn_task = Some(task);

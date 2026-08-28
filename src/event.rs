@@ -82,6 +82,30 @@ pub enum AgentEvent {
     },
 }
 
+/// A message injected into the agent loop mid-turn (Pi parity:
+///
+/// - `SteeringMessages` get pushed into the conversation as a fresh
+///   user turn as soon as the current iteration ends, so the LLM sees
+///   them in its next call.
+/// - `FollowUpMessages` are queued and run AFTER the current turn
+///   returns — they don't interrupt the model mid-response, but they
+///   fire as a follow-on turn instead of letting the agent idle.
+///
+/// `tui.rs` owns the receiving end of these (`mpsc::Receiver`); the
+/// TUI's input handler sends `SteerMessage` whenever the user types
+/// while the agent is working. Non-interactive modes (`-p`, scripts)
+/// pass `None` and ignore this entirely — their loop is single-turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SteerMessage {
+    /// Push this text as a new user message at the next iteration
+    /// boundary. Matches Pi's `getSteeringMessages()`.
+    Steering { text: String },
+    /// Queue this text for execution AFTER the current turn ends.
+    /// Matches Pi's `getFollowUpMessages()`.
+    FollowUp { text: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::agent::context::Context;
 use crate::agent::hook::{run_hooks, run_session_hooks, HookConfig, HookEvent, HookOutcome};
 use crate::agent::permission::PermissionGate;
-use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
+use crate::event::{AgentEvent, FinishReason, SteerMessage, ToolCall, Usage};
 use crate::provider::openai::OpenAiProvider;
 use crate::session::{self, SessionEntry};
 
@@ -100,6 +100,11 @@ pub struct Agent {
     /// in `run_turn`. Empty when discovery is disabled and no --skill
     /// paths were passed.
     pub skills: Vec<crate::resources::Skill>,
+    /// v0.11.0: text pending from a `SteerMessage::FollowUp`. When
+    /// non-empty, the TUI's turn-completed handler auto-starts a new
+    /// turn with this text (Pi's `getFollowUpMessages()` semantic).
+    /// Reset to `None` when consumed.
+    pub pending_follow_up: Option<String>,
     /// When true, AGENTS.md / CLAUDE.md discovery is skipped entirely
     /// (CLI `--no-context-files` / `-nc`). Stashed here so `/reload` can
     /// rebuild the system prompt with the same policy. Mirrors PI's
@@ -239,6 +244,7 @@ impl Agent {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         })
     }
@@ -347,6 +353,7 @@ impl Agent {
         user_msg: &str,
         tx: &mpsc::Sender<AgentEvent>,
         cancel: Option<tokio_util::sync::CancellationToken>,
+        steer_rx: Option<mpsc::Receiver<SteerMessage>>,
     ) -> Result<String, AgentError> {
         // If the accumulated context is too big, compact it before adding
         // the new user message so the new message survives intact.
@@ -515,12 +522,51 @@ impl Agent {
         let mut stuck_streak: u32 = 0;
         let mut last_error_sig: Option<Vec<(String, String)>> = None;
 
+        // ── Steer / follow-up (v0.11.0) ────────────────────────────────
+        // Mutably held so the loop body can `try_recv()` at each
+        // iteration boundary. `take()` happens once; after that the
+        // Option is `None` (the receiver is moved into the loop
+        // scope).
+        let mut steer_rx = steer_rx;
+        let mut follow_up_queue: Vec<String> = Vec::new();
+
         for iteration_idx in 0..MAX_ITERATIONS {
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
                 if ct.is_cancelled() {
                     return Ok(final_text);
+                }
+            }
+
+            // ── Steer pump (v0.11.0) ───────────────────────────────
+            // Drain any pending `SteerMessage::Steering` messages
+            // from the channel and push them as fresh user messages
+            // into context so the next LLM call sees them. `FollowUp`
+            // messages are queued — they fire after the turn ends.
+            // `try_recv` is non-blocking so the agent loop never
+            // stalls waiting for user input.
+            if let Some(rx) = steer_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(SteerMessage::Steering { text }) => {
+                            self.context.push_user_text(text.clone());
+                            let _ = session::append_entry(
+                                &self.session_path,
+                                &SessionEntry::Message {
+                                    id: uuid::v7().to_string(),
+                                    timestamp: time::now_iso8601(),
+                                    role: "user".into(),
+                                    content: text,
+                                },
+                            );
+                        }
+                        Ok(SteerMessage::FollowUp { text }) => {
+                            follow_up_queue.push(text);
+                        }
+                        // Empty or disconnected — nothing pending.
+                        _ => break,
+                    }
                 }
             }
 
@@ -882,6 +928,13 @@ impl Agent {
         // compaction event bundled with the just-finished response
         // instead of at the start of the next turn.
         self.maybe_compact(tx).await;
+
+        // v0.11.0: surface the first `FollowUp` message (if any)
+        // onto the Agent so the caller can auto-trigger another
+        // turn. Matches Pi's `getFollowUpMessages()` semantic.
+        if !follow_up_queue.is_empty() {
+            self.pending_follow_up = Some(follow_up_queue.remove(0));
+        }
         Ok(final_text)
     }
 
@@ -1189,7 +1242,7 @@ async fn run_one_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::context::{ContextMessage, ToolSpec};
+    use crate::agent::context::{ContentBlock, ContextMessage, ToolSpec};
     use serde_json::json;
 
     fn tmp() -> PathBuf {
@@ -1237,6 +1290,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1329,6 +1383,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1412,6 +1467,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1493,6 +1549,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -1569,6 +1626,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1585,7 +1643,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let out = agent.run_turn("do something forever", &tx, Some(ct)).await;
+        let out = agent.run_turn("do something forever", &tx, Some(ct), None).await;
         canceller.await.ok();
         let elapsed = start.elapsed();
 
@@ -1667,6 +1725,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         (agent, dir)
@@ -1810,6 +1869,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1824,7 +1884,7 @@ mod tests {
             got_error
         });
 
-        let r = agent.run_turn("hi", &tx, None).await;
+        let r = agent.run_turn("hi", &tx, None, None).await;
         drop(tx);
         let got_error_event = drain.await.unwrap();
 
@@ -1895,6 +1955,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         agent.fire_session_start().await;
@@ -2311,6 +2372,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2318,7 +2380,7 @@ mod tests {
         // Drain events so the sender doesn't block.
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let final_text = agent.run_turn("go", &tx, None).await.expect("turn");
+        let final_text = agent.run_turn("go", &tx, None, None).await.expect("turn");
         drop(tx);
         drain.await.unwrap();
 
@@ -2375,6 +2437,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2492,6 +2555,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_up: None,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2506,7 +2570,7 @@ mod tests {
             got_error
         });
 
-        let r = agent.run_turn("hi", &tx, None).await;
+        let r = agent.run_turn("hi", &tx, None, None).await;
         drop(tx);
         let got_error_event = drain.await.unwrap();
 
@@ -2528,6 +2592,178 @@ mod tests {
         assert!(
             calls >= 3,
             "tripwire should require ≥3 identical rounds before firing, got {calls}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3 regression: `SteerMessage::Steering` sent mid-turn must be
+    /// picked up at the next iteration boundary and injected as a
+    /// fresh user message. Two-iteration SteppedProvider: first
+    /// iteration emits text + tool_call, second iteration emits
+    /// final text. The test sends `Steering { text: "hi steer" }`
+    /// before the second iteration starts.
+    #[tokio::test]
+    async fn steer_message_injected_as_user_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct SteppedProvider {
+            step: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for SteppedProvider {
+            fn id(&self) -> &'static str {
+                "stepped"
+            }
+            async fn stream_turn(
+                &self,
+                ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let step = self.step.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(AgentEvent::Start { message_id: "m".into() }).await;
+                match step {
+                    0 => {
+                        let _ = tx.send(AgentEvent::TextDelta {
+                            content_index: 0,
+                            text: "first".into(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::ToolCall {
+                            content_index: 0,
+                            call: ToolCall {
+                                id: "c1".into(),
+                                name: "bash".into(),
+                                arguments: json!({"command": "echo hi"}),
+                            },
+                        }).await;
+                        let _ = tx.send(AgentEvent::Done {
+                            finish_reason: FinishReason::ToolCalls,
+                            usage: Usage::default(),
+                        }).await;
+                    }
+                    1 => {
+                        // The steer message should now be in context
+                        // as a user turn. Verify by checking the
+                        // context's last user message.
+                        let steer_present = ctx.messages.iter().any(|m| match m {
+                            ContextMessage::User { content } => content.iter().any(|b| match b {
+                                ContentBlock::Text { text } => text.contains("hi steer"),
+                                _ => false,
+                            }),
+                            _ => false,
+                        });
+                        assert!(
+                            steer_present,
+                            "steer message must be in context by iteration 2"
+                        );
+                        let _ = tx.send(AgentEvent::TextDelta {
+                            content_index: 0,
+                            text: "done".into(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::Done {
+                            finish_reason: FinishReason::Stop,
+                            usage: Usage::default(),
+                        }).await;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("steer.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"stepped\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let step = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProvider { step: step.clone() }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "stepped".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            pending_follow_up: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+
+        // Fire the steer AFTER the first iteration's tool_call is
+        // processed but BEFORE the second iteration's stream_turn.
+        // The real TUI sends it while the user types mid-turn; here
+        // we just enqueue it before calling run_turn and let the
+        // try_recv drain it on the second iteration boundary.
+        let _ = steer_tx.send(SteerMessage::Steering {
+            text: "hi steer".into(),
+        }).await;
+
+        let final_text = agent.run_turn("go", &tx, None, Some(steer_rx)).await.expect("turn");
+        assert_eq!(final_text, "firstdone");
+
+        // Drain channel.
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Follow-up messages: a FollowUp steer message queues text for
+    /// after the turn ends. `pending_follow_up` must be populated.
+    #[tokio::test]
+    async fn follow_up_message_populates_pending() {
+        let dir = tmp();
+        let session_path = dir.join("fu.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+
+        // Enqueue a follow-up message before calling run_turn.
+        let _ = steer_tx.send(SteerMessage::FollowUp {
+            text: "next question".into(),
+        }).await;
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider { response: "ok".into() }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            pending_follow_up: None,
+        };
+
+        agent.run_turn("go", &tx, None, Some(steer_rx)).await.unwrap();
+
+        assert_eq!(
+            agent.pending_follow_up.as_deref(),
+            Some("next question"),
+            "FollowUp message must surface on agent.pending_follow_up"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
