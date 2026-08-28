@@ -92,6 +92,26 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.29", features = ["windows"] }
 
+# v0.11.0 optional: WASM plugin runtime. Heavy (~1.5-2 MB unpacked)
+# so we gate behind a feature. Default build stays at ~4 MB; users who
+# want `[[extensions]] .wasm` support build with `--features wasm`.
+#
+# `component-model` is the WIT/canonical-abi interface we'll define.
+# `async` is not yet enabled (we dispatch plugin calls via async
+# traits in the host, not futures exported from guest).
+[features]
+default = []
+wasm = ["dep:wasmtime"]
+
+[dependencies.wasmtime]
+version = "19"
+optional = true
+default-features = false
+# `component-model` enables the WIT/canonical-abi Component API;
+# `cranelift` is required to actually compile `.wasm` bytes
+# (Component::new / from_binary are gated on cranelift OR winch).
+features = ["component-model", "cranelift", "runtime"]
+
 [dev-dependencies]
 # v0.9.3: for settings_toml tests that need a scratch NANOPI_HOME.
 tempfile = "3"

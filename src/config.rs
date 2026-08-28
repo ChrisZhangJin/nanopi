@@ -85,6 +85,62 @@ pub struct Config {
     /// enable/disable toggles.
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// v0.11.0: WASM plugin extensions. Each entry points at a `.wasm`
+    /// file (or a directory of `.wasm` files); the wasmtime runtime
+    /// loads them and any `register-tool` / `register-command` calls
+    /// they make during init() flow into the agent's registry.
+    ///
+    /// Loading happens on `Agent::build_fresh` / `hydrate_resumed` —
+    /// the binary stays `~4 MB` when no entries are present (wasmtime
+    /// is feature-gated).
+    #[serde(default)]
+    pub extensions: Vec<ExtensionConfig>,
+}
+
+/// v0.11.0: one WASM extension declaration.
+///
+/// ```toml
+/// [[extensions]]
+/// path = "~/.nanopi/extensions/query_tool.wasm"
+/// ```
+///
+/// `path` may also point at a directory; every `*.wasm` inside (one
+/// level) is loaded as an extension. When `allow_network` /
+/// `allow_fs` are true, the plugin's `host-http-get` / `host-fs-read`
+/// calls are forwarded to the host's actual network / filesystem;
+/// otherwise those host functions return `Err` (defense in depth).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExtensionConfig {
+    /// `.wasm` file or directory of `.wasm` files. Supports `~/` and
+    /// `$HOME/` expansion.
+    pub path: PathBuf,
+    /// If `path` is a directory, load at most this many files
+    /// (default: 64). Cheap protection against a misconfigured glob.
+    pub max_files: usize,
+    /// Enable the `host-http-get` host function for this plugin.
+    /// Default: `false` — most plugins can do their work without it.
+    pub allow_network: bool,
+    /// Enable the `host-fs-read` host function (read-only).
+    /// Default: `false`.
+    pub allow_fs: bool,
+    /// Comma-separated URL allowlist for `host-http-get`. Empty =
+    /// allowlist disabled (any URL is denied). Effective only when
+    /// `allow_network = true`.
+    pub url_allowlist: Vec<String>,
+}
+
+impl Default for ExtensionConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            max_files: 64,
+            allow_network: false,
+            allow_fs: false,
+            url_allowlist: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,6 +175,7 @@ impl Config {
             trust: TrustConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -208,6 +265,12 @@ fn merge(a: Config, b: Config) -> Config {
         },
         hooks,
         skills,
+        // Extensions concatenate (both additive, never override).
+        extensions: {
+            let mut ext = a.extensions;
+            ext.extend(b.extensions);
+            ext
+        },
     }
 }
 
@@ -336,6 +399,7 @@ base_url = "https://project.example/v1"
             trust: TrustConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
+            extensions: Vec::new(),
         };
         let b = Config {
             model: None,
@@ -347,6 +411,7 @@ base_url = "https://project.example/v1"
             trust: TrustConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
+            extensions: Vec::new(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));

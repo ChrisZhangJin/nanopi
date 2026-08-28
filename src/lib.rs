@@ -22,6 +22,9 @@ pub mod tool;
 pub mod util;
 pub mod vendor;
 
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 /// Process-wide test mutex. Tests that mutate `$NANOPI_HOME` (or any
 /// other global env var) MUST acquire this lock before changing it,
 /// so parallel test execution can't poison each other's environment.
