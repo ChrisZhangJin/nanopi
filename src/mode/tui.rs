@@ -328,6 +328,12 @@ pub async fn run_tui_mode(
         )),
     );
     let registry = ToolRegistry::standard();
+
+    // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
+    // config.toml, which isn't in this function's parameter list.
+    // Re-read it here; a parse failure already surfaced through
+    // load_settings, so fall back to defaults rather than re-report.
+    let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
     let hooks = match settings::load_settings(&cwd) {
         Ok(h) => h,
         Err(e) => {
@@ -372,7 +378,8 @@ pub async fn run_tui_mode(
             no_context_files,
             prompt_overrides,
             initial_follow_up: None,
-            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_mode: cfg_for_build.tool_exec_mode,
+            extensions: cfg_for_build.extensions.clone(),
         });
         print_skill_diagnostics(&diags);
         a
@@ -1648,6 +1655,10 @@ async fn handle_action(
             };
             let _ = session::set_active_session(&cwd, &new_path);
             let registry = crate::tool::ToolRegistry::standard();
+            // `/new` rebuilds the agent from scratch, so re-read
+            // config for exec mode + extensions the same way startup
+            // does. Picks up an edited config.toml without a restart.
+            let cfg_now = crate::config::load_config(&cwd).unwrap_or_default();
             let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
                 cwd: cwd.clone(),
                 registry,
@@ -1663,7 +1674,8 @@ async fn handle_action(
                 no_context_files: app.no_context_files,
                 prompt_overrides: app.prompt_overrides.clone(),
                 initial_follow_up: None,
-            tool_exec_mode: crate::config::ToolExecMode::default(),
+                tool_exec_mode: cfg_now.tool_exec_mode,
+                extensions: cfg_now.extensions,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
             {

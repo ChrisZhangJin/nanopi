@@ -123,6 +123,13 @@ pub async fn run_print_mode(
 
     let registry = ToolRegistry::standard();
 
+    // v0.11.0: `tool_exec_mode` + `[[extensions]]` live in config.toml,
+    // which isn't threaded through this function's parameter list.
+    // Re-read it here rather than widening the signature; a parse
+    // failure already surfaced above via load_settings, so fall back
+    // to defaults quietly instead of double-reporting.
+    let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
+
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
@@ -159,7 +166,8 @@ pub async fn run_print_mode(
             no_context_files,
             prompt_overrides,
             initial_follow_up: None,
-            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_mode: cfg_for_build.tool_exec_mode,
+            extensions: cfg_for_build.extensions,
         });
         print_skill_diagnostics(&diags);
         a

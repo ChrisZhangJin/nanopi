@@ -92,6 +92,59 @@ pub struct AgentBuildInputs {
     pub initial_follow_up: Option<String>,
     /// v0.11.0: tool execution mode (parallel or sequential).
     pub tool_exec_mode: crate::config::ToolExecMode,
+    /// v0.11.0: `[[extensions]]` from config.toml. Each entry points at
+    /// a `.wasm` component (or a directory of them) whose exported
+    /// tools get registered alongside the built-ins. Ignored entirely
+    /// unless the binary was built with `--features wasm`.
+    pub extensions: Vec<crate::config::ExtensionConfig>,
+}
+
+/// Load `[[extensions]]` into the registry. Failures are reported on
+/// stderr and skipped — a broken plugin must not stop nanopi from
+/// starting with the rest of its tools.
+///
+/// Compiled out entirely without the `wasm` feature, so the default
+/// build carries neither wasmtime nor this code path.
+#[cfg(feature = "wasm")]
+fn load_extensions(
+    registry: &mut ToolRegistry,
+    extensions: &[crate::config::ExtensionConfig],
+) {
+    if extensions.is_empty() {
+        return;
+    }
+    let summary = crate::wasm::PluginHost::new().load_all(extensions);
+    for (path, err) in &summary.errors {
+        eprintln!("nanopi: extension {} failed to load: {err}", path.display());
+    }
+    for tool in summary.tools {
+        let name = tool.spec().name.clone();
+        if let Err(collision) = registry.register_external(tool) {
+            eprintln!(
+                "nanopi: extension tool {collision:?} collides with an \
+                 existing tool — skipping it (rename it in the plugin)"
+            );
+        } else {
+            eprintln!("nanopi: registered extension tool {name:?}");
+        }
+    }
+}
+
+/// No-op stand-in for builds without the `wasm` feature. Warns once if
+/// the user configured extensions anyway, so a silently-ignored
+/// `[[extensions]]` block doesn't read as a nanopi bug.
+#[cfg(not(feature = "wasm"))]
+fn load_extensions(
+    _registry: &mut ToolRegistry,
+    extensions: &[crate::config::ExtensionConfig],
+) {
+    if !extensions.is_empty() {
+        eprintln!(
+            "nanopi: {} [[extensions]] entries ignored — this build has no \
+             WASM support (rebuild with `--features wasm`)",
+            extensions.len()
+        );
+    }
 }
 
 impl Agent {
@@ -116,7 +169,15 @@ impl Agent {
             prompt_overrides,
             initial_follow_up,
             tool_exec_mode,
+            extensions,
         } = inputs;
+
+        // v0.11.0: load WASM extensions BEFORE reading `registry.names()`
+        // / `all_specs()` below — otherwise plugin tools would be absent
+        // from both the system prompt's tool list and the `tools` array
+        // sent to the model, i.e. registered but uncallable.
+        let mut registry = registry;
+        load_extensions(&mut registry, &extensions);
 
         let tool_names = registry.names();
         let LoadSkillsResult {
@@ -315,6 +376,39 @@ mod tests {
 
     fn tools() -> Vec<String> {
         vec!["read".into(), "bash".into()]
+    }
+
+    /// An empty `[[extensions]]` list must be a no-op in both feature
+    /// configurations — no warning, no registry mutation.
+    #[test]
+    fn load_extensions_empty_is_noop() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+        load_extensions(&mut r, &[]);
+        assert_eq!(r.names(), before);
+    }
+
+    /// Without the `wasm` feature, a configured extension is skipped
+    /// with a warning rather than panicking or silently pretending to
+    /// have loaded. With the feature on, a nonexistent path is
+    /// likewise reported and skipped. Either way the built-in tool set
+    /// is untouched — that's the invariant worth pinning.
+    #[test]
+    fn load_extensions_bad_path_leaves_registry_intact() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+        load_extensions(
+            &mut r,
+            &[crate::config::ExtensionConfig {
+                path: PathBuf::from("/nonexistent/plugin.wasm"),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(
+            r.names(),
+            before,
+            "a broken extension must not add or remove tools"
+        );
     }
 
     /// A cwd-level AGENTS.md is injected as a <project_context> block.

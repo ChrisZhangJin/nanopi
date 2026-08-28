@@ -60,6 +60,7 @@ fn stub_agent_inputs(
         prompt_overrides: nanopi::agent::prompt_override::PromptOverrides::default(),
         initial_follow_up: None,
         tool_exec_mode: nanopi::config::ToolExecMode::default(),
+        extensions: Vec::new(),
     }
 }
 
