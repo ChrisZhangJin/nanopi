@@ -196,6 +196,19 @@ command = "logger 'nanopi about to shell out'"
 
 Keys are `snake_case` (`pre_tool_use`, not `PreToolUse`). Full protocol in [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) §6.
 
+### Lifecycle events (v0.11.0)
+
+In addition to the Claude Code trio, nanopi exposes four lifecycle hooks that mirror Pi's `before_agent_start` / `turn_start` / `turn_end` / `message_end`:
+
+| Hook key | Fires | Blockable? |
+|---|---|---|
+| `before_agent_start` | Once per turn, after compaction but before the user message enters context | yes (returns early with a synthetic message) |
+| `turn_start` | Top of each agent-loop iteration | no (advisory) |
+| `turn_end` | Bottom of each agent-loop iteration | no (advisory) |
+| `message_end` | Once after the for-loop completes | no (advisory) |
+
+For all four, the `matcher` runs against the turn number string (so `^1$` fires only on the first turn), and stdin carries `{ "turn_count": N, ... }` plus event-specific fields. Full enumeration in [`config.toml.example`](https://github.com/ChrisZhangJin/nanopi/blob/main/config.toml.example).
+
 ## Versions
 
 | Version | Status | Size | Notes |

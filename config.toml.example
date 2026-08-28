@@ -111,3 +111,31 @@ base_url = "https://api.openai.com/v1"
 # Ex 5: run cleanup on session exit.
 # [[hooks.session_end]]
 # command = "~/.nanopi/hooks/cleanup.sh"
+
+# ── v0.11.0 lifecycle hooks ─────────────────────────────────────────
+# These map to PI's before_agent_start / turn_start / turn_end /
+# message_end. See docs/pi-vs-nanopi.md §4.3 for the full list.
+
+# Ex 6: log every turn start for debugging.
+# [[hooks.before_agent_start]]
+# matcher = "*"
+# command = "echo \"turn $TURN_COUNT started\" >> ~/.nanopi/turns.log"
+# timeout = 2000
+
+# Ex 7: audit each agent-loop iteration.
+# [[hooks.turn_start]]
+# matcher = "*"
+# command = "echo \"[turn_start] iter=$ITERATION\" >> ~/.nanopi/agent.log"
+# timeout = 2000
+
+# Ex 8: track tool usage across iterations.
+# [[hooks.turn_end]]
+# matcher = "*"
+# command = "echo \"[turn_end] had_tools=$HAD_TOOL_CALLS\" >> ~/.nanopi/agent.log"
+# timeout = 2000
+
+# Ex 9: fire a notification when a turn completes.
+# [[hooks.message_end]]
+# matcher = "*"
+# command = "notify-send \"nanopi turn done\""
+# timeout = 2000

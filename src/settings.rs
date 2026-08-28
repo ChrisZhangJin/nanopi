@@ -57,6 +57,15 @@ pub struct HooksSection {
     pub session_start: Vec<HookConfig>,
     #[serde(default)]
     pub session_end: Vec<HookConfig>,
+    /// NEW v0.11.0 lifecycle hooks (see docs/pi-vs-nanopi.md §4.3).
+    #[serde(default)]
+    pub before_agent_start: Vec<HookConfig>,
+    #[serde(default)]
+    pub turn_start: Vec<HookConfig>,
+    #[serde(default)]
+    pub turn_end: Vec<HookConfig>,
+    #[serde(default)]
+    pub message_end: Vec<HookConfig>,
 }
 
 impl From<Settings> for HooksConfig {
@@ -67,6 +76,10 @@ impl From<Settings> for HooksConfig {
             user_prompt_submit: s.hooks.user_prompt_submit,
             session_start: s.hooks.session_start,
             session_end: s.hooks.session_end,
+            before_agent_start: s.hooks.before_agent_start,
+            turn_start: s.hooks.turn_start,
+            turn_end: s.hooks.turn_end,
+            message_end: s.hooks.message_end,
         }
     }
 }
@@ -87,6 +100,10 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
                 .extend(cfg.hooks.user_prompt_submit);
             hooks.session_start.extend(cfg.hooks.session_start);
             hooks.session_end.extend(cfg.hooks.session_end);
+            hooks.before_agent_start.extend(cfg.hooks.before_agent_start);
+            hooks.turn_start.extend(cfg.hooks.turn_start);
+            hooks.turn_end.extend(cfg.hooks.turn_end);
+            hooks.message_end.extend(cfg.hooks.message_end);
         }
         Err(e) => {
             // config.toml parse errors surface as SettingsError so mode
@@ -105,6 +122,10 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
             hooks.user_prompt_submit.extend(s.hooks.user_prompt_submit);
             hooks.session_start.extend(s.hooks.session_start);
             hooks.session_end.extend(s.hooks.session_end);
+            hooks.before_agent_start.extend(s.hooks.before_agent_start);
+            hooks.turn_start.extend(s.hooks.turn_start);
+            hooks.turn_end.extend(s.hooks.turn_end);
+            hooks.message_end.extend(s.hooks.message_end);
         }
     }
 
@@ -116,6 +137,10 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
         hooks.user_prompt_submit.extend(s.hooks.user_prompt_submit);
         hooks.session_start.extend(s.hooks.session_start);
         hooks.session_end.extend(s.hooks.session_end);
+        hooks.before_agent_start.extend(s.hooks.before_agent_start);
+        hooks.turn_start.extend(s.hooks.turn_start);
+        hooks.turn_end.extend(s.hooks.turn_end);
+        hooks.message_end.extend(s.hooks.message_end);
     }
 
     // Validate regex matchers up front; surface errors at startup.
@@ -125,6 +150,11 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
         .map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.session_start).map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.session_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.before_agent_start)
+        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.turn_start).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.turn_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.message_end).map_err(SettingsError::Matcher)?;
 
     Ok(hooks)
 }

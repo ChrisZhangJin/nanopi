@@ -41,6 +41,19 @@ pub enum HookEvent {
     UserPromptSubmit,
     SessionStart,
     SessionEnd,
+    /// Fired once at the top of `run_turn`, BEFORE the user message is
+    /// pushed to context. The only new-hook variant that supports
+    /// Block (early return) and Transform (rewrite the prompt).
+    BeforeAgentStart,
+    /// Fired at the top of each agent-loop iteration (the `for` body
+    /// in `run_turn`). Advisory only — Block is logged, not enforced.
+    TurnStart,
+    /// Fired at the bottom of each agent-loop iteration, after tool
+    /// calls have been processed. Advisory only.
+    TurnEnd,
+    /// Fired once after the for-loop completes (all tool rounds done),
+    /// just before post-turn compaction. Advisory only.
+    MessageEnd,
 }
 
 impl HookEvent {
@@ -51,6 +64,10 @@ impl HookEvent {
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::BeforeAgentStart => "BeforeAgentStart",
+            HookEvent::TurnStart => "TurnStart",
+            HookEvent::TurnEnd => "TurnEnd",
+            HookEvent::MessageEnd => "MessageEnd",
         }
     }
 }
@@ -629,6 +646,35 @@ mod tests {
         // Round-trip.
         let back: HookEvent = serde_json::from_str("\"session_start\"").unwrap();
         assert_eq!(back, HookEvent::SessionStart);
+    }
+
+    /// v0.11.0 lifecycle hook env_var names. These are exported as
+    /// process env vars (NANOPI_EVENT=<name>) so hook scripts can
+    /// branch on event without parsing stdin JSON.
+    #[test]
+    fn lifecycle_events_env_var_names() {
+        assert_eq!(HookEvent::BeforeAgentStart.env_var(), "BeforeAgentStart");
+        assert_eq!(HookEvent::TurnStart.env_var(), "TurnStart");
+        assert_eq!(HookEvent::TurnEnd.env_var(), "TurnEnd");
+        assert_eq!(HookEvent::MessageEnd.env_var(), "MessageEnd");
+    }
+
+    /// v0.11.0 lifecycle hooks serialize as snake_case (matching the
+    /// `serde(rename_all = "snake_case")` on the enum) and round-trip
+    /// through JSON.
+    #[test]
+    fn lifecycle_events_serialize_snake_case() {
+        for (v, expected) in [
+            (HookEvent::BeforeAgentStart, "before_agent_start"),
+            (HookEvent::TurnStart, "turn_start"),
+            (HookEvent::TurnEnd, "turn_end"),
+            (HookEvent::MessageEnd, "message_end"),
+        ] {
+            let s = serde_json::to_string(&v).unwrap();
+            assert_eq!(s, format!("\"{expected}\""));
+            let back: HookEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, v);
+        }
     }
 
     #[tokio::test]

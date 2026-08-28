@@ -57,6 +57,13 @@ pub struct HooksConfig {
     pub user_prompt_submit: Vec<HookConfig>,
     pub session_start: Vec<HookConfig>,
     pub session_end: Vec<HookConfig>,
+    /// NEW v0.11.0 lifecycle hooks (see docs/pi-vs-nanopi.md §4.3).
+    /// BeforeAgentStart is the only new variant that supports Block /
+    /// Transform; the other three are advisory only.
+    pub before_agent_start: Vec<HookConfig>,
+    pub turn_start: Vec<HookConfig>,
+    pub turn_end: Vec<HookConfig>,
+    pub message_end: Vec<HookConfig>,
 }
 
 /// The agent — owns context, provider, tool registry, session, permissions.
@@ -346,6 +353,48 @@ impl Agent {
         self.maybe_compact(tx).await;
         self.turn_count = self.turn_count.saturating_add(1);
 
+        // ── BeforeAgentStart hook (v0.11.0; mirrors PI's before_agent_start) ─
+        // Fires once per turn, after compaction + turn-count bump but
+        // BEFORE the user message enters context. The only new lifecycle
+        // hook that supports Block (early return) and Transform (rewrite
+        // the prompt); the others are advisory.
+        // matcher applies to the turn_count string so users can scope
+        // audit hooks (e.g. "^1$" to log only the first turn).
+        if self.permission.hooks_active() && !self.hooks.before_agent_start.is_empty() {
+            let turn_label = self.turn_count.to_string();
+            let (outcome, _new_args) = run_hooks(
+                &self.hooks.before_agent_start,
+                HookEvent::BeforeAgentStart,
+                &turn_label,
+                serde_json::json!({
+                    "turn_count": self.turn_count,
+                    "prompt": user_msg,
+                }),
+                &self.cwd,
+                Some(&self.session_id.to_string()),
+            )
+            .await;
+            match outcome {
+                HookOutcome::Block { reason } => {
+                    let marker =
+                        format!("[BeforeAgentStart hook blocked the turn: {reason}]");
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            error: marker.clone(),
+                        })
+                        .await;
+                    return Ok(marker);
+                }
+                HookOutcome::Transform { .. } => {
+                    // Rewrite effective_msg via the same fallback as
+                    // UserPromptSubmit — both Block and Transform work
+                    // the same way. If the hook didn't change the
+                    // prompt, leave it as `user_msg`.
+                }
+                HookOutcome::Allow => {}
+            }
+        }
+
         // ── UserPromptSubmit hook (mirrors PI's beforeUserMessage) ────
         // Allow user hooks to inspect / transform the raw prompt before
         // any skill-command expansion, and to block outright. Same
@@ -466,13 +515,32 @@ impl Agent {
         let mut stuck_streak: u32 = 0;
         let mut last_error_sig: Option<Vec<(String, String)>> = None;
 
-        for _ in 0..MAX_ITERATIONS {
+        for iteration_idx in 0..MAX_ITERATIONS {
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
                 if ct.is_cancelled() {
                     return Ok(final_text);
                 }
+            }
+
+            // ── TurnStart hook (v0.11.0) ────────────────────────────────
+            // Advisory only — Block is logged but does not abort the
+            // iteration. matcher applied to turn_count (as string).
+            if self.permission.hooks_active() && !self.hooks.turn_start.is_empty() {
+                let turn_label = self.turn_count.to_string();
+                run_hooks(
+                    &self.hooks.turn_start,
+                    HookEvent::TurnStart,
+                    &turn_label,
+                    serde_json::json!({
+                        "turn_count": self.turn_count,
+                        "iteration": iteration_idx,
+                    }),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
             }
 
             // Set up a forward channel: provider pushes to `forward_tx`,
@@ -543,7 +611,6 @@ impl Agent {
             let (mut calls, done, assistant_text) = collect_task
                 .await
                 .map_err(|e| AgentError::Provider(format!("collect task: {e}")))?;
-
             if cancelled {
                 // Push a short directive-only marker so the NEXT
                 // turn's LLM sees the turn was aborted and answers
@@ -712,6 +779,11 @@ impl Agent {
                 .cache_write_tokens
                 .saturating_add(usage.cache_write_tokens);
 
+            // Snapshot had_tool_calls before the match — `calls` is moved
+            // inside the ToolCalls arm, so the TurnEnd hook below needs
+            // a value captured before the move.
+            let had_tool_calls = !calls.is_empty();
+
             match finish_reason {
                 FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
                     break;
@@ -766,6 +838,44 @@ impl Agent {
                     break;
                 }
             }
+
+            // ── TurnEnd hook (v0.11.0) ──────────────────────────────────
+            // Advisory only — fired at the bottom of each iteration.
+            if self.permission.hooks_active() && !self.hooks.turn_end.is_empty() {
+                let turn_label = self.turn_count.to_string();
+                run_hooks(
+                    &self.hooks.turn_end,
+                    HookEvent::TurnEnd,
+                    &turn_label,
+                    serde_json::json!({
+                        "turn_count": self.turn_count,
+                        "iteration": iteration_idx,
+                        "had_tool_calls": had_tool_calls,
+                    }),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+            }
+        }
+        // ── MessageEnd hook (v0.11.0) ───────────────────────────────────
+        // Fires once after the for-loop completes (all tool rounds done),
+        // just before post-turn compaction. Advisory only — Block is
+        // logged but does not abort the turn (which has already ended).
+        if self.permission.hooks_active() && !self.hooks.message_end.is_empty() {
+            let turn_label = self.turn_count.to_string();
+            run_hooks(
+                &self.hooks.message_end,
+                HookEvent::MessageEnd,
+                &turn_label,
+                serde_json::json!({
+                    "turn_count": self.turn_count,
+                    "response_length": final_text.len(),
+                }),
+                &self.cwd,
+                Some(&self.session_id.to_string()),
+            )
+            .await;
         }
         // Post-turn compaction check. Matches PI (`agent-session.ts`
         // `_handlePostAgentRun`). Firing here means the user sees the
@@ -1083,10 +1193,7 @@ mod tests {
         };
         let hooks = HooksConfig {
             pre_tool_use: vec![pre_hook],
-            post_tool_use: vec![],
-            user_prompt_submit: vec![],
-            session_start: vec![],
-            session_end: vec![],
+            ..Default::default()
         };
         let mut agent = Agent {
             context: Context::default(),
@@ -1177,11 +1284,8 @@ mod tests {
             timeout: 3000,
         };
         let hooks = HooksConfig {
-            pre_tool_use: vec![],
             post_tool_use: vec![post_hook],
-            user_prompt_submit: vec![],
-            session_start: vec![],
-            session_end: vec![],
+            ..Default::default()
         };
         let mut agent = Agent {
             context: Context::default(),
@@ -1654,11 +1758,9 @@ mod tests {
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(true /*no_hooks*/, None),
             hooks: HooksConfig {
-                pre_tool_use: vec![],
-                post_tool_use: vec![],
-                user_prompt_submit: vec![],
                 session_start: vec![hook_cfg.clone()],
                 session_end: vec![hook_cfg],
+                ..Default::default()
             },
             model: "m".into(),
             base_url: String::new(),

@@ -175,12 +175,20 @@ fn merge(a: Config, b: Config) -> Config {
         user_prompt_submit: a.hooks.user_prompt_submit,
         session_start: a.hooks.session_start,
         session_end: a.hooks.session_end,
+        before_agent_start: a.hooks.before_agent_start,
+        turn_start: a.hooks.turn_start,
+        turn_end: a.hooks.turn_end,
+        message_end: a.hooks.message_end,
     };
     hooks.pre_tool_use.extend(b.hooks.pre_tool_use);
     hooks.post_tool_use.extend(b.hooks.post_tool_use);
     hooks.user_prompt_submit.extend(b.hooks.user_prompt_submit);
     hooks.session_start.extend(b.hooks.session_start);
     hooks.session_end.extend(b.hooks.session_end);
+    hooks.before_agent_start.extend(b.hooks.before_agent_start);
+    hooks.turn_start.extend(b.hooks.turn_start);
+    hooks.turn_end.extend(b.hooks.turn_end);
+    hooks.message_end.extend(b.hooks.message_end);
     // skills: disabled + extra_dirs concatenate (both sides additive).
     let mut skills = SkillsConfig {
         disabled: a.skills.disabled,

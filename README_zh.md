@@ -191,6 +191,19 @@ command = "logger 'nanopi 即将执行 shell'"
 
 TOML key 是 snake_case（`pre_tool_use`，不是 `PreToolUse`）。完整协议见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 第 6 节。
 
+### 生命周期事件（v0.11.0）
+
+除了 Claude Code 的三个，nanopi 还多四个对齐 Pi `before_agent_start` / `turn_start` / `turn_end` / `message_end` 的生命周期钩子：
+
+| Hook key | 触发时机 | 可阻断？ |
+|---|---|---|
+| `before_agent_start` | 每个 turn 一次，compaction 之后、用户消息进入 context 之前 | 是（提前返回并写入合成消息）|
+| `turn_start` | agent 循环每次迭代的开头 | 否（仅通知）|
+| `turn_end` | agent 循环每次迭代的末尾 | 否（仅通知）|
+| `message_end` | for 循环结束后触发一次 | 否（仅通知）|
+
+四个 hook 的 `matcher` 都对 turn_count 字符串匹配（`^1$` 只匹配第一个 turn），stdin 收到 `{ "turn_count": N, ... }` 加事件特定字段。完整示例在 [`config.toml.example`](https://github.com/ChrisZhangJin/nanopi/blob/main/config.toml.example)。
+
 ## 版本
 
 | 版本 | 状态 | 体积 | 说明 |
