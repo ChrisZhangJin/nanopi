@@ -25,21 +25,48 @@ cargo build --release --features wasm     # in the nanopi repo
 
 ## Build
 
-Two steps: compile to a core module, then wrap it as a component.
+Three steps, run **from the repo root** so the `wit/` path resolves:
 
 ```bash
-cd examples/wasm-plugin
+# 1. compile to a core module
+cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
+  --target wasm32-wasip1 --release
 
-cargo build --target wasm32-wasip1 --release
+# 2. embed the WIT world into the module
+wasm-tools component embed wit/ \
+  examples/wasm-plugin/target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
+  -o /tmp/embedded.wasm --world extension
 
-wasm-tools component new \
-  target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
+# 3. wrap it as a component
+wasm-tools component new /tmp/embedded.wasm \
   -o nanopi-example-plugin.component.wasm
 ```
 
-`cargo build` alone gives you a **core module**, which nanopi will
-reject — the host instantiates components, not modules. The
-`wasm-tools component new` step is what adds the component wrapper.
+`cargo build` alone gives you a **core module**, which nanopi rejects —
+the host instantiates components, not modules.
+
+The `embed` step is what makes `component new` work: without a WIT
+world baked in, `component new` has no idea which core exports to
+promote, and silently produces a component with an empty world that
+the host then can't find `list-tools` in.
+
+Verify before installing:
+
+```bash
+wasm-tools component wit nanopi-example-plugin.component.wasm
+```
+
+should print
+
+```wit
+world root {
+  export list-tools: func() -> string;
+  export execute-tool: func(name: string, args-json: string) -> string;
+}
+```
+
+An empty `world root {}` means step 2 was skipped or the export names
+didn't match the WIT.
 
 ## Install
 

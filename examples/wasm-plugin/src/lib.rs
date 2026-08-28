@@ -9,11 +9,18 @@
 //! nothing to sandbox. Swap the bodies of `wordcount` / `rot13` for
 //! whatever your plugin actually does.
 //!
-//! Build:
-//!   cargo build --target wasm32-wasip1 --release
-//!   wasm-tools component new \
-//!     target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
+//! Build (from the repo root, so `wit/` resolves):
+//!   cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
+//!     --target wasm32-wasip1 --release
+//!   wasm-tools component embed wit/ \
+//!     examples/wasm-plugin/target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
+//!     -o /tmp/embedded.wasm --world extension
+//!   wasm-tools component new /tmp/embedded.wasm \
 //!     -o nanopi-example-plugin.component.wasm
+//!
+//! The `embed` step is not optional — `component new` on a bare module
+//! yields a component with an empty world, and the host then fails to
+//! find `list-tools`.
 //!
 //! Install:
 //!   cp nanopi-example-plugin.component.wasm ~/.nanopi/extensions/
@@ -120,10 +127,15 @@ pub unsafe extern "C" fn cabi_realloc(
     ALLOC.alloc(layout)
 }
 
-/// Leak a String into linear memory and write its (ptr, len) into the
-/// 8-byte return area the host gives us. The arena owns the bytes; the
-/// host copies them out before the next call resets it.
-unsafe fn write_string_result(s: String, ret_area: *mut u8) {
+/// Leak a String into linear memory, then return a pointer to an
+/// 8-byte area holding its `(ptr, len)`.
+///
+/// This is the canonical ABI's return convention for a `string`
+/// result: the export returns `i32` pointing at the pair, rather than
+/// taking a caller-provided out-param. Both the string bytes and the
+/// pair live in our arena; the host copies them out before the next
+/// call resets it.
+unsafe fn string_result(s: String) -> *mut u8 {
     let bytes = s.into_bytes();
     let len = bytes.len();
     let ptr = if len == 0 {
@@ -135,8 +147,12 @@ unsafe fn write_string_result(s: String, ret_area: *mut u8) {
         p
     };
     core::mem::forget(bytes);
+
+    let ret_layout = Layout::from_size_align_unchecked(8, 4);
+    let ret_area = ALLOC.alloc(ret_layout);
     ret_area.cast::<u32>().write(ptr as u32);
     ret_area.cast::<u32>().add(1).write(len as u32);
+    ret_area
 }
 
 unsafe fn read_string(ptr: *const u8, len: usize) -> String {
@@ -149,15 +165,16 @@ unsafe fn read_string(ptr: *const u8, len: usize) -> String {
 
 /// `list-tools: func() -> string`
 ///
-/// The symbol name must be the WIT name verbatim — the host resolves
-/// root exports by that string, and `wasm-tools component new` does
-/// not rename anything.
+/// The exported symbol must be the WIT name *verbatim*, hyphens and
+/// all — `wasm-tools component embed` looks for `list-tools`, not
+/// `list_tools`, and Rust identifiers can't contain hyphens. Hence
+/// `#[export_name]` rather than `#[no_mangle]`.
 ///
 /// The JSON Schema in `parameters` is what the model sees, so its
 /// `description` fields matter as much as the tool's own — that text
 /// is the entire spec the model gets for how to call this.
-#[no_mangle]
-pub unsafe extern "C" fn list_tools(ret_area: *mut u8) {
+#[export_name = "list-tools"]
+pub unsafe extern "C" fn list_tools() -> *mut u8 {
     reset_arena();
     let specs = r#"[
   {
@@ -183,25 +200,24 @@ pub unsafe extern "C" fn list_tools(ret_area: *mut u8) {
     }
   }
 ]"#;
-    write_string_result(specs.to_string(), ret_area);
+    string_result(specs.to_string())
 }
 
 /// `execute-tool: func(name: string, args-json: string) -> string`
-#[no_mangle]
+#[export_name = "execute-tool"]
 pub unsafe extern "C" fn execute_tool(
     name_ptr: *const u8,
     name_len: usize,
     args_ptr: *const u8,
     args_len: usize,
-    ret_area: *mut u8,
-) {
-    // Read arguments BEFORE resetting — they live in our arena, put
-    // there by the host's cabi_realloc calls.
+) -> *mut u8 {
+    // Read arguments before allocating anything else — they live in
+    // our arena, put there by the host's cabi_realloc calls, and
+    // `reset_arena` is deliberately NOT called here for that reason.
     let name = read_string(name_ptr, name_len);
     let args_json = read_string(args_ptr, args_len);
 
-    let out = dispatch(&name, &args_json);
-    write_string_result(out, ret_area);
+    string_result(dispatch(&name, &args_json))
 }
 
 fn dispatch(name: &str, args_json: &str) -> String {

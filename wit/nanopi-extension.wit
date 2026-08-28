@@ -1,25 +1,27 @@
 /// nanopi WASM extension interface (v0.11.0).
 ///
-/// Plugins export `list-tools` and `execute-tool`; the host provides
-/// `host-log`. Structured payloads cross the boundary as JSON strings
-/// rather than WIT records — that keeps the ABI to one primitive type,
-/// which is what lets the host bind these by hand with
-/// `Instance::get_typed_func` instead of pulling in a wit-bindgen
-/// build step. If this interface grows, switch to wit-bindgen.
+/// Plugins export `list-tools` and `execute-tool` at the world root;
+/// the host provides `host-log`. Structured payloads cross the
+/// boundary as JSON strings rather than WIT records — that keeps the
+/// ABI to one primitive type, which is what lets the host bind these
+/// by hand with `Instance::get_typed_func` instead of pulling in a
+/// wit-bindgen build step. If this interface grows, switch to
+/// wit-bindgen.
+///
+/// The exports are on the world directly, not inside an interface.
+/// An interface would namespace them as
+/// `nanopi:extension/tool-api#list-tools`, and the host resolves
+/// root exports by bare name.
 ///
 /// Canonical ABI: WIT Component Model (wasmtime 19+).
 
 package nanopi:extension;
 
-/// Host-provided functions, imported at the component root.
-interface host {
+world extension {
     /// Log a message to nanopi's stderr.
     /// Level: 0 = trace, 1 = info, 2 = warn, 3 = error.
-    host-log: func(level: u8, message: string);
-}
+    import host-log: func(level: u8, message: string);
 
-/// Guest exports — what the host calls.
-interface tool-api {
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [
@@ -34,7 +36,7 @@ interface tool-api {
     /// verbatim as the tool's parameter schema. Called once at load
     /// time. A component that does not export this is rejected as
     /// "not a nanopi extension".
-    list-tools: func() -> string;
+    export list-tools: func() -> string;
 
     /// Execute one of the tools from `list-tools`.
     ///
@@ -46,11 +48,5 @@ interface tool-api {
     /// `is_error` is optional and defaults to false. A trap here is
     /// reported to the model as a failed tool call; it does not take
     /// down nanopi.
-    execute-tool: func(name: string, args-json: string) -> string;
-}
-
-/// Top-level world the host instantiates.
-world extension {
-    import host;
-    export tool-api;
+    export execute-tool: func(name: string, args-json: string) -> string;
 }

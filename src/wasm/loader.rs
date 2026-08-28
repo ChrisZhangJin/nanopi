@@ -49,6 +49,11 @@ impl PluginEngine {
     pub fn new() -> Result<Self, String> {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        // The component model lowers into reference types, so this is
+        // not optional despite reading like a separate feature — a
+        // component built by `wasm-tools component new` fails to
+        // compile with "reference-types not enabled" without it.
+        config.wasm_reference_types(true);
         // Conservative resource caps — a runaway plugin should not
         // allocate gigabytes of linear memory.
         config.max_wasm_stack(512 * 1024); // 512 KiB
@@ -70,8 +75,12 @@ impl PluginEngine {
     ) -> Result<(Arc<dyn WasmExecuteBridge>, Vec<ToolSpec>), String> {
         let bytes = std::fs::read(wasm_path)
             .map_err(|e| format!("read {} failed: {e}", wasm_path.display()))?;
+        // `{:#}` not `{}`: wasmtime returns an anyhow chain whose outer
+        // message is often just "WebAssembly translation error", with
+        // the actual cause one level down. Plain `{}` throws that away
+        // and leaves the user with nothing to act on.
         let component = Component::from_binary(&self.engine, &bytes)
-            .map_err(|e| format!("compile {} failed: {e}", wasm_path.display()))?;
+            .map_err(|e| format!("compile {} failed: {e:#}", wasm_path.display()))?;
 
         let mut linker: Linker<PluginState> = Linker::new(&self.engine);
         // Host import: `host-log(level: u8, message: string)`.

@@ -109,8 +109,10 @@ optional = true
 default-features = false
 # `component-model` enables the WIT/canonical-abi Component API;
 # `cranelift` is required to actually compile `.wasm` bytes
-# (Component::new / from_binary are gated on cranelift OR winch).
-features = ["component-model", "cranelift", "runtime"]
+# (Component::new / from_binary are gated on cranelift OR winch);
+# `gc` gates Config::wasm_reference_types, which the component model
+# lowers into and therefore cannot run without.
+features = ["component-model", "cranelift", "runtime", "gc"]
 
 [dev-dependencies]
 # v0.9.3: for settings_toml tests that need a scratch NANOPI_HOME.
