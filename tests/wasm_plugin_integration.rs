@@ -43,13 +43,13 @@ fn fixture() -> PathBuf {
 fn loads_real_component_and_executes_its_tools() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, specs) = engine
-        .load(&fixture(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false)
         .expect("example component must load");
 
     // list-tools reached the host intact.
     let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, vec!["rot13", "wordcount"]);
+    assert_eq!(names, vec!["readfile", "rot13", "wordcount"]);
 
     // Descriptions and schemas survive too — these are what the model
     // sees, so an empty or mangled one is a silent quality failure.
@@ -78,7 +78,7 @@ fn loads_real_component_and_executes_its_tools() {
 #[test]
 fn repeated_calls_stay_correct() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new()).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false).expect("load");
 
     for _ in 0..20 {
         let out = bridge
@@ -93,7 +93,7 @@ fn repeated_calls_stay_correct() {
 #[test]
 fn unknown_tool_name_is_rejected() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new()).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false).expect("load");
 
     let err = bridge
         .execute_tool("definitely_not_a_tool", "{}")
@@ -106,7 +106,7 @@ fn unknown_tool_name_is_rejected() {
 #[test]
 fn plugin_reports_bad_arguments_as_tool_error() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new()).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false).expect("load");
 
     // `text` missing entirely.
     let out = bridge.execute_tool("rot13", r#"{}"#).expect("no trap");
@@ -130,9 +130,112 @@ fn core_module_is_rejected_with_a_useful_message() {
     // Smallest valid core module: magic + version.
     std::fs::write(&p, [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]).unwrap();
 
-    match engine.load(&p, Vec::new()) {
+    match engine.load(&p, Vec::new(), std::env::temp_dir(), false) {
         Ok(_) => panic!("a core module is not a component and must be refused"),
         Err(e) => assert!(e.contains("compile") || e.contains("list-tools"), "{e}"),
     }
     let _ = std::fs::remove_file(&p);
+}
+
+// ── host-fs-read capability gate ────────────────────────────────────
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("nanopi-fs-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// With `allow_fs = false` (the default), the host refuses before it
+/// ever touches the filesystem — and says which knob to turn.
+#[test]
+fn fs_read_denied_without_allow_fs() {
+    let dir = scratch_dir("denied");
+    std::fs::write(dir.join("secret.txt"), "classified").unwrap();
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), false)
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("readfile", r#"{"path":"secret.txt"}"#)
+        .expect("no trap");
+    assert!(out.is_error, "denied read must be a tool error");
+    assert!(out.content.contains("allow_fs"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With the gate open, a file inside cwd reads fine.
+#[test]
+fn fs_read_allowed_inside_cwd() {
+    let dir = scratch_dir("allowed");
+    std::fs::write(dir.join("notes.txt"), "line one\nline two\n").unwrap();
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), true)
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("readfile", r#"{"path":"notes.txt"}"#)
+        .expect("no trap");
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("18 bytes"), "{}", out.content);
+    assert!(out.content.contains("2 lines"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Traversal out of cwd is refused even with the gate open. The guard
+/// canonicalizes first, so `../` cannot slip past a prefix check the
+/// way it does against a raw string comparison.
+#[test]
+fn fs_read_refuses_traversal_out_of_cwd() {
+    let dir = scratch_dir("traversal");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), true)
+        .expect("load");
+
+    for probe in [
+        r#"{"path":"../../../../etc/hostname"}"#,
+        r#"{"path":"/etc/hostname"}"#,
+    ] {
+        let out = bridge.execute_tool("readfile", probe).expect("no trap");
+        assert!(out.is_error, "{probe} should be refused, got {}", out.content);
+        // Either containment refused it, or the path didn't resolve —
+        // both are correct refusals; what matters is no contents leak.
+        assert!(
+            !out.content.contains("bytes,"),
+            "{probe} leaked file contents: {}",
+            out.content
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlink pointing outside cwd is refused too — canonicalization
+/// resolves it before the containment check, which a raw prefix test
+/// would miss.
+#[test]
+#[cfg(unix)]
+fn fs_read_refuses_symlink_escape() {
+    let dir = scratch_dir("symlink");
+    std::os::unix::fs::symlink("/etc/hostname", dir.join("sneaky")).unwrap();
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), true)
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("readfile", r#"{"path":"sneaky"}"#)
+        .expect("no trap");
+    assert!(out.is_error, "symlink escape must be refused: {}", out.content);
+    assert!(out.content.contains("escapes"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

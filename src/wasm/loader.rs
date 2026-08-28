@@ -19,7 +19,7 @@
 //! Strings rather than WIT records keep the ABI to one primitive type,
 //! which is what makes the hand-rolled binding tractable.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -30,13 +30,54 @@ use crate::agent::context::ToolSpec;
 use crate::tool::ToolOutput;
 use crate::wasm::host::WasmExecuteBridge;
 
-/// Per-plugin host state carried in the wasmtime `Store`. Phase 4 will
-/// hang the network/fs capability gates off this.
+/// Per-plugin host state carried in the wasmtime `Store`. Host
+/// functions read their capability gates from here.
 pub struct PluginState {
     /// URL allowlist for a future `host-http-get`. Recorded now so the
     /// capability plumbing has somewhere to land.
     #[allow(dead_code)]
     url_allowlist: Vec<String>,
+    /// Session working directory. `host-fs-read` refuses anything that
+    /// resolves outside it.
+    cwd: PathBuf,
+    /// Whether `host-fs-read` is permitted at all for this plugin.
+    allow_fs: bool,
+}
+
+/// Resolve a plugin-supplied path, refusing anything outside `cwd`.
+///
+/// Unlike the built-in `read` tool — which deliberately has no cwd
+/// guard, on the reasoning that the model can shell out anyway (see
+/// the comment on `tool/read.rs::resolve_path`) — a plugin has no
+/// shell. Here the boundary is a real constraint rather than security
+/// theater, so it is enforced.
+///
+/// Both sides are canonicalized before comparison. Comparing raw paths
+/// would accept `<cwd>/../../etc/passwd`, which *is* literally
+/// prefixed by cwd; canonicalizing also collapses symlinks pointing
+/// outward.
+fn resolve_readable(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
+    let joined = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        cwd.join(requested)
+    };
+
+    // Canonicalization needs the file to exist. A missing file is
+    // reported as such rather than as a containment failure, so the
+    // plugin author can tell the two apart.
+    let real = std::fs::canonicalize(&joined)
+        .map_err(|e| format!("cannot resolve {}: {e}", joined.display()))?;
+    let real_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory: {e}"))?;
+
+    if !real.starts_with(&real_cwd) {
+        return Err(format!(
+            "path escapes the working directory: {}",
+            real.display()
+        ));
+    }
+    Ok(real)
 }
 
 /// One running wasmtime engine; threadsafe, cheap to clone (internally
@@ -72,6 +113,8 @@ impl PluginEngine {
         &self,
         wasm_path: &Path,
         url_allowlist: Vec<String>,
+        cwd: PathBuf,
+        allow_fs: bool,
     ) -> Result<(Arc<dyn WasmExecuteBridge>, Vec<ToolSpec>), String> {
         let bytes = std::fs::read(wasm_path)
             .map_err(|e| format!("read {} failed: {e}", wasm_path.display()))?;
@@ -104,10 +147,45 @@ impl PluginEngine {
             )
             .map_err(|e| format!("link host-log failed: {e}"))?;
 
+        // Host import: `host-fs-read(path: string) -> string`.
+        //
+        // Returns the file contents, or a string starting with
+        // `error: ` on refusal. Errors are returned in-band rather than
+        // as a trap so a plugin can handle a missing file without
+        // dying — and so a denied capability reads as a normal failure
+        // rather than looking like a plugin bug.
+        linker
+            .root()
+            .func_wrap(
+                "host-fs-read",
+                |store: wasmtime::StoreContextMut<'_, PluginState>,
+                 (path,): (String,)| {
+                    let state = store.data();
+                    if !state.allow_fs {
+                        return Ok((
+                            "error: filesystem access denied (set allow_fs = true \
+                             on this plugin's [[extensions]] entry)"
+                                .to_string(),
+                        ));
+                    }
+                    let resolved = match resolve_readable(&state.cwd, &path) {
+                        Ok(p) => p,
+                        Err(e) => return Ok((format!("error: {e}"),)),
+                    };
+                    match std::fs::read_to_string(&resolved) {
+                        Ok(contents) => Ok((contents,)),
+                        Err(e) => Ok((format!("error: cannot read file: {e}"),)),
+                    }
+                },
+            )
+            .map_err(|e| format!("link host-fs-read failed: {e}"))?;
+
         let mut store = Store::new(
             &self.engine,
             PluginState {
                 url_allowlist: url_allowlist.clone(),
+                cwd,
+                allow_fs,
             },
         );
         let instance = linker
@@ -296,7 +374,7 @@ mod tests {
         std::fs::write(&p, b"definitely not a wasm component").unwrap();
         // `unwrap_err()` needs the Ok half to be Debug, and
         // `Arc<dyn WasmExecuteBridge>` isn't — match instead.
-        match engine.load(&p, Vec::new()) {
+        match engine.load(&p, Vec::new(), std::env::temp_dir(), false) {
             Ok(_) => panic!("garbage bytes must not compile as a component"),
             Err(e) => assert!(e.contains("compile"), "got {e}"),
         }

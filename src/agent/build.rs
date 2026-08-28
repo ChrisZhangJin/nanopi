@@ -109,11 +109,12 @@ pub struct AgentBuildInputs {
 fn load_extensions(
     registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
+    cwd: &std::path::Path,
 ) {
     if extensions.is_empty() {
         return;
     }
-    let summary = crate::wasm::PluginHost::new().load_all(extensions);
+    let summary = crate::wasm::PluginHost::new().load_all(extensions, cwd);
     for (path, err) in &summary.errors {
         eprintln!("nanopi: extension {} failed to load: {err}", path.display());
     }
@@ -137,6 +138,7 @@ fn load_extensions(
 fn load_extensions(
     _registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
+    _cwd: &std::path::Path,
 ) {
     if !extensions.is_empty() {
         eprintln!(
@@ -177,7 +179,7 @@ impl Agent {
         // from both the system prompt's tool list and the `tools` array
         // sent to the model, i.e. registered but uncallable.
         let mut registry = registry;
-        load_extensions(&mut registry, &extensions);
+        load_extensions(&mut registry, &extensions, &cwd);
 
         let tool_names = registry.names();
         let LoadSkillsResult {
@@ -384,7 +386,7 @@ mod tests {
     fn load_extensions_empty_is_noop() {
         let mut r = ToolRegistry::standard();
         let before = r.names();
-        load_extensions(&mut r, &[]);
+        load_extensions(&mut r, &[], std::path::Path::new("/tmp"));
         assert_eq!(r.names(), before);
     }
 
@@ -403,6 +405,7 @@ mod tests {
                 path: PathBuf::from("/nonexistent/plugin.wasm"),
                 ..Default::default()
             }],
+            std::path::Path::new("/tmp"),
         );
         assert_eq!(
             r.names(),

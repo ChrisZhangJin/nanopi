@@ -235,17 +235,22 @@ A plugin exports two functions ([`wit/nanopi-extension.wit`](https://github.com/
 | `list-tools` | `() -> string` | JSON array of `{name, description, parameters}`. Called once at load. `parameters` is a JSON Schema handed to the model verbatim. |
 | `execute-tool` | `(name: string, args-json: string) -> string` | Runs a tool, returns `{"content": "...", "is_error": false}`. |
 
-And may import one host function:
+And may import these host functions:
 
-| Import | Signature | Purpose |
-|---|---|---|
-| `host-log` | `(level: u8, message: string)` | Write to nanopi's stderr. `0`=trace `1`=info `2`=warn `3`=error. |
+| Import | Signature | Gate | Purpose |
+|---|---|---|---|
+| `host-log` | `(level: u8, message: string)` | always | Write to nanopi's stderr. `0`=trace `1`=info `2`=warn `3`=error. |
+| `host-fs-read` | `(path: string) -> string` | `allow_fs` | Read a UTF-8 file inside the working directory. Returns contents, or a string starting with `error: `. |
 
 Payloads cross the boundary as JSON strings rather than WIT records — one primitive type keeps the ABI small enough that neither side needs a codegen step.
 
 A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin), including the build command.
 
-**Sandboxing.** Components run inside wasmtime with no filesystem and no network. The `allow_network` / `allow_fs` / `url_allowlist` fields on `[[extensions]]` are reserved for the capability-gated host functions landing in a later release; today a plugin can compute and log, nothing else. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
+**Sandboxing.** Components run inside wasmtime with no ambient authority — a plugin reaches the outside world only through host functions you opt into.
+
+`host-fs-read` is gated on `allow_fs = true`, and even then the path must resolve *inside* the working directory. Paths are canonicalized before that check, so `../` traversal and symlinks pointing outward are both refused. (The built-in `read` tool deliberately has no such guard, on the reasoning that the model can shell out anyway — but a plugin has no shell, so here the boundary is real rather than theater.)
+
+Network access (`allow_network` / `url_allowlist` → `host-http-get`) is **not implemented yet**; those config fields are plumbed but inert. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
 
 **Name collisions.** A plugin may not register a tool whose name already exists. Collisions are reported and skipped, so a plugin cannot quietly replace `bash`.
 

@@ -1,13 +1,14 @@
 # nanopi WASM plugin — worked example
 
-Two tools (`wordcount`, `rot13`) exported as a WebAssembly component
+Three tools (`wordcount`, `rot13`, `readfile`) exported as a WebAssembly component
 that nanopi loads at startup and offers to the model alongside `bash`
 and `read`.
 
-Neither tool does anything a built-in couldn't. That's on purpose —
-the point is the wiring, with nothing to install and nothing to
-sandbox. Replace the bodies in `src/lib.rs` with whatever your plugin
-actually does.
+The first two are pure computation, deliberately trivial — the point
+is the wiring. `readfile` shows the other half: how a plugin reaches
+outside itself, and what happens when the user hasn't granted that
+capability. Replace the bodies in `src/lib.rs` with whatever your
+plugin actually does.
 
 ## Prerequisites
 
@@ -89,6 +90,7 @@ On startup nanopi logs each tool it registers:
 ```
 nanopi: registered extension tool "wordcount"
 nanopi: registered extension tool "rot13"
+nanopi: registered extension tool "readfile"
 ```
 
 Then ask for one:
@@ -102,7 +104,7 @@ WASM support`, the binary was built without `--features wasm`.
 
 ## What the host expects
 
-Two exports, one optional import. Full definitions in
+Two exports, two optional imports. Full definitions in
 [`../../wit/nanopi-extension.wit`](../../wit/nanopi-extension.wit).
 
 | Direction | Function | Signature |
@@ -110,6 +112,12 @@ Two exports, one optional import. Full definitions in
 | export | `list-tools` | `() -> string` |
 | export | `execute-tool` | `(name: string, args-json: string) -> string` |
 | import | `host-log` | `(level: u8, message: string)` |
+| import | `host-fs-read` | `(path: string) -> string` |
+
+Note the asymmetry: an **export** returning a string returns a pointer
+to a `(ptr, len)` pair, while an **import** returning one takes the
+return area as a trailing out-param. Getting it backwards fails at
+`wasm-tools component new` with a type mismatch, not at runtime.
 
 `list-tools` returns a JSON array read once at load:
 
@@ -155,11 +163,22 @@ program.
 
 ## Sandbox
 
-The component runs in wasmtime with no filesystem and no network. A
-plugin can compute and call `host-log`; that's it. The
-`allow_network` / `allow_fs` / `url_allowlist` fields on
-`[[extensions]]` are plumbed through the config but the host functions
-behind them are not implemented yet.
+The component runs in wasmtime with no ambient authority. It reaches
+outside only through host functions the user opts into.
+
+`readfile` demonstrates the gate. It calls `host-fs-read`, which:
+
+- returns `error: filesystem access denied ...` unless the plugin's
+  `[[extensions]]` entry sets `allow_fs = true`;
+- confines reads to the working directory even when allowed. Paths are
+  canonicalized before the containment check, so `../` traversal and
+  symlinks pointing outward are both refused.
+
+To try it, add `allow_fs = true` to the `[[extensions]]` entry and ask
+the model to read a file in the project.
+
+Network access (`allow_network` / `url_allowlist` → `host-http-get`)
+is **not implemented yet** — those config fields are plumbed but inert.
 
 A trap inside a plugin surfaces to the model as a failed tool call
 rather than taking nanopi down, and a `.wasm` that fails to load is

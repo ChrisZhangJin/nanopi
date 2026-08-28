@@ -230,17 +230,22 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 | `list-tools` | `() -> string` | 返回 `{name, description, parameters}` 的 JSON 数组。加载时调用一次。`parameters` 是 JSON Schema，原样交给模型。 |
 | `execute-tool` | `(name: string, args-json: string) -> string` | 执行工具，返回 `{"content": "...", "is_error": false}`。 |
 
-可以导入一个宿主函数：
+可以导入这些宿主函数：
 
-| 导入 | 签名 | 用途 |
-|---|---|---|
-| `host-log` | `(level: u8, message: string)` | 写 nanopi 的 stderr。`0`=trace `1`=info `2`=warn `3`=error。 |
+| 导入 | 签名 | 门控 | 用途 |
+|---|---|---|---|
+| `host-log` | `(level: u8, message: string)` | 始终可用 | 写 nanopi 的 stderr。`0`=trace `1`=info `2`=warn `3`=error。 |
+| `host-fs-read` | `(path: string) -> string` | `allow_fs` | 读工作目录内的 UTF-8 文件。返回内容，或以 `error: ` 开头的字符串。 |
 
 数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
 
 完整可运行的例子在 [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin)，含编译命令。
 
-**沙箱。** 组件跑在 wasmtime 里，无文件系统、无网络。`[[extensions]]` 上的 `allow_network` / `allow_fs` / `url_allowlist` 字段是给后续版本的能力门控宿主函数预留的；现在插件只能计算和打日志。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
+**沙箱。** 组件跑在 wasmtime 里，没有环境权限 —— 插件只能通过你显式开启的宿主函数接触外部。
+
+`host-fs-read` 由 `allow_fs = true` 门控，且路径必须解析到工作目录**内部**。检查前会先 canonicalize，所以 `../` 穿越和指向外部的符号链接都会被拒。（内置 `read` 工具刻意没有这道检查，理由是模型反正能 shell out —— 但插件没有 shell，所以这里的边界是真约束而非安全剧场。）
+
+网络访问（`allow_network` / `url_allowlist` → `host-http-get`）**尚未实现**；这些配置字段已接通但当前无效。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
 
 **同名冲突。** 插件不能注册已存在的工具名。冲突会被报告并跳过，所以插件无法悄悄替换 `bash`。
 

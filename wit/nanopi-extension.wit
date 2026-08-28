@@ -22,6 +22,19 @@ world extension {
     /// Level: 0 = trace, 1 = info, 2 = warn, 3 = error.
     import host-log: func(level: u8, message: string);
 
+    /// Read a UTF-8 text file, relative to the session's working
+    /// directory. Returns the file's contents, or an error string
+    /// prefixed with `error: `.
+    ///
+    /// Gated on `allow_fs = true` in the plugin's `[[extensions]]`
+    /// entry — without it every call returns an error, so a plugin
+    /// cannot read anything the user did not opt into.
+    ///
+    /// Even with the gate open, the resolved path must stay inside the
+    /// working directory. Paths are canonicalized before the check, so
+    /// `../` sequences and symlinks pointing outward are both refused.
+    import host-fs-read: func(path: string) -> string;
+
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [

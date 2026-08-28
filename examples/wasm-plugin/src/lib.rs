@@ -1,13 +1,14 @@
 //! Example nanopi WASM extension.
 //!
-//! Exports two tools the model can call:
+//! Exports three tools the model can call:
 //!   - `wordcount` — count words / lines / chars in a string
 //!   - `rot13`     — the classic letter rotation
+//!   - `readfile`  — read a file through the gated `host-fs-read`
 //!
-//! Neither does anything a built-in tool could not, on purpose: the
-//! point is to show the wiring end to end with nothing to install and
-//! nothing to sandbox. Swap the bodies of `wordcount` / `rot13` for
-//! whatever your plugin actually does.
+//! The first two are pure computation, deliberately trivial: the point
+//! is the wiring, with nothing to install. `readfile` exists to show
+//! the other half — how a plugin reaches outside itself, and what
+//! happens when the user hasn't granted that capability.
 //!
 //! Build (from the repo root, so `wit/` resolves):
 //!   cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
@@ -95,6 +96,43 @@ unsafe impl core::alloc::GlobalAlloc for BumpAlloc {
 
 #[global_allocator]
 static ALLOC: BumpAlloc = BumpAlloc;
+
+// ── Host imports ────────────────────────────────────────────────────
+// Declared at the component root (`$root`), with `link_name` giving
+// the hyphenated WIT name that Rust identifiers can't express.
+//
+// The string return comes back as a pointer to an 8-byte (ptr, len)
+// pair in our own memory, same convention as our exports use.
+
+#[link(wasm_import_module = "$root")]
+extern "C" {
+    #[link_name = "host-log"]
+    fn host_log_raw(level: u32, ptr: *const u8, len: usize);
+    // Note the shape: an *import* returning a string takes the return
+    // area as a trailing out-param, whereas an *export* returns a
+    // pointer to it. The canonical ABI is not symmetric here, and
+    // getting it backwards fails at `wasm-tools component new` with a
+    // type mismatch rather than at runtime.
+    #[link_name = "host-fs-read"]
+    fn host_fs_read_raw(ptr: *const u8, len: usize, ret_area: *mut u8);
+}
+
+/// Log to nanopi's stderr. 0=trace 1=info 2=warn 3=error.
+unsafe fn host_log(level: u32, msg: &str) {
+    host_log_raw(level, msg.as_ptr(), msg.len());
+}
+
+/// Read a file through the host. Returns whatever the host gives us,
+/// including its `error: ` strings — the caller decides what to do
+/// with a refusal.
+unsafe fn host_fs_read(path: &str) -> String {
+    // 8 bytes, 4-aligned: the (ptr, len) pair the host writes back.
+    let ret_area = ALLOC.alloc(Layout::from_size_align_unchecked(8, 4));
+    host_fs_read_raw(path.as_ptr(), path.len(), ret_area);
+    let ptr = ret_area.cast::<u32>().read() as *const u8;
+    let len = ret_area.cast::<u32>().add(1).read() as usize;
+    read_string(ptr, len)
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -189,6 +227,17 @@ pub unsafe extern "C" fn list_tools() -> *mut u8 {
     }
   },
   {
+    "name": "readfile",
+    "description": "Read a UTF-8 text file from the working directory and report its size. Requires allow_fs = true on this plugin's [[extensions]] entry.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "Path relative to the working directory." }
+      },
+      "required": ["path"]
+    }
+  },
+  {
     "name": "rot13",
     "description": "Apply the ROT13 letter substitution to a string.",
     "parameters": {
@@ -225,6 +274,27 @@ fn dispatch(name: &str, args_json: &str) -> String {
         Ok(v) => v,
         Err(e) => return err_result(&format!("arguments were not valid JSON: {e}")),
     };
+    // `readfile` takes `path`; the other two take `text`.
+    if name == "readfile" {
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return err_result("missing required string field `path`"),
+        };
+        let contents = unsafe {
+            host_log(1, "readfile: asking the host for the file");
+            host_fs_read(path)
+        };
+        // The host signals refusal in-band with an `error: ` prefix.
+        if let Some(reason) = contents.strip_prefix("error: ") {
+            return err_result(reason);
+        }
+        let lines = contents.lines().count();
+        return ok_result(&format!(
+            "{} bytes, {lines} lines",
+            contents.len()
+        ));
+    }
+
     let text = match args.get("text").and_then(|v| v.as_str()) {
         Some(t) => t,
         None => return err_result("missing required string field `text`"),

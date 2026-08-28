@@ -78,9 +78,12 @@ base_url = "https://api.openai.com/v1"
 # Fields:
 #   path            .wasm file or directory. Supports ~ and $HOME.
 #   max_files       Cap when path is a directory. Default 64.
-#   allow_network   Reserved (phase 4). Default false.
-#   allow_fs        Reserved (phase 4). Default false.
-#   url_allowlist   Reserved (phase 4) — URLs host-http-get may reach.
+#   allow_fs        Let the plugin call host-fs-read. Default false.
+#                   Even when true, reads are confined to the working
+#                   directory: paths are canonicalized first, so `../`
+#                   and outward-pointing symlinks are refused.
+#   allow_network   Reserved — host-http-get is not implemented yet.
+#   url_allowlist   Reserved — see allow_network.
 #
 # See docs/pi-vs-nanopi.md §4.3 and wit/nanopi-extension.wit for the
 # guest interface a plugin must export.

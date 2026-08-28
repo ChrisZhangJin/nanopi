@@ -45,7 +45,11 @@ impl PluginHost {
     /// extension. Errors are collected per-file rather than
     /// short-circuiting: one malformed `.wasm` must not stop nanopi
     /// from starting with the rest.
-    pub fn load_all(&self, configs: &[ExtensionConfig]) -> PluginLoadSummary {
+    pub fn load_all(
+        &self,
+        configs: &[ExtensionConfig],
+        cwd: &std::path::Path,
+    ) -> PluginLoadSummary {
         let mut tools: Vec<std::sync::Arc<dyn crate::tool::Tool>> = Vec::new();
         let mut errors = Vec::new();
         let mut loaded = 0usize;
@@ -72,7 +76,12 @@ impl PluginHost {
 
         for cfg in configs {
             for path in self.resolve_paths(std::slice::from_ref(cfg)) {
-                match engine.load(&path, cfg.url_allowlist.clone()) {
+                match engine.load(
+                    &path,
+                    cfg.url_allowlist.clone(),
+                    cwd.to_path_buf(),
+                    cfg.allow_fs,
+                ) {
                     Ok((bridge, specs)) => {
                         let plugin_name: std::sync::Arc<str> = path
                             .file_stem()
