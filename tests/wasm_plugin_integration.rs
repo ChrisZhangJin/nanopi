@@ -49,7 +49,7 @@ fn loads_real_component_and_executes_its_tools() {
     // list-tools reached the host intact.
     let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, vec!["readfile", "rot13", "wordcount"]);
+    assert_eq!(names, vec!["fetch", "readfile", "rot13", "wordcount"]);
 
     // Descriptions and schemas survive too — these are what the model
     // sees, so an empty or mangled one is a silent quality failure.

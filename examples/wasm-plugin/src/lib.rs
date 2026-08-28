@@ -1,14 +1,15 @@
 //! Example nanopi WASM extension.
 //!
-//! Exports three tools the model can call:
+//! Exports four tools the model can call:
 //!   - `wordcount` — count words / lines / chars in a string
 //!   - `rot13`     — the classic letter rotation
 //!   - `readfile`  — read a file through the gated `host-fs-read`
+//!   - `fetch`     — get a URL through the gated `host-http-get`
 //!
 //! The first two are pure computation, deliberately trivial: the point
-//! is the wiring, with nothing to install. `readfile` exists to show
-//! the other half — how a plugin reaches outside itself, and what
-//! happens when the user hasn't granted that capability.
+//! is the wiring, with nothing to install. `readfile` and `fetch`
+//! exist to show the other half — how a plugin reaches outside itself,
+//! and what happens when the user hasn't granted that capability.
 //!
 //! Build (from the repo root, so `wit/` resolves):
 //!   cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
@@ -115,6 +116,10 @@ extern "C" {
     // type mismatch rather than at runtime.
     #[link_name = "host-fs-read"]
     fn host_fs_read_raw(ptr: *const u8, len: usize, ret_area: *mut u8);
+    // Same trailing-`ret_area` shape as `host-fs-read` above, for the
+    // same reason: this is an import returning a string.
+    #[link_name = "host-http-get"]
+    fn host_http_get_raw(ptr: *const u8, len: usize, ret_area: *mut u8);
 }
 
 /// Log to nanopi's stderr. 0=trace 1=info 2=warn 3=error.
@@ -129,6 +134,18 @@ unsafe fn host_fs_read(path: &str) -> String {
     // 8 bytes, 4-aligned: the (ptr, len) pair the host writes back.
     let ret_area = ALLOC.alloc(Layout::from_size_align_unchecked(8, 4));
     host_fs_read_raw(path.as_ptr(), path.len(), ret_area);
+    let ptr = ret_area.cast::<u32>().read() as *const u8;
+    let len = ret_area.cast::<u32>().add(1).read() as usize;
+    read_string(ptr, len)
+}
+
+/// Fetch a URL through the host. Returns whatever the host gives us,
+/// `error: ` strings included — a refusal (gate closed, host not on
+/// the allowlist, request failed) is the caller's to interpret.
+unsafe fn host_http_get(url: &str) -> String {
+    // 8 bytes, 4-aligned: the (ptr, len) pair the host writes back.
+    let ret_area = ALLOC.alloc(Layout::from_size_align_unchecked(8, 4));
+    host_http_get_raw(url.as_ptr(), url.len(), ret_area);
     let ptr = ret_area.cast::<u32>().read() as *const u8;
     let len = ret_area.cast::<u32>().add(1).read() as usize;
     read_string(ptr, len)
@@ -238,6 +255,17 @@ pub unsafe extern "C" fn list_tools() -> *mut u8 {
     }
   },
   {
+    "name": "fetch",
+    "description": "Fetch a URL over HTTP(S) and return the response body. Requires allow_network = true and a matching url_allowlist entry on this plugin's [[extensions]] entry.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "An http:// or https:// URL." }
+      },
+      "required": ["url"]
+    }
+  },
+  {
     "name": "rot13",
     "description": "Apply the ROT13 letter substitution to a string.",
     "parameters": {
@@ -274,7 +302,26 @@ fn dispatch(name: &str, args_json: &str) -> String {
         Ok(v) => v,
         Err(e) => return err_result(&format!("arguments were not valid JSON: {e}")),
     };
-    // `readfile` takes `path`; the other two take `text`.
+    // `readfile` takes `path` and `fetch` takes `url`; the other two
+    // take `text`. Both must be handled ahead of the `text`-extracting
+    // tail, or a call missing `url` would report a missing `text`.
+    if name == "fetch" {
+        let url = match args.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u,
+            None => return err_result("missing required string field `url`"),
+        };
+        let body = unsafe {
+            host_log(1, "fetch: asking the host for the URL");
+            host_http_get(url)
+        };
+        // The host signals refusal in-band with an `error: ` prefix.
+        if let Some(reason) = body.strip_prefix("error: ") {
+            return err_result(reason);
+        }
+        // Hand the body back verbatim — passing the content to the
+        // model is the entire point of a fetch tool.
+        return ok_result(&body);
+    }
     if name == "readfile" {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
