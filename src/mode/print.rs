@@ -159,6 +159,7 @@ pub async fn run_print_mode(
             no_context_files,
             prompt_overrides,
             initial_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
         });
         print_skill_diagnostics(&diags);
         a

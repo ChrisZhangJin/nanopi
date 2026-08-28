@@ -66,6 +66,11 @@ pub struct HooksSection {
     pub turn_end: Vec<HookConfig>,
     #[serde(default)]
     pub message_end: Vec<HookConfig>,
+    /// v0.11.0: compaction lifecycle hooks.
+    #[serde(default)]
+    pub session_before_compact: Vec<HookConfig>,
+    #[serde(default)]
+    pub session_compact: Vec<HookConfig>,
 }
 
 impl From<Settings> for HooksConfig {
@@ -80,6 +85,8 @@ impl From<Settings> for HooksConfig {
             turn_start: s.hooks.turn_start,
             turn_end: s.hooks.turn_end,
             message_end: s.hooks.message_end,
+            session_before_compact: s.hooks.session_before_compact,
+            session_compact: s.hooks.session_compact,
         }
     }
 }
@@ -104,6 +111,10 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
             hooks.turn_start.extend(cfg.hooks.turn_start);
             hooks.turn_end.extend(cfg.hooks.turn_end);
             hooks.message_end.extend(cfg.hooks.message_end);
+            hooks
+                .session_before_compact
+                .extend(cfg.hooks.session_before_compact);
+            hooks.session_compact.extend(cfg.hooks.session_compact);
         }
         Err(e) => {
             // config.toml parse errors surface as SettingsError so mode
@@ -126,6 +137,10 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
             hooks.turn_start.extend(s.hooks.turn_start);
             hooks.turn_end.extend(s.hooks.turn_end);
             hooks.message_end.extend(s.hooks.message_end);
+            hooks
+                .session_before_compact
+                .extend(s.hooks.session_before_compact);
+            hooks.session_compact.extend(s.hooks.session_compact);
         }
     }
 
@@ -155,6 +170,9 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     crate::agent::hook::validate_hooks(&hooks.turn_start).map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.turn_end).map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.message_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_before_compact)
+        .map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_compact).map_err(SettingsError::Matcher)?;
 
     Ok(hooks)
 }

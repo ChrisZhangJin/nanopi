@@ -96,6 +96,37 @@ pub struct Config {
     /// is feature-gated).
     #[serde(default)]
     pub extensions: Vec<ExtensionConfig>,
+
+    /// v0.11.0: tool execution mode within a single turn.
+    ///
+    /// `"parallel"` (default) — all tool calls from one LLM response
+    /// run concurrently via `tokio::join_all`. Matches Pi's default.
+    ///
+    /// `"sequential"` — tool calls run one at a time, in the order
+    /// the LLM emitted them. Some scripts or stateful tools require
+    /// this (e.g. `write` then `read` where the read must see the
+    /// write's output).
+    ///
+    /// The `[[extensions]]` tool's `executionMode` (Pi's per-tool
+    /// override) is reserved for a future release; today this field
+    /// applies globally.
+    #[serde(default)]
+    pub tool_exec_mode: ToolExecMode,
+}
+
+/// Global tool execution mode. Deserialized from
+/// `tool_exec_mode = "parallel" | "sequential"` in config.toml.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecMode {
+    Parallel,
+    Sequential,
+}
+
+impl Default for ToolExecMode {
+    fn default() -> Self {
+        Self::Parallel
+    }
 }
 
 /// v0.11.0: one WASM extension declaration.
@@ -176,6 +207,7 @@ impl Config {
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
+            tool_exec_mode: ToolExecMode::default(),
         }
     }
 }
@@ -236,6 +268,8 @@ fn merge(a: Config, b: Config) -> Config {
         turn_start: a.hooks.turn_start,
         turn_end: a.hooks.turn_end,
         message_end: a.hooks.message_end,
+        session_before_compact: a.hooks.session_before_compact,
+        session_compact: a.hooks.session_compact,
     };
     hooks.pre_tool_use.extend(b.hooks.pre_tool_use);
     hooks.post_tool_use.extend(b.hooks.post_tool_use);
@@ -246,6 +280,10 @@ fn merge(a: Config, b: Config) -> Config {
     hooks.turn_start.extend(b.hooks.turn_start);
     hooks.turn_end.extend(b.hooks.turn_end);
     hooks.message_end.extend(b.hooks.message_end);
+    hooks
+        .session_before_compact
+        .extend(b.hooks.session_before_compact);
+    hooks.session_compact.extend(b.hooks.session_compact);
     // skills: disabled + extra_dirs concatenate (both sides additive).
     let mut skills = SkillsConfig {
         disabled: a.skills.disabled,
@@ -270,6 +308,14 @@ fn merge(a: Config, b: Config) -> Config {
             let mut ext = a.extensions;
             ext.extend(b.extensions);
             ext
+        },
+        // tool_exec_mode: b wins if explicitly set; default otherwise.
+        // Default::default() == Parallel; users opt into Sequential.
+        // tool_exec_mode: last explicit (non-Parallel) wins; else default.
+        tool_exec_mode: if b.tool_exec_mode != ToolExecMode::default() {
+            b.tool_exec_mode
+        } else {
+            a.tool_exec_mode
         },
     }
 }
@@ -400,6 +446,7 @@ base_url = "https://project.example/v1"
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
+            tool_exec_mode: ToolExecMode::default(),
         };
         let b = Config {
             model: None,
@@ -412,6 +459,7 @@ base_url = "https://project.example/v1"
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
+            tool_exec_mode: ToolExecMode::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));

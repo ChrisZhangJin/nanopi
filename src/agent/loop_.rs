@@ -64,6 +64,10 @@ pub struct HooksConfig {
     pub turn_start: Vec<HookConfig>,
     pub turn_end: Vec<HookConfig>,
     pub message_end: Vec<HookConfig>,
+    /// v0.11.0: compaction lifecycle hooks (mirrors Pi's
+    /// `session_before_compact` / `session_compact`).
+    pub session_before_compact: Vec<HookConfig>,
+    pub session_compact: Vec<HookConfig>,
 }
 
 /// The agent — owns context, provider, tool registry, session, permissions.
@@ -105,6 +109,10 @@ pub struct Agent {
     /// turn with this text (Pi's `getFollowUpMessages()` semantic).
     /// Reset to `None` when consumed.
     pub pending_follow_up: Option<String>,
+    /// v0.11.0: tool execution mode (parallel by default; user can
+    /// configure sequential via `tool_exec_mode` in config.toml).
+    /// Set at build time and reused on every turn.
+    pub tool_exec_mode: crate::config::ToolExecMode,
     /// When true, AGENTS.md / CLAUDE.md discovery is skipped entirely
     /// (CLI `--no-context-files` / `-nc`). Stashed here so `/reload` can
     /// rebuild the system prompt with the same policy. Mirrors PI's
@@ -245,6 +253,7 @@ impl Agent {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         })
     }
@@ -295,6 +304,23 @@ impl Agent {
     /// the palette; the auto-trigger passes Some(&turn_tx).
     pub async fn compact_now(&mut self, tx: Option<&mpsc::Sender<AgentEvent>>, reason: &str) {
         use crate::agent::compact::compact;
+
+        // ── SessionBeforeCompact hook (v0.11.0) ──────────────────
+        // Advisory only — fires before compaction runs. matches
+        // against the compaction reason string ("threshold" or
+        // "manual").
+        if self.permission.hooks_active()
+            && !self.hooks.session_before_compact.is_empty()
+        {
+            run_session_hooks(
+                &self.hooks.session_before_compact,
+                HookEvent::SessionBeforeCompact,
+                reason,
+                &self.cwd,
+            )
+            .await;
+        }
+
         if let Some(tx) = tx {
             let _ = tx
                 .send(AgentEvent::CompactionStart {
@@ -305,6 +331,7 @@ impl Agent {
         let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
             return;
         };
+
         if let Some(tx) = tx {
             let _ = tx
                 .send(AgentEvent::CompactionEnd {
@@ -313,6 +340,22 @@ impl Agent {
                 })
                 .await;
         }
+
+        // ── SessionCompact hook (v0.11.0) ──────────────────────────
+        // Fires after compaction completes. matcher is the
+        // compaction reason.
+        if self.permission.hooks_active()
+            && !self.hooks.session_compact.is_empty()
+        {
+            run_session_hooks(
+                &self.hooks.session_compact,
+                HookEvent::SessionCompact,
+                reason,
+                &self.cwd,
+            )
+            .await;
+        }
+
         let _ = session::append_entry(
             &self.session_path,
             &SessionEntry::Compaction {
@@ -947,9 +990,13 @@ impl Agent {
         tx: &mpsc::Sender<AgentEvent>,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<bool>, AgentError> {
-        // Phase 1: Run all tool executions CONCURRENTLY via join_all.
-        // Each future resolves to (ToolCall, Result<ToolOutput, ToolError>).
-        // Hooks, persistence, and context mutation happen in phase 2.
+        // Phase 1: Run tool executions per `tool_exec_mode`.
+        // - Parallel (default): `tokio::join_all` — all calls concurrently.
+        // - Sequential: each call awaited in order.
+        //
+        // In sequential mode we still wrap cancel race around the whole
+        // batch so Esc can short-circuit. Cancellation drops in-flight
+        // bash children via `kill_on_drop`.
         let cwd = self.cwd.clone();
         let registry = self.registry.clone();
         let session_path = self.session_path.clone();
@@ -1001,13 +1048,39 @@ impl Agent {
         // tool_result entries so the assistant's tool_use blocks stay
         // paired with tool_result blocks — otherwise the next request
         // to Anthropic would 400 on unmatched tool_use ids.
-        let (results, cancelled) = match cancel.as_ref() {
-            Some(ct) => tokio::select! {
-                biased;
-                _ = ct.cancelled() => (Vec::new(), true),
-                r = join_all(futs) => (r, false),
+        let (results, cancelled) = match self.tool_exec_mode {
+            crate::config::ToolExecMode::Parallel => match cancel.as_ref() {
+                Some(ct) => tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => (Vec::new(), true),
+                    r = join_all(futs) => (r, false),
+                },
+                None => (join_all(futs).await, false),
             },
-            None => (join_all(futs).await, false),
+            crate::config::ToolExecMode::Sequential => {
+                // Sequentially await each tool; cancel can interrupt
+                // mid-batch by dropping the iterator. The returned
+                // `Vec<ToolCallOutcome>` has the same shape as
+                // `join_all` for the post-phase.
+                let mut results = Vec::with_capacity(futs.len());
+                let mut cancelled = false;
+                let mut iter = futs.into_iter();
+                loop {
+                    if let Some(ct) = cancel.as_ref() {
+                        if ct.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
+                    }
+                    match iter.next() {
+                        Some(fut) => {
+                            results.push(fut.await);
+                        }
+                        None => break,
+                    }
+                }
+                (results, cancelled)
+            }
         };
 
         let results = if cancelled {
@@ -1291,6 +1364,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1384,6 +1458,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1468,6 +1543,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1550,6 +1626,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -1627,6 +1704,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1726,6 +1804,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         (agent, dir)
@@ -1870,6 +1949,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1956,6 +2036,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         agent.fire_session_start().await;
@@ -2373,6 +2454,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2438,6 +2520,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2556,6 +2639,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2698,6 +2782,7 @@ mod tests {
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -2756,6 +2841,7 @@ mod tests {
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
         };
 
         agent.run_turn("go", &tx, None, Some(steer_rx)).await.unwrap();

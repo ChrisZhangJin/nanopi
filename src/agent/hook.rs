@@ -54,6 +54,14 @@ pub enum HookEvent {
     /// Fired once after the for-loop completes (all tool rounds done),
     /// just before post-turn compaction. Advisory only.
     MessageEnd,
+    /// Fired inside `compact_now` BEFORE compaction runs.
+    /// Mirrors Pi's `session_before_compact`. Advisory — can log or
+    /// observe; cannot cancel the compaction (since v0.11; future
+    /// versions may add a Cancel hook arm).
+    SessionBeforeCompact,
+    /// Fired after compaction runs successfully. Mirrors Pi's
+    /// `session_compact`. Advisory only.
+    SessionCompact,
 }
 
 impl HookEvent {
@@ -68,6 +76,8 @@ impl HookEvent {
             HookEvent::TurnStart => "TurnStart",
             HookEvent::TurnEnd => "TurnEnd",
             HookEvent::MessageEnd => "MessageEnd",
+            HookEvent::SessionBeforeCompact => "SessionBeforeCompact",
+            HookEvent::SessionCompact => "SessionCompact",
         }
     }
 }

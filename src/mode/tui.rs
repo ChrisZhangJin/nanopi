@@ -372,6 +372,7 @@ pub async fn run_tui_mode(
             no_context_files,
             prompt_overrides,
             initial_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
         });
         print_skill_diagnostics(&diags);
         a
@@ -1632,6 +1633,7 @@ async fn handle_action(
                 no_context_files: app.no_context_files,
                 prompt_overrides: app.prompt_overrides.clone(),
                 initial_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
             });
             crate::agent::build::print_skill_diagnostics(&diags);
             {

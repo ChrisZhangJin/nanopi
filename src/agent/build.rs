@@ -90,6 +90,8 @@ pub struct AgentBuildInputs {
     /// turn's pending_follow_up queue. None in `build_fresh`; set
     /// for `hydrate_resumed` when the previous turn queued one.
     pub initial_follow_up: Option<String>,
+    /// v0.11.0: tool execution mode (parallel or sequential).
+    pub tool_exec_mode: crate::config::ToolExecMode,
 }
 
 impl Agent {
@@ -113,6 +115,7 @@ impl Agent {
             no_context_files,
             prompt_overrides,
             initial_follow_up,
+            tool_exec_mode,
         } = inputs;
 
         let tool_names = registry.names();
@@ -151,6 +154,7 @@ impl Agent {
             no_context_files,
             prompt_overrides,
             pending_follow_up: initial_follow_up,
+            tool_exec_mode,
         };
         (agent, diagnostics)
     }

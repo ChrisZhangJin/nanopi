@@ -59,6 +59,7 @@ fn stub_agent_inputs(
         no_context_files: false,
         prompt_overrides: nanopi::agent::prompt_override::PromptOverrides::default(),
         initial_follow_up: None,
+        tool_exec_mode: nanopi::config::ToolExecMode::default(),
     }
 }
 
