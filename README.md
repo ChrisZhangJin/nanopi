@@ -209,6 +209,46 @@ In addition to the Claude Code trio, nanopi exposes four lifecycle hooks that mi
 
 For all four, the `matcher` runs against the turn number string (so `^1$` fires only on the first turn), and stdin carries `{ "turn_count": N, ... }` plus event-specific fields. Full enumeration in [`config.toml.example`](https://github.com/ChrisZhangJin/nanopi/blob/main/config.toml.example).
 
+Two more fire around context compaction: `session_before_compact` and `session_compact`. Both are advisory, and their `matcher` runs against the reason string (`threshold` or `manual`).
+
+## WASM extensions (v0.11.0)
+
+Shell hooks can observe and veto, but they can't add a tool the model is allowed to call. Extensions can. A nanopi extension is a WebAssembly component — written in Rust, Go, C, or anything else that compiles to WASM — whose exported tools show up in the model's tool list next to `bash` and `read`.
+
+**This is opt-in at build time.** The stock release binary has no WASM runtime, so it stays ~4 MB; `[[extensions]]` entries are ignored with a warning. To use them:
+
+```bash
+cargo build --release --features wasm
+```
+
+Then declare the components in `config.toml`:
+
+```toml
+[[extensions]]
+path = "~/.nanopi/extensions/my-tool.wasm"
+```
+
+A plugin exports two functions ([`wit/nanopi-extension.wit`](https://github.com/ChrisZhangJin/nanopi/blob/main/wit/nanopi-extension.wit)):
+
+| Export | Signature | Purpose |
+|---|---|---|
+| `list-tools` | `() -> string` | JSON array of `{name, description, parameters}`. Called once at load. `parameters` is a JSON Schema handed to the model verbatim. |
+| `execute-tool` | `(name: string, args-json: string) -> string` | Runs a tool, returns `{"content": "...", "is_error": false}`. |
+
+And may import one host function:
+
+| Import | Signature | Purpose |
+|---|---|---|
+| `host-log` | `(level: u8, message: string)` | Write to nanopi's stderr. `0`=trace `1`=info `2`=warn `3`=error. |
+
+Payloads cross the boundary as JSON strings rather than WIT records — one primitive type keeps the ABI small enough that neither side needs a codegen step.
+
+A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin), including the build command.
+
+**Sandboxing.** Components run inside wasmtime with no filesystem and no network. The `allow_network` / `allow_fs` / `url_allowlist` fields on `[[extensions]]` are reserved for the capability-gated host functions landing in a later release; today a plugin can compute and log, nothing else. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
+
+**Name collisions.** A plugin may not register a tool whose name already exists. Collisions are reported and skipped, so a plugin cannot quietly replace `bash`.
+
 ## Versions
 
 | Version | Status | Size | Notes |

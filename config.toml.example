@@ -52,6 +52,46 @@ base_url = "https://api.openai.com/v1"
 # MiMo ignores `cache_control` and `thinking.budget_tokens` on its
 # Anthropic surface, so thinking budgets there are advisory only.
 
+# ─── Tool execution (v0.11.0) ───────────────────────────────────────
+
+# How tool calls from a single LLM response are run.
+#   "parallel"   (default) all calls run concurrently
+#   "sequential" one at a time, in the order the model emitted them
+#
+# Sequential is for stateful chains where order matters — e.g. a
+# `write` whose output the next `read` must see. It is slower; leave
+# it on the default unless you hit an ordering bug.
+# tool_exec_mode = "sequential"
+
+# ─── WASM extensions (v0.11.0) ──────────────────────────────────────
+#
+# Requires a build with `--features wasm`. The stock release binary
+# does NOT include the runtime — entries here are ignored with a
+# warning on stderr.
+#
+# Each entry points at a `.wasm` component, or a directory of them
+# (scanned one level deep, non-recursive). Tools the component
+# exports are registered alongside the built-ins and offered to the
+# model like any other tool. A plugin may not shadow an existing tool
+# name; collisions are reported and skipped.
+#
+# Fields:
+#   path            .wasm file or directory. Supports ~ and $HOME.
+#   max_files       Cap when path is a directory. Default 64.
+#   allow_network   Reserved (phase 4). Default false.
+#   allow_fs        Reserved (phase 4). Default false.
+#   url_allowlist   Reserved (phase 4) — URLs host-http-get may reach.
+#
+# See docs/pi-vs-nanopi.md §4.3 and wit/nanopi-extension.wit for the
+# guest interface a plugin must export.
+
+# [[extensions]]
+# path = "~/.nanopi/extensions/my-tool.wasm"
+
+# [[extensions]]
+# path = "~/.nanopi/extensions/"
+# max_files = 16
+
 # ─── API key: pick ONE of the two below ─────────────────────────────
 
 # Option A — file (recommended). Path to a chmod-600 file containing

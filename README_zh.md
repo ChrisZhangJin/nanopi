@@ -204,6 +204,46 @@ TOML key 是 snake_case（`pre_tool_use`，不是 `PreToolUse`）。完整协议
 
 四个 hook 的 `matcher` 都对 turn_count 字符串匹配（`^1$` 只匹配第一个 turn），stdin 收到 `{ "turn_count": N, ... }` 加事件特定字段。完整示例在 [`config.toml.example`](https://github.com/ChrisZhangJin/nanopi/blob/main/config.toml.example)。
 
+另外两个在上下文压缩前后触发：`session_before_compact` 和 `session_compact`。都是仅通知，`matcher` 对压缩原因字符串匹配（`threshold` 或 `manual`）。
+
+## WASM 扩展（v0.11.0）
+
+Shell hook 能观察、能否决，但没法给模型加一个可调用的新工具。扩展可以。nanopi 的扩展是一个 WebAssembly 组件 —— 用 Rust、Go、C 或任何能编译到 WASM 的语言写 —— 它导出的工具会和 `bash`、`read` 并列出现在模型的工具列表里。
+
+**这是编译期可选项。** 官方发布的二进制不含 WASM 运行时，所以保持在 ~4 MB；`[[extensions]]` 配置会被忽略并在 stderr 警告。要用的话：
+
+```bash
+cargo build --release --features wasm
+```
+
+然后在 `config.toml` 里声明组件：
+
+```toml
+[[extensions]]
+path = "~/.nanopi/extensions/my-tool.wasm"
+```
+
+插件需要导出两个函数（见 [`wit/nanopi-extension.wit`](https://github.com/ChrisZhangJin/nanopi/blob/main/wit/nanopi-extension.wit)）：
+
+| 导出 | 签名 | 用途 |
+|---|---|---|
+| `list-tools` | `() -> string` | 返回 `{name, description, parameters}` 的 JSON 数组。加载时调用一次。`parameters` 是 JSON Schema，原样交给模型。 |
+| `execute-tool` | `(name: string, args-json: string) -> string` | 执行工具，返回 `{"content": "...", "is_error": false}`。 |
+
+可以导入一个宿主函数：
+
+| 导入 | 签名 | 用途 |
+|---|---|---|
+| `host-log` | `(level: u8, message: string)` | 写 nanopi 的 stderr。`0`=trace `1`=info `2`=warn `3`=error。 |
+
+数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
+
+完整可运行的例子在 [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin)，含编译命令。
+
+**沙箱。** 组件跑在 wasmtime 里，无文件系统、无网络。`[[extensions]]` 上的 `allow_network` / `allow_fs` / `url_allowlist` 字段是给后续版本的能力门控宿主函数预留的；现在插件只能计算和打日志。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
+
+**同名冲突。** 插件不能注册已存在的工具名。冲突会被报告并跳过，所以插件无法悄悄替换 `bash`。
+
 ## 版本
 
 | 版本 | 状态 | 体积 | 说明 |
