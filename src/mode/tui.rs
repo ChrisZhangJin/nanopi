@@ -1446,6 +1446,23 @@ async fn run_app(
                         // Blank separator between turns.
                         insert_line(term, Line::from(""))?;
                         term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+
+                        // v0.11.0: a SteerMessage::FollowUp queued during
+                        // the turn lands on agent.pending_follow_up. Take
+                        // it and auto-start the next turn (Pi's
+                        // getFollowUpMessages semantic — the agent keeps
+                        // working instead of idling back to the prompt).
+                        let follow_up = {
+                            let mut g = agent_slot.lock().await;
+                            g.as_mut().and_then(|a| a.pending_follow_up.take())
+                        };
+                        if let Some(text) = follow_up {
+                            handle_action(
+                                KeyAction::StartTurn(text),
+                                app, term, &agent_slot,
+                                &mut ag_rx, &mut steer_tx_slot, &mut cancel, &mut turn_task,
+                            ).await?;
+                        }
                     }
                 }
             }
