@@ -255,6 +255,8 @@ Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki
 
 `host-http-get` is gated twice: on `allow_network = true`, and then on the URL's host appearing in `url_allowlist`. An **empty allowlist denies everything**, so switching the capability on does not by itself reach anything. Matching is on the parsed host, not a substring — `https://evil.com/?x=api.github.com` and `https://api.github.com@evil.com/` are both refused against an allowlist of `api.github.com`, while an entry covers its subdomains and any port. Only `http`/`https`; requests time out at 10s so a plugin cannot hang a turn; redirects are **not** followed, since a 3xx would otherwise walk the fetch onto a host you never approved. Refusals and failures come back to the plugin in-band as `error: `-prefixed strings rather than as traps. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
 
+**Runaway plugins.** Guest code gets a ~30s wall-clock budget per tool call, enforced by wasmtime's epoch interruption. Exceeding it is a trap, which surfaces to the model as a failed tool call. Without it a plugin containing an infinite loop would wedge nanopi permanently — the guest holds a real thread with no yield points, so <kbd>Esc</kbd> cannot reach inside it. The budget covers the whole call including time spent in host functions, so a plugin chaining several 10s fetches can hit it.
+
 **Name collisions.** A plugin may not register a tool whose name already exists. Collisions are reported and skipped, so a plugin cannot quietly replace `bash`.
 
 ## Versions

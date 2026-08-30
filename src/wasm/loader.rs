@@ -240,14 +240,40 @@ fn fetch_url(url: String) -> Result<String, String> {
         .unwrap_or_else(|_| Err("network worker thread died".to_string()))
 }
 
+/// How often the epoch ticker advances the engine's epoch.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Guest wall-clock budget per exported-function call, in epoch ticks.
+///
+/// Coarse on purpose — this is a hang breaker, not a scheduler. It has
+/// to sit above the worst legitimate call, and the slowest thing a
+/// plugin can legally do is a `host-http-get`, itself capped at 10s.
+/// 30s leaves room for a fetch plus real work while still bounding a
+/// runaway at half a minute instead of forever.
+const EPOCH_BUDGET_TICKS: u64 = 30;
+
 /// One running wasmtime engine; threadsafe, cheap to clone (internally
 /// `Arc`-refcounted).
 pub struct PluginEngine {
     engine: Engine,
+    /// Guest budget per exported-function call, in epoch ticks. Carried
+    /// on the engine so every store armed from it shares one number.
+    budget_ticks: u64,
 }
 
 impl PluginEngine {
     pub fn new() -> Result<Self, String> {
+        Self::with_epoch(EPOCH_TICK, EPOCH_BUDGET_TICKS)
+    }
+
+    /// `new()` with the epoch knobs exposed, so tests can exercise the
+    /// hang breaker in milliseconds rather than waiting out the real
+    /// half-minute budget. Private: the shipped configuration is the
+    /// one above, and a caller has no reason to pick a different one.
+    fn with_epoch(
+        tick: std::time::Duration,
+        budget_ticks: u64,
+    ) -> Result<Self, String> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         // The component model lowers into reference types, so this is
@@ -258,9 +284,42 @@ impl PluginEngine {
         // Conservative resource caps — a runaway plugin should not
         // allocate gigabytes of linear memory.
         config.max_wasm_stack(512 * 1024); // 512 KiB
-        Engine::new(&config)
-            .map(PluginEngine::from)
-            .map_err(|e| format!("wasmtime engine init failed: {e}"))
+        // Epoch interruption is the only thing standing between a
+        // plugin containing `loop {}` and a permanently wedged nanopi.
+        // `max_wasm_stack` bounds recursion, not iteration, and the
+        // guest holds a real OS thread (see `WasmTool::execute`), so
+        // there is nothing else to cancel it — Esc cannot reach inside
+        // guest code. Instrumentation is inserted at compile time,
+        // which is why it belongs on the Config rather than per-call.
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config)
+            .map_err(|e| format!("wasmtime engine init failed: {e}"))?;
+        let this = Self {
+            engine,
+            budget_ticks,
+        };
+        this.spawn_epoch_ticker(tick);
+        Ok(this)
+    }
+
+    /// Drive the epoch forward on a background thread.
+    ///
+    /// Holds a `Weak` handle rather than an `Engine`: a strong clone
+    /// would keep the engine — and this thread — alive for the life of
+    /// the process even after the last plugin is gone. Upgrading
+    /// failing is the shutdown signal.
+    ///
+    /// One wakeup per second is cheap even on the hardware nanopi
+    /// targets; the TUI already runs a 120ms ticker.
+    fn spawn_epoch_ticker(&self, tick: std::time::Duration) {
+        let weak = self.engine.weak();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(tick);
+            match weak.upgrade() {
+                Some(engine) => engine.increment_epoch(),
+                None => break,
+            }
+        });
     }
 
     /// Read a `.wasm` file, compile it, link host imports, instantiate,
@@ -410,6 +469,13 @@ impl PluginEngine {
                     wasm_path.display()
                 )
             })?;
+        // Arm the budget before every guest call. The deadline is
+        // relative to the current epoch and is consumed once reached,
+        // so it has to be re-armed each time — and with
+        // `epoch_interruption` on, a store whose deadline was never set
+        // traps immediately, since the default deadline of 0 has
+        // already elapsed.
+        store.set_epoch_deadline(self.budget_ticks);
         let (specs_json,) = list_tools
             .call(&mut store, ())
             .map_err(|e| format!("list-tools trapped: {e}"))?;
@@ -433,6 +499,7 @@ impl PluginEngine {
 
         let bridge: Arc<dyn WasmExecuteBridge> = Arc::new(ComponentBridge {
             specs: specs.clone(),
+            budget_ticks: self.budget_ticks,
             // The Store is not Sync, and a component instance is
             // single-threaded by construction. nanopi runs tool calls
             // concurrently (`join_all`), so serialize plugin entry
@@ -443,12 +510,6 @@ impl PluginEngine {
             }),
         });
         Ok((bridge, specs))
-    }
-}
-
-impl From<Engine> for PluginEngine {
-    fn from(engine: Engine) -> Self {
-        Self { engine }
     }
 }
 
@@ -491,6 +552,9 @@ struct BridgeInner {
 
 struct ComponentBridge {
     specs: Vec<ToolSpec>,
+    /// Copied off the engine so `execute_tool` can re-arm the deadline
+    /// without reaching back for it.
+    budget_ticks: u64,
     inner: Mutex<BridgeInner>,
 }
 
@@ -504,6 +568,12 @@ impl WasmExecuteBridge for ComponentBridge {
         // later call to this plugin.
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *guard;
+        // Re-arm the hang breaker. Required per call: the deadline is
+        // relative to the epoch at the time it is set, so a store armed
+        // once at load would be long past its deadline by the first
+        // call. A plugin that blows the budget traps, and the trap is
+        // reported to the model as a failed tool call by the arm below.
+        inner.store.set_epoch_deadline(self.budget_ticks);
         let (out_json,) = inner
             .execute
             .call(
@@ -570,6 +640,79 @@ mod tests {
     #[test]
     fn engine_new_succeeds() {
         assert!(PluginEngine::new().is_ok());
+    }
+
+    /// A plugin that never returns must be cut off, not ridden out.
+    ///
+    /// Before epoch interruption this was an unbounded hang with no way
+    /// out: the guest runs on a real OS thread with no yield points, so
+    /// Esc cannot reach it, and `max_wasm_stack` bounds recursion
+    /// rather than iteration. The fixture's `execute-tool` spins on a
+    /// volatile write forever.
+    ///
+    /// Run with a 50ms tick and a 2-tick budget so the breaker fires in
+    /// ~100ms instead of the shipped 30s. The generous 30s ceiling on
+    /// the assertion is there to catch "never trapped at all", not to
+    /// measure the deadline — the point is that it terminates.
+    #[test]
+    fn runaway_plugin_is_cut_off_by_the_epoch_deadline() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/runaway-plugin.component.wasm");
+
+        let engine = PluginEngine::with_epoch(
+            std::time::Duration::from_millis(50),
+            2,
+        )
+        .expect("engine init");
+        let (bridge, specs) = engine
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false)
+            .expect("runaway fixture must still LOAD — only execute-tool spins");
+        assert_eq!(specs.len(), 1, "fixture advertises one tool");
+
+        let started = std::time::Instant::now();
+        let err = bridge
+            .execute_tool("spin", "{}")
+            .expect_err("an endless loop must not return Ok");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the deadline never fired; the call ran for {elapsed:?}"
+        );
+        assert!(
+            err.contains("trapped"),
+            "expected a trap reported as a failed tool call, got {err:?}"
+        );
+    }
+
+    /// The flip side: arming the deadline is per-call, so a well-behaved
+    /// plugin must stay callable no matter how many epochs have passed
+    /// since it loaded. Getting this wrong is easy and quiet — with
+    /// `epoch_interruption` on, a store whose deadline is never re-armed
+    /// traps on its *second* call, because the first consumed it.
+    #[test]
+    fn epoch_deadline_is_rearmed_between_calls() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/example-plugin.component.wasm");
+
+        let engine = PluginEngine::with_epoch(
+            std::time::Duration::from_millis(10),
+            2,
+        )
+        .expect("engine init");
+        let (bridge, _) = engine
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false)
+            .expect("example fixture loads");
+
+        for i in 0..3 {
+            // Sleep past a full budget between calls: if the deadline
+            // were armed once at load, this is what would kill it.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let out = bridge
+                .execute_tool("rot13", r#"{"text":"abc"}"#)
+                .unwrap_or_else(|e| panic!("call {i} failed: {e}"));
+            assert!(!out.is_error, "call {i} errored: {}", out.content);
+        }
     }
 
     // ── url_allowed ─────────────────────────────────────────────────
