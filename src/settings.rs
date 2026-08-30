@@ -156,6 +156,14 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
         hooks.turn_start.extend(s.hooks.turn_start);
         hooks.turn_end.extend(s.hooks.turn_end);
         hooks.message_end.extend(s.hooks.message_end);
+        // The compaction hooks were added to the other three sources but
+        // missed here, so a project-level settings.toml declaring them
+        // parsed clean and then silently never fired. Every source must
+        // read every field or the omission looks like a user error.
+        hooks
+            .session_before_compact
+            .extend(s.hooks.session_before_compact);
+        hooks.session_compact.extend(s.hooks.session_compact);
     }
 
     // Validate regex matchers up front; surface errors at startup.
@@ -321,6 +329,54 @@ command = "/bin/true"
         assert_eq!(h.pre_tool_use[0].matcher, "modern");
         assert_eq!(h.pre_tool_use[1].matcher, "legacy");
         assert_eq!(h.session_start.len(), 1);
+    }
+
+    /// Regression: the project-level `.nanopi/settings.toml` branch
+    /// stopped extending at `message_end`, so the two compaction hooks
+    /// parsed without error and then never fired. Global sources are
+    /// pointed at an empty NANOPI_HOME so the only hooks that can reach
+    /// `load_settings` are the project-level ones this test wrote.
+    #[test]
+    fn project_settings_toml_loads_compaction_hooks() {
+        let _guard = lock();
+        let home = tmp();
+        let cwd = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+
+        std::fs::create_dir_all(cwd.join(".nanopi")).unwrap();
+        std::fs::write(
+            cwd.join(".nanopi").join("settings.toml"),
+            r#"
+[[hooks.session_before_compact]]
+matcher = "*"
+type = "command"
+command = "/bin/true"
+timeout = 1000
+
+[[hooks.session_compact]]
+matcher = "*"
+type = "command"
+command = "/bin/true"
+timeout = 1000
+"#,
+        )
+        .unwrap();
+
+        let h = load_settings(&cwd).unwrap();
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+
+        assert_eq!(h.session_before_compact.len(), 1);
+        assert_eq!(h.session_before_compact[0].command, "/bin/true");
+        assert_eq!(h.session_compact.len(), 1);
+        assert_eq!(h.session_compact[0].command, "/bin/true");
     }
 
     #[test]
