@@ -506,11 +506,19 @@ impl PluginEngine {
             &self.engine,
             PluginState {
                 url_allowlist: url_allowlist.clone(),
-                cwd,
+                cwd: cwd.clone(),
                 allow_fs,
                 allow_network,
             },
         );
+        // Armed before `instantiate`, not after. A component built as a
+        // WASI reactor runs guest code in `_initialize` during
+        // instantiation, and with `epoch_interruption` on, a store whose
+        // deadline was never set traps immediately — its default of 0
+        // has always elapsed. The `#![no_std]` fixtures here happen not
+        // to run anything at instantiation, which is why the ordering
+        // went unnoticed.
+        store.set_epoch_deadline(self.budget_ticks);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| format!("instantiate {} failed: {e}", wasm_path.display()))?;
@@ -557,6 +565,15 @@ impl PluginEngine {
         let bridge: Arc<dyn WasmExecuteBridge> = Arc::new(ComponentBridge {
             specs: specs.clone(),
             budget_ticks: self.budget_ticks,
+            rebuild: PluginRebuild {
+                engine: self.engine.clone(),
+                component,
+                linker,
+                url_allowlist,
+                cwd,
+                allow_fs,
+                allow_network,
+            },
             // The Store is not Sync, and a component instance is
             // single-threaded by construction. nanopi runs tool calls
             // concurrently (`join_all`), so serialize plugin entry
@@ -612,7 +629,63 @@ struct ComponentBridge {
     /// Copied off the engine so `execute_tool` can re-arm the deadline
     /// without reaching back for it.
     budget_ticks: u64,
+    /// Everything needed to stand a fresh instance back up after a
+    /// trap. A trapped component instance cannot be re-entered — every
+    /// later call returns "cannot enter component instance" — so
+    /// without this one bad call bricks the plugin for the rest of the
+    /// session, which is the opposite of what the mutex-poison recovery
+    /// below claims to guarantee.
+    rebuild: PluginRebuild,
     inner: Mutex<BridgeInner>,
+}
+
+/// The ingredients for re-instantiating a plugin after a trap.
+struct PluginRebuild {
+    engine: Engine,
+    component: Component,
+    linker: Linker<PluginState>,
+    url_allowlist: Vec<String>,
+    cwd: PathBuf,
+    allow_fs: bool,
+    allow_network: bool,
+}
+
+impl PluginRebuild {
+    /// Fresh store + instance + `execute-tool` handle. Same shape as
+    /// the tail of `PluginEngine::load`.
+    fn build(&self, budget_ticks: u64) -> Result<BridgeInner, String> {
+        let mut store = Store::new(
+            &self.engine,
+            PluginState {
+                url_allowlist: self.url_allowlist.clone(),
+                cwd: self.cwd.clone(),
+                allow_fs: self.allow_fs,
+                allow_network: self.allow_network,
+            },
+        );
+        store.set_epoch_deadline(budget_ticks);
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.component)
+            .map_err(|e| format!("re-instantiate failed: {e}"))?;
+        let execute = instance
+            .get_typed_func::<(String, String), (String,)>(&mut store, "execute-tool")
+            .map_err(|e| format!("re-resolve execute-tool failed: {e}"))?;
+        Ok(BridgeInner { store, execute })
+    }
+}
+
+impl ComponentBridge {
+    /// Swap in a fresh store + instance after a trap, so the next call
+    /// starts clean. On failure the old, unusable instance is left in
+    /// place — the next call then reports the original trap style of
+    /// error rather than panicking, which is the safe direction.
+    fn reset(inner: &mut BridgeInner, rebuild: &PluginRebuild, budget_ticks: u64) {
+        match rebuild.build(budget_ticks) {
+            Ok(fresh) => *inner = fresh,
+            Err(e) => eprintln!("nanopi: could not recover plugin after trap: {e}"),
+        }
+    }
 }
 
 impl WasmExecuteBridge for ComponentBridge {
@@ -629,19 +702,38 @@ impl WasmExecuteBridge for ComponentBridge {
         // relative to the epoch at the time it is set, so a store armed
         // once at load would be long past its deadline by the first
         // call. A plugin that blows the budget traps, and the trap is
-        // reported to the model as a failed tool call by the arm below.
+        // reported to the model as a failed tool call below.
         inner.store.set_epoch_deadline(self.budget_ticks);
-        let (out_json,) = inner
-            .execute
-            .call(
-                &mut inner.store,
-                (name.to_string(), args_json.to_string()),
-            )
-            .map_err(|e| format!("execute-tool trapped: {e}"))?;
-        inner
-            .execute
-            .post_return(&mut inner.store)
-            .map_err(|e| format!("execute-tool post_return failed: {e}"))?;
+        let called = inner.execute.call(
+            &mut inner.store,
+            (name.to_string(), args_json.to_string()),
+        );
+
+        let out_json = match called {
+            Ok((out,)) => {
+                match inner.execute.post_return(&mut inner.store) {
+                    Ok(()) => out,
+                    Err(e) => {
+                        // The instance is left mid-call and cannot be
+                        // re-entered, same as a trap.
+                        Self::reset(inner, &self.rebuild, self.budget_ticks);
+                        return Err(format!("execute-tool post_return failed: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                // A trapped component instance is permanently
+                // un-enterable: every later call returns "cannot enter
+                // component instance", in microseconds, with a message
+                // neither the user nor the model can act on. Recovering
+                // here is what makes the guarantee above true rather
+                // than aspirational — and the trigger is not exotic, a
+                // tool argument large enough to exhaust the guest's
+                // allocator is enough.
+                Self::reset(inner, &self.rebuild, self.budget_ticks);
+                return Err(format!("execute-tool trapped: {e}"));
+            }
+        };
 
         let wire: WireToolOutput = serde_json::from_str(&out_json).map_err(|e| {
             format!("execute-tool returned invalid JSON: {e} (got {out_json:?})")
@@ -980,6 +1072,45 @@ mod tests {
         std::fs::write(&ok, vec![b'x'; MAX_HOST_READ_BYTES as usize]).unwrap();
         assert!(resolve_readable(&dir, "ok.txt").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a trapped component instance cannot be re-entered,
+    /// so before the bridge learned to rebuild itself, the FIRST trap
+    /// killed the plugin for the rest of the session — every later call
+    /// returned "cannot enter component instance" in microseconds.
+    ///
+    /// The trigger needs no malicious plugin: a tool argument large
+    /// enough to exhaust the guest's bump allocator does it, and the
+    /// model has no way to know it just disabled the tool. It keeps
+    /// seeing the spec in its tool list and keeps calling.
+    #[test]
+    fn plugin_survives_a_trap_and_stays_callable() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/example-plugin.component.wasm");
+        let engine = PluginEngine::new().expect("engine init");
+        let (bridge, _) = engine
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false)
+            .expect("example fixture loads");
+
+        let good = r#"{"text":"abc"}"#;
+        let before = bridge.execute_tool("rot13", good).expect("healthy call");
+        assert!(!before.is_error, "baseline call should succeed");
+
+        // Blow the guest's 1 MiB arena.
+        let huge = "x".repeat(3 * 1024 * 1024);
+        let trapped = bridge
+            .execute_tool("rot13", &format!(r#"{{"text":"{huge}"}}"#))
+            .expect_err("an oversized argument must trap");
+        assert!(trapped.contains("trapped"), "got {trapped}");
+
+        let after = bridge
+            .execute_tool("rot13", good)
+            .expect("plugin must still be callable after a trap");
+        assert!(!after.is_error, "post-trap call errored: {}", after.content);
+        assert_eq!(
+            after.content, before.content,
+            "a recovered instance must compute the same answer"
+        );
     }
 
     /// A non-wasm file must fail at compile, not panic.
