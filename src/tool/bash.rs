@@ -111,25 +111,75 @@ impl Tool for BashTool {
         // what makes Esc cancel a long-running bash command
         // immediately (see `agent/loop_.rs::execute_tool_calls`).
         let (out, err, status) = {
-            let mut out = String::new();
-            let mut err = String::new();
+            // Accumulated incrementally rather than via
+            // `read_to_string`. That helper buffers internally and only
+            // hands the bytes over once the read completes, so
+            // cancelling it at the deadline yields an EMPTY string —
+            // which is why the timeout branch had nothing to return and
+            // the module header's promise of partial output was false.
+            let mut out_buf: Vec<u8> = Vec::new();
+            let mut err_buf: Vec<u8> = Vec::new();
             let mut stdout_reader = BufReader::new(stdout);
             let mut stderr_reader = BufReader::new(stderr);
             let read_and_wait = async {
-                let (_, _, status) = tokio::join!(
-                    stdout_reader.read_to_string(&mut out),
-                    stderr_reader.read_to_string(&mut err),
-                    child.wait(),
-                );
+                let drain_out = async {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stdout_reader.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => out_buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                };
+                let drain_err = async {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stderr_reader.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => err_buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                };
+                let (_, _, status) = tokio::join!(drain_out, drain_err, child.wait());
                 status
             };
             match tokio::time::timeout(timeout, read_and_wait).await {
-                Ok(status) => (out, err, status),
+                Ok(status) => (
+                    // Lossy: a command killed mid-character would
+                    // otherwise fail the whole tool call over one byte.
+                    String::from_utf8_lossy(&out_buf).into_owned(),
+                    String::from_utf8_lossy(&err_buf).into_owned(),
+                    status,
+                ),
                 Err(_) => {
                     // Timed out; child dropped when this scope exits →
                     // kill_on_drop terminates it.
+                    //
+                    // Whatever was read before the deadline is returned
+                    // with the notice, which is what the module header
+                    // has always promised. Discarding it threw away the
+                    // most useful thing about a timeout: a build that
+                    // hangs after printing the error explaining why is
+                    // the common case, and the model was shown only
+                    // "timed out".
+                    let out = String::from_utf8_lossy(&out_buf);
+                    let err = String::from_utf8_lossy(&err_buf);
+                    let mut content = String::new();
+                    if !out.is_empty() {
+                        content.push_str(&out);
+                    }
+                    if !err.is_empty() {
+                        if !content.is_empty() && !content.ends_with('\n') {
+                            content.push('\n');
+                        }
+                        content.push_str(&err);
+                    }
+                    if !content.is_empty() && !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content.push_str(&format!("[command timed out after {timeout:?}]"));
                     return Ok(ToolOutput {
-                        content: format!("command timed out after {timeout:?}"),
+                        content,
                         is_error: true,
                         images: Vec::new(),
                         metadata: None,
@@ -225,6 +275,46 @@ async fn write_overflow(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The module header has always said a timeout "returns partial
+    /// output with is_error: true". It did not — it discarded whatever
+    /// had been read and returned only the notice. That threw away the
+    /// most useful part: a command that prints its error and then hangs
+    /// is the common shape of a timeout, and the model was shown none
+    /// of it.
+    #[tokio::test]
+    async fn timeout_returns_output_produced_before_the_deadline() {
+        use super::*;
+        let ctx = ToolContext {
+            cwd: std::env::temp_dir(),
+        };
+        // Short deadline, constructed directly: the timeout is a field
+        // on the tool, not a call argument.
+        let tool = BashTool {
+            timeout: Duration::from_millis(700),
+            max_bytes: DEFAULT_MAX_BYTES,
+            max_lines: DEFAULT_MAX_LINES,
+        };
+        let out = tool
+            .execute(
+                serde_json::json!({"command": "echo BEFORE_HANG; sleep 30"}),
+                &ctx,
+            )
+            .await
+            .expect("timeout is a tool result, not a tool error");
+
+        assert!(out.is_error, "a timeout must be flagged as an error");
+        assert!(
+            out.content.contains("BEFORE_HANG"),
+            "partial output was discarded: {:?}",
+            out.content
+        );
+        assert!(
+            out.content.contains("timed out"),
+            "the timeout itself must still be reported: {:?}",
+            out.content
+        );
+    }
+
     use super::*;
     use std::path::PathBuf;
 
