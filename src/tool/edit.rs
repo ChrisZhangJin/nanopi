@@ -1,8 +1,9 @@
 //! `edit` tool — replaces `oldText` with `newText` in a file.
 //!
 //! Errors if `oldText` is not found or matches more than once (ambiguous).
-
-use std::path::PathBuf;
+//!
+//! Refuses to edit outside cwd (`tool::resolve_in_cwd`), same boundary
+//! as `write`.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -42,16 +43,8 @@ impl Tool for EditTool {
             .ok_or_else(|| ToolError::InvalidArgs("newText must be a string".into()))?;
 
         // Resolve path with cwd boundary check.
-        let abs = if std::path::Path::new(path_str).is_absolute() {
-            if !std::path::Path::new(path_str).starts_with(&ctx.cwd) {
-                return Err(ToolError::Execution(format!(
-                    "absolute path escapes cwd: {path_str}"
-                )));
-            }
-            PathBuf::from(path_str)
-        } else {
-            ctx.cwd.join(path_str)
-        };
+        let abs = crate::tool::resolve_in_cwd(&ctx.cwd, path_str)
+            .map_err(ToolError::Execution)?;
 
         let content = std::fs::read_to_string(&abs)
             .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
@@ -95,6 +88,7 @@ impl Tool for EditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -152,6 +146,46 @@ mod tests {
             _ => panic!("expected ambiguous error"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `edit` carried the same broken guard as `write` —
+    /// raw `starts_with`, and only on the absolute branch. Both shapes
+    /// of escape are checked here against a real file outside cwd, so
+    /// a pass means the edit was refused rather than merely erroring
+    /// on a missing file.
+    #[tokio::test]
+    async fn rejects_traversal_out_of_cwd() {
+        let dir = tmp();
+        let outside = tmp();
+        let target = outside.join("victim.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+
+        for path in [
+            dir.join("..").join(outside.file_name().unwrap()).join("victim.txt")
+                .display()
+                .to_string(),
+            format!(
+                "../{}/victim.txt",
+                outside.file_name().unwrap().to_string_lossy()
+            ),
+        ] {
+            let r = EditTool
+                .execute(
+                    json!({"path": path, "oldText": "original", "newText": "pwned"}),
+                    &ctx,
+                )
+                .await;
+            assert!(r.is_err(), "{path} must be refused");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "the file outside cwd must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]

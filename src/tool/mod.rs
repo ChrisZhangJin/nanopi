@@ -17,7 +17,7 @@ pub mod read;
 pub mod write;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +26,104 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::agent::context::ToolSpec;
+
+/// Resolve a model-supplied path for a *mutating* tool, refusing
+/// anything that lands outside `cwd`.
+///
+/// `read` deliberately has no such guard — the model can shell out and
+/// read anything anyway, so guarding it was theater with a real UX cost
+/// (see `tool/read.rs::resolve_path`). Writing is different: this is
+/// the boundary that keeps a confused model from editing files outside
+/// the project it was pointed at.
+///
+/// The guard this replaces compared raw paths with `starts_with`, and
+/// only on the absolute-path branch. Both halves were holes:
+///
+///   - `<cwd>/../../etc/passwd` *is* literally prefixed by `<cwd>`, so
+///     a textual prefix test accepts it.
+///   - a relative `../../etc/passwd` was never checked at all — it went
+///     straight through `cwd.join(...)`.
+///
+/// So the path is normalized before comparison. `..` is applied
+/// lexically first, which is what makes the tail of a not-yet-existing
+/// path meaningful; then the deepest ancestor that does exist is
+/// canonicalized, which resolves symlinks pointing out of the tree.
+/// Both steps are needed: canonicalize alone fails on a file being
+/// created, and lexical normalization alone cannot see a symlink.
+///
+/// `wasm/loader.rs::resolve_readable` is the same idea for plugin
+/// reads. It stays separate: it only ever resolves paths that already
+/// exist, and it is compiled out without the `wasm` feature.
+pub(crate) fn resolve_in_cwd(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
+    let joined = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        cwd.join(requested)
+    };
+
+    let real_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory: {e}"))?;
+    let resolved = canonicalize_deepest_existing(&lexical_normalize(&joined))?;
+
+    if !resolved.starts_with(&real_cwd) {
+        return Err(format!("path escapes cwd: {requested}"));
+    }
+    Ok(resolved)
+}
+
+/// Apply `.` and `..` textually, without touching the filesystem.
+///
+/// Done before any FS lookup so that a `..` in the not-yet-existing
+/// tail of a path still collapses — `canonicalize` cannot help there,
+/// since it requires every component to exist.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            // `pop` at the root is a no-op, so this cannot escape above
+            // `/` and turn into a relative path.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonicalize the deepest ancestor of `p` that exists, then re-attach
+/// the components that do not exist yet.
+///
+/// `write` creates files, so the target itself usually does not exist
+/// and `canonicalize(p)` would fail outright. Resolving the existing
+/// prefix is what still catches a symlinked parent aimed out of the
+/// tree. `p` must already be lexically normalized — with no `..` left,
+/// `file_name()` is guaranteed to be `Some` for every non-root
+/// component, which is what makes the walk terminate.
+fn canonicalize_deepest_existing(p: &Path) -> Result<PathBuf, String> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if cur.exists() {
+            let mut out = std::fs::canonicalize(&cur)
+                .map_err(|e| format!("cannot resolve {}: {e}", cur.display()))?;
+            for name in tail.iter().rev() {
+                out.push(name);
+            }
+            return Ok(out);
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            // Walked to the root without finding anything that exists.
+            // Only reachable if the filesystem root itself is missing.
+            _ => return Err(format!("cannot resolve {}", p.display())),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ToolError {
