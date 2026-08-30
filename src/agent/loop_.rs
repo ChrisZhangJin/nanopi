@@ -1036,6 +1036,13 @@ impl Agent {
             .map(|c| (c.id.clone(), c.name.clone()))
             .collect();
 
+        // Outcomes land here as each tool finishes, so a cancel that
+        // interrupts the batch still sees what already completed. Plain
+        // `std::sync::Mutex`: the lock is taken and released inside one
+        // statement, never across an await.
+        let completed: std::sync::Arc<std::sync::Mutex<Vec<ToolCallOutcome>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
         let futs: Vec<_> = calls
             .into_iter()
             .map(|call| {
@@ -1046,6 +1053,7 @@ impl Agent {
                 let permission = permission.clone();
                 let hooks = hooks.clone();
                 let tx = tx.clone();
+                let done = completed.clone();
                 async move {
                     let outcome = run_one_tool(
                         call,
@@ -1058,7 +1066,15 @@ impl Agent {
                         tx,
                     )
                     .await;
-                    outcome
+                    // Recorded through a shared handle rather than only
+                    // returned, because `join_all`'s output is
+                    // all-or-nothing: when cancel wins the race below,
+                    // its `Vec` is empty even for tools that already
+                    // finished — and already wrote their real
+                    // ToolResult to the session file. Losing them there
+                    // is what made the cancel path append a SECOND,
+                    // contradictory entry for the same tool_call_id.
+                    done.lock().unwrap_or_else(|e| e.into_inner()).push(outcome);
                 }
             })
             .collect();
@@ -1072,14 +1088,17 @@ impl Agent {
         // tool_result entries so the assistant's tool_use blocks stay
         // paired with tool_result blocks — otherwise the next request
         // to Anthropic would 400 on unmatched tool_use ids.
-        let (results, cancelled) = match self.tool_exec_mode {
+        let cancelled = match self.tool_exec_mode {
             crate::config::ToolExecMode::Parallel => match cancel.as_ref() {
                 Some(ct) => tokio::select! {
                     biased;
-                    _ = ct.cancelled() => (Vec::new(), true),
-                    r = join_all(futs) => (r, false),
+                    _ = ct.cancelled() => true,
+                    _ = join_all(futs) => false,
                 },
-                None => (join_all(futs).await, false),
+                None => {
+                    join_all(futs).await;
+                    false
+                }
             },
             crate::config::ToolExecMode::Sequential => {
                 // Sequentially await each tool. Cancel is raced against
@@ -1093,7 +1112,6 @@ impl Agent {
                 // The returned `Vec<ToolCallOutcome>` has the same
                 // shape as `join_all` for the post-phase, except it may
                 // be short when cancel won.
-                let mut results = Vec::with_capacity(futs.len());
                 let mut cancelled = false;
                 let mut iter = futs.into_iter();
                 loop {
@@ -1116,31 +1134,48 @@ impl Agent {
                                     cancelled = true;
                                     break;
                                 }
-                                r = fut => results.push(r),
+                                _ = fut => {}
                             },
-                            None => results.push(fut.await),
+                            None => fut.await,
                         },
                         None => break,
                     }
                 }
-                (results, cancelled)
+                cancelled
             }
         };
 
+        // Both arms record into `completed`; neither returns outcomes
+        // directly any more, so the two modes now behave identically
+        // under cancellation.
+        let results = std::sync::Arc::try_unwrap(completed)
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or_else(|arc| {
+                // A future still holds a reference — only reachable if
+                // cancel dropped the batch mid-poll. Clone what landed.
+                arc.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            });
+
         let results = if cancelled {
-            // Sequential cancel can land mid-batch, so some tools already
-            // ran — and already appended their real ToolResult to the
-            // session JSONL. Overwriting those with a cancelled marker
-            // would make the context disagree with the transcript on
-            // disk and throw away work the user already paid for, so
-            // keep completed outcomes and only synthesize for the calls
-            // that never got to run. Iterating `call_meta` (not
-            // `results`) keeps tool_result order matching tool_use
-            // order — Anthropic 400s on an unmatched or misordered pair.
+            // Cancel can land mid-batch in either mode, so some tools
+            // already ran — and already appended their real ToolResult
+            // to the session JSONL from inside `run_one_tool`. Keeping
+            // those and synthesizing only for the calls that never ran
+            // is what stops a second, contradictory entry being written
+            // for the same tool_call_id.
             //
-            // No-op for Parallel: cancel there leaves `results` empty,
-            // so `done` is empty and every call gets synthesized exactly
-            // as before.
+            // That duplicate was live in Parallel until `completed`
+            // existed: `join_all` returns an empty Vec when cancel wins
+            // the race, so finished-and-persisted tools looked un-run
+            // here and got a cancel marker appended on top of their real
+            // result. On resume `load_session` replayed both, and two
+            // tool_result blocks sharing one tool_use_id is a permanent
+            // 400 from Anthropic — the session could never be resumed
+            // again.
+            //
+            // Iterating `call_meta` rather than `results` keeps
+            // tool_result order matching tool_use order; Anthropic also
+            // 400s on an unmatched or misordered pair.
             let mut done: std::collections::HashMap<String, ToolCallOutcome> = results
                 .into_iter()
                 .map(|o| (o.call_id.clone(), o))
@@ -1196,6 +1231,7 @@ impl Agent {
 /// caller's join_all. Only what the caller actually needs to push a
 /// tool result into context; persistence already happened inside
 /// `run_one_tool`.
+#[derive(Clone)]
 struct ToolCallOutcome {
     call_id: String,
     content: String,
@@ -1954,6 +1990,113 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: cancelling a Parallel batch wrote TWO `tool_result`
+    /// entries for a tool that had already finished — its real one from
+    /// `run_one_tool`, then a synthetic cancel marker on top, because
+    /// `join_all` reports an empty Vec when cancel wins and the
+    /// finished work looked un-run.
+    ///
+    /// The assertion is on the session file, not on context, because
+    /// that is where the damage was permanent: `load_session` replays
+    /// every entry, and two `tool_result` blocks sharing one
+    /// `tool_use_id` is a 400 from Anthropic on every future resume,
+    /// fork, or `--continue` of that session.
+    ///
+    /// Parallel is the default mode, so this was the reachable one.
+    #[tokio::test]
+    async fn cancelled_parallel_batch_writes_one_result_per_call() {
+        for mode in [
+            crate::config::ToolExecMode::Parallel,
+            crate::config::ToolExecMode::Sequential,
+        ] {
+            let dir = tmp();
+            let session_path = dir.join("s.jsonl");
+            std::fs::write(&session_path, "").unwrap();
+            let mut agent = Agent {
+                context: Context::default(),
+                provider: Box::new(fake_provider()),
+                registry: ToolRegistry::standard(),
+                session_path: session_path.clone(),
+                session_id: uuid::v7().to_string(),
+                cwd: dir.clone(),
+                permission: PermissionGate::from_cli(false, None),
+                hooks: HooksConfig::default(),
+                model: String::new(),
+                base_url: String::new(),
+                api_key: String::new(),
+                usage_total: Usage::default(),
+                turn_count: 0,
+                skills: Vec::new(),
+                no_context_files: false,
+                pending_follow_up: None,
+                tool_exec_mode: mode,
+                prompt_overrides:
+                    crate::agent::prompt_override::PromptOverrides::default(),
+            };
+
+            let ct = tokio_util::sync::CancellationToken::new();
+            let ct2 = ct.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                ct2.cancel();
+            });
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+            agent
+                .execute_tool_calls(
+                    vec![
+                        ToolCall {
+                            id: "c_fast".into(),
+                            name: "bash".into(),
+                            arguments: json!({"command": "echo FIRST_DONE"}),
+                        },
+                        ToolCall {
+                            id: "c_slow".into(),
+                            name: "bash".into(),
+                            arguments: json!({"command": "sleep 30"}),
+                        },
+                    ],
+                    &tx,
+                    Some(ct),
+                )
+                .await
+                .unwrap();
+            drop(tx);
+            drain.await.ok();
+
+            let raw = std::fs::read_to_string(&session_path).unwrap();
+            let ids: Vec<String> = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                .filter_map(|v| {
+                    v.get("tool_call_id")
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string)
+                })
+                .collect();
+
+            let fast = ids.iter().filter(|i| *i == "c_fast").count();
+            let slow = ids.iter().filter(|i| *i == "c_slow").count();
+            assert_eq!(
+                fast, 1,
+                "{mode:?}: c_fast got {fast} tool_result entries in the session file; \
+                 a resumed session would 400"
+            );
+            assert_eq!(slow, 1, "{mode:?}: c_slow got {slow} tool_result entries");
+
+            // The finished tool must also keep its real output rather
+            // than being overwritten by the cancel marker.
+            assert!(
+                raw.contains("FIRST_DONE"),
+                "{mode:?}: completed work was discarded"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]
