@@ -115,9 +115,25 @@ fn canonicalize_deepest_existing(p: &Path) -> Result<PathBuf, String> {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p.to_path_buf();
     loop {
-        if std::fs::symlink_metadata(&cur).is_ok() {
-            let mut out = std::fs::canonicalize(&cur)
-                .map_err(|e| format!("cannot resolve {}: {e}", cur.display()))?;
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            let mut out = std::fs::canonicalize(&cur).map_err(|e| {
+                // A dangling symlink is the case that stops the walk
+                // here but has nothing to canonicalize. Saying "No such
+                // file or directory" about a path whose directory
+                // plainly exists sends the reader — and the model,
+                // which relays it — hunting for a missing directory.
+                // Name what is actually wrong.
+                if meta.is_symlink() {
+                    format!(
+                        "{} is a symlink whose target does not exist; refusing to \
+                         write through it, since it may point outside the working \
+                         directory",
+                        cur.display()
+                    )
+                } else {
+                    format!("cannot resolve {}: {e}", cur.display())
+                }
+            })?;
             for name in tail.iter().rev() {
                 out.push(name);
             }

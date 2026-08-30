@@ -281,7 +281,17 @@ mod tests {
             .execute(json!({"path": "link", "content": "pwned"}), &ctx)
             .await;
 
-        assert!(r.is_err(), "a dangling symlink out of cwd must be refused");
+        let msg = match r {
+            Err(e) => e.to_string(),
+            Ok(o) => panic!("a dangling symlink out of cwd must be refused, got {o:?}"),
+        };
+        // The message has to name the symlink. "No such file or
+        // directory" about a path whose directory exists made the model
+        // relay a fabricated reason to the user in end-to-end testing.
+        assert!(
+            msg.contains("symlink"),
+            "refusal must say why, got {msg:?}"
+        );
         assert!(
             !outside.exists(),
             "the write escaped cwd through the dangling symlink"
