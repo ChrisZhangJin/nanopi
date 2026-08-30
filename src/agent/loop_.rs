@@ -410,9 +410,15 @@ impl Agent {
         // the prompt); the others are advisory.
         // matcher applies to the turn_count string so users can scope
         // audit hooks (e.g. "^1$" to log only the first turn).
+        //
+        // A rewritten prompt lands in `pre_start_msg` rather than being
+        // applied directly: `effective_msg` is only born below, and
+        // seeding it from here is what makes the two prompt hooks chain
+        // — BeforeAgentStart's output is UserPromptSubmit's input.
+        let mut pre_start_msg: Option<String> = None;
         if self.permission.hooks_active() && !self.hooks.before_agent_start.is_empty() {
             let turn_label = self.turn_count.to_string();
-            let (outcome, _new_args) = run_hooks(
+            let (outcome, new_args) = run_hooks(
                 &self.hooks.before_agent_start,
                 HookEvent::BeforeAgentStart,
                 &turn_label,
@@ -435,13 +441,31 @@ impl Agent {
                         .await;
                     return Ok(marker);
                 }
-                HookOutcome::Transform { .. } => {
-                    // Rewrite effective_msg via the same fallback as
-                    // UserPromptSubmit — both Block and Transform work
-                    // the same way. If the hook didn't change the
-                    // prompt, leave it as `user_msg`.
+                HookOutcome::Transform { new_arguments } => {
+                    // Only the `prompt` key is honored — the payload
+                    // also carries `turn_count`, which is ours, not the
+                    // hook's, to rewrite.
+                    if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
+                        pre_start_msg = Some(v.to_string());
+                    }
                 }
-                HookOutcome::Allow => {}
+                HookOutcome::Allow => {
+                    // `run_hooks` folds transforms into its accumulated
+                    // args and still reports Allow when no hook blocked,
+                    // so a rewrite usually arrives here rather than in
+                    // the Transform arm. Same fallback UserPromptSubmit
+                    // uses; compare against `user_msg` so an unchanged
+                    // echo doesn't count as a rewrite.
+                    if let Some(v) = new_args
+                        .as_ref()
+                        .and_then(|a| a.get("prompt"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if v != user_msg {
+                            pre_start_msg = Some(v.to_string());
+                        }
+                    }
+                }
             }
         }
 
@@ -451,7 +475,7 @@ impl Agent {
         // Allow/Block/Transform semantics as pre_tool_use hooks; Block
         // aborts the turn with a synthetic assistant marker so the user
         // sees why. Transform mutates the prompt in place.
-        let mut effective_msg = user_msg.to_string();
+        let mut effective_msg = pre_start_msg.unwrap_or_else(|| user_msg.to_string());
         if self.permission.hooks_active() && !self.hooks.user_prompt_submit.is_empty() {
             let (outcome, new_args) = run_hooks(
                 &self.hooks.user_prompt_submit,
@@ -1598,6 +1622,172 @@ mod tests {
         assert!(
             found_redacted,
             "renderer must receive the post-hook rewritten content"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the BeforeAgentStart `Transform` arm was empty and
+    /// `run_hooks`' rewritten args were dropped on the floor, so a hook
+    /// returning `updated_input.prompt` was silently inert even though
+    /// the payload ships `prompt` specifically for it. Fix mirrors
+    /// UserPromptSubmit and seeds `effective_msg` from the result.
+    #[tokio::test]
+    async fn before_agent_start_hook_can_transform_prompt() {
+        let dir = tmp();
+        let session_path = dir.join("bas.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let hooks = HooksConfig {
+            before_agent_start: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command:
+                    r#"echo '{"decision":"allow","updated_input":{"prompt":"REWRITTEN BY HOOK"}}'"#
+                        .into(),
+                timeout: 2000,
+            }],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.run_turn("original prompt", &tx, None, None).await.unwrap();
+
+        let user_text = agent
+            .context
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                ContextMessage::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("user message in context");
+        assert_eq!(
+            user_text, "REWRITTEN BY HOOK",
+            "BeforeAgentStart transform must reach context, got {user_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two prompt hooks must chain: BeforeAgentStart runs first and
+    /// its rewritten text is what UserPromptSubmit receives. The second
+    /// hook here only emits a rewrite when it sees the first hook's
+    /// output, so a passing assert proves the ordering, not just that
+    /// each hook fired.
+    #[tokio::test]
+    async fn before_agent_start_output_feeds_user_prompt_submit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let session_path = dir.join("chain.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let ups_script = dir.join("ups.sh");
+        std::fs::write(
+            &ups_script,
+            "#!/usr/bin/env bash\n\
+             payload=$(cat)\n\
+             if grep -q FROM_BAS <<< \"$payload\"; then\n\
+             \x20 echo '{\"decision\":\"allow\",\"updated_input\":{\"prompt\":\"CHAINED\"}}'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ups_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hooks = HooksConfig {
+            before_agent_start: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: r#"echo '{"decision":"allow","updated_input":{"prompt":"FROM_BAS"}}'"#
+                    .into(),
+                timeout: 2000,
+            }],
+            user_prompt_submit: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: ups_script.display().to_string(),
+                timeout: 3000,
+            }],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.run_turn("original", &tx, None, None).await.unwrap();
+
+        let user_text = agent
+            .context
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                ContextMessage::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("user message in context");
+        assert_eq!(
+            user_text, "CHAINED",
+            "UserPromptSubmit must see BeforeAgentStart's rewrite, got {user_text:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
