@@ -95,6 +95,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # v0.8: image base64 encoding for the read tool's vision path.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 
+# O_NOFOLLOW for the write tool's final open. Already in the tree via
+# tokio; declared so the constant comes from the platform definition
+# rather than a hardcoded octal that differs across ABIs.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
 # Windows-only: crossterm needs its `windows` feature to compile on
 # Windows targets (pulls in crossterm_winapi / windows-sys). Merging
 # happens via feature-union, so Unix targets stay lean.
