@@ -276,8 +276,12 @@ approximate: it is measured from a development build, not a published tag.
 
 ## Roadmap
 
-- **v1.0** — full PI parity: themes, compaction, extension system
-- Linux aarch64 not yet in the CI matrix (see `cargo build --release --target aarch64-unknown-linux-musl` above)
+No feature checklist. nanopi is the lightweight Rust take on Pi: the aim is to
+carry Pi's core surface in one small static binary, not to match everything Pi
+does. A feature gets in when it earns the weight it adds.
+
+Known gap: Linux aarch64 is not in the CI matrix yet — build it yourself with
+`cargo build --release --target aarch64-unknown-linux-musl` (see above).
 
 ## Cargo mirror (China)
 

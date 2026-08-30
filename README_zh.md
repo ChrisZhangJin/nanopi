@@ -240,7 +240,9 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
 
-完整可运行的例子在 [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin)，含编译命令。
+完整可运行的例子在 [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin)，含编译命令。[`examples/wasm-plugin-minimal/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-minimal) 是更小的可直接复制的骨架 —— 两个工具，分成"样板"和"你要替换的部分"两段。
+
+写插件、调试插件、能力门的分步指南在 [wiki](https://github.com/ChrisZhangJin/nanopi/wiki)（中英双语）。
 
 **沙箱。** 组件跑在 wasmtime 里，没有环境权限 —— 插件只能通过你显式开启的宿主函数接触外部。
 
@@ -254,7 +256,8 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 | 版本 | 状态 | 体积 | 说明 |
 |---|---|---|---|
-| **v0.10.0** | 当前 | 1.6 MB | 自定义 system prompt（`--system-prompt`、`SYSTEM.md`）；显式 `api_kind` 优先于 vendor 嗅探；`-p` 模式工具失败可读；发布产物 UPX 压缩 |
+| **v0.11.0** | 当前 | ~1.6 MB | WASM 扩展，带门控的 `host-fs-read` / `host-http-get`；Pi 生命周期钩子（`before_agent_start`、`turn_start`、`turn_end`、`message_end`）；流式中途转向；可配置的工具执行模式 |
+| v0.10.0 | 已发布 | 1.6 MB | 自定义 system prompt（`--system-prompt`、`SYSTEM.md`）；显式 `api_kind` 优先于 vendor 嗅探；`-p` 模式工具失败可读；发布产物 UPX 压缩 |
 | v0.9.x | 已发布 | ~3.9 MB | 首次运行向导，`/settings` + `/keybindings`，8 个 vendor 分发，重试封装（0.9.2–0.9.3）；v0.9.1 修了 v0.9.0 的 tool-loop bug |
 | v0.9.0 | 已发布 | ~4.0 MB | Skills（PI-parity），`--skill`/`--no-skills`，折叠 TUI 卡片，`UserPromptSubmit` hook |
 | v0.8.x | 已发布 | ~3.9 MB | 完整 ratatui TUI、`/fork`、`--continue`/`--session`、hooks、JSONL 会话 |
@@ -262,12 +265,17 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 | v0.1.0 | 已发布 | 2.4 MB | 单文件 OpenAI 流式演示（保留为 `nanopi_v0_1` 二进制） |
 
 体积都是发布的 musl 产物。从 v0.10.0 起，这个产物经过 UPX 压缩（`make`），所以 1.6 MB
-无法和上面几行未压缩的数字直接对比 —— 同一次编译在压缩前是 4.4 MB。
+无法和上面几行未压缩的数字直接对比 —— 同一次编译在压缩前是 4.4 MB。v0.11.0 那个数字
+是近似值：它测自开发构建，而非已发布的 tag。
 
 ## 路线图
 
-- **v1.0** —— 完整 PI parity：themes、compaction、扩展系统
-- Linux aarch64 暂未加入 CI 矩阵（背景段落里有自编指令：见上方）
+不列特性清单。nanopi 是 Pi 的 Rust 轻量实现：目标是用一个小体积静态二进制承载
+Pi 的核心能力，而不是把 Pi 做的每件事都对齐。一个特性值不值得进来，看它配不配
+得上它增加的体积。
+
+已知缺口：Linux aarch64 暂未加入 CI 矩阵 —— 需自行构建
+`cargo build --release --target aarch64-unknown-linux-musl`（见上方）。
 
 ## Cargo 国内镜像
 
