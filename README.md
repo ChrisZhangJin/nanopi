@@ -245,7 +245,9 @@ And may import these host functions:
 
 Payloads cross the boundary as JSON strings rather than WIT records — one primitive type keeps the ABI small enough that neither side needs a codegen step.
 
-A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin), including the build command.
+A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin), including the build command. [`examples/wasm-plugin-minimal/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-minimal) is a smaller skeleton to copy — two tools, split into boilerplate and the part you replace.
+
+Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki](https://github.com/ChrisZhangJin/nanopi/wiki) (English and Chinese).
 
 **Sandboxing.** Components run inside wasmtime with no ambient authority — a plugin reaches the outside world only through host functions you opt into.
 
@@ -259,7 +261,8 @@ A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhan
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.10.0** | current | 1.6 MB | Custom system prompt (`--system-prompt`, `SYSTEM.md`); explicit `api_kind` beats the vendor sniff; readable tool failures in `-p`; UPX-packed release |
+| **v0.11.0** | current | ~1.6 MB | WASM extensions with gated `host-fs-read` / `host-http-get`; Pi lifecycle hooks (`before_agent_start`, `turn_start`, `turn_end`, `message_end`); mid-stream steering; configurable tool exec mode |
+| v0.10.0 | released | 1.6 MB | Custom system prompt (`--system-prompt`, `SYSTEM.md`); explicit `api_kind` beats the vendor sniff; readable tool failures in `-p`; UPX-packed release |
 | v0.9.x | released | ~3.9 MB | First-run wizard, `/settings` + `/keybindings`, 8-vendor dispatch, retry envelope (0.9.2–0.9.3); v0.9.1 fixed the v0.9.0 tool loop |
 | v0.9.0 | released | ~4.0 MB | Skills (PI-parity), `--skill`/`--no-skills`, folded TUI card, `UserPromptSubmit` hook |
 | v0.8.x | released | ~3.9 MB | Full ratatui TUI, `/fork`, `--continue`/`--session`, hooks, JSONL sessions |
@@ -268,7 +271,8 @@ A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhan
 
 Sizes are the published musl artifact. From v0.10.0 that artifact is
 UPX-packed (`make`), so 1.6 MB is not comparable to the unpacked figures
-above it — the same build is 4.4 MB before packing.
+above it — the same build is 4.4 MB before packing. The v0.11.0 figure is
+approximate: it is measured from a development build, not a published tag.
 
 ## Roadmap
 
