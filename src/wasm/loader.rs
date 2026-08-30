@@ -79,8 +79,37 @@ fn resolve_readable(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
             real.display()
         ));
     }
+
+    // Containment is not the only thing that matters: the read itself
+    // has to be able to finish. `read_to_string` on a FIFO with no
+    // writer blocks forever, and nothing can interrupt it — the epoch
+    // deadline instruments guest code, so it cannot reach a host
+    // function that is parked in a syscall. One `mkfifo` inside the
+    // working directory would hang the turn, leak the blocking thread,
+    // and hold this plugin's bridge lock for the life of the process.
+    // Character devices (`/dev/zero`) are the unbounded-length version
+    // of the same problem.
+    let meta = std::fs::metadata(&real)
+        .map_err(|e| format!("cannot stat {}: {e}", real.display()))?;
+    if !meta.is_file() {
+        return Err(format!("not a regular file: {}", real.display()));
+    }
+    // Read size is capped for the same reason the HTTP body is: the
+    // guest allocates from a 1 MiB arena, so a larger payload is a
+    // guest trap, and buffering it host-side first is wasted memory on
+    // a machine that may not have much.
+    if meta.len() > MAX_HOST_READ_BYTES {
+        return Err(format!(
+            "file too large ({} bytes, limit {MAX_HOST_READ_BYTES})",
+            meta.len()
+        ));
+    }
     Ok(real)
 }
+
+/// Ceiling on what `host-fs-read` and `host-http-get` hand back.
+/// Matches the example guest's arena, which is the real constraint.
+const MAX_HOST_READ_BYTES: u64 = 1 << 20;
 
 /// Is `url`'s host covered by `allowlist`?
 ///
@@ -233,18 +262,30 @@ fn fetch_url(url: String) -> Result<String, String> {
                 if !status.is_success() {
                     return Err(format!("HTTP {status}"));
                 }
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| format!("cannot read response body: {e}"))?;
-                // The example guest allocates from a 1 MiB bump arena
-                // (`ARENA_SIZE` in examples/wasm-plugin), so an
-                // unbounded body is a guest allocation failure — i.e.
-                // a trap — not merely wasted host memory.
-                if body.len() > (1 << 20) {
-                    return Err("response too large (> 1 MiB)".to_string());
+                // Streamed, and aborted the moment the cap is passed.
+                // Checking `resp.text()`'s length afterwards was too
+                // late: the whole body was already resident in host
+                // memory, so an allowlisted (or, before the parser was
+                // fixed, any) host could push gigabytes into a machine
+                // that may only have hundreds of megabytes. The cap
+                // itself exists because the example guest allocates
+                // from a 1 MiB arena, making a larger body a guest trap
+                // rather than merely wasted host memory.
+                use futures_util::StreamExt;
+                let mut stream = resp.bytes_stream();
+                let mut body: Vec<u8> = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk =
+                        chunk.map_err(|e| format!("cannot read response body: {e}"))?;
+                    if body.len() + chunk.len() > MAX_HOST_READ_BYTES as usize {
+                        return Err(format!(
+                            "response too large (> {MAX_HOST_READ_BYTES} bytes)"
+                        ));
+                    }
+                    body.extend_from_slice(&chunk);
                 }
-                Ok(body)
+                String::from_utf8(body)
+                    .map_err(|_| "response body is not valid UTF-8".to_string())
             }),
         };
         // Receiver gone means the host stopped waiting; nothing to do.
@@ -877,6 +918,68 @@ mod tests {
     fn url_allowed_trailing_dot_does_not_widen_matching() {
         let l = list(&["api.github.com"]);
         assert!(!url_allowed("https://api.github.com.evil.com./x", &l));
+    }
+
+    /// Regression: `resolve_readable` only checked containment, so a
+    /// FIFO inside the working directory was accepted and the
+    /// subsequent `read_to_string` blocked forever with no writer.
+    /// Nothing could break it: the epoch deadline instruments guest
+    /// code and cannot reach a host function parked in a syscall, so
+    /// the turn never ended, the blocking thread leaked, and the
+    /// plugin's bridge lock was held for the life of the process.
+    ///
+    /// Asserting at the guard means the test does not have to risk
+    /// actually performing the hanging read.
+    #[test]
+    #[cfg(unix)]
+    fn fs_read_refuses_a_fifo() {
+        let dir = std::env::temp_dir()
+            .join(format!("nanopi-fifo-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no mkfifo on this box; nothing to assert
+        }
+        let err = resolve_readable(&dir, "pipe")
+            .expect_err("a FIFO must not be accepted for reading");
+        assert!(err.contains("not a regular file"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory is not readable either, and must say so rather than
+    /// surfacing a confusing io error from the read.
+    #[test]
+    fn fs_read_refuses_a_directory() {
+        let dir = std::env::temp_dir()
+            .join(format!("nanopi-dir-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let err = resolve_readable(&dir, "sub").expect_err("a directory is not a file");
+        assert!(err.contains("not a regular file"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Oversized files are refused at the guard, before anything is
+    /// buffered host-side.
+    #[test]
+    fn fs_read_refuses_oversized_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("nanopi-big-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.txt");
+        std::fs::write(&big, vec![b'x'; (MAX_HOST_READ_BYTES as usize) + 1]).unwrap();
+        let err = resolve_readable(&dir, "big.txt").expect_err("over the cap");
+        assert!(err.contains("too large"), "got {err}");
+        // A file at the limit is still fine.
+        let ok = dir.join("ok.txt");
+        std::fs::write(&ok, vec![b'x'; MAX_HOST_READ_BYTES as usize]).unwrap();
+        assert!(resolve_readable(&dir, "ok.txt").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A non-wasm file must fail at compile, not panic.
