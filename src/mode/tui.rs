@@ -1185,6 +1185,39 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     out
 }
 
+/// Hand a mid-stream message to the running turn.
+///
+/// `Ok(msg)` means it reached the turn; `Err(msg)` hands the text back
+/// because there is no live turn to steer — the caller queues it as the
+/// next turn rather than dropping it. Both arms return the message so
+/// the caller can echo it either way.
+///
+/// Extracted from `handle_action` purely so this decision is reachable
+/// from a test: `handle_action` needs a live `Term` and agent slot,
+/// which is why the silent-drop bug survived in there in the first
+/// place.
+async fn try_steer(
+    steer_tx: Option<&mpsc::Sender<SteerMessage>>,
+    msg: String,
+) -> Result<String, String> {
+    let stx = match steer_tx {
+        Some(s) => s,
+        // No turn has ever run. Not reachable through the TUI today,
+        // since steering is only offered while streaming, but handled
+        // rather than assumed away.
+        None => return Err(msg),
+    };
+    // Cloned so the message survives a failed send. `SendError` does
+    // return the payload, but unwrapping it back out of the enum is
+    // more code than copying a line of user input.
+    match stx.send(SteerMessage::Steering { text: msg.clone() }).await {
+        Ok(()) => Ok(msg),
+        // The receiver is gone: `run_turn` returned between the
+        // keypress and now.
+        Err(_) => Err(msg),
+    }
+}
+
 /// Interpret a bare Enter submit (no capture mode active) as either
 /// exit, compact, or a chat turn. Extracted so the Submit path in
 /// interpret_key stays readable now that capture modes have their
@@ -1306,6 +1339,7 @@ async fn run_app(
     let mut key_events = EventStream::new();
     let mut ag_rx: Option<mpsc::Receiver<AgentEvent>> = None;
     let mut steer_tx_slot: Option<mpsc::Sender<SteerMessage>> = None;
+    let mut follow_up_slot: Option<String> = None;
     let mut turn_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut cancel: Option<CancellationToken> = None;
     // 120ms ticker keeps the "Elapsed X.Xs" / spinner glyph moving
@@ -1338,7 +1372,7 @@ async fn run_app(
                                 handle_action(
                                     KeyAction::SummaryFinished(outcome),
                                     app, term, &agent_slot,
-                                    &mut ag_rx, &mut steer_tx_slot, &mut cancel, &mut turn_task,
+                                    &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
                                 ).await?;
                             }
                             Err(_join_err) => {
@@ -1369,7 +1403,8 @@ async fn run_app(
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                         let action = interpret_key(app, k);
                         handle_action(action, app, term, &agent_slot,
-                                      &mut ag_rx, &mut steer_tx_slot, &mut cancel, &mut turn_task).await?;
+                                      &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot,
+                                      &mut cancel, &mut turn_task).await?;
                     }
                     Some(Ok(Event::Paste(s))) => {
                         app.input.insert_str(&s);
@@ -1454,20 +1489,25 @@ async fn run_app(
                         insert_line(term, Line::from(""))?;
                         term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
 
-                        // v0.11.0: a SteerMessage::FollowUp queued during
-                        // the turn lands on agent.pending_follow_up. Take
-                        // it and auto-start the next turn (Pi's
-                        // getFollowUpMessages semantic — the agent keeps
-                        // working instead of idling back to the prompt).
+                        // v0.11.0: auto-start the next turn instead of
+                        // idling back to the prompt (Pi's
+                        // getFollowUpMessages semantic). Two sources
+                        // feed this, and they cannot both be one field:
+                        // a `SteerMessage::FollowUp` handled inside the
+                        // turn lands on `agent.pending_follow_up`, but a
+                        // steer that missed its turn is noticed out here,
+                        // in a window where the agent has been taken out
+                        // of the slot and cannot be written to.
                         let follow_up = {
                             let mut g = agent_slot.lock().await;
                             g.as_mut().and_then(|a| a.pending_follow_up.take())
-                        };
+                        }
+                        .or_else(|| follow_up_slot.take());
                         if let Some(text) = follow_up {
                             handle_action(
                                 KeyAction::StartTurn(text),
                                 app, term, &agent_slot,
-                                &mut ag_rx, &mut steer_tx_slot, &mut cancel, &mut turn_task,
+                                &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
                             ).await?;
                         }
                     }
@@ -1484,6 +1524,10 @@ async fn handle_action(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     ag_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     steer_tx: &mut Option<mpsc::Sender<SteerMessage>>,
+    // Text the user typed mid-stream that arrived too late to steer.
+    // Drained by the turn-completion handler, which starts it as the
+    // next turn instead of letting it vanish.
+    follow_up: &mut Option<String>,
     cancel: &mut Option<CancellationToken>,
     turn_task: &mut Option<tokio::task::JoinHandle<Result<String, String>>>,
 ) -> Result<()> {
@@ -2624,14 +2668,24 @@ async fn handle_action(
             // turn's steer channel so the agent picks it up at the
             // next iteration boundary. Matches Pi's mid-stream typing.
             //
-            // If the channel is gone (turn finished between keypress
-            // and dispatch), fall through silently — the message is
-            // dropped rather than starting a surprise new turn.
-            if let Some(stx) = steer_tx.as_ref() {
-                // Echo it so the user sees their steer landed, with a
-                // marker distinguishing it from a normal turn.
-                render_user_echo(term, &format!("[steer] {msg}"))?;
-                let _ = stx.send(SteerMessage::Steering { text: msg }).await;
+            // The send is attempted BEFORE the echo. It used to be the
+            // other way around, which meant the one case that can fail
+            // — the turn ending between the keypress and this dispatch,
+            // dropping the receiver — printed "[steer] ..." and then
+            // silently discarded the text. The user saw their message
+            // land and it was gone.
+            match try_steer(steer_tx.as_ref(), msg).await {
+                // Marked so it reads differently from a normal turn.
+                Ok(landed) => render_user_echo(term, &format!("[steer] {landed}"))?,
+                Err(missed) => {
+                    // Nothing left to steer. Queue it as the next turn
+                    // rather than throwing away something the user
+                    // typed — the turn-completion handler starts it.
+                    // Echoed as queued, not as a steer, so the
+                    // distinction is visible.
+                    render_user_echo(term, &format!("[queued] {missed}"))?;
+                    *follow_up = Some(missed);
+                }
             }
         }
     }
@@ -4364,6 +4418,41 @@ mod tests {
             KeyAction::SteerTurn(s) => assert_eq!(s, "also check the logs"),
             other => panic!("expected SteerTurn, got {other:?}"),
         }
+    }
+
+    /// A steer that reaches a live turn arrives as a `Steering`
+    /// message, and the text comes back for the caller to echo.
+    #[tokio::test]
+    async fn steer_reaches_a_live_turn() {
+        let (tx, mut rx) = mpsc::channel::<SteerMessage>(4);
+        let got = try_steer(Some(&tx), "also check the logs".into()).await;
+        assert_eq!(got.as_deref(), Ok("also check the logs"));
+        match rx.recv().await {
+            Some(SteerMessage::Steering { text }) => assert_eq!(text, "also check the logs"),
+            other => panic!("expected a Steering message, got {other:?}"),
+        }
+    }
+
+    /// Regression: when the turn ended between the keypress and the
+    /// dispatch, the send failed and the text was dropped — after the
+    /// TUI had already echoed "[steer] ...", so the user believed it
+    /// had landed. It must come back to be queued instead.
+    #[tokio::test]
+    async fn steer_that_missed_its_turn_is_handed_back() {
+        let (tx, rx) = mpsc::channel::<SteerMessage>(4);
+        drop(rx); // the turn finished; run_turn dropped the receiver
+        let got = try_steer(Some(&tx), "also update the tests".into()).await;
+        assert_eq!(
+            got.as_deref().unwrap_err(),
+            "also update the tests",
+            "a steer with nowhere to go must be returned, not swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_with_no_channel_is_handed_back() {
+        let got = try_steer(None, "hello".into()).await;
+        assert_eq!(got.as_deref().unwrap_err(), "hello");
     }
 
     /// Slash commands mid-stream stay a no-op — steering the model
