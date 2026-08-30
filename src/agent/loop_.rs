@@ -1082,14 +1082,23 @@ impl Agent {
                 None => (join_all(futs).await, false),
             },
             crate::config::ToolExecMode::Sequential => {
-                // Sequentially await each tool; cancel can interrupt
-                // mid-batch by dropping the iterator. The returned
-                // `Vec<ToolCallOutcome>` has the same shape as
-                // `join_all` for the post-phase.
+                // Sequentially await each tool. Cancel is raced against
+                // the *in-flight* future, not just checked between
+                // tools: a between-tools-only check meant a 30s bash
+                // ran to completion after Esc, since nothing was
+                // polling the token while it was awaited. Dropping the
+                // future here has the same effect as the Parallel arm —
+                // kill_on_drop SIGKILLs any live bash child.
+                //
+                // The returned `Vec<ToolCallOutcome>` has the same
+                // shape as `join_all` for the post-phase, except it may
+                // be short when cancel won.
                 let mut results = Vec::with_capacity(futs.len());
                 let mut cancelled = false;
                 let mut iter = futs.into_iter();
                 loop {
+                    // Pre-check so an already-cancelled token doesn't
+                    // pay for spawning the next tool at all.
                     if let Some(ct) = cancel.as_ref() {
                         if ct.is_cancelled() {
                             cancelled = true;
@@ -1097,9 +1106,20 @@ impl Agent {
                         }
                     }
                     match iter.next() {
-                        Some(fut) => {
-                            results.push(fut.await);
-                        }
+                        Some(fut) => match cancel.as_ref() {
+                            // `biased` matches the Parallel arm: cancel
+                            // is polled first so a fast Esc can't lose
+                            // the race to a fast-finishing tool.
+                            Some(ct) => tokio::select! {
+                                biased;
+                                _ = ct.cancelled() => {
+                                    cancelled = true;
+                                    break;
+                                }
+                                r = fut => results.push(r),
+                            },
+                            None => results.push(fut.await),
+                        },
                         None => break,
                     }
                 }
@@ -1108,8 +1128,29 @@ impl Agent {
         };
 
         let results = if cancelled {
+            // Sequential cancel can land mid-batch, so some tools already
+            // ran — and already appended their real ToolResult to the
+            // session JSONL. Overwriting those with a cancelled marker
+            // would make the context disagree with the transcript on
+            // disk and throw away work the user already paid for, so
+            // keep completed outcomes and only synthesize for the calls
+            // that never got to run. Iterating `call_meta` (not
+            // `results`) keeps tool_result order matching tool_use
+            // order — Anthropic 400s on an unmatched or misordered pair.
+            //
+            // No-op for Parallel: cancel there leaves `results` empty,
+            // so `done` is empty and every call gets synthesized exactly
+            // as before.
+            let mut done: std::collections::HashMap<String, ToolCallOutcome> = results
+                .into_iter()
+                .map(|o| (o.call_id.clone(), o))
+                .collect();
             let mut synth = Vec::with_capacity(call_meta.len());
             for (id, _name) in call_meta {
+                if let Some(finished) = done.remove(&id) {
+                    synth.push(finished);
+                    continue;
+                }
                 let content = "[cancelled by user before tool completed]".to_string();
                 let _ = session::append_entry(
                     &self.session_path,
@@ -1788,6 +1829,128 @@ mod tests {
         assert_eq!(
             user_text, "CHAINED",
             "UserPromptSubmit must see BeforeAgentStart's rewrite, got {user_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: in Sequential mode cancel was only checked *between*
+    /// tools, so Esc during a long-running bash waited for it to finish;
+    /// and the cancel path then replaced every result — including tools
+    /// that had already run and already written their real ToolResult to
+    /// the session JSONL — with a synthetic marker.
+    ///
+    /// Asserts all three properties at once: the batch aborts long
+    /// before the 30s sleep would end, the completed tool keeps its real
+    /// output, and the un-run tool gets the marker in call order.
+    #[tokio::test]
+    async fn sequential_cancel_interrupts_and_keeps_completed_results() {
+        let dir = tmp();
+        let session_path = dir.join("seqcancel.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_up: None,
+            tool_exec_mode: crate::config::ToolExecMode::Sequential,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        let ct = tokio_util::sync::CancellationToken::new();
+        let ct_clone = ct.clone();
+        // Long enough for the `echo` to finish and the `sleep` to be the
+        // in-flight future; far shorter than the sleep itself.
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            ct_clone.cancel();
+        });
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let start = std::time::Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "call_fast".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "echo FIRST_DONE"}),
+                    },
+                    ToolCall {
+                        id: "call_slow".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 30"}),
+                    },
+                    ToolCall {
+                        id: "call_never".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "echo NEVER_RAN"}),
+                    },
+                ],
+                &tx,
+                Some(ct),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        drop(tx);
+        canceller.await.ok();
+        drain.await.ok();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cancel must interrupt the in-flight tool, not wait it out; took {elapsed:?}"
+        );
+
+        // Every tool_use needs a paired tool_result, in the original
+        // call order — Anthropic 400s otherwise.
+        let tools: Vec<(&str, &str)> = agent
+            .context
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } => Some((tool_call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["call_fast", "call_slow", "call_never"],
+            "tool_results must stay paired and in call order"
+        );
+        assert!(
+            tools[0].1.contains("FIRST_DONE"),
+            "completed tool must keep its real output, got {:?}",
+            tools[0].1
+        );
+        assert!(
+            tools[1].1.contains("cancelled by user"),
+            "interrupted tool must get the cancel marker, got {:?}",
+            tools[1].1
+        );
+        assert!(
+            tools[2].1.contains("cancelled by user"),
+            "never-started tool must get the cancel marker, got {:?}",
+            tools[2].1
         );
 
         let _ = std::fs::remove_dir_all(&dir);
