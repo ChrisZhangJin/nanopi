@@ -307,6 +307,16 @@ const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// plugin can legally do is a `host-http-get`, itself capped at 10s.
 /// 30s leaves room for a fetch plus real work while still bounding a
 /// runaway at half a minute instead of forever.
+///
+/// Applies to GUEST code only. Epoch interruption is instrumentation
+/// compiled into the guest, so it cannot preempt a host function that
+/// is already executing — those are bounded by their own limits
+/// (`fetch_url`'s request timeout; `resolve_readable`'s regular-file
+/// and size checks, which are what keep a FIFO from blocking forever).
+/// An earlier version of this comment, and both READMEs, claimed the
+/// budget covered time spent inside host functions. It does not, and
+/// believing it did is how `host-fs-read` on a FIFO stayed an
+/// unbounded hang.
 const EPOCH_BUDGET_TICKS: u64 = 30;
 
 /// One running wasmtime engine; threadsafe, cheap to clone (internally

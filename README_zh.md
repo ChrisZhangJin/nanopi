@@ -250,7 +250,9 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 `host-http-get` 有两道门：先是 `allow_network = true`，然后 URL 的 host 必须出现在 `url_allowlist` 里。**空 allowlist 拒绝一切**，所以只把开关打开本身还是什么都访问不到。匹配比对的是解析出的 host 而不是子串 —— allowlist 为 `api.github.com` 时，`https://evil.com/?x=api.github.com` 和 `https://api.github.com@evil.com/` 都会被拒；而一条 entry 会覆盖它的子域名和任意端口。只接受 `http`/`https`；请求 10 秒超时，插件因此没法把一轮对话挂死；重定向**不会**跟随 —— 否则一个 3xx 就能把这次抓取带到你从没批准过的 host 上。拒绝和失败都以 `error: ` 前缀的字符串在带内返回给插件，而不是 trap。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
 
-**失控插件。** 每次工具调用，guest 代码有约 30 秒的墙钟预算，由 wasmtime 的 epoch interruption 强制执行。超时即 trap，作为失败的工具调用报给模型。没有这道闸，一个含死循环的插件会让 nanopi 永久卡死 —— guest 占着一个真实线程且没有让出点，<kbd>Esc</kbd> 够不到它里面。这个预算覆盖整次调用，包括花在宿主函数里的时间，所以一个连续做几次 10 秒抓取的插件也可能撞上。
+**失控插件。** 每次工具调用，guest 代码有约 30 秒的墙钟预算，由 wasmtime 的 epoch interruption 强制执行。超时即 trap，作为失败的工具调用报给模型，且插件仍然可用 —— 实例会被重建，一次坏调用不会让它在整个 session 里失效。没有这道闸，一个含死循环的插件会让 nanopi 永久卡死：guest 占着一个真实线程且没有让出点，<kbd>Esc</kbd> 够不到它里面。
+
+这个预算**只作用于 guest 代码**。epoch interruption 是编译进 guest 的插桩，打断不了一个已经在跑的宿主函数 —— 插件阻塞在 `host-http-get` 或 `host-fs-read` 里时，兜底的是那两个函数各自的限制（10 秒请求超时；只接受常规文件加 1 MiB 上限，后者正是 FIFO 不会永久阻塞的原因），而不是 epoch deadline。所以单次调用的最坏情况是「预算 + 一次宿主调用」，不是只有预算。
 
 **同名冲突。** 插件不能注册已存在的工具名。冲突会被报告并跳过，所以插件无法悄悄替换 `bash`。
 
