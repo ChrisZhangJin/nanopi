@@ -101,11 +101,21 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// tree. `p` must already be lexically normalized — with no `..` left,
 /// `file_name()` is guaranteed to be `Some` for every non-root
 /// component, which is what makes the walk terminate.
+///
+/// The walk stops on `symlink_metadata`, not `exists()`. `exists()`
+/// follows symlinks and so reports `false` for a *dangling* one, which
+/// made the walk step straight over it and re-attach the name as if it
+/// were an ordinary not-yet-created component — landing inside cwd and
+/// passing the containment check. `fs::write` then follows that same
+/// symlink on open(2) and the write escapes. A dangling link inside a
+/// cloned repo is enough; no shell access is needed. `symlink_metadata`
+/// sees the link itself, so the walk halts there and the
+/// `canonicalize` below fails, which is the refusal we want.
 fn canonicalize_deepest_existing(p: &Path) -> Result<PathBuf, String> {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p.to_path_buf();
     loop {
-        if cur.exists() {
+        if std::fs::symlink_metadata(&cur).is_ok() {
             let mut out = std::fs::canonicalize(&cur)
                 .map_err(|e| format!("cannot resolve {}: {e}", cur.display()))?;
             for name in tail.iter().rev() {

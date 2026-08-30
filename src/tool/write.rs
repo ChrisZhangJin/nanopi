@@ -199,6 +199,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    /// Regression: a *dangling* symlink defeated the first version of
+    /// this guard. `exists()` follows the link, so a broken one reads
+    /// as "does not exist", the walk stepped over it, and the name was
+    /// re-attached as an ordinary new component well inside cwd — then
+    /// `fs::write` followed it on open(2) and the content landed
+    /// outside. Distinct from the resolvable-symlink case above, which
+    /// canonicalization already caught; this one needs the target to
+    /// NOT exist, which is also why it creates the escape rather than
+    /// just redirecting into one.
+    ///
+    /// Reachable without a shell: a checked-out repo containing
+    /// `notes.md -> ~/.ssh/authorized_keys` is enough.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rejects_write_through_dangling_symlink() {
+        let base = tmp();
+        let cwd = base.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let outside = base.join("victim.txt");
+        assert!(!outside.exists(), "target must not exist — that is the point");
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+
+        let ctx = ToolContext { cwd: cwd.clone() };
+        let r = WriteTool
+            .execute(json!({"path": "link", "content": "pwned"}), &ctx)
+            .await;
+
+        assert!(r.is_err(), "a dangling symlink out of cwd must be refused");
+        assert!(
+            !outside.exists(),
+            "the write escaped cwd through the dangling symlink"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The guard must run before `create_dir_all`, or a refused path
     /// still litters directories outside the tree on its way out.
     #[tokio::test]
