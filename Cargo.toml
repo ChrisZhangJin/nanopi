@@ -80,6 +80,15 @@ async-trait = "0.1"
 # Hook matchers + the grep tool
 regex = { version = "1.10", default-features = false, features = ["std"] }
 
+# URL parsing for the WASM plugin `url_allowlist` gate. Not a new
+# dependency in any real sense — reqwest already pulls this exact
+# version in, so declaring it costs zero download and zero binary
+# size. It is declared because the allowlist MUST parse a URL the same
+# way the HTTP client does; a hand-rolled parser that disagrees with
+# reqwest by one character is a bypass, which is exactly what happened
+# with `\` before this was adopted.
+url = { version = "2.5", default-features = false }
+
 # Date/time (RFC3339 for sessions)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

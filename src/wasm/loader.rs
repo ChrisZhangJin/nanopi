@@ -111,13 +111,32 @@ fn resolve_readable(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
 /// turn the network capability into a filesystem read, sidestepping
 /// the separate `allow_fs` gate.
 ///
-/// Deliberately hand-rolled `str` work: this is a dozen lines, and a
-/// URL-parsing crate is a new dependency for one comparison.
+/// The host is extracted with the SAME parser the HTTP client uses,
+/// which is the only property that actually makes this gate sound. An
+/// earlier version hand-rolled the parse, on the reasoning that a
+/// dozen lines of `str` work beat a new dependency for one comparison.
+/// That reasoning was wrong, and not subtly:
+///
+///   `https://evil.com\@api.github.com/`
+///
+/// The hand-rolled version ended the authority at `/`, `?` or `#`, so
+/// it saw `evil.com\@api.github.com`, took everything after the last
+/// `@`, and matched `api.github.com`. WHATWG — and therefore `url`,
+/// and therefore reqwest — treats `\` as an authority terminator for
+/// special schemes, so the request went to `evil.com`. Every plugin
+/// with `allow_network = true` and any non-empty allowlist could reach
+/// any host on the internet. `https://evil.com\.api.github.com/` is the
+/// same hole without even needing the `@`.
+///
+/// The lesson is not "handle backslash too". It is that a validator
+/// which parses differently from the executor is a bypass waiting to be
+/// found, so the two now share one parser. `url` is not a new
+/// dependency in substance: reqwest already links this exact version.
 fn url_allowed(url: &str, allowlist: &[String]) -> bool {
     if allowlist.is_empty() {
         return false;
     }
-    let host = match extract_host(url) {
+    let host = match request_host(url) {
         Some(h) => h,
         None => return false,
     };
@@ -128,53 +147,50 @@ fn url_allowed(url: &str, allowlist: &[String]) -> bool {
     })
 }
 
-/// Pull the lowercased host out of an `http`/`https` URL, or `None` if
-/// the scheme is anything else (including absent).
-fn extract_host(url: &str) -> Option<String> {
-    let lower = url.to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("https://")
-        .or_else(|| lower.strip_prefix("http://"))?;
-    // Authority ends at the first `/`, `?`, or `#`.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
-    Some(host_of_authority(authority)).filter(|h| !h.is_empty())
+/// The host reqwest will actually connect to, lowercased, or `None` if
+/// the URL is unparseable or not `http`/`https`.
+///
+/// `url` normalizes as it parses — `0177.0.0.1` becomes `127.0.0.1`,
+/// IDNA is applied, `%`-escapes are resolved. That is a feature here:
+/// whatever it returns is what the connection will use, so allowlist
+/// comparisons cannot drift from reality.
+fn request_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    // `file://` would turn the network capability into a filesystem
+    // read, sidestepping the separate `allow_fs` gate.
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.host_str().map(canonical_host)
 }
 
-/// Strip userinfo and `:port` from an authority, leaving the host.
-fn host_of_authority(authority: &str) -> String {
-    // Userinfo may itself contain `@`, so split on the LAST one.
-    let after_userinfo = match authority.rfind('@') {
-        Some(i) => &authority[i + 1..],
-        None => authority,
-    };
-    // An IPv6 literal is bracketed and contains `:`, so the port
-    // strip has to look after the closing bracket, not from the left.
-    if let Some(stripped) = after_userinfo.strip_prefix('[') {
-        return match stripped.find(']') {
-            Some(i) => stripped[..i].to_string(),
-            None => String::new(),
-        };
-    }
-    match after_userinfo.find(':') {
-        Some(i) => after_userinfo[..i].to_string(),
-        None => after_userinfo.to_string(),
-    }
+/// Lowercase and drop a fully-qualified trailing dot. `example.com.`
+/// and `example.com` resolve identically, so treating them as
+/// different hosts would deny a request for no reason.
+fn canonical_host(h: &str) -> String {
+    h.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Reduce a config entry to a bare lowercase host, tolerating a user
-/// who wrote a whole URL (`https://api.github.com/`) where a hostname
-/// was wanted.
+/// Reduce a config entry to a bare host, tolerating a user who wrote a
+/// whole URL (`https://api.github.com/`) where a hostname was wanted.
+///
+/// Runs through the same parser as `request_host` so the two sides
+/// cannot disagree. A bare host is not a URL, so it gets a scheme
+/// bolted on before parsing.
 fn normalize_allowlist_entry(entry: &str) -> String {
-    let e = entry.trim().to_ascii_lowercase();
-    let e = e
-        .strip_prefix("https://")
-        .or_else(|| e.strip_prefix("http://"))
-        .unwrap_or(&e);
-    let e = e.split(['/', '?', '#']).next().unwrap_or("");
-    host_of_authority(e)
+    let e = entry.trim();
+    if e.is_empty() {
+        return String::new();
+    }
+    let candidate = if e.contains("://") {
+        e.to_string()
+    } else {
+        format!("https://{e}")
+    };
+    url::Url::parse(&candidate)
+        .ok()
+        .and_then(|u| u.host_str().map(canonical_host))
+        .unwrap_or_default()
 }
 
 /// Fetch `url` and return its body, bridging sync host code to async
@@ -811,6 +827,56 @@ mod tests {
     fn url_allowed_refuses_url_without_scheme() {
         let l = list(&["api.github.com"]);
         assert!(!url_allowed("api.github.com/x", &l));
+    }
+
+    /// Regression for the bypass that retired the hand-rolled parser.
+    /// WHATWG ends the authority at `\` for http/https; the old code
+    /// ended it only at `/`, `?`, `#`, so it read the host from after
+    /// the last `@` and matched the allowlist while reqwest connected
+    /// somewhere else entirely. Verified against a live client at the
+    /// time: the connection landed on the host BEFORE the backslash.
+    #[test]
+    fn url_allowed_refuses_backslash_authority_bypass() {
+        let l = list(&["api.github.com"]);
+        assert!(!url_allowed(r"https://evil.com\@api.github.com/", &l));
+        // Same hole without needing userinfo at all: the old suffix
+        // check saw a host ending in `.api.github.com`.
+        assert!(!url_allowed(r"https://evil.com\.api.github.com/", &l));
+    }
+
+    /// The SSRF shape of the same bypass — a metadata endpoint reached
+    /// through an allowlist that never mentioned it.
+    #[test]
+    fn url_allowed_refuses_backslash_ssrf() {
+        let l = list(&["github.com"]);
+        assert!(!url_allowed(
+            r"https://169.254.169.254\@github.com/latest/meta-data/",
+            &l
+        ));
+    }
+
+    /// Sharing the client's parser also fixes a fail-closed quirk: an
+    /// obfuscated IP literal is normalized, so an allowlisted address
+    /// written differently now matches instead of being refused.
+    #[test]
+    fn url_allowed_normalizes_ip_literals() {
+        let l = list(&["127.0.0.1"]);
+        assert!(url_allowed("http://0177.0.0.1/x", &l));
+        assert!(url_allowed("http://2130706433/x", &l));
+    }
+
+    /// A fully-qualified trailing dot names the same host.
+    #[test]
+    fn url_allowed_ignores_trailing_dot() {
+        let l = list(&["api.github.com"]);
+        assert!(url_allowed("https://api.github.com./x", &l));
+    }
+
+    /// ...but the dot must not become a way to smuggle a suffix match.
+    #[test]
+    fn url_allowed_trailing_dot_does_not_widen_matching() {
+        let l = list(&["api.github.com"]);
+        assert!(!url_allowed("https://api.github.com.evil.com./x", &l));
     }
 
     /// A non-wasm file must fail at compile, not panic.
