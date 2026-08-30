@@ -104,11 +104,15 @@ pub struct Agent {
     /// in `run_turn`. Empty when discovery is disabled and no --skill
     /// paths were passed.
     pub skills: Vec<crate::resources::Skill>,
-    /// v0.11.0: text pending from a `SteerMessage::FollowUp`. When
-    /// non-empty, the TUI's turn-completed handler auto-starts a new
-    /// turn with this text (Pi's `getFollowUpMessages()` semantic).
-    /// Reset to `None` when consumed.
-    pub pending_follow_up: Option<String>,
+    /// v0.11.0: messages waiting to become their own turn. The TUI's
+    /// turn-completed handler pops the front and auto-starts a turn
+    /// with it (Pi's `getFollowUpMessages()` semantic).
+    ///
+    /// A queue rather than one slot: a `SteerMessage::FollowUp` can
+    /// arrive more than once per turn, and cancelling a turn converts
+    /// every still-pending steer into a follow-up at once. Keeping only
+    /// the first silently dropped the rest.
+    pub pending_follow_ups: std::collections::VecDeque<String>,
     /// v0.11.0: tool execution mode (parallel by default; user can
     /// configure sequential via `tool_exec_mode` in config.toml).
     /// Set at build time and reused on every turn.
@@ -252,7 +256,7 @@ impl Agent {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         })
@@ -391,6 +395,34 @@ impl Agent {
     /// with whatever was streamed so far. The session file is left in a
     /// consistent state (last completed turns persisted; the cancelled
     /// turn's partial assistant text is dropped).
+    /// Move anything still sitting in the steer channel onto the
+    /// follow-up queue.
+    ///
+    /// Called on every early return from `run_turn`. A steer that the
+    /// channel accepted but the pump never reached has already been
+    /// echoed to the user as landed; letting it die with the receiver
+    /// makes their text vanish without a trace — the same failure
+    /// c15c8a9 fixed on the send side and missed here. On cancellation
+    /// a `Steering` message becomes a follow-up, since there is no
+    /// longer a turn for it to steer.
+    fn drain_steer_to_follow_ups(
+        &mut self,
+        steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
+        queue: &mut Vec<String>,
+    ) {
+        if let Some(rx) = steer_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(SteerMessage::Steering { text })
+                    | Ok(SteerMessage::FollowUp { text }) => queue.push(text),
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        self.pending_follow_ups.extend(queue.drain(..));
+    }
+
     pub async fn run_turn(
         &mut self,
         user_msg: &str,
@@ -602,6 +634,7 @@ impl Agent {
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
                 if ct.is_cancelled() {
+                    self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
                     return Ok(final_text);
                 }
             }
@@ -632,7 +665,13 @@ impl Agent {
                             follow_up_queue.push(text);
                         }
                         // Empty or disconnected — nothing pending.
-                        _ => break,
+                        // Spelled out rather than `_` so adding a
+                        // `SteerMessage` variant is a compile error
+                        // here instead of silently falling into this
+                        // arm and aborting the drain with the rest of
+                        // the queue still buffered.
+                        Err(mpsc::error::TryRecvError::Empty)
+                        | Err(mpsc::error::TryRecvError::Disconnected) => break,
                     }
                 }
             }
@@ -762,6 +801,7 @@ impl Agent {
                     },
                 )?;
                 self.context.push_assistant_text(marker);
+                self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
                 return Ok(final_text);
             }
 
@@ -999,9 +1039,7 @@ impl Agent {
         // v0.11.0: surface the first `FollowUp` message (if any)
         // onto the Agent so the caller can auto-trigger another
         // turn. Matches Pi's `getFollowUpMessages()` semantic.
-        if !follow_up_queue.is_empty() {
-            self.pending_follow_up = Some(follow_up_queue.remove(0));
-        }
+        self.pending_follow_ups.extend(follow_up_queue.drain(..));
         Ok(final_text)
     }
 
@@ -1464,7 +1502,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -1558,7 +1596,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -1643,7 +1681,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -1744,7 +1782,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -1837,7 +1875,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -1901,7 +1939,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::Sequential,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -2030,7 +2068,7 @@ mod tests {
                 turn_count: 0,
                 skills: Vec::new(),
                 no_context_files: false,
-                pending_follow_up: None,
+                pending_follow_ups: Default::default(),
                 tool_exec_mode: mode,
                 prompt_overrides:
                     crate::agent::prompt_override::PromptOverrides::default(),
@@ -2099,6 +2137,75 @@ mod tests {
         }
     }
 
+    /// Regression: a steer that the channel ACCEPTED could still be
+    /// lost. c15c8a9 handled the send failing; it did not handle the
+    /// turn being cancelled after a successful send but before the pump
+    /// reached the message. The user had already seen `[steer] …`
+    /// echoed, and the text died with the receiver — no context entry,
+    /// no session entry, no follow-up.
+    ///
+    /// On cancel a pending steer becomes a follow-up: there is no turn
+    /// left to steer, but the text is still something the user typed.
+    #[tokio::test]
+    async fn cancelled_turn_keeps_pending_steers_as_follow_ups() {
+        let dir = tmp();
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        // Two messages buffered and a token already cancelled, so
+        // `run_turn` takes its very first early return.
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(8);
+        steer_tx
+            .send(SteerMessage::Steering { text: "first".into() })
+            .await
+            .unwrap();
+        steer_tx
+            .send(SteerMessage::Steering { text: "second".into() })
+            .await
+            .unwrap();
+        let ct = tokio_util::sync::CancellationToken::new();
+        ct.cancel();
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .run_turn("go", &tx, Some(ct), Some(steer_rx))
+            .await
+            .unwrap();
+
+        let queued: Vec<&str> = agent
+            .pending_follow_ups
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["first", "second"],
+            "pending steers must survive cancellation, in order and all of them"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn execute_tool_calls_unknown_tool_yields_error_result() {
         let dir = tmp();
@@ -2121,7 +2228,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -2199,7 +2306,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -2299,7 +2406,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -2444,7 +2551,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -2531,7 +2638,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -2949,7 +3056,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -3015,7 +3122,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -3134,7 +3241,7 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
@@ -3277,7 +3384,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
         };
 
@@ -3336,16 +3443,16 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
-            pending_follow_up: None,
+            pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
         };
 
         agent.run_turn("go", &tx, None, Some(steer_rx)).await.unwrap();
 
         assert_eq!(
-            agent.pending_follow_up.as_deref(),
+            agent.pending_follow_ups.front().map(String::as_str),
             Some("next question"),
-            "FollowUp message must surface on agent.pending_follow_up"
+            "FollowUp message must surface on agent.pending_follow_ups"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

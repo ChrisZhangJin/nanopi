@@ -1339,7 +1339,11 @@ async fn run_app(
     let mut key_events = EventStream::new();
     let mut ag_rx: Option<mpsc::Receiver<AgentEvent>> = None;
     let mut steer_tx_slot: Option<mpsc::Sender<SteerMessage>> = None;
-    let mut follow_up_slot: Option<String> = None;
+    // A queue, not a slot: two messages can land in the dead window
+    // between a turn ending and the completion handler running, and a
+    // single slot silently kept only the second — after echoing both.
+    let mut follow_up_slot: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
     let mut turn_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut cancel: Option<CancellationToken> = None;
     // 120ms ticker keeps the "Elapsed X.Xs" / spinner glyph moving
@@ -1494,15 +1498,15 @@ async fn run_app(
                         // getFollowUpMessages semantic). Two sources
                         // feed this, and they cannot both be one field:
                         // a `SteerMessage::FollowUp` handled inside the
-                        // turn lands on `agent.pending_follow_up`, but a
+                        // turn lands on `agent.pending_follow_ups`, but a
                         // steer that missed its turn is noticed out here,
                         // in a window where the agent has been taken out
                         // of the slot and cannot be written to.
                         let follow_up = {
                             let mut g = agent_slot.lock().await;
-                            g.as_mut().and_then(|a| a.pending_follow_up.take())
+                            g.as_mut().and_then(|a| a.pending_follow_ups.pop_front())
                         }
-                        .or_else(|| follow_up_slot.take());
+                        .or_else(|| follow_up_slot.pop_front());
                         if let Some(text) = follow_up {
                             handle_action(
                                 KeyAction::StartTurn(text),
@@ -1527,7 +1531,7 @@ async fn handle_action(
     // Text the user typed mid-stream that arrived too late to steer.
     // Drained by the turn-completion handler, which starts it as the
     // next turn instead of letting it vanish.
-    follow_up: &mut Option<String>,
+    follow_up: &mut std::collections::VecDeque<String>,
     cancel: &mut Option<CancellationToken>,
     turn_task: &mut Option<tokio::task::JoinHandle<Result<String, String>>>,
 ) -> Result<()> {
@@ -2684,7 +2688,7 @@ async fn handle_action(
                     // Echoed as queued, not as a steer, so the
                     // distinction is visible.
                     render_user_echo(term, &format!("[queued] {missed}"))?;
-                    *follow_up = Some(missed);
+                    follow_up.push_back(missed);
                 }
             }
         }
