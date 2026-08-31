@@ -58,9 +58,30 @@ base_url = "https://api.openai.com/v1"
 #   "parallel"   (default) all calls run concurrently
 #   "sequential" one at a time, in the order the model emitted them
 #
-# Sequential is for stateful chains where order matters — e.g. a
-# `write` whose output the next `read` must see. It is slower; leave
-# it on the default unless you hit an ordering bug.
+# You do NOT need sequential to make same-file edits safe. In parallel
+# mode, `edit` and `write` calls targeting the same file are detected
+# (by resolved path, so `foo.txt` and `./foo.txt` count as one file)
+# and run one after another in the order the model emitted them.
+# Different files still run concurrently.
+#
+# What sequential is actually for:
+#
+#   1. Concurrent `bash` data loss. `bash` is NOT serialized — a
+#      command string cannot be analyzed to know which files it
+#      touches, so nanopi does not try. Two same-batch `bash` calls
+#      doing a read-modify-write of one file (`sed -i`, a formatter, a
+#      codemod) can each snapshot the file before the other writes, and
+#      whichever finishes last silently reverts the other. Both report
+#      success; nothing surfaces the loss. Sequential is the mitigation:
+#      the first command is awaited to completion before the second is
+#      spawned at all.
+#   2. Stateful chains where order matters across different tools —
+#      e.g. a `write` whose result the next `bash` must see.
+#
+# The cost is real: sequential serializes the *entire* batch, including
+# reads and greps that had no reason to wait. Reach for it if the model
+# is driving shell-based rewrites of the same files, or if you hit an
+# ordering bug; otherwise leave the default.
 # tool_exec_mode = "sequential"
 
 # ─── WASM extensions (v0.11.0) ──────────────────────────────────────
