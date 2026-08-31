@@ -1081,9 +1081,28 @@ impl Agent {
         let completed: std::sync::Arc<std::sync::Mutex<Vec<ToolCallOutcome>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let futs: Vec<_> = calls
+        // Per-path serialization. The batch is split into groups; the
+        // groups run concurrently, the calls inside one group run one
+        // after another in the order the model emitted them. A group is
+        // "the calls that mutate the same file" (see
+        // `tool::mutation_key`); every non-mutating call is its own
+        // one-element group, so it still runs fully in parallel.
+        //
+        // Sequential mode is NOT grouped, and that is load-bearing
+        // rather than an optimization: grouping reorders a batch (all
+        // calls for one key move to the position of the first of them),
+        // and Sequential's contract is "one at a time, in the order the
+        // model emitted them". One call per group reproduces today's
+        // behaviour exactly — including the per-call cancel checks
+        // below, which straddle group boundaries.
+        let groups: Vec<Vec<ToolCall>> = match self.tool_exec_mode {
+            crate::config::ToolExecMode::Sequential => calls.into_iter().map(|c| vec![c]).collect(),
+            crate::config::ToolExecMode::Parallel => group_by_mutation_key(&registry, &cwd, calls),
+        };
+
+        let futs: Vec<_> = groups
             .into_iter()
-            .map(|call| {
+            .map(|group| {
                 let cwd = cwd.clone();
                 let registry = registry.clone();
                 let session_path = session_path.clone();
@@ -1093,26 +1112,40 @@ impl Agent {
                 let tx = tx.clone();
                 let done = completed.clone();
                 async move {
-                    let outcome = run_one_tool(
-                        call,
-                        registry,
-                        session_path,
-                        session_id,
-                        cwd,
-                        permission,
-                        hooks,
-                        tx,
-                    )
-                    .await;
-                    // Recorded through a shared handle rather than only
-                    // returned, because `join_all`'s output is
-                    // all-or-nothing: when cancel wins the race below,
-                    // its `Vec` is empty even for tools that already
-                    // finished — and already wrote their real
-                    // ToolResult to the session file. Losing them there
-                    // is what made the cancel path append a SECOND,
-                    // contradictory entry for the same tool_call_id.
-                    done.lock().unwrap_or_else(|e| e.into_inner()).push(outcome);
+                    // Serial within the group. Awaiting each call before
+                    // starting the next is the whole guarantee: the
+                    // second `edit` of a file cannot snapshot it until
+                    // the first has written.
+                    for call in group {
+                        let outcome = run_one_tool(
+                            call,
+                            registry.clone(),
+                            session_path.clone(),
+                            session_id.clone(),
+                            cwd.clone(),
+                            permission.clone(),
+                            hooks.clone(),
+                            tx.clone(),
+                        )
+                        .await;
+                        // Recorded through a shared handle rather than
+                        // only returned, because `join_all`'s output is
+                        // all-or-nothing: when cancel wins the race
+                        // below, its `Vec` is empty even for tools that
+                        // already finished — and already wrote their
+                        // real ToolResult to the session file. Losing
+                        // them there is what made the cancel path append
+                        // a SECOND, contradictory entry for the same
+                        // tool_call_id.
+                        //
+                        // Pushing per call (not per group) keeps that
+                        // true at group granularity too: a cancel that
+                        // drops a group mid-way still leaves the calls
+                        // it already finished recorded here, so the
+                        // synthesis pass below only invents results for
+                        // calls that genuinely never ran.
+                        done.lock().unwrap_or_else(|e| e.into_inner()).push(outcome);
+                    }
                 }
             })
             .collect();
@@ -1278,6 +1311,51 @@ struct ToolCallOutcome {
     /// tools). Forwarded into context so the next request to a vision
     /// model can carry the image blocks.
     images: Vec<crate::tool::ImageAttachment>,
+}
+
+/// Split a parallel batch into groups that must not run concurrently
+/// with each other.
+///
+/// Calls sharing a `tool::mutation_key` land in one group and are run
+/// serially by the caller; calls with no key (`bash`, `read`, `grep`,
+/// `find`, `ls`, WASM plugin tools — see `tool::mutation_key` for why)
+/// each get their own group and stay fully parallel.
+///
+/// Two ordering properties the caller depends on:
+///
+///   - within a group, model order is preserved (calls are pushed in
+///     iteration order);
+///   - groups appear in order of their first member, so the batch's
+///     overall shape stays as close to model order as grouping allows.
+///
+/// Names are canonicalized first. `run_turn` already normalizes
+/// gateway-mangled names (`Edit_tool` → `edit`) before calling
+/// `execute_tool_calls`, but `execute_tool_calls` is `pub` and reachable
+/// with raw names, and a missed normalization here would silently
+/// degrade to "no serialization" rather than fail loudly.
+fn group_by_mutation_key(
+    registry: &ToolRegistry,
+    cwd: &Path,
+    calls: Vec<ToolCall>,
+) -> Vec<Vec<ToolCall>> {
+    let mut groups: Vec<Vec<ToolCall>> = Vec::new();
+    let mut index: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    for call in calls {
+        let name = registry
+            .canonical_name(&call.name)
+            .unwrap_or_else(|| call.name.clone());
+        match crate::tool::mutation_key(cwd, &name, &call.arguments) {
+            Some(key) => match index.get(&key) {
+                Some(&i) => groups[i].push(call),
+                None => {
+                    index.insert(key, groups.len());
+                    groups.push(vec![call]);
+                }
+            },
+            None => groups.push(vec![call]),
+        }
+    }
+    groups
 }
 
 /// Run a single tool call: hooks → execute → persist → render. Pure
@@ -3456,5 +3534,599 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────── concurrent file mutation under Parallel tool exec ───────
+    //
+    // `execute_tool_calls` groups a parallel batch by
+    // `tool::mutation_key` and runs same-key calls serially, so `edit`
+    // and `write` against one file are serialized. `bash` has no key
+    // (its command string is not analyzable) and stays fully parallel,
+    // so it can still lose an update. The tests below pin down both
+    // halves of that split, with the variable being *which tool*
+    // performs the concurrent mutation:
+    //
+    //   edit + edit  → safe, guaranteed by the per-path grouping
+    //   bash + bash  → genuinely races (no key, so no serialization)
+    //   Sequential   → the bash race disappears too, confirming the
+    //                  config knob is the real mitigation for bash
+
+    /// Builds an Agent wired to `dir` with the given exec mode.
+    fn concurrency_agent(dir: &std::path::Path, mode: crate::config::ToolExecMode) -> Agent {
+        let session_path = dir.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.to_path_buf(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: mode,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        }
+    }
+
+    /// Two `edit` calls hitting the same file in one parallel batch,
+    /// each replacing a different line. Both changes must survive.
+    ///
+    /// What guarantees this now is the per-path pipeline: both calls
+    /// resolve to the same `tool::mutation_key`, so
+    /// `execute_tool_calls` puts them in one group and awaits the first
+    /// to completion before starting the second. The second edit reads
+    /// a file that already contains the first edit's write.
+    ///
+    /// It is worth being precise about what changed, because the test
+    /// body did not. Before the pipeline this test also passed, but by
+    /// accident: `EditTool::execute` contains no `.await` between
+    /// `read_to_string` and `fs::write`, and `join_all` polls every
+    /// tool future on ONE task, so nothing could preempt an edit
+    /// mid-read-modify-write. That property still holds, and it must
+    /// still not be relied on — it is one keystroke from evaporating
+    /// (switching `edit` to `tokio::fs::…().await` reads like a
+    /// harmless async cleanup), and a second mechanism quietly
+    /// disappearing is exactly the kind of thing that goes unnoticed
+    /// while a test stays green for the wrong reason. The grouping is
+    /// the designed guarantee; the no-await property is an accident
+    /// that happens to agree with it.
+    ///
+    /// So this test now asserts the pipeline works. If it goes red,
+    /// suspect the grouping in `execute_tool_calls` or the key in
+    /// `tool::mutation_key`, not `edit.rs`.
+    #[tokio::test]
+    async fn parallel_edits_to_one_file_keep_both_changes() {
+        let dir = tmp();
+        let target = dir.join("foo.txt");
+        std::fs::write(&target, "alpha\nbravo\n").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "edit".into(),
+                        arguments: json!({
+                            "path": "foo.txt",
+                            "oldText": "alpha",
+                            "newText": "ALPHA"
+                        }),
+                    },
+                    ToolCall {
+                        id: "e2".into(),
+                        name: "edit".into(),
+                        arguments: json!({
+                            "path": "foo.txt",
+                            "oldText": "bravo",
+                            "newText": "BRAVO"
+                        }),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got, "ALPHA\nBRAVO\n",
+            "both edits must survive; a lost update here means the \
+             read-modify-write in edit.rs gained a yield point"
+        );
+    }
+
+    /// The batch shape that actually loses data: two `bash` calls
+    /// mutating one file.
+    ///
+    /// `bash` awaits, so unlike `edit` it has no atomic critical
+    /// section. Both children are spawned before either yields control
+    /// back, both snapshot the file at t≈spawn, both write their own
+    /// snapshot back at t≈spawn+300ms — so whichever writes second
+    /// silently reverts the other. Each command is a read-modify-write
+    /// straddling a sleep, which is the shape of any real `sed -i`,
+    /// formatter, or codemod the model might reach for.
+    ///
+    /// Note this is NOT reachable by pairing `bash` with `edit`: a
+    /// same-batch `edit` finishes its whole read-modify-write in
+    /// microseconds, while bash needs milliseconds just to fork/exec,
+    /// so bash always snapshots the post-edit file. The exposure is
+    /// specifically bash-against-bash, where the two sides are
+    /// symmetric and neither has an atomic section.
+    ///
+    /// Expected today: FAILS, and which change survives is genuinely
+    /// nondeterministic. Both tools report success — nothing surfaces
+    /// the loss to the model. Ignored so CI stays green; run with
+    /// `cargo test -- --ignored` to demonstrate the bug.
+    #[tokio::test]
+    #[ignore = "known bug: no per-path mutation queue, concurrent bash loses updates"]
+    async fn parallel_bash_calls_on_one_file_lose_an_update() {
+        let dir = tmp();
+        let target = dir.join("foo.txt");
+        std::fs::write(&target, "alpha\nbravo\n").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/alpha/ALPHA}\" > foo.txt"
+                        }),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/bravo/BRAVO}\" > foo.txt"
+                        }),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            got.contains("ALPHA") && got.contains("BRAVO"),
+            "both mutations must survive, got {got:?} — one bash wrote \
+             back a snapshot taken before the other committed"
+        );
+    }
+
+    // ─────────── the per-path pipeline itself (v0.11.0) ───────────
+
+    /// A stand-in for `write` that yields for `delay_ms` before touching
+    /// the file, so the grouping becomes observable in wall-clock time.
+    ///
+    /// The real `write` finishes its whole read-modify-write without an
+    /// `.await`, which is precisely why timing cannot distinguish
+    /// parallel from serial with it. This tool has the yield point the
+    /// real one lacks — i.e. it is the shape the real one might become —
+    /// so it measures the pipeline rather than an implementation
+    /// accident of `write.rs`.
+    struct SlowWriteTool {
+        delay_ms: u64,
+        /// Tags in the order calls actually *finished*. Some effects of
+        /// (mis)grouping are invisible in the resulting file contents
+        /// but plain here — notably a reorder, where the same writes
+        /// land in the same places, just not in the order the model
+        /// asked for.
+        journal: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for SlowWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "slow write stand-in".into(),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            }
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            ctx: &crate::tool::ToolContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            let path = args["path"].as_str().unwrap_or_default().to_string();
+            let abs = crate::tool::resolve_in_cwd(&ctx.cwd, &path)
+                .map_err(crate::tool::ToolError::Execution)?;
+            // Read-modify-write straddling a yield: appends its own tag
+            // to whatever it saw. Two of these racing lose a tag.
+            let before = std::fs::read_to_string(&abs).unwrap_or_default();
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let tag = args["content"].as_str().unwrap_or("?");
+            std::fs::write(&abs, format!("{before}{tag}")).unwrap();
+            self.journal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(tag.to_string());
+            Ok(crate::tool::ToolOutput {
+                content: "ok".into(),
+                is_error: false,
+                metadata: None,
+                images: Vec::new(),
+            })
+        }
+    }
+
+    /// Registry whose `write` is the slow stand-in above, plus the
+    /// completion journal it writes into. Built from `new()` rather than
+    /// `standard()` so `register_external` does not hit the
+    /// anti-shadowing refusal.
+    #[allow(clippy::type_complexity)]
+    fn slow_write_registry(
+        delay_ms: u64,
+    ) -> (ToolRegistry, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let journal = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut r = ToolRegistry::new();
+        r.register_external(std::sync::Arc::new(SlowWriteTool {
+            delay_ms,
+            journal: journal.clone(),
+        }))
+        .expect("fresh registry has no `write` to shadow");
+        (r, journal)
+    }
+
+    /// The over-serialization guard. Two `write` calls to DIFFERENT
+    /// files get different mutation keys, so they must land in different
+    /// groups and still run concurrently.
+    ///
+    /// This is the failure mode a naive "just take one global file lock"
+    /// fix would have: correct, and quietly half the throughput on every
+    /// multi-file batch the model emits (which is most of them).
+    #[tokio::test]
+    async fn parallel_writes_to_different_paths_stay_parallel() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        std::fs::write(dir.join("b.txt"), "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        agent.registry = slow_write_registry(400).0;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        let start = std::time::Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "A"}),
+                    },
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "b.txt", "content": "B"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        let elapsed = start.elapsed();
+        while rx.try_recv().is_ok() {}
+
+        let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let b = std::fs::read_to_string(dir.join("b.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            ("A", "B"),
+            "both writes must land"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "two writes to different paths must run in parallel; took \
+             {elapsed:?} for 2×400ms, which is serial — the mutation key \
+             is over-matching and grouping unrelated files together"
+        );
+    }
+
+    /// The other side of the same coin: two `write` calls to the SAME
+    /// file share a key, so the pipeline must serialize them.
+    ///
+    /// Both assertions matter. The timing one proves they did not
+    /// overlap; the content one proves the serialization actually
+    /// prevented the lost update, and that the calls ran in the order
+    /// the model emitted them rather than whatever order the executor
+    /// found convenient.
+    #[tokio::test]
+    async fn parallel_writes_to_one_path_are_serialized_in_order() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        agent.registry = slow_write_registry(400).0;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        let start = std::time::Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "A"}),
+                    },
+                    // Same file, spelled differently on purpose: the key
+                    // must collapse `./a.txt` onto `a.txt`.
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "./a.txt", "content": "B"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        let elapsed = start.elapsed();
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got, "AB",
+            "same-file writes must serialize in model order; {got:?} means \
+             the second call snapshotted the file before the first wrote"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(750),
+            "expected two serialized 400ms writes, got {elapsed:?} — they \
+             overlapped, so the two spellings did not share a key"
+        );
+    }
+
+    /// The grouping contract, tested directly on the pure function so
+    /// the ordering properties `execute_tool_calls` relies on are pinned
+    /// without timing.
+    #[test]
+    fn group_by_mutation_key_shapes_the_batch() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let registry = ToolRegistry::standard();
+
+        let call = |id: &str, name: &str, args: serde_json::Value| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args,
+        };
+
+        let groups = group_by_mutation_key(
+            &registry,
+            &dir,
+            vec![
+                call(
+                    "1",
+                    "edit",
+                    json!({"path": "a.txt", "oldText": "x", "newText": "y"}),
+                ),
+                call("2", "bash", json!({"command": "ls"})),
+                call("3", "write", json!({"path": "./a.txt", "content": "z"})),
+                call("4", "read", json!({"path": "a.txt"})),
+                call("5", "write", json!({"path": "b.txt", "content": "z"})),
+                call(
+                    "6",
+                    "edit",
+                    json!({"path": "a.txt", "oldText": "x", "newText": "w"}),
+                ),
+            ],
+        );
+
+        let ids: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|g| g.iter().map(|c| c.id.as_str()).collect())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                // a.txt: all three spellings collapse, in model order,
+                // and the group sits where its FIRST member was.
+                vec!["1", "3", "6"],
+                // bash and read are unserialized, each its own group.
+                vec!["2"],
+                vec!["4"],
+                // b.txt is a separate file, so a separate group.
+                vec!["5"],
+            ],
+            "grouping must collapse same-file mutations in model order \
+             while leaving everything else parallel"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gateway-mangled names must still group. If `Write_tool` failed to
+    /// canonicalize to `write` here, the key would come back `None` and
+    /// the serialization would silently not happen — a failure that is
+    /// invisible except as a rare lost update.
+    #[test]
+    fn group_by_mutation_key_canonicalizes_mangled_tool_names() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let groups = group_by_mutation_key(
+            &ToolRegistry::standard(),
+            &dir,
+            vec![
+                ToolCall {
+                    id: "1".into(),
+                    name: "Write_tool".into(),
+                    arguments: json!({"path": "a.txt", "content": "z"}),
+                },
+                ToolCall {
+                    id: "2".into(),
+                    name: "EDIT_TOOL".into(),
+                    arguments: json!({"path": "a.txt", "oldText": "x", "newText": "y"}),
+                },
+            ],
+        );
+
+        assert_eq!(groups.len(), 1, "mangled names must canonicalize and group");
+        assert_eq!(groups[0].len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sequential mode must NOT be regrouped: its contract is "every
+    /// call, one at a time, in the order the model emitted them", and
+    /// grouping reorders a batch — same-key calls migrate to the
+    /// position of the first of them. In the batch below, grouping would
+    /// hoist `C` (a.txt) ahead of `B` (b.txt).
+    ///
+    /// The assertion is on completion ORDER, not on timing or file
+    /// contents, because those two do not distinguish the cases: a
+    /// grouped Sequential run still awaits every group serially, so it
+    /// still takes 3×200ms, and `a.txt` still ends up "AC" and `b.txt`
+    /// still "B" either way. The reorder is the entire observable
+    /// difference, and for a `write`-then-`bash`-then-`write` chain —
+    /// exactly what `sequential` exists to serve — a reorder is a
+    /// correctness bug.
+    #[tokio::test]
+    async fn sequential_mode_is_not_regrouped() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        std::fs::write(dir.join("b.txt"), "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Sequential);
+        let (registry, journal) = slow_write_registry(50);
+        agent.registry = registry;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "A"}),
+                    },
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "b.txt", "content": "B"}),
+                    },
+                    // Same key as w1. Grouping would pull this call up
+                    // next to it, ahead of w2.
+                    ToolCall {
+                        id: "w3".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "C"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let order = journal.lock().unwrap().clone();
+        let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let b = std::fs::read_to_string(dir.join("b.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            order,
+            vec!["A", "B", "C"],
+            "sequential mode must run the batch in model order; \
+             [\"A\", \"C\", \"B\"] means the per-path grouping leaked into \
+             the Sequential arm and reordered the batch"
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("AC", "B"));
+    }
+
+    /// The same batch as the test above under
+    /// `tool_exec_mode = "sequential"`. The first bash is awaited to
+    /// completion before the second is spawned at all, so the second
+    /// snapshots the first's output instead of racing it and both
+    /// mutations land.
+    ///
+    /// This is what makes `sequential` a genuine mitigation rather than
+    /// a placebo — at the cost of serialising every tool in the batch.
+    #[tokio::test]
+    async fn sequential_mode_prevents_the_concurrent_bash_race() {
+        let dir = tmp();
+        let target = dir.join("foo.txt");
+        std::fs::write(&target, "alpha\nbravo\n").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Sequential);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/alpha/ALPHA}\" > foo.txt"
+                        }),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/bravo/BRAVO}\" > foo.txt"
+                        }),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            got.contains("ALPHA") && got.contains("BRAVO"),
+            "sequential mode must serialise the batch, got {got:?}"
+        );
     }
 }

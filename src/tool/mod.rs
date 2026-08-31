@@ -151,6 +151,114 @@ fn canonicalize_deepest_existing(p: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// The *mutation key* for one tool call: an identifier for the single
+/// file this call will mutate, or `None` if it mutates no one knowable
+/// path. `agent::loop_::execute_tool_calls` groups a parallel batch by
+/// this key and runs same-key calls serially, in model order.
+///
+/// Only `edit` and `write` get a key. This mirrors the reference
+/// implementation (PI's `file-mutation-queue.ts`, applied at
+/// `edit.ts:312` and `write.ts:203` and nowhere else): those two are
+/// the tools that do a read-modify-write of a path the caller names, so
+/// they are the ones where two same-batch calls can silently lose an
+/// update.
+///
+/// Load-bearing precondition: **one call mutates at most one knowable
+/// path**, which is why the return is a single `Option<PathBuf>` and why
+/// grouping can be a HashMap bucketing by equality. Both tools take a
+/// singular `path` at the top level of their arguments, so it holds
+/// today.
+///
+/// It is worth knowing what would break it. Giving `edit` PI's
+/// multi-replacement shape does NOT: PI keeps `path` singular and puts
+/// only `oldText`/`newText` pairs in the array (`edit.ts`'s
+/// `editSchema`), so nothing here would need to change — this function
+/// never reads `oldText`/`newText`, only the tool name and `path`.
+/// Moving `path` *into* such an array — one call editing several files —
+/// is the change that breaks it: the key becomes a set, and grouping
+/// stops being "equal keys" and becomes "key sets that intersect", i.e.
+/// connected components rather than a hash bucket. Do not extend the
+/// schema that way without rewriting `group_by_mutation_key` to match.
+///
+/// Everything else is deliberately `None`:
+///
+///   - `bash` could mutate anything, or nothing, and the command string
+///     is not statically analyzable. Serializing it would mean
+///     serializing the whole batch, which is what `tool_exec_mode =
+///     "sequential"` already offers as an explicit opt-in. So concurrent
+///     `bash` against one file remains a real (documented, tested) way
+///     to lose an update — see
+///     `parallel_bash_calls_on_one_file_lose_an_update`.
+///   - `read`, `grep`, `find`, `ls` do not mutate.
+///   - externally registered WASM plugin tools cannot mutate the
+///     filesystem at all: the host exposes exactly `host-log`,
+///     `host-fs-read` and `host-http-get` (verified in
+///     `wasm/loader.rs`), with no write capability. If a `host-fs-write`
+///     is ever added, THIS DECISION MUST BE REVISITED — a plugin tool
+///     would then need a key too, and the key would have to come from
+///     somewhere other than a hardcoded tool-name match.
+///
+/// Known blind spot: **hard links**. Two paths sharing one inode
+/// canonicalize to two different keys, so `edit a.txt` and
+/// `edit b.txt` on the same inode are placed in different groups and
+/// still race. `write` happens to be immune — it refuses `nlink > 1`
+/// outright (`write.rs`) — but `edit` has no such check and none is
+/// being added: an nlink check on `edit` would break the legitimate and
+/// not-rare case of editing a hard-linked file in a repo that uses
+/// them, to close a race that requires the model to name both aliases
+/// in one batch. Documented rather than fixed.
+///
+/// The key is `resolve_in_cwd` + `canonicalize`, so `foo.txt`,
+/// `./foo.txt` and `/abs/cwd/foo.txt` all collapse to one key, as do
+/// two different symlinks to one file.
+///
+/// On the collapsing: `resolve_in_cwd` alone already does all of it
+/// today, because it ends in `canonicalize_deepest_existing`, which
+/// fully canonicalizes any path that exists. The explicit
+/// `canonicalize` below is therefore currently redundant — removing it
+/// breaks no test, verified. It stays anyway, because
+/// `resolve_in_cwd`'s canonicalization is *incidental* to its actual
+/// job (the cwd boundary check) and not part of its contract: were it
+/// ever relaxed to a cheaper lexical check, the boundary check would
+/// still be sound while every symlink alias here would silently split
+/// into a separate key — a lost update with no failing test. This call
+/// is the belt to that suspenders, and it costs one `stat`.
+pub(crate) fn mutation_key(cwd: &Path, tool_name: &str, args: &Value) -> Option<PathBuf> {
+    if tool_name != "edit" && tool_name != "write" {
+        return None;
+    }
+    // No `path`, or a non-string one: the tool itself will reject the
+    // call in its own arg parsing, before touching the filesystem, so
+    // there is nothing to serialize against.
+    let path_str = args.get("path")?.as_str()?;
+    // Same resolution the tools themselves use, so the key names the
+    // path they will actually open. A resolution failure (escapes cwd,
+    // dangling symlink) means the tool will refuse too — again nothing
+    // to serialize.
+    let resolved = resolve_in_cwd(cwd, path_str).ok()?;
+    match std::fs::canonicalize(&resolved) {
+        Ok(real) => Some(real),
+        // The `write`-creates-a-new-file case: nothing to canonicalize
+        // yet. PI does exactly this (ENOENT/ENOTDIR → the merely
+        // resolved path). `resolve_in_cwd` has already canonicalized
+        // the deepest existing ancestor, so the fallback key is stable
+        // across spellings of the same not-yet-existing file.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(resolved)
+        }
+        // PI rethrows here. We cannot: an error out of this function
+        // would have to become `None`, i.e. *less* serialization, on a
+        // path we have every reason to believe is a real mutation
+        // target. The resolved path is already a stable key, so use it.
+        Err(_) => Some(resolved),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("invalid arguments: {0}")]
@@ -423,6 +531,201 @@ mod tests {
             names,
             vec!["bash", "edit", "find", "grep", "ls", "read", "write"]
         );
+    }
+
+    // ───────────────── mutation_key (v0.11.0) ─────────────────
+
+    fn key_tmp() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nanopi-mutkey-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        // Canonicalized because on macOS `temp_dir()` is itself behind a
+        // `/var -> /private/var` symlink, so an uncanonicalized cwd
+        // would make every assertion below trivially true for the wrong
+        // reason.
+        std::fs::canonicalize(&p).unwrap()
+    }
+
+    /// The three spellings a model actually emits for one file must all
+    /// produce the same key — otherwise same-file calls land in
+    /// different groups and the serialization silently does nothing.
+    #[test]
+    fn mutation_key_collapses_path_spellings() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("foo.txt"), "x").unwrap();
+
+        let abs = cwd.join("foo.txt");
+        let variants = [
+            "foo.txt",
+            "./foo.txt",
+            abs.to_str().unwrap(),
+            // A `..` round-trip lands on the same file too.
+            "./sub/../foo.txt",
+        ];
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+
+        let keys: Vec<Option<PathBuf>> = variants
+            .iter()
+            .map(|v| mutation_key(&cwd, "edit", &json!({"path": v})))
+            .collect();
+
+        assert_eq!(
+            keys[0],
+            Some(abs.clone()),
+            "relative path must key on the absolute canonical path"
+        );
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                k, &keys[0],
+                "spelling {:?} produced a different key",
+                variants[i]
+            );
+        }
+
+        // `write` keys identically to `edit` — they share a queue.
+        assert_eq!(
+            mutation_key(&cwd, "write", &json!({"path": "foo.txt"})),
+            keys[0],
+            "write and edit must share one key for one file"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The `write`-creates-a-new-file case: nothing to canonicalize, but
+    /// the key must still exist and still be stable across spellings.
+    /// Without this, two `write` calls creating the same new file would
+    /// not be serialized at all.
+    #[test]
+    fn mutation_key_stable_for_not_yet_existing_file() {
+        let cwd = key_tmp();
+
+        let a = mutation_key(&cwd, "write", &json!({"path": "new.txt"}));
+        let b = mutation_key(&cwd, "write", &json!({"path": "./new.txt"}));
+        let c = mutation_key(
+            &cwd,
+            "write",
+            &json!({"path": cwd.join("new.txt").to_str().unwrap()}),
+        );
+
+        assert_eq!(
+            a,
+            Some(cwd.join("new.txt")),
+            "must key on the resolved path"
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert!(
+            !cwd.join("new.txt").exists(),
+            "computing a key must not create the file"
+        );
+
+        // Also true one directory deeper, where the parent does not
+        // exist either (`write` creates parents).
+        let deep = mutation_key(&cwd, "write", &json!({"path": "a/b/c.txt"}));
+        assert_eq!(deep, Some(cwd.join("a/b/c.txt")));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Two symlinks to one file must collapse to one key, or the
+    /// pipeline would let two aliases of one file race.
+    ///
+    /// Note this passes on `resolve_in_cwd`'s canonicalization alone —
+    /// it does NOT exercise the explicit `canonicalize` in
+    /// `mutation_key`, which is redundant today. See that function's
+    /// doc comment for why the redundant call is kept regardless. The
+    /// property under test is the one that matters either way.
+    #[test]
+    #[cfg(unix)]
+    fn mutation_key_follows_symlinks_to_one_key() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(cwd.join("real.txt"), cwd.join("link.txt")).unwrap();
+
+        assert_eq!(
+            mutation_key(&cwd, "edit", &json!({"path": "link.txt"})),
+            mutation_key(&cwd, "edit", &json!({"path": "real.txt"})),
+            "a symlink and its target are one file and must share a key"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Non-mutating and unanalyzable tools get no key, so they are never
+    /// serialized against anything. `bash` being in this list is a
+    /// deliberate design decision, not an oversight — see
+    /// `mutation_key`'s doc comment.
+    #[test]
+    fn mutation_key_none_for_non_mutating_tools() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("foo.txt"), "x").unwrap();
+
+        for tool in ["bash", "read", "grep", "find", "ls"] {
+            assert_eq!(
+                mutation_key(&cwd, tool, &json!({"path": "foo.txt"})),
+                None,
+                "{tool} must not take a mutation key"
+            );
+        }
+        // A WASM plugin tool, named whatever the component declares.
+        assert_eq!(
+            mutation_key(&cwd, "my-plugin-tool", &json!({"path": "foo.txt"})),
+            None,
+            "external plugin tools have no fs-write capability, so no key"
+        );
+        // bash's real argument shape has no `path` at all.
+        assert_eq!(
+            mutation_key(&cwd, "bash", &json!({"command": "rm -rf foo.txt"})),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Malformed or refused args yield `None`: the tool will reject the
+    /// call in its own arg parsing before touching the filesystem, so
+    /// there is nothing to serialize against.
+    #[test]
+    fn mutation_key_none_for_unusable_args() {
+        let cwd = key_tmp();
+
+        assert_eq!(
+            mutation_key(&cwd, "edit", &json!({"oldText": "a"})),
+            None,
+            "missing path"
+        );
+        assert_eq!(
+            mutation_key(&cwd, "write", &json!({"path": 42})),
+            None,
+            "non-string path"
+        );
+        assert_eq!(
+            mutation_key(&cwd, "write", &json!({"path": "../../etc/passwd"})),
+            None,
+            "path escaping cwd is refused by resolve_in_cwd, so no key"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Two different files must NOT share a key — the whole point is
+    /// that unrelated mutations still run in parallel.
+    #[test]
+    fn mutation_key_distinguishes_different_files() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("a.txt"), "x").unwrap();
+        std::fs::write(cwd.join("b.txt"), "x").unwrap();
+
+        let a = mutation_key(&cwd, "write", &json!({"path": "a.txt"}));
+        let b = mutation_key(&cwd, "write", &json!({"path": "b.txt"}));
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(
+            a, b,
+            "different files must not be serialized against each other"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[tokio::test]
