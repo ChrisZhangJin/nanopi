@@ -192,8 +192,10 @@ pub fn write_key_file(path: &Path, key: &str) -> anyhow::Result<()> {
 }
 
 /// Emit a minimal `config.toml` containing just the four essentials.
-/// `api_key_file` is `Some("~/.nanopi/api_key")` for normal providers,
-/// `None` for localhost (no key needed, no file to reference).
+///
+/// `api_key_file` should be an absolute path — the wizard passes the
+/// very path it wrote the key to. Backslashes are escaped by
+/// `toml_escape`, so Windows paths survive the round-trip verbatim.
 pub fn write_config_toml(
     path: &Path,
     model: &str,
@@ -475,8 +477,19 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
         // We always emit api_key_file so subsequent launches load
         // cleanly — the config loader accepts an empty key file for
         // no-auth localhost endpoints.
+        //
+        // The path we emit is the same absolute `key_path` we just
+        // wrote to, never a `~/…` literal: the two sides used to
+        // disagree about where `~` points, which broke every Windows
+        // first run.
         write_key_file(&key_path, &api_key)?;
-        write_config_toml(&cfg_path, &model, &base_url, &api_kind, Some("~/.nanopi/api_key"))?;
+        write_config_toml(
+            &cfg_path,
+            &model,
+            &base_url,
+            &api_kind,
+            Some(&key_path.to_string_lossy()),
+        )?;
         let _ = std::fs::remove_file(&draft_path);
 
         println!();
@@ -552,7 +565,7 @@ mod tests {
             "gpt-4o-mini",
             "https://api.openai.com/v1",
             "openai",
-            Some("~/.nanopi/api_key"),
+            Some("/home/u/.nanopi/api_key"),
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -563,8 +576,36 @@ mod tests {
         assert_eq!(cfg.api_kind.as_deref(), Some("openai"));
         assert_eq!(
             cfg.api_key_file.as_deref(),
-            Some(std::path::Path::new("~/.nanopi/api_key"))
+            Some(std::path::Path::new("/home/u/.nanopi/api_key"))
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_config_toml_round_trips_a_windows_path() {
+        // Regression: the wizard used to emit the literal
+        // "~/.nanopi/api_key", which the reader couldn't expand on
+        // Windows (no $HOME) — every first run died with os error 3.
+        // Now it emits the absolute path, so backslashes must survive
+        // TOML escaping intact.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "nanopi-wizard-cfg-win-{}.toml",
+            crate::util::uuid::v7()
+        ));
+        let key = r"C:\Users\dell\.nanopi\api_key";
+        write_config_toml(
+            &path,
+            "gpt-4o-mini",
+            "https://api.openai.com/v1",
+            "openai",
+            Some(key),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r"C:\\Users\\dell"), "unescaped: {text}");
+        let cfg: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.api_key_file.as_deref(), Some(std::path::Path::new(key)));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -583,7 +624,7 @@ mod tests {
             "llama3.2",
             "http://localhost:11434/v1",
             "openai",
-            Some("~/.nanopi/api_key"),
+            Some("/home/u/.nanopi/api_key"),
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -592,7 +633,7 @@ mod tests {
         assert_eq!(cfg.model.as_deref(), Some("llama3.2"));
         assert_eq!(
             cfg.api_key_file.as_deref(),
-            Some(std::path::Path::new("~/.nanopi/api_key"))
+            Some(std::path::Path::new("/home/u/.nanopi/api_key"))
         );
         let _ = std::fs::remove_file(&path);
     }
