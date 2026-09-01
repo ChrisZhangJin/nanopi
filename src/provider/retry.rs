@@ -147,6 +147,53 @@ pub(crate) fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Flatten a gateway error body into one printable line, capped at `n`
+/// characters.
+///
+/// Gateways answer with multi-line HTML — an nginx/openresty 404 page
+/// is six lines of tag soup — and the TUI redraws over its own lines
+/// while the spinner runs, so a multi-line body gets shredded on the
+/// way to the terminal: the user sees `<html>\nFound</h1></center>t
+/// Found</title></head>` and none of the status code that actually
+/// mattered. Strip the tags, collapse the whitespace, cut it short.
+pub(crate) fn flatten_error_body(s: &str, n: usize) -> String {
+    let text = if looks_like_html(s) {
+        strip_tags(s)
+    } else {
+        s.to_string()
+    };
+    truncate(&text.split_whitespace().collect::<Vec<_>>().join(" "), n)
+}
+
+/// Cheap sniff — enough to catch the error pages gateways actually
+/// serve. A JSON or plain-text body must not match, or we'd eat the
+/// `<` in a legitimate error message.
+fn looks_like_html(s: &str) -> bool {
+    let head: String = s
+        .trim_start()
+        .chars()
+        .take(200)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    head.starts_with("<!doctype html") || head.starts_with("<html") || head.contains("<html>")
+}
+
+/// Drop everything between `<` and `>`. Unclosed `<` swallows the rest,
+/// which is the right call for a truncated error page.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Compute the delay for attempt `n` (0-indexed): exponential base *
 /// 2^n, then jitter (subtract up to `jitter` fraction), then cap.
 /// A server-provided `Retry-After` always wins (still capped by
@@ -183,6 +230,48 @@ mod tests {
             );
         }
         h
+    }
+
+    /// The exact body MiniMax's gateway returns for a wrong path, which
+    /// is what shredded the terminal in the reported 404.
+    const NGINX_404: &str = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>\r\n";
+
+    #[test]
+    fn flatten_error_body_makes_an_html_page_one_readable_line() {
+        let out = flatten_error_body(NGINX_404, 300);
+        assert_eq!(out, "404 Not Found 404 Not Found openresty");
+        assert!(!out.contains('<'), "tags survived: {out}");
+        assert!(
+            !out.contains('\n') && !out.contains('\r'),
+            "newlines: {out}"
+        );
+    }
+
+    #[test]
+    fn flatten_error_body_caps_length() {
+        let out = flatten_error_body(NGINX_404, 10);
+        assert_eq!(out, "404 Not Fo…");
+    }
+
+    #[test]
+    fn flatten_error_body_leaves_plain_messages_alone() {
+        // A JSON/plain message must not be tag-stripped — the `<` in a
+        // real error message is content, not markup.
+        let msg = "model `x` not found; expected one of <list>";
+        assert_eq!(flatten_error_body(msg, 300), msg);
+        assert_eq!(
+            flatten_error_body("invalid api key", 300),
+            "invalid api key"
+        );
+    }
+
+    #[test]
+    fn flatten_error_body_collapses_multiline_json() {
+        let body = "{\n  \"error\": {\n    \"message\": \"nope\"\n  }\n}";
+        assert_eq!(
+            flatten_error_body(body, 300),
+            "{ \"error\": { \"message\": \"nope\" } }"
+        );
     }
 
     #[test]
