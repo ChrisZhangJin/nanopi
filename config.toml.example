@@ -55,7 +55,10 @@ base_url = "https://api.openai.com/v1"
 # ─── API key: pick ONE of the two below ─────────────────────────────
 
 # Option A — file (recommended). Path to a chmod-600 file containing
-# just the token. `~/` expands to $HOME.
+# just the token. An absolute path is safest — that's what `nanopi init`
+# writes. `~/` and `$HOME/` are also expanded (on Windows, via the
+# profile folder, since cmd and PowerShell don't set $HOME), and
+# `~/.nanopi/...` follows NANOPI_HOME when you've set it.
 # api_key_file = "~/.nanopi/api_key"
 
 # Option B — inline (convenient for local dev). A stderr warning fires

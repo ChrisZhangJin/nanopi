@@ -113,28 +113,11 @@ pub enum HookOutcome {
     },
 }
 
-/// Expand `~`, `$HOME`, `${HOME}` in a hook command. Relative paths
-/// resolve against `~/.nanopi/hooks/`.
+/// Expand `~`, `$HOME`, `${HOME}` in a hook command. Anything else —
+/// including a relative path — is passed to the shell unchanged, so it
+/// resolves against the process cwd.
 pub fn expand_command(command: &str) -> PathBuf {
-    let expanded = if let Some(stripped) = command.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            format!("{}/{}", home.to_string_lossy(), stripped)
-        } else {
-            command.to_string()
-        }
-    } else if command.starts_with("${HOME}/") || command.starts_with("$HOME/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            let stripped = command
-                .trim_start_matches("${HOME}/")
-                .trim_start_matches("$HOME/");
-            format!("{}/{}", home.to_string_lossy(), stripped)
-        } else {
-            command.to_string()
-        }
-    } else {
-        command.to_string()
-    };
-    PathBuf::from(expanded)
+    crate::paths::expand_home(command)
 }
 
 /// Check if `matcher` (regex) matches `tool_name`. Empty matches all.

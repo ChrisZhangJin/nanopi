@@ -450,14 +450,8 @@ fn is_init_subcommand(args: &Args) -> bool {
         && args.append_system_prompt.is_empty()
 }
 
-/// Expand a leading `~/` to `$HOME/`. Best-effort — if HOME is unset,
-/// the path is returned unchanged.
+/// Expand a leading `~` / `$HOME` in a config-supplied path. Thin
+/// wrapper over [`nanopi::paths::expand_home`], which takes a `&str`.
 fn expand_tilde(p: &std::path::Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    p.to_path_buf()
+    nanopi::paths::expand_home(&p.to_string_lossy())
 }
