@@ -1,6 +1,6 @@
 [package]
 name = "nanopi"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 # `description` 是 crates.io 搜索结果里显示的那一行 —— 把差异点写进去，
 # 别写「a minimal port」这种谁都能说的话。参照：同类的 pi_agent_rust
