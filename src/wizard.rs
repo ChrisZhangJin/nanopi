@@ -146,7 +146,10 @@ pub async fn probe_config(
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(240).collect();
+            // A wrong base_url gets an HTML error page here, and 240
+            // raw chars of that is unreadable — same flattening the
+            // provider error path uses.
+            let snippet = crate::provider::retry::flatten_error_body(&body, 240);
             Err(format!("HTTP {}: {snippet}", status.as_u16()))
         }
         Err(e) => {

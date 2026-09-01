@@ -414,7 +414,13 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                     let retryable =
                         is_retryable_status(status.as_u16()) || is_retryable_message(&body_text);
                     if attempt >= retry.max_attempts || !retryable {
-                        return Err(format!("HTTP {}: {}", status.as_u16(), body_text));
+                        // `retryable` above saw the full body; only the
+                        // user-facing string gets flattened.
+                        return Err(format!(
+                            "HTTP {}: {}",
+                            status.as_u16(),
+                            crate::provider::retry::flatten_error_body(&body_text, 300)
+                        ));
                     }
                     let delay = compute_delay(attempt, &retry, hint, rand01());
                     eprintln!(
@@ -423,7 +429,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                         retry.max_attempts,
                         delay.as_secs_f64(),
                         status.as_u16(),
-                        truncate(&body_text, 100),
+                        crate::provider::retry::flatten_error_body(&body_text, 100),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;

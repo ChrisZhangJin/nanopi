@@ -516,9 +516,12 @@ impl OpenAiProvider {
                     let retryable = crate::provider::retry::is_retryable_status(status.as_u16())
                         || crate::provider::retry::is_retryable_message(&clean);
                     if attempt >= retry.max_attempts || !retryable {
+                        // Flatten only on the way out — `retryable` above
+                        // is decided on the full text so truncation can't
+                        // hide a retry keyword.
                         return Err(OpenAiError::Status {
                             status: status.as_u16(),
-                            body: clean,
+                            body: crate::provider::retry::flatten_error_body(&clean, 300),
                         });
                     }
                     let delay =
@@ -529,7 +532,7 @@ impl OpenAiProvider {
                         retry.max_attempts,
                         delay.as_secs_f64(),
                         status.as_u16(),
-                        truncate(&clean, 100),
+                        crate::provider::retry::flatten_error_body(&clean, 100),
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
