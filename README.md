@@ -21,6 +21,12 @@ Runs on Alpine, on CentOS 6, and anywhere `npm install` isn't an option.
 
 <img src="https://raw.githubusercontent.com/ChrisZhangJin/nanopi/main/img/tui.png" alt="nanopi TUI screenshot" width="760">
 
+<p><em>TUI on Linux (macOS / Linux terminal)</em></p>
+
+<img src="https://raw.githubusercontent.com/ChrisZhangJin/nanopi/main/img/tui_win.png" alt="nanopi TUI screenshot (Windows)" width="760">
+
+<p><em>TUI on Windows — captured from <code>nanopi.exe</code> on Windows 10/11</em></p>
+
 </div>
 
 ---
