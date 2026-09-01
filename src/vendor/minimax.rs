@@ -11,8 +11,14 @@ pub struct MinimaxVendor;
 impl Vendor for MinimaxVendor {
     fn id(&self) -> &'static str { "minimax" }
     fn transport(&self) -> ApiKind { ApiKind::Anthropic }
+    /// MiniMax answers on two hosts — the older `api.minimax.chat` and
+    /// the current `api.minimaxi.com` (the one behind the
+    /// `platform.minimaxi.com` console). Both still serve
+    /// `/anthropic/v1/messages`; we default to the current one. An
+    /// explicit `base_url` for either host keeps working, since
+    /// `pick_vendor` sniffs on the substring "minimax".
     fn default_base_url(&self) -> Option<&'static str> {
-        Some("https://api.minimax.chat/anthropic")
+        Some("https://api.minimaxi.com/anthropic")
     }
     fn supports_thinking(&self, model: &str) -> bool {
         let m = model.to_ascii_lowercase();

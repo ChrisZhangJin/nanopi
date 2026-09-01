@@ -275,6 +275,7 @@ mod tests {
         assert_eq!(pick_vendor(None, Some("https://api.z.ai/api/paas/v4"), "m").id(), "zai");
         assert_eq!(pick_vendor(None, Some("https://dashscope.aliyuncs.com/x"), "m").id(), "qwen");
         assert_eq!(pick_vendor(None, Some("https://api.minimax.chat/anthropic"), "m").id(), "minimax");
+        assert_eq!(pick_vendor(None, Some("https://api.minimaxi.com/anthropic"), "m").id(), "minimax");
         assert_eq!(pick_vendor(None, Some("https://xiaomimimo.example.com"), "m").id(), "xiaomi");
         assert_eq!(pick_vendor(None, Some("https://api.anthropic.com"), "m").id(), "anthropic");
     }
