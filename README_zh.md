@@ -21,6 +21,12 @@ Alpine 能跑，CentOS 6 能跑，`npm install` 跑不通的地方它也能跑�
 
 <img src="https://raw.githubusercontent.com/ChrisZhangJin/nanopi/main/img/tui.png" alt="nanopi TUI 截图" width="760">
 
+<p><em>Linux 上的 TUI（macOS / Linux 终端）</em></p>
+
+<img src="https://raw.githubusercontent.com/ChrisZhangJin/nanopi/main/img/tui_win.png" alt="nanopi TUI 截图（Windows）" width="760">
+
+<p><em>Windows 上的 TUI —— 在 Windows 10/11 上跑 <code>nanopi.exe</code> 实拍</em></p>
+
 </div>
 
 ---
