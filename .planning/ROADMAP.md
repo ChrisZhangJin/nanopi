@@ -57,15 +57,24 @@ Also landed in this milestone:
   gate in `release.yml`), per `.planning/PLAN-VERSION.md` — that plan
   is **done**, not pending.
 
+- **Plugin slash-command registration** (`4df493b`…`e9ce962`,
+  2026-09-02) — the last plugin capability. A component may export
+  `list-commands` / `execute-command` from a second WIT world,
+  `extension-commands`, which `include`s the first so tool-only
+  plugins keep building unchanged. A command returns an action rather
+  than calling back into the host, keeping the import list at three.
+  Pi's dispatch shape was followed
+  (`.planning/reference/pi-slash-commands.md`, since verified against
+  Pi's source); its collision rules deliberately were not — nanopi
+  refuses rather than renaming. Shipped alongside two adjacent fixes:
+  plugins now load on resumed sessions, and a leading space no longer
+  routes a slash command to the model as chat text.
+
 **Deferred to a later milestone** (from the parity review):
-- **Plugin slash-command registration.** The WIT world exports only
-  `list-tools` / `execute-tool`; a plugin cannot register a command.
-  Upstream Pi's dispatch model is traced in
-  `.planning/reference/pi-slash-commands.md` — note its trust model
-  does not transfer, since nanopi plugins are sandboxed and
-  capability-gated where Pi's are unsandboxed in-process imports.
-  This is the largest remaining plugin capability.
 - Per-tool `executionMode` override.
+- **Plugin hot reload.** `/reload` deliberately skips `[[extensions]]`
+  and says so; doing it properly needs an unregister path on
+  `ToolRegistry` plus a generation counter on `ComponentBridge`.
 - Provider registration from plugins; session-management hooks beyond
   compaction; richer session metadata (thinking-level changes, labels,
   custom entries).

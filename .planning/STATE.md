@@ -3,34 +3,26 @@ gsd_state_version: 1.0
 milestone: v0.11.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-09-01T00:00:00.000Z"
-last_activity: "2026-09-01 - Shipped v0.10.1 (Windows first-run fix, MiniMax default, error-body flattening); cherry-picked all three onto v0.11.0; reconciled this file and ROADMAP.md against the tree."
+last_updated: "2026-09-02T00:00:00.000Z"
+last_activity: "2026-09-02 - Shipped plugin slash-command registration, the last M2 plugin capability."
 ---
 
 # Project State
 
-Last activity: 2026-09-01 — released `v0.10.1`, cherry-picked its three
-fixes onto `v0.11.0`, and re-derived this file from the code (it had
-drifted 30 commits behind).
+Last activity: 2026-09-02 — shipped plugin slash-command registration
+(`4df493b`…`e9ce962`), the last outstanding plugin capability.
 
 ## Current Focus
 
-**M2 · Extensions (v0.11.0).** The four planned phases (P0–P3) are
-shipped, and so are both capability-gated host functions. The feature
-surface looks closed; what remains is one deferred capability plus a
-release decision.
+**M2 · Extensions (v0.11.0) — feature surface closed.** The four
+planned phases (P0–P3) shipped, both capability-gated host functions
+shipped, and plugin slash commands shipped on 2026-09-02.
 
-Remaining in the plugin story: **plugin slash-command registration** —
-the WIT world (`wit/nanopi-extension.wit:73,85`) exports only
-`list-tools` and `execute-tool`, so a plugin cannot register a command.
-Upstream Pi's dispatch model is traced in
-[`.planning/reference/pi-slash-commands.md`](./reference/pi-slash-commands.md);
-its trust model does not transfer, since nanopi plugins are sandboxed
-and capability-gated where Pi's extensions are unsandboxed in-process
-imports.
-
-Then: decide whether v0.11.0 merges to `main` and ships. See
-ROADMAP M2. That is a release call, not a routine merge.
+Next is a decision, not a feature: whether v0.11.0 merges to `main` and
+ships. That is a release call. Note it needs `make bump VERSION=…`
+first — release branches do not carry their own version, and
+`release.yml` hard-fails the whole build matrix on a tag/VERSION
+mismatch *after* publishing an empty release. See ROADMAP M3.
 
 ## What's Built
 
@@ -59,6 +51,16 @@ ROADMAP M2. That is a release call, not a routine merge.
   `post_tool_use` can transform the result, not just observe it.
 - **Steer / follow-up injection** — mid-stream typing steers the
   running turn; queued follow-ups auto-start the next one.
+- **Plugin slash commands** (2026-09-02) — a component may export
+  `list-commands` / `execute-command` from the second WIT world
+  `extension-commands`, and its commands appear in the `/` palette
+  tagged with the plugin name. A command returns an action rather than
+  calling back into the host, so the import list stays at three:
+  `{"print"}` writes to scrollback (never seen by the model),
+  `{"send_user_message"}` starts or steers a turn (always echoed
+  verbatim first), `{"error"}` is shown only to the user. Collisions
+  are refused, never renamed. `src/command.rs` is deliberately
+  non-gated so `mode/tui.rs` keeps zero `cfg(feature = "wasm")`.
 - **`tool_exec_mode`** — parallel vs sequential tool execution
   (`src/config.rs:114`). Pi's per-tool override is still deferred.
 - **WASM plugin system** behind `--features wasm` (`src/wasm/`).
@@ -79,11 +81,15 @@ ROADMAP M2. That is a release call, not a routine merge.
 
 ## What's Next
 
-- **Plugin slash-command registration** — the last plugin capability.
-  See `.planning/reference/pi-slash-commands.md`.
 - **v0.11.0 release decision** — merge to `main` + bump + tag, or keep
   developing. The release procedure (and its traps) is documented per
   ROADMAP M3.
+- Deferred plugin capabilities, none blocking: per-tool `executionMode`
+  override, provider registration from plugins, richer session
+  metadata. Plugin **hot reload** is the notable one — `/reload`
+  deliberately skips `[[extensions]]` because `ToolRegistry` has no
+  unregister path; doing it properly needs that plus a generation
+  counter on `ComponentBridge`.
 
 ## Blockers/Concerns
 
@@ -104,8 +110,10 @@ ROADMAP M2. That is a release call, not a routine merge.
   boilerplate blocks into one `with_temp_nanopi_home()` helper — kills
   the race. New tests should inject paths instead of touching env;
   `paths::expand_against` is the pattern.
-  Deterministically green with `-- --test-threads=1` (491 passed,
-  1 ignored as of 2026-09-01).
+  Deterministically green with `-- --test-threads=1`: as of
+  2026-09-02, 508 lib tests in the default build, 550 with
+  `--features wasm`, plus 20 in `wasm_plugin_integration` and 6 in
+  `skills_integration`; 1 ignored.
 
 - ~~Non-canonicalized path guard in `src/tool/write.rs` /
   `src/tool/edit.rs`~~ — **RESOLVED.** Fixed across `1149f38`,
@@ -123,3 +131,4 @@ ROADMAP M2. That is a release call, not a routine merge.
 | 260825-kft | `--system-prompt` / `--append-system-prompt` flags + `SYSTEM.md` / `APPEND_SYSTEM.md` discovery | 2026-08-25 | 885b0a7 | [260825-kft-add-system-prompt-append-system-prompt-c](./quick/260825-kft-add-system-prompt-append-system-prompt-c/) |
 | 260828-l4d | Gated `host-http-get` for WASM plugins (`allow_network` + host-matching `url_allowlist`, no-redirect guard, 10s timeout) | 2026-08-28 | `83bbe68`…`28c2e75` | [260828-l4d-finish-gated-host-http-get-capability-fo](./quick/260828-l4d-finish-gated-host-http-get-capability-fo/) |
 | — | v0.10.1 fixes cherry-picked onto this branch (Windows `~` expansion, MiniMax default, error-body flattening) | 2026-09-01 | `e9425b8`, `777eb8a`, `642f696` | — |
+| — | Plugin slash-command registration (WIT second world, non-gated `command` vocabulary, collision-refusing registry, TUI dispatch on the blocking pool) + two adjacent fixes: plugins now load on resumed sessions, and a leading space no longer sends a slash command to the model | 2026-09-02 | `4df493b`…`e9ce962` | — |
