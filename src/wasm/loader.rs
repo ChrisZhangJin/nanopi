@@ -429,6 +429,14 @@ const EPOCH_BUDGET_TICKS: u64 = 30;
 /// warning in `wit/nanopi-extension.wit`.
 const EVENT_EPOCH_BUDGET_TICKS: u64 = 2;
 
+/// The invariant that makes the two budgets meaningful, checked where
+/// the values live. A `const` assertion rather than a `#[test]`: both
+/// sides are compile-time constants, so a test would only restate what
+/// the compiler already knows and would fail at test time instead of
+/// build time. Raising the event budget above the tool budget breaks
+/// the build, which is what an invariant should do.
+const _: () = assert!(EVENT_EPOCH_BUDGET_TICKS < EPOCH_BUDGET_TICKS);
+
 /// One running wasmtime engine; threadsafe, cheap to clone (internally
 /// `Arc`-refcounted).
 pub struct PluginEngine {
@@ -1278,16 +1286,6 @@ impl WasmExecuteBridge for ComponentBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Event delivery must use a smaller epoch budget than tool calls —
-    /// events fire on every turn's critical path, tool calls do not.
-    #[test]
-    fn the_event_budget_is_smaller_than_the_tool_budget() {
-        assert!(
-            EVENT_EPOCH_BUDGET_TICKS < EPOCH_BUDGET_TICKS,
-            "event budget ({EVENT_EPOCH_BUDGET_TICKS}) must be smaller than the tool budget ({EPOCH_BUDGET_TICKS})"
-        );
-    }
 
     #[test]
     fn parse_event_requests_reads_json_array() {

@@ -552,6 +552,13 @@ impl Agent {
                 "turn_count": self.turn_count,
                 "prompt": user_msg,
             });
+            // A Block is stashed rather than returned from inside the
+            // match, so the WASM delivery below still runs. Observe-only
+            // subscribers must not have a blind spot exactly where a
+            // shell hook refuses something — an audit plugin cares most
+            // about the refused turns. Matches what the
+            // ToolExecutionStart site does with its own block.
+            let mut blocked: Option<String> = None;
             if !self.hooks.before_agent_start.is_empty() {
                 let (outcome, new_args) = run_hooks(
                     &self.hooks.before_agent_start,
@@ -565,14 +572,7 @@ impl Agent {
                 .await;
                 match outcome {
                     HookOutcome::Block { reason } => {
-                        let marker =
-                            format!("[BeforeAgentStart hook blocked the turn: {reason}]");
-                        let _ = tx
-                            .send(AgentEvent::Error {
-                                error: marker.clone(),
-                            })
-                            .await;
-                        return Ok(marker);
+                        blocked = Some(reason);
                     }
                     HookOutcome::Transform { new_arguments } => {
                         // Only the `prompt` key is honored — the payload
@@ -614,6 +614,15 @@ impl Agent {
                     )
                 })
                 .await;
+            if let Some(reason) = blocked {
+                let marker = format!("[BeforeAgentStart hook blocked the turn: {reason}]");
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        error: marker.clone(),
+                    })
+                    .await;
+                return Ok(marker);
+            }
         }
 
         // ── Input hook (mirrors PI's beforeUserMessage) ────
@@ -627,6 +636,11 @@ impl Agent {
             // Pre-transform arguments — shared byte-for-byte by the
             // shell-hook call and the WASM delivery below, per §4.1.
             let arguments = serde_json::json!({ "prompt": effective_msg });
+            // Stashed, not returned from inside the match — same
+            // reasoning as the BeforeAgentStart site above: an
+            // observe-only subscriber must still see a prompt that a
+            // shell hook refused.
+            let mut blocked: Option<String> = None;
             if !self.hooks.input.is_empty() {
                 let (outcome, new_args) = run_hooks(
                     &self.hooks.input,
@@ -643,13 +657,7 @@ impl Agent {
                 .await;
                 match outcome {
                     HookOutcome::Block { reason } => {
-                        let marker = format!("[Input hook blocked the prompt: {reason}]");
-                        let _ = tx
-                            .send(AgentEvent::Error {
-                                error: marker.clone(),
-                            })
-                            .await;
-                        return Ok(marker);
+                        blocked = Some(reason);
                     }
                     HookOutcome::Transform { new_arguments } => {
                         if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
@@ -682,6 +690,15 @@ impl Agent {
                     )
                 })
                 .await;
+            if let Some(reason) = blocked {
+                let marker = format!("[Input hook blocked the prompt: {reason}]");
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        error: marker.clone(),
+                    })
+                    .await;
+                return Ok(marker);
+            }
         }
 
         // ── /skill:name expansion (mirrors PI's _expandSkillCommand) ──
@@ -2079,6 +2096,124 @@ mod tests {
     /// returning `updated_input.prompt` was silently inert even though
     /// the payload ships `prompt` specifically for it. Fix mirrors
     /// Input and seeds `effective_msg` from the result.
+    /// A shell hook that BLOCKS must still deliver the event to
+    /// observe-only WASM subscribers.
+    ///
+    /// Regression guard for an inconsistency: `tool_execution_start`
+    /// stashed its block and delivered first, while
+    /// `before_agent_start` and `input` returned from inside the match
+    /// and skipped delivery. Two behaviours for one situation, and the
+    /// missing half is the security-relevant one — an audit plugin
+    /// cares most about the turns something refused, and a dropped
+    /// event is invisible to it.
+    ///
+    /// Delivery cannot change the outcome (observe-only is in the
+    /// `EventHandler` signature), so delivering costs nothing but a
+    /// blind spot is real.
+    #[tokio::test]
+    async fn a_blocking_hook_still_delivers_the_event_to_subscribers() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Recorder {
+            events: std::sync::Mutex<Vec<String>>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: &str, _payload_json: &str) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.events.lock().unwrap().push(event.to_string());
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorder = Arc::new(Recorder {
+            events: std::sync::Mutex::new(Vec::new()),
+            calls: calls.clone(),
+        });
+
+        let dir = tmp();
+        let session_path = dir.join("blocked.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        // exit 2 is the hook protocol's "block".
+        let blocking = |event: &str| HooksConfig {
+            before_agent_start: if event == "before_agent_start" {
+                vec![HookConfig {
+                    matcher: "*".into(),
+                    kind: "command".into(),
+                    command: "exit 2".into(),
+                    timeout: 2000,
+                }]
+            } else {
+                Vec::new()
+            },
+            input: if event == "input" {
+                vec![HookConfig {
+                    matcher: "*".into(),
+                    kind: "command".into(),
+                    command: "exit 2".into(),
+                    timeout: 2000,
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+
+        for event in ["before_agent_start", "input"] {
+            calls.store(0, Ordering::SeqCst);
+            recorder.events.lock().unwrap().clear();
+
+            let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+                plugin_name: Arc::from("test-watcher"),
+                events: crate::agent::hook::EVENT_NAMES.to_vec(),
+                handler: recorder.clone(),
+            }]);
+
+            let mut agent = Agent {
+                context: Context::default(),
+                provider: Box::new(FakeProvider {
+                    response: "ok".into(),
+                }),
+                registry: ToolRegistry::standard(),
+                session_path: session_path.clone(),
+                session_id: uuid::v7().to_string(),
+                cwd: dir.clone(),
+                permission: PermissionGate::from_cli(false, None),
+                hooks: blocking(event),
+                model: String::new(),
+                base_url: String::new(),
+                api_key: String::new(),
+                usage_total: Usage::default(),
+                turn_count: 0,
+                skills: Vec::new(),
+                no_context_files: false,
+                pending_follow_ups: Default::default(),
+                tool_exec_mode: crate::config::ToolExecMode::default(),
+                plugin_commands: Vec::new(),
+                event_subscribers: subs,
+                prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            };
+
+            let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+            let out = agent.run_turn("a prompt", &tx, None, None).await.unwrap();
+
+            // The block still takes effect — this is not a regression
+            // in the veto, only in what observers see.
+            assert!(
+                out.contains("blocked"),
+                "{event}: the hook should still have blocked the turn, got {out:?}"
+            );
+            let seen = recorder.events.lock().unwrap().clone();
+            assert!(
+                seen.iter().any(|e| e == event),
+                "{event}: subscriber never saw it, only saw {seen:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn before_agent_start_hook_can_transform_prompt() {
         let dir = tmp();
