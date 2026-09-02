@@ -120,17 +120,37 @@ base_url = "https://api.openai.com/v1"
 #                   fetch onto a host you did not approve.
 #   url_allowlist   Hosts host-http-get may reach. EMPTY DENIES
 #                   EVERYTHING — allow_network alone reaches nothing.
-#                   Matching is on the URL's host, so an entry covers
-#                   its subdomains and any port ("github.com" allows
-#                   api.github.com:8443) but not a host that merely
-#                   ends with it ("evilgithub.com" is refused).
-#                   Effective only when allow_network = true.
+#                   Matching is on the URL's host, never a substring.
+#                   Three spellings:
+#                     "github.com"    the host AND its subdomains, any
+#                                     port (api.github.com:8443 passes;
+#                                     evilgithub.com does not)
+#                     "*.github.com"  subdomains ONLY — the apex
+#                                     github.com is refused
+#                     "*"             any http/https host. For plugins
+#                                     whose hosts aren't knowable up
+#                                     front. This turns the second gate
+#                                     off: allow_network becomes the
+#                                     only check, link-local metadata
+#                                     endpoints (169.254.169.254)
+#                                     included. nanopi warns at startup
+#                                     when it sees this.
+#                   A star anywhere else ("api.*.com") is refused
+#                   rather than widened. Effective only when
+#                   allow_network = true.
 #
 # See docs/pi-vs-nanopi.md §4.3 and wit/nanopi-extension.wit for the
 # guest interface a plugin must export.
 
 # [[extensions]]
 # path = "~/.nanopi/extensions/my-tool.wasm"
+
+# A plugin that fetches arbitrary URLs — no finite host list to
+# enumerate, so the wildcard is the honest way to say so.
+# [[extensions]]
+# path = "~/.nanopi/extensions/fetcher.wasm"
+# allow_network = true
+# url_allowlist = ["*"]
 
 # [[extensions]]
 # path = "~/.nanopi/extensions/"

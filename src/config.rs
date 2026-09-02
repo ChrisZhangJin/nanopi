@@ -160,9 +160,16 @@ pub struct ExtensionConfig {
     pub allow_fs: bool,
     /// Hosts `host-http-get` may reach. Empty denies every URL, so
     /// `allow_network = true` alone reaches nothing. Compared against
-    /// the URL's parsed host, which means an entry also covers its
-    /// subdomains and any port. Effective only when
-    /// `allow_network = true`.
+    /// the URL's parsed host, never a substring.
+    ///
+    /// Three spellings: `example.com` covers the host and its
+    /// subdomains (and any port); `*.example.com` covers only the
+    /// subdomains; `*` covers any `http`/`https` host, for plugins
+    /// whose host set isn't knowable in advance. `*` is warned about
+    /// at load — it leaves `allow_network` as the only gate. A star
+    /// elsewhere (`api.*.com`) is refused, not widened.
+    ///
+    /// Effective only when `allow_network = true`.
     pub url_allowlist: Vec<String>,
 }
 

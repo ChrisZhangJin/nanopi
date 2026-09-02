@@ -240,6 +240,8 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 **工具 vs 命令。** 工具是*模型*决定调用的；命令是*你*敲的。命令出现在 `/` 面板里并标注来源插件，且仅限交互模式 —— `nanopi -p` 没有命令面板，但插件的工具在那里照常可用。
 
+**查看到底加载了什么。** `/tools` 列出模型真正能调用的每个工具，标注 `[builtin]` 或 `[plugin:<名字>]` 并给出来源 `.wasm` 路径。它读的是实时注册表 —— 和交给模型的是同一份 —— 所以插件工具看起来没生效时，先看这里。让模型自己列工具不能替代：它分不清插件工具和内置工具，只会猜。
+
 `print` 直接写进你的 scrollback：模型看不到，也不进会话记录。`send_user_message` 会像你自己输入一样开启一轮对话 —— 但**总是先原样回显**，插件无法在你不知情的情况下替你说话；流式输出中途调用则转为转向（steer）当前这轮，和你自己打字的行为完全一致。`error` 只展示给你，和 trap 一样绝不转发给模型。
 
 两个命令导出放在第二个 WIT world `extension-commands` 里，它 `include` 了第一个。只提供工具的插件继续用 `extension`，源码一行都不用改 —— WIT 无法表达「可选导出」，直接扩宽原来的 world 会让所有已有插件的*源码*编译不过，尽管宿主仍然能加载它们编译好的*二进制*。
@@ -262,7 +264,17 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 `host-fs-read` 由 `allow_fs = true` 门控，且路径必须解析到工作目录**内部**。检查前会先 canonicalize，所以 `../` 穿越和指向外部的符号链接都会被拒。（内置 `read` 工具刻意没有这道检查，理由是模型反正能 shell out —— 但插件没有 shell，所以这里的边界是真约束而非安全剧场。）
 
-`host-http-get` 有两道门：先是 `allow_network = true`，然后 URL 的 host 必须出现在 `url_allowlist` 里。**空 allowlist 拒绝一切**，所以只把开关打开本身还是什么都访问不到。匹配比对的是解析出的 host 而不是子串 —— allowlist 为 `api.github.com` 时，`https://evil.com/?x=api.github.com` 和 `https://api.github.com@evil.com/` 都会被拒；而一条 entry 会覆盖它的子域名和任意端口。只接受 `http`/`https`；请求 10 秒超时，插件因此没法把一轮对话挂死；重定向**不会**跟随 —— 否则一个 3xx 就能把这次抓取带到你从没批准过的 host 上。拒绝和失败都以 `error: ` 前缀的字符串在带内返回给插件，而不是 trap。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
+`host-http-get` 有两道门：先是 `allow_network = true`，然后 URL 的 host 必须匹配 `url_allowlist`。**空 allowlist 拒绝一切**，所以只把开关打开本身还是什么都访问不到。匹配比对的是解析出的 host 而不是子串 —— allowlist 为 `api.github.com` 时，`https://evil.com/?x=api.github.com` 和 `https://api.github.com@evil.com/` 都会被拒。
+
+entry 是**模式**，不是主机名 —— 一个「抓模型给的任意 URL」的插件根本没有有限的 host 清单可枚举：
+
+| entry | 匹配 |
+|---|---|
+| `github.com` | 该 host **及其**子域名，任意端口 |
+| `*.github.com` | 仅子域名 —— 顶级域 `github.com` 本身会被拒 |
+| `*` | 任意 `http`/`https` host |
+
+`*` 是逃生门，而且是真的门：它等于关掉第二道闸，只剩 `allow_network` 一道检查 —— 包括 link-local 元数据端点。只要开着网络又出现 `*`，nanopi 会在启动时打印点名到插件的警告。星号出现在别的位置（`api.*.com`）会被**拒绝**而不是放宽，这样一个笔误不会悄悄把闸门开大。`*` 只放宽 host；scheme 检查是独立的，所以任何模式下 `file://` 都进不了网络能力。只接受 `http`/`https`；请求 10 秒超时，插件因此没法把一轮对话挂死；重定向**不会**跟随 —— 否则一个 3xx 就能把这次抓取带到你从没批准过的 host 上。拒绝和失败都以 `error: ` 前缀的字符串在带内返回给插件，而不是 trap。插件里的 trap 会作为失败的工具调用报给模型 —— 不会拖垮 nanopi；加载失败的 `.wasm` 会被跳过并警告，不阻塞启动。
 
 **失控插件。** 每次工具调用，guest 代码有约 30 秒的墙钟预算，由 wasmtime 的 epoch interruption 强制执行。超时即 trap，作为失败的工具调用报给模型，且插件仍然可用 —— 实例会被重建，一次坏调用不会让它在整个 session 里失效。没有这道闸，一个含死循环的插件会让 nanopi 永久卡死：guest 占着一个真实线程且没有让出点，<kbd>Esc</kbd> 够不到它里面。
 

@@ -19,6 +19,10 @@ use crate::tool::{Tool, ToolContext, ToolOutput};
 pub struct WasmTool {
     spec: ToolSpec,
     plugin_name: Arc<str>,
+    /// The `.wasm` this tool came from. Carried alongside the display
+    /// name because `/tools` shows the path — a stem like `my-plugin`
+    /// does not tell you which file on disk to go edit.
+    plugin_path: Arc<str>,
     /// Synchronous handle the WASM plugin uses to satisfy execute
     /// requests. `Arc` so the registry can hand out clones cheaply.
     /// The actual call uses wasmtime's blocking API.
@@ -26,8 +30,18 @@ pub struct WasmTool {
 }
 
 impl WasmTool {
-    pub fn new(spec: ToolSpec, plugin_name: Arc<str>, bridge: Arc<dyn WasmExecuteBridge>) -> Self {
-        Self { spec, plugin_name, bridge }
+    pub fn new(
+        spec: ToolSpec,
+        plugin_name: Arc<str>,
+        plugin_path: Arc<str>,
+        bridge: Arc<dyn WasmExecuteBridge>,
+    ) -> Self {
+        Self {
+            spec,
+            plugin_name,
+            plugin_path,
+            bridge,
+        }
     }
 
     pub fn plugin_name(&self) -> &str {
@@ -64,6 +78,13 @@ impl crate::command::CommandHandler for WasmCommandHandler {
 impl Tool for WasmTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    fn source(&self) -> crate::tool::ToolSource {
+        crate::tool::ToolSource::Plugin {
+            name: self.plugin_name.to_string(),
+            path: self.plugin_path.to_string(),
+        }
     }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, crate::tool::ToolError> {
@@ -227,12 +248,39 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
             Arc::from("test_plugin"),
+            Arc::from("/tmp/test_plugin.wasm"),
             Arc::new(NoopBridge),
         );
         let ctx = ToolContext { cwd: std::path::PathBuf::from("/tmp") };
         let out = tool.execute(serde_json::json!({"sql": "SELECT 1"}), &ctx).await.unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("plugin error"));
+    }
+
+    /// `/tools` has to be able to say "this one came from a plugin".
+    /// The `Tool::source` default is `Builtin`, so forgetting the
+    /// override here would make every plugin tool claim to ship with
+    /// nanopi — which is precisely the confusion `/tools` exists to
+    /// remove.
+    #[test]
+    fn a_plugin_tool_reports_its_origin() {
+        let tool = WasmTool::new(
+            ToolSpec {
+                name: "greet".into(),
+                description: "say hi".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            Arc::from("my-plugin"),
+            Arc::from("/tmp/my-plugin/my-plugin.component.wasm"),
+            Arc::new(NoopBridge),
+        );
+        assert_eq!(
+            tool.source(),
+            crate::tool::ToolSource::Plugin {
+                name: "my-plugin".into(),
+                path: "/tmp/my-plugin/my-plugin.component.wasm".into(),
+            }
+        );
     }
 
     /// A plugin call must not occupy a tokio worker while it runs.
@@ -274,6 +322,7 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
             Arc::from("sleepy_plugin"),
+            Arc::from("/tmp/sleepy_plugin.wasm"),
             Arc::new(SleepyBridge),
         );
 

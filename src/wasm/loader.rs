@@ -127,10 +127,18 @@ const MAX_HOST_READ_BYTES: u64 = 1 << 20;
 ///   - `https://api.github.com.evil.com/`   — a subdomain of a domain
 ///     the attacker owns
 ///
-/// So the host is extracted and compared as a host. An entry matches
-/// when the host equals it, or ends with `.` + the entry: the leading
-/// dot is what lets `github.com` cover `api.github.com` without also
-/// covering `evilgithub.com` or `github.com.evil.com`.
+/// So the host is extracted and compared as a host. A bare entry
+/// matches when the host equals it, or ends with `.` + the entry: the
+/// leading dot is what lets `github.com` cover `api.github.com`
+/// without also covering `evilgithub.com` or `github.com.evil.com`.
+///
+/// Three spellings, parsed by [`AllowRule`]:
+///
+/// | Entry | Matches |
+/// |---|---|
+/// | `*` | any `http`/`https` host |
+/// | `*.example.com` | subdomains of `example.com`, apex excluded |
+/// | `example.com` | `example.com` and any subdomain |
 ///
 /// An empty allowlist returns false. That is the documented contract
 /// (`config.toml.example`), not an oversight — empty means "no host
@@ -169,11 +177,89 @@ fn url_allowed(url: &str, allowlist: &[String]) -> bool {
         Some(h) => h,
         None => return false,
     };
-    allowlist.iter().any(|entry| {
-        let entry = normalize_allowlist_entry(entry);
-        !entry.is_empty()
-            && (host == entry || host.ends_with(&format!(".{entry}")))
-    })
+    allowlist
+        .iter()
+        .filter_map(|e| parse_allow_rule(e))
+        .any(|rule| rule.matches(&host))
+}
+
+/// One parsed `url_allowlist` entry.
+///
+/// Entries are patterns, not hostnames, because the alternative is
+/// asking users to enumerate hosts they cannot know in advance — a
+/// plugin that follows links, or fetches whatever the model hands it,
+/// has no finite host list. An allowlist that cannot express the
+/// intended policy gets switched off wholesale, which is worse than
+/// expressing it precisely.
+///
+/// Note the scheme check in `request_host` applies to every variant,
+/// `Any` included: `*` widens which *hosts* are reachable, never which
+/// schemes, so `file://` stays outside the network capability.
+#[derive(Debug, PartialEq, Eq)]
+enum AllowRule {
+    /// `*` — any `http`/`https` host. Explicit, loud, and warned about
+    /// at load: it turns the second gate off and leaves
+    /// `allow_network` as the only thing standing between the plugin
+    /// and the network (including link-local metadata endpoints).
+    Any,
+    /// `*.example.com` — subdomains only; the apex is NOT matched.
+    ///
+    /// Glob semantics, deliberately narrower than a bare entry: `*.`
+    /// reads as "something, then a dot, then this", and a user who
+    /// wanted the apex too can write the bare form. Having both spellings
+    /// mean the same thing would leave no way to say "subdomains only".
+    Subdomains(String),
+    /// `example.com` — the host itself and any subdomain of it. The
+    /// original behavior, unchanged.
+    Host(String),
+}
+
+/// Parse one config entry, or `None` if it names nothing usable.
+///
+/// `None` (not a permissive default) for garbage: an entry that fails
+/// to parse must not widen the gate.
+fn parse_allow_rule(entry: &str) -> Option<AllowRule> {
+    let e = entry.trim();
+    if e == "*" {
+        return Some(AllowRule::Any);
+    }
+    // Only a leading `*.` is a wildcard. A `*` anywhere else (say
+    // `api.*.com`) is not supported, and must not be silently reduced
+    // to a broader rule by normalization dropping the star — refuse it.
+    if let Some(rest) = e.strip_prefix("*.") {
+        let host = normalize_allowlist_entry(rest);
+        return (!host.is_empty() && !host.contains('*')).then_some(AllowRule::Subdomains(host));
+    }
+    if e.contains('*') {
+        return None;
+    }
+    let host = normalize_allowlist_entry(e);
+    (!host.is_empty()).then_some(AllowRule::Host(host))
+}
+
+impl AllowRule {
+    /// `host` must already be canonical — i.e. straight out of
+    /// `request_host`, so the comparison is against what reqwest will
+    /// actually connect to.
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            AllowRule::Any => true,
+            // Dot-boundary, so `evil-example.com` can't pass as a
+            // subdomain of `example.com`.
+            AllowRule::Subdomains(e) => host.ends_with(&format!(".{e}")),
+            AllowRule::Host(e) => host == e || host.ends_with(&format!(".{e}")),
+        }
+    }
+}
+
+/// Whether an allowlist contains `*`. Used to warn at plugin load:
+/// granting any-host is a legitimate choice, but a silent one would be
+/// indistinguishable from a typo that happened to widen the gate.
+pub fn allowlist_allows_any_host(allowlist: &[String]) -> bool {
+    allowlist
+        .iter()
+        .filter_map(|e| parse_allow_rule(e))
+        .any(|r| r == AllowRule::Any)
 }
 
 /// The host reqwest will actually connect to, lowercased, or `None` if
@@ -359,6 +445,22 @@ impl PluginEngine {
         // guest code. Instrumentation is inserted at compile time,
         // which is why it belongs on the Config rather than per-call.
         config.epoch_interruption(true);
+        // Silence `libunwind: __unw_add_dynamic_fde: bad fde: FDE is
+        // really a CIE` on the static musl build.
+        //
+        // wasmtime registers `.eh_frame` for its JIT code so a
+        // *third-party* unwinder (the system one, the `backtrace`
+        // crate) can walk through guest frames. LLVM's libunwind, which
+        // the musl target links, rejects what Cranelift registers and
+        // says so on stderr — once per plugin load, before nanopi has
+        // printed anything, so it reads like a crash. Nothing consumes
+        // that unwind info here: traps come back through wasmtime's own
+        // mechanism, which this option explicitly does not affect
+        // (`Config::wasm_backtrace` governs that, and stays on).
+        //
+        // Not on Windows: there the ABI requires the unwind tables.
+        #[cfg(not(windows))]
+        config.native_unwind_info(false);
         let engine = Engine::new(&config)
             .map_err(|e| format!("wasmtime engine init failed: {e}"))?;
         let this = Self {
@@ -499,7 +601,9 @@ impl PluginEngine {
                         return Ok((format!(
                             "error: url_allowlist does not permit {url} \
                              (add the host to url_allowlist on this plugin's \
-                             [[extensions]] entry; an empty allowlist denies \
+                             [[extensions]] entry — `example.com` covers its \
+                             subdomains, `*.example.com` covers only those, \
+                             `*` covers any host; an empty allowlist denies \
                              everything)"
                         ),));
                     }
@@ -1163,6 +1267,80 @@ mod tests {
 
     fn list(entries: &[&str]) -> Vec<String> {
         entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `*` is the escape hatch for plugins whose host set isn't
+    /// knowable in advance. It must actually work — a pattern that
+    /// silently matches nothing is worse than no pattern at all,
+    /// because the user believes the gate is open.
+    #[test]
+    fn url_allowed_star_matches_any_host() {
+        let l = list(&["*"]);
+        assert!(url_allowed("https://www.workbuddy.cn/", &l));
+        assert!(url_allowed("http://192.168.1.1:8080/x", &l));
+        assert!(url_allowed("https://anything.example/", &l));
+    }
+
+    /// ...but `*` widens hosts only. The scheme check is a separate
+    /// guarantee — `file://` under `*` would turn the network
+    /// capability into the filesystem one that `allow_fs` gates.
+    #[test]
+    fn star_does_not_widen_the_scheme_check() {
+        let l = list(&["*"]);
+        assert!(!url_allowed("file:///etc/passwd", &l));
+        assert!(!url_allowed("ftp://example.com/x", &l));
+    }
+
+    /// `*.example.com` covers subdomains, on a dot boundary.
+    #[test]
+    fn url_allowed_subdomain_wildcard() {
+        let l = list(&["*.workbuddy.cn"]);
+        assert!(url_allowed("https://www.workbuddy.cn/", &l));
+        assert!(url_allowed("https://a.b.workbuddy.cn/", &l));
+        // The bypass a suffix-only check would wave through.
+        assert!(!url_allowed("https://evil-workbuddy.cn/", &l));
+        assert!(!url_allowed("https://workbuddy.cn.evil.com/", &l));
+    }
+
+    /// `*.example.com` deliberately excludes the apex — the bare entry
+    /// is how you ask for both. If the two spellings meant the same
+    /// thing there would be no way to say "subdomains only".
+    #[test]
+    fn subdomain_wildcard_excludes_the_apex() {
+        assert!(!url_allowed("https://workbuddy.cn/", &list(&["*.workbuddy.cn"])));
+        assert!(url_allowed("https://workbuddy.cn/", &list(&["workbuddy.cn"])));
+    }
+
+    /// An unsupported star position must be refused, not normalized
+    /// into something broader. Dropping the `*` from `api.*.com` would
+    /// leave a rule the user never wrote.
+    #[test]
+    fn a_star_in_the_middle_is_refused_not_widened() {
+        assert_eq!(parse_allow_rule("api.*.com"), None);
+        assert_eq!(parse_allow_rule("*.*"), None);
+        assert_eq!(parse_allow_rule("*evil.com"), None);
+        // And a refused entry grants nothing, rather than everything.
+        assert!(!url_allowed("https://api.foo.com/", &list(&["api.*.com"])));
+    }
+
+    /// A wildcard entry alongside real hosts still works, and an
+    /// unparseable neighbour doesn't disable the good ones.
+    #[test]
+    fn rules_are_independent_of_each_other() {
+        let l = list(&["", "api.*.com", "*.workbuddy.cn"]);
+        assert!(url_allowed("https://www.workbuddy.cn/", &l));
+        assert!(!url_allowed("https://elsewhere.com/", &l));
+    }
+
+    /// The warning at load time keys off this, so it has to see `*`
+    /// through the same parser the gate uses — including a `*` written
+    /// with stray whitespace.
+    #[test]
+    fn any_host_detection_matches_the_gate() {
+        assert!(allowlist_allows_any_host(&list(&["  * "])));
+        assert!(allowlist_allows_any_host(&list(&["example.com", "*"])));
+        assert!(!allowlist_allows_any_host(&list(&["*.example.com"])));
+        assert!(!allowlist_allows_any_host(&[]));
     }
 
     /// The documented contract: an empty allowlist denies everything.

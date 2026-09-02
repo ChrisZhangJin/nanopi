@@ -106,6 +106,12 @@ enum SlashCmd {
     /// source · path). Doesn't take an arg. PI does this implicitly
     /// on startup; nanopi adds the on-demand relist.
     ListSkills,
+    /// List every tool the model can call, with its source (built-in
+    /// or the plugin `.wasm` that supplied it). The registry is the
+    /// same one handed to the provider, so this is ground truth —
+    /// asking the model to list its own tools is not: it will happily
+    /// present plugin tools as built-ins, or invent skills.
+    ListTools,
     /// Re-read config.toml + settings.toml + skills without exiting
     /// the session. Mirrors PI's `/reload` — new skills installed
     /// mid-session become visible to the model on the next turn.
@@ -209,6 +215,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
         MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
         MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
+        MenuItem::new(
+            "/tools",
+            "List all callable tools + their source",
+            SlashCmd::ListTools,
+        ),
         MenuItem::new(
             "/reload",
             "Reload skills, config, settings",
@@ -681,10 +692,19 @@ struct App {
     /// `expanded` bool that flips true on Ctrl+O so a second press
     /// doesn't duplicate the dump.
     last_tool_output: Option<LastTool>,
-    /// A tool_call event just arrived; its bar is not yet drawn. On the
-    /// matching tool-result marker we colour it green (success) or red
-    /// (failure) using the marker's separator (`→` vs `✗`).
-    pending_tool_call: Option<PendingBar>,
+    /// Tool calls whose bars are not yet drawn, keyed by call id and
+    /// kept in arrival order. On the matching tool-result marker we
+    /// colour a bar green (success) or red (failure) using the
+    /// marker's separator (`→` vs `✗`).
+    ///
+    /// A `Vec`, not an `Option`: with `tool_exec_mode = "parallel"`
+    /// (the default) every `ToolCall` in a batch arrives before the
+    /// first `ToolResult`, so a single slot meant the last call
+    /// overwrote its predecessors — the first card was then labelled
+    /// with the wrong tool and the rest rendered with no header line
+    /// at all. Order is preserved for the orphan flush, which has no
+    /// ids to match against.
+    pending_tool_calls: Vec<(String, PendingBar)>,
     /// When Some, a tool is currently executing — show a live BLUE
     /// "$ command  Elapsed X.Xs" strip inside the dock (PI-style
     /// working state, see img/PI_work_status.jpg). Cleared when
@@ -773,7 +793,7 @@ impl App {
             turn_count: 0,
             stream_buf: String::new(),
             thinking_buf: String::new(),
-            pending_tool_call: None,
+            pending_tool_calls: Vec::new(),
             tool_started_at: None,
             turn_started_at: None,
             status_note: None,
@@ -872,6 +892,26 @@ struct PendingBar {
     body: String,
 }
 
+/// Remove and return the pending bar for `call_id`.
+///
+/// Falls back to the oldest pending entry when the id is unknown,
+/// which covers providers that renumber tool_call ids between the
+/// stream and the result. Dropping the bar instead would leave a
+/// headerless card, and an out-of-order label is still strictly more
+/// informative than none.
+fn take_pending_bar(app: &mut App, call_id: &str) -> Option<PendingBar> {
+    let idx = app
+        .pending_tool_calls
+        .iter()
+        .position(|(id, _)| id == call_id)
+        .or(if app.pending_tool_calls.is_empty() {
+            None
+        } else {
+            Some(0)
+        })?;
+    Some(app.pending_tool_calls.remove(idx).1)
+}
+
 #[derive(Debug, Clone)]
 struct LastTool {
     content: String,
@@ -942,6 +982,8 @@ enum KeyAction {
     ShowKeybindings,
     /// `/skills`: dump the loaded skill list into scrollback.
     ShowSkills,
+    /// `/tools`: dump the live tool registry into scrollback.
+    ShowTools,
     /// `/session`: dump usage / cost / model summary into scrollback.
     ShowSessionInfo,
     /// Bare `/name` — print the session's current name to scrollback.
@@ -1387,6 +1429,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Fork => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
         SlashCmd::ListSkills => KeyAction::ShowSkills,
+        SlashCmd::ListTools => KeyAction::ShowTools,
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
         // PI's /name: bare shows current, `/name X` sets it. See
         // packages/coding-agent/src/modes/interactive/interactive-
@@ -1564,7 +1607,10 @@ async fn run_app(
                         // e.g. turn was cancelled).
                         flush_stream_buf(term, app)?;
                         flush_thinking_buf(term, app)?;
-                        if let Some(pending) = app.pending_tool_call.take() {
+                        // Every call still in flight is orphaned, not
+                        // just the newest one — a cancelled parallel
+                        // batch leaves several.
+                        for (_, pending) in std::mem::take(&mut app.pending_tool_calls) {
                             // Muted amber (Indexed 137 #af875f) for
                             // interrupted state — Morandi warm tone.
                             let bg = Color::Indexed(137);
@@ -2567,6 +2613,87 @@ async fn handle_action(
                 insert_line(term, Line::from(""))?;
             }
         }
+        KeyAction::ShowTools => {
+            // Read the live registry rather than a cache: `/new`,
+            // `/resume` and `/fork` rebuild the Agent (and reload
+            // plugins), so a snapshot taken at startup would go stale
+            // in exactly the sessions where a user is most likely to
+            // ask what changed.
+            let entries = {
+                let g = agent_slot.lock().await;
+                g.as_ref().map(|a| a.registry.entries()).unwrap_or_default()
+            };
+            let plugin_count = entries
+                .iter()
+                .filter(|(_, src)| !matches!(src, crate::tool::ToolSource::Builtin))
+                .count();
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    format!(
+                        "Callable tools ({}, {} from plugins)",
+                        entries.len(),
+                        plugin_count
+                    ),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+            for (spec, src) in &entries {
+                let tag = match src {
+                    crate::tool::ToolSource::Builtin => "[builtin]".to_string(),
+                    crate::tool::ToolSource::Plugin { name, .. } => format!("[plugin:{name}]"),
+                };
+                insert_line(
+                    term,
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {:<20}", spec.name),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("{tag} "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        // First line only: a plugin author's
+                        // description can be a paragraph, and the
+                        // point here is the inventory, not the docs.
+                        Span::styled(
+                            spec.description
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string(),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]),
+                )?;
+                if let crate::tool::ToolSource::Plugin { path, .. } = src {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("      {path}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        )]),
+                    )?;
+                }
+            }
+            if plugin_count == 0 {
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
+                        "  No plugin tools. Declare [[extensions]] in config.toml \
+                         (needs a build with --features wasm)."
+                            .to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                )?;
+            }
+            insert_line(term, Line::from(""))?;
+        }
         KeyAction::OpenForkPicker => {
             // Tree-aware picker: walk the parent_id chain upward from
             // the current session, then render as a depth-first tree
@@ -3290,21 +3417,35 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
-            app.pending_tool_call = Some(PendingBar { leading, body });
+            app.pending_tool_calls
+                .push((call.id.clone(), PendingBar { leading, body }));
             // Start the live "Elapsed X.Xs" clock so the dock can
             // render a blue running-state strip until ToolResult.
             app.tool_started_at = Some(std::time::Instant::now());
         }
         AgentEvent::ToolResult {
+            call_id,
+            tool_name,
             content,
             is_error,
             elapsed_ms,
-            ..
         } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            render_tool_card(term, app, &content, is_error, elapsed_ms)?;
-            app.tool_started_at = None;
+            render_tool_card(
+                term,
+                app,
+                &call_id,
+                &tool_name,
+                &content,
+                is_error,
+                elapsed_ms,
+            )?;
+            // Only once every in-flight call has reported: with
+            // parallel execution the batch is still running.
+            if app.pending_tool_calls.is_empty() {
+                app.tool_started_at = None;
+            }
             // Stash full output so Ctrl+O can expand it later — with
             // the outcome flag so expansion uses matching bg.
             app.last_tool_output = Some(LastTool {
@@ -3495,6 +3636,8 @@ fn expand_tabs(s: &str) -> String {
 fn render_tool_card(
     term: &mut Term,
     app: &mut App,
+    call_id: &str,
+    tool_name: &str,
     content: &str,
     is_error: bool,
     elapsed_ms: u64,
@@ -3524,17 +3667,28 @@ fn render_tool_card(
     // Breathing room above.
     insert_line(term, Line::from(""))?;
 
-    // Row 1: command bar (from stashed pending_tool_call).
-    if let Some(pending) = app.pending_tool_call.take() {
-        insert_line_bg(
-            term,
-            Line::from(vec![
-                Span::styled(pending.leading, bar_style),
-                Span::styled(pending.body, bar_style),
-            ]),
-            Some(bar_style),
-        )?;
-    }
+    // Row 1: command bar — the stash left by this call's ToolCall
+    // event, matched on call id so a parallel batch can't mislabel a
+    // card. Missing stash falls back to the tool's name rather than
+    // dropping the row: a card with no header is unreadable, and the
+    // name is the one thing the result event always carries.
+    let pending = take_pending_bar(app, call_id).unwrap_or_else(|| PendingBar {
+        // Replayed history carries no tool name on the result entry,
+        // so the generic word beats an empty chip.
+        leading: match tool_name {
+            "" => " tool ".to_string(),
+            n => format!(" {} ", n.to_ascii_lowercase()),
+        },
+        body: String::new(),
+    });
+    insert_line_bg(
+        term,
+        Line::from(vec![
+            Span::styled(pending.leading, bar_style),
+            Span::styled(pending.body, bar_style),
+        ]),
+        Some(bar_style),
+    )?;
 
     // Output preview: last N lines. If more, show a truncation marker.
     let lines: Vec<&str> = content.lines().collect();
@@ -3683,7 +3837,7 @@ fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEnt
     app.md_state = crate::render::markdown::MdState::default();
     app.stream_buf.clear();
     app.thinking_buf.clear();
-    app.pending_tool_call = None;
+    app.pending_tool_calls.clear();
 
     for entry in entries {
         match entry {
@@ -4276,7 +4430,12 @@ fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
         % BRAILLE.len();
 
     // Tool running has priority.
-    if let (Some(started), Some(bar)) = (app.tool_started_at, app.pending_tool_call.as_ref()) {
+    // Oldest in-flight call: with a parallel batch the strip can only
+    // show one, and the one that has been running longest is the one
+    // the elapsed clock actually belongs to.
+    if let (Some(started), Some((_, bar))) =
+        (app.tool_started_at, app.pending_tool_calls.first())
+    {
         let elapsed = started.elapsed().as_secs_f64();
         let blue_bg = Color::Indexed(24); // muted navy — matches Morandi
         let bar_style = Style::default()
@@ -5102,6 +5261,50 @@ mod tests {
         // The rows flanking the block are unstyled separators.
         assert!(rows.first().unwrap().1.is_none());
         assert!(rows.last().unwrap().1.is_none());
+    }
+
+    /// Regression: with `tool_exec_mode = "parallel"` (the default)
+    /// every ToolCall in a batch arrives before the first ToolResult.
+    /// A single-slot stash meant the last call overwrote the rest, so
+    /// the first card was labelled with the wrong tool and later cards
+    /// rendered with no header line at all — which is what made
+    /// plugin tools look like they printed nothing.
+    #[test]
+    fn parallel_tool_calls_each_keep_their_own_bar() {
+        let mut app = mkapp();
+        for (id, name) in [("call_a", "greet"), ("call_b", "fetch_head")] {
+            app.pending_tool_calls.push((
+                id.to_string(),
+                PendingBar {
+                    leading: format!(" {name} "),
+                    body: "{}".into(),
+                },
+            ));
+        }
+        // Results may come back in either order; each must find its own.
+        let second = take_pending_bar(&mut app, "call_b").expect("call_b bar");
+        assert_eq!(second.leading, " fetch_head ");
+        let first = take_pending_bar(&mut app, "call_a").expect("call_a bar");
+        assert_eq!(first.leading, " greet ");
+        assert!(app.pending_tool_calls.is_empty());
+    }
+
+    /// An unknown id must not silently drop the row. Providers do
+    /// renumber tool_call ids, and a card with no header at all is
+    /// worse than one labelled from the oldest pending call.
+    #[test]
+    fn an_unmatched_result_falls_back_to_the_oldest_bar() {
+        let mut app = mkapp();
+        app.pending_tool_calls.push((
+            "call_a".into(),
+            PendingBar {
+                leading: " greet ".into(),
+                body: String::new(),
+            },
+        ));
+        let bar = take_pending_bar(&mut app, "some-renumbered-id").expect("fallback bar");
+        assert_eq!(bar.leading, " greet ");
+        assert!(take_pending_bar(&mut app, "call_a").is_none());
     }
 
     /// Typing a command name in full must preselect that command.

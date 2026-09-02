@@ -423,6 +423,62 @@ fn http_get_allowed_host_reaches_server() {
     );
 }
 
+/// `url_allowlist = ["*"]` reaches a host it never named.
+///
+/// The unit tests cover the matcher; this one covers the whole path —
+/// config value, `PluginState`, host function, real socket — because
+/// the failure mode users actually hit is a pattern that parses but
+/// never reaches the gate. `localhost` rather than `127.0.0.1` on
+/// purpose: a wildcard that only worked for entries resembling
+/// something in the list would still pass a same-string test.
+#[test]
+fn http_get_wildcard_allowlist_reaches_an_unnamed_host() {
+    let port = spawn_test_server("SERVED-BODY-WILDCARD-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["*".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://localhost:{port}/"}}"#))
+        .expect("no trap");
+    assert!(!out.is_error, "wildcard fetch failed: {}", out.content);
+    assert!(
+        out.content.contains("SERVED-BODY-WILDCARD-CASE"),
+        "body did not reach the guest: {}",
+        out.content
+    );
+}
+
+/// The wildcard widens hosts, not schemes. `file://` under `*` would
+/// hand the plugin the filesystem read that `allow_fs` exists to gate
+/// — a capability it was never granted here.
+#[test]
+fn wildcard_allowlist_still_refuses_non_http_schemes() {
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["*".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", r#"{"url":"file:///etc/hostname"}"#)
+        .expect("no trap");
+    assert!(out.is_error, "file:// was allowed: {}", out.content);
+    assert!(out.content.contains("url_allowlist"), "{}", out.content);
+}
+
 /// Serve a single `302` pointing at `location`, forever. Same
 /// never-joined-thread shape as `spawn_test_server`.
 fn spawn_redirect_server(location: String) -> u16 {

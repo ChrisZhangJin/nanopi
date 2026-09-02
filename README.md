@@ -245,6 +245,8 @@ A plugin exports two required functions, and optionally two more ([`wit/nanopi-e
 
 **Tools vs commands.** A tool is something the *model* decides to call; a command is something *you* type. Commands show up in the `/` palette with the plugin's name attached, and are interactive-mode only — `nanopi -p` has no palette, though the plugin's tools still work there.
 
+**Seeing what loaded.** `/tools` lists every tool the model can actually call, tagged `[builtin]` or `[plugin:<name>]` with the `.wasm` it came from. It reads the live registry — the same list handed to the provider — so it is the thing to check when a plugin tool seems missing. Asking the model to list its own tools is not a substitute: it cannot tell a plugin tool from a built-in one, and will guess.
+
 `print` goes straight to your scrollback: the model never sees it and it never enters the session transcript. `send_user_message` starts a turn as if you had typed it — always echoed verbatim first, so a plugin cannot put words in your mouth invisibly; typed mid-stream it steers the running turn instead, exactly like your own typing. `error` is shown to you and, like a trap, is never forwarded to the model.
 
 The two command exports live in a second WIT world, `extension-commands`, which `include`s the first. A tool-only plugin keeps targeting `extension` and keeps building unchanged — WIT cannot express an optional export, so widening the original world would have broken every existing plugin's *source* even though the host still loads its compiled *binary*.
@@ -267,7 +269,17 @@ Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki
 
 `host-fs-read` is gated on `allow_fs = true`, and even then the path must resolve *inside* the working directory. Paths are canonicalized before that check, so `../` traversal and symlinks pointing outward are both refused. (The built-in `read` tool deliberately has no such guard, on the reasoning that the model can shell out anyway — but a plugin has no shell, so here the boundary is real rather than theater.)
 
-`host-http-get` is gated twice: on `allow_network = true`, and then on the URL's host appearing in `url_allowlist`. An **empty allowlist denies everything**, so switching the capability on does not by itself reach anything. Matching is on the parsed host, not a substring — `https://evil.com/?x=api.github.com` and `https://api.github.com@evil.com/` are both refused against an allowlist of `api.github.com`, while an entry covers its subdomains and any port. Only `http`/`https`; requests time out at 10s so a plugin cannot hang a turn; redirects are **not** followed, since a 3xx would otherwise walk the fetch onto a host you never approved. Refusals and failures come back to the plugin in-band as `error: `-prefixed strings rather than as traps. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
+`host-http-get` is gated twice: on `allow_network = true`, and then on the URL's host matching `url_allowlist`. An **empty allowlist denies everything**, so switching the capability on does not by itself reach anything. Matching is on the parsed host, not a substring — `https://evil.com/?x=api.github.com` and `https://api.github.com@evil.com/` are both refused against an allowlist of `api.github.com`.
+
+Entries are patterns, because a plugin that fetches whatever the model hands it has no finite host list to enumerate:
+
+| Entry | Matches |
+|---|---|
+| `github.com` | the host **and** its subdomains, any port |
+| `*.github.com` | subdomains only — the apex `github.com` is refused |
+| `*` | any `http`/`https` host |
+
+`*` is the escape hatch, and it is a real one: it turns the second gate off, leaving `allow_network` as the only check — link-local metadata endpoints included. nanopi prints a warning at startup naming the plugin whenever it sees `*` with networking on. A star anywhere else (`api.*.com`) is refused rather than widened, so a typo can't quietly broaden the gate. `*` widens hosts only; the scheme check is separate, so `file://` stays outside the network capability under every pattern. Only `http`/`https`; requests time out at 10s so a plugin cannot hang a turn; redirects are **not** followed, since a 3xx would otherwise walk the fetch onto a host you never approved. Refusals and failures come back to the plugin in-band as `error: `-prefixed strings rather than as traps. A trap in a plugin is reported to the model as a failed tool call — it does not take down nanopi, and a `.wasm` that fails to load is skipped with a warning rather than blocking startup.
 
 **Runaway plugins.** Guest code gets a ~30s wall-clock budget per tool call, enforced by wasmtime's epoch interruption. Exceeding it is a trap, which surfaces to the model as a failed tool call and leaves the plugin callable — the instance is rebuilt, so one bad call does not disable it for the rest of the session. Without the budget, a plugin containing an infinite loop would wedge nanopi permanently: the guest holds a real thread with no yield points, so <kbd>Esc</kbd> cannot reach inside it.
 

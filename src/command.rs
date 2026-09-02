@@ -117,6 +117,7 @@ pub const RESERVED_COMMAND_NAMES: &[&str] = &[
     "compact",
     "hotkeys",
     "skills",
+    "tools",
     "reload",
     "settings",
     "keybindings",

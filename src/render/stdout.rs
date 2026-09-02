@@ -109,12 +109,23 @@ fn error_body(content: &str) -> (String, String) {
 
 pub struct StdoutRenderer {
     buffer: String,
+    /// True when the last thing written was a thinking chunk.
+    ///
+    /// Reasoning arrives as deltas with no trailing newline, so the
+    /// first token of the actual answer landed on the same line:
+    /// `That's a simple greeting.Hello, Tom! — from my-plugin`. The
+    /// two are different kinds of text — one is the model musing, one
+    /// is its reply — and in `-p` mode dim styling is the only thing
+    /// separating them, which is nothing at all once the output is
+    /// piped or the terminal drops SGR.
+    after_thinking: bool,
 }
 
 impl StdoutRenderer {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
+            after_thinking: false,
         }
     }
 
@@ -128,6 +139,13 @@ impl StdoutRenderer {
                 write!(out, "\x1b[1;32m")?;
             }
             AgentEvent::TextDelta { text, .. } => {
+                // Break the line the reasoning left open. Only on the
+                // first chunk after thinking — inside the answer,
+                // deltas must concatenate exactly as they arrive, or
+                // every token boundary becomes a line break.
+                if std::mem::take(&mut self.after_thinking) {
+                    writeln!(out)?;
+                }
                 self.buffer.push_str(text);
                 write!(out, "{}", text)?;
                 out.flush()?;
@@ -135,12 +153,17 @@ impl StdoutRenderer {
             AgentEvent::ThinkingDelta { text, .. } => {
                 // Subtle gray, dim.
                 write!(out, "\x1b[2m{}\x1b[0m", text)?;
+                self.after_thinking = true;
                 out.flush()?;
             }
             AgentEvent::ToolCall { call, .. } => {
                 // The arg preview is what makes a later failure legible:
                 // `[tool_call: bash call_92c4…]` alone never said WHICH
                 // command was about to run.
+                // The marker's own leading `\n` already closes any
+                // open thinking line, so drop the flag rather than
+                // letting it add a blank one after the result.
+                self.after_thinking = false;
                 let preview = arg_preview(&call.name, &call.arguments);
                 write!(
                     out,
@@ -267,6 +290,70 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.buffer, "hi");
+    }
+
+    /// Reasoning must not run into the answer.
+    ///
+    /// `-p` produced `That's a simple greeting.Hello, Tom! — from
+    /// my-plugin`: thinking deltas carry no trailing newline, so the
+    /// reply's first token continued the line. Dim SGR was the only
+    /// thing distinguishing them, and that survives neither a pipe nor
+    /// a terminal that ignores it.
+    ///
+    /// Asserts the state machine, not the bytes: `render` writes to
+    /// the process's real stdout, which a unit test can't capture
+    /// without threading a writer through the whole renderer.
+    #[test]
+    fn a_reply_after_thinking_starts_on_its_own_line() {
+        let mut r = StdoutRenderer::new();
+        r.render(&AgentEvent::ThinkingDelta {
+            content_index: 0,
+            text: "That's a simple greeting.".into(),
+        })
+        .unwrap();
+        assert!(r.after_thinking, "thinking left the line open");
+
+        r.render(&AgentEvent::TextDelta {
+            content_index: 0,
+            text: "Hello, Tom!".into(),
+        })
+        .unwrap();
+        assert!(!r.after_thinking, "flag must clear on the first chunk");
+
+        // Mid-answer deltas must concatenate untouched — a newline per
+        // delta would break the reply at every token boundary.
+        r.render(&AgentEvent::TextDelta {
+            content_index: 0,
+            text: " — from my-plugin".into(),
+        })
+        .unwrap();
+        // The separator is display-only: `buffer` feeds `--output json`
+        // and the saved session, neither of which should gain a
+        // newline the model never emitted.
+        assert_eq!(r.buffer, "Hello, Tom! — from my-plugin");
+    }
+
+    /// A tool marker already opens with `\n`, so the flag must not
+    /// also insert one after the result — that would leave a blank
+    /// line between the tool card and the reply.
+    #[test]
+    fn a_tool_call_consumes_the_pending_separator() {
+        let mut r = StdoutRenderer::new();
+        r.render(&AgentEvent::ThinkingDelta {
+            content_index: 0,
+            text: "I should call greet.".into(),
+        })
+        .unwrap();
+        r.render(&AgentEvent::ToolCall {
+            content_index: 0,
+            call: crate::event::ToolCall {
+                id: "call_1".into(),
+                name: "greet".into(),
+                arguments: json!({"name": "Tom"}),
+            },
+        })
+        .unwrap();
+        assert!(!r.after_thinking);
     }
 
     #[test]

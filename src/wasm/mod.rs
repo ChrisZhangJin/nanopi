@@ -81,6 +81,17 @@ impl PluginHost {
         };
 
         for cfg in configs {
+            // Say it once per entry, before the paths expand — a
+            // directory entry would otherwise repeat the warning per
+            // `.wasm` and bury the rest of startup.
+            if cfg.allow_network && loader::allowlist_allows_any_host(&cfg.url_allowlist) {
+                eprintln!(
+                    "nanopi: {} has url_allowlist = [\"*\"] — this plugin may fetch \
+                     ANY http/https host, including link-local metadata endpoints. \
+                     Narrow it to `*.example.com` or `example.com` if you can.",
+                    cfg.path.display()
+                );
+            }
             for path in self.resolve_paths(std::slice::from_ref(cfg)) {
                 match engine.load(
                     &path,
@@ -95,10 +106,13 @@ impl PluginHost {
                             .and_then(|s| s.to_str())
                             .unwrap_or("wasm-plugin")
                             .into();
+                        let plugin_path: std::sync::Arc<str> =
+                            path.display().to_string().into();
                         for spec in specs {
                             tools.push(std::sync::Arc::new(host::WasmTool::new(
                                 spec,
                                 plugin_name.clone(),
+                                plugin_path.clone(),
                                 bridge.clone(),
                             )));
                         }

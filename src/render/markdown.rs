@@ -6,14 +6,16 @@
 //!
 //!   `# H1` / `## H2` / `### H3`   → colored bold, whole line
 //!   `- item` / `1. item`          → keep prefix, dim the marker
-//!   `> quote`                     → dim italic, whole line
+//!   `> quote`                     → dim `▏` gutter + dimmed text
 //!   ``` fenced code block         → different bg on all lines inside
 //!   `**bold**`                    → bold
 //!   `*italic*` / `_italic_`       → italic
 //!   `` `code` ``                  → inline code (dim bg)
 //!   `[label](url)`                → underline blue label + dim url
 //!
-//! Not handled (yet): tables, blockquotes with `>`, task lists, HTML.
+//! Not handled (yet): tables, task lists, HTML. (Blockquotes were on
+//! this list until `> quote` above shipped; nested `>>` still isn't
+//! distinguished from a single level.)
 //!
 //! Called per-line by the TUI when flushing assistant text. Fenced
 //! code blocks are a per-flush *state* — the caller passes a mutable
@@ -77,14 +79,28 @@ pub fn render_line<'a>(line: &'a str, state: &mut MdState) -> Vec<Span<'a>> {
         )];
     }
 
-    // Blockquotes → dim italic.
-    if let Some(rest) = trimmed_start.strip_prefix("> ") {
-        return vec![Span::styled(
-            format!("> {rest}"),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )];
+    // Blockquotes → dim gutter bar + slightly-dimmed text.
+    //
+    // Deliberately NOT `DarkGray + ITALIC`: that is what the TUI uses
+    // for the model's *thinking* stream, and a reply that quotes
+    // something was rendering identically to the model muttering to
+    // itself. These models quote tool output constantly, so the
+    // collision fired on most turns — see the `> Hello, elon musk!`
+    // case, where the reply and the reasoning above it were the same
+    // grey italic.
+    //
+    // The gutter carries the "this is quoted" signal instead, which
+    // is both what other renderers do and cheaper than spending
+    // another color: 250 is legible enough to still read as speech,
+    // where DarkGray reads as an aside.
+    if let Some(rest) = trimmed_start
+        .strip_prefix("> ")
+        .or_else(|| (trimmed_start == ">").then_some(""))
+    {
+        return vec![
+            Span::styled("▏ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(rest.to_string(), Style::default().fg(Color::Indexed(250))),
+        ];
     }
 
     // List item marker — dim the `-` / `*` / `1.`, then parse the rest
@@ -260,6 +276,45 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s[0].style.add_modifier.contains(Modifier::BOLD));
         assert!(concat_content(&s).contains("Hello"));
+    }
+
+    /// A blockquote must not look like the thinking stream.
+    ///
+    /// The TUI renders thinking as `DarkGray + ITALIC`
+    /// (`flush_thinking_buf`). Blockquotes used the same pair, so a
+    /// reply quoting its tool output was indistinguishable from the
+    /// model's reasoning. Asserting the *absence* of that exact
+    /// combination is the point of the test — any future restyling
+    /// that drifts back into it fails here.
+    #[test]
+    fn blockquote_is_not_styled_like_thinking() {
+        let mut st = MdState::default();
+        let s = render_line("> Hello, elon musk! — from my-plugin", &mut st);
+        let body = s.last().expect("a body span");
+        assert!(
+            !body.style.add_modifier.contains(Modifier::ITALIC),
+            "quoted text is italic again — that is the thinking style"
+        );
+        assert_ne!(
+            body.style.fg,
+            Some(Color::DarkGray),
+            "quoted text is DarkGray again — that is the thinking color"
+        );
+        // The gutter replaces the raw `>`; the text itself survives.
+        let rendered = concat_content(&s);
+        assert!(rendered.starts_with('▏'), "no gutter: {rendered:?}");
+        assert!(rendered.contains("Hello, elon musk!"), "{rendered:?}");
+        assert!(!rendered.contains('>'), "raw marker left in: {rendered:?}");
+    }
+
+    /// A bare `>` is a blank quote line in markdown, and models emit
+    /// it between quoted paragraphs. It must keep the gutter rather
+    /// than falling through to inline parsing as literal text.
+    #[test]
+    fn a_bare_gt_is_still_a_quote_line() {
+        let mut st = MdState::default();
+        let s = render_line(">", &mut st);
+        assert_eq!(concat_content(&s).trim_end(), "▏");
     }
 
     #[test]

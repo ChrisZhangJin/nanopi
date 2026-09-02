@@ -309,10 +309,34 @@ pub struct ToolContext {
     pub cwd: PathBuf,
 }
 
+/// Where a registered tool came from.
+///
+/// Exists for `/tools`, which is the user's only way to see what the
+/// model can actually call. A name alone is not enough there: "is
+/// `greet` something nanopi ships, or something a plugin added?" is
+/// exactly the question the listing has to answer, and guessing from
+/// the name is how the model ended up claiming a plugin tool was
+/// built in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSource {
+    Builtin,
+    /// A WASM extension: the plugin's display name (its `.wasm` file
+    /// stem) plus the path it was loaded from, so a user who sees an
+    /// unexpected tool can find the file that supplied it.
+    Plugin { name: String, path: String },
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Defaulted so built-ins say nothing: the trait has one external
+    /// implementor (`WasmTool`) and every other impl, tests included,
+    /// is a built-in by construction.
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
+    }
 }
 
 /// Registry of tools, keyed by name.
@@ -391,6 +415,21 @@ impl ToolRegistry {
 
     pub fn all_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
+    }
+
+    /// Every registered tool as `(spec, source)`, sorted by name.
+    ///
+    /// Sorted because this backs `/tools`, and the registry is a
+    /// `HashMap` — an unsorted listing would reshuffle between runs
+    /// and be unreadable.
+    pub fn entries(&self) -> Vec<(ToolSpec, ToolSource)> {
+        let mut v: Vec<_> = self
+            .tools
+            .values()
+            .map(|t| (t.spec(), t.source()))
+            .collect();
+        v.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        v
     }
 
     pub fn names(&self) -> Vec<String> {
