@@ -572,6 +572,106 @@ mod tests {
         );
     }
 
+    // ───────────────── entries() / ToolSource, for `/tools` ─────────────────
+
+    /// Stands in for a plugin-supplied tool: the only thing that
+    /// matters here is that it overrides `Tool::source`.
+    struct FakePluginTool {
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Tool for FakePluginTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "from a plugin".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+            unreachable!("not executed in these tests")
+        }
+        fn source(&self) -> ToolSource {
+            ToolSource::Plugin {
+                name: "my-plugin".into(),
+                path: "/tmp/my-plugin/my-plugin.component.wasm".into(),
+            }
+        }
+    }
+
+    /// `/tools` exists because the model cannot reliably say what it
+    /// can call — in the session that motivated it, the model
+    /// presented plugin tools as built-ins and then contradicted
+    /// itself. So the attribution is the feature, and this is the test
+    /// that it is real.
+    #[test]
+    fn entries_attributes_each_tool_to_its_source() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(FakePluginTool { name: "greet" }))
+            .expect("greet does not collide");
+
+        let entries = r.entries();
+        assert_eq!(entries.len(), 8, "7 built-ins + 1 plugin tool");
+
+        let by_name = |n: &str| -> ToolSource {
+            entries
+                .iter()
+                .find(|(spec, _)| spec.name == n)
+                .map(|(_, src)| src.clone())
+                .unwrap_or_else(|| panic!("{n} missing from entries()"))
+        };
+
+        // Every built-in takes the defaulted `Tool::source`.
+        for builtin in ["bash", "read", "write", "edit", "grep", "find", "ls"] {
+            assert_eq!(by_name(builtin), ToolSource::Builtin, "{builtin}");
+        }
+        // The plugin tool names its plugin AND the file it came from —
+        // a stem alone would not tell a user which file to go edit.
+        assert_eq!(
+            by_name("greet"),
+            ToolSource::Plugin {
+                name: "my-plugin".into(),
+                path: "/tmp/my-plugin/my-plugin.component.wasm".into(),
+            }
+        );
+    }
+
+    /// Sorted, because the registry is a `HashMap` and an unsorted
+    /// listing would reshuffle between runs.
+    #[test]
+    fn entries_are_sorted_by_name() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(FakePluginTool { name: "greet" }))
+            .unwrap();
+        r.register_external(Arc::new(FakePluginTool { name: "aardvark" }))
+            .unwrap();
+
+        let names: Vec<String> = r.entries().into_iter().map(|(s, _)| s.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "entries() must be name-sorted");
+        // And a plugin tool sorts among the built-ins rather than
+        // being appended — the listing is one inventory, not two.
+        assert_eq!(names.first().map(String::as_str), Some("aardvark"));
+    }
+
+    /// A plugin may not shadow a built-in: `register_external` refuses
+    /// rather than overwriting, so a plugin cannot quietly replace
+    /// `bash`. `/tools` would otherwise attribute `bash` to a plugin.
+    #[test]
+    fn a_plugin_cannot_shadow_a_builtin_in_the_listing() {
+        let mut r = ToolRegistry::standard();
+        let err = r
+            .register_external(Arc::new(FakePluginTool { name: "bash" }))
+            .expect_err("bash must be refused");
+        assert_eq!(err, "bash");
+
+        let entries = r.entries();
+        assert_eq!(entries.len(), 7, "the refused tool must not appear");
+        let bash = entries.iter().find(|(s, _)| s.name == "bash").unwrap();
+        assert_eq!(bash.1, ToolSource::Builtin, "bash is still the built-in");
+    }
+
     // ───────────────── mutation_key (v0.11.0) ─────────────────
 
     fn key_tmp() -> PathBuf {

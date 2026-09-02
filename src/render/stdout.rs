@@ -133,6 +133,19 @@ impl StdoutRenderer {
     pub fn render(&mut self, event: &AgentEvent) -> io::Result<()> {
         let stdout = io::stdout();
         let mut out = stdout.lock();
+        self.render_to(&mut out, event)
+    }
+
+    /// Render one AgentEvent into an arbitrary sink.
+    ///
+    /// Exists so tests can assert the actual bytes. Everything in `-p`
+    /// mode is bytes on a pipe — the separator between reasoning and
+    /// reply, the `\n` a tool marker opens with, whether a newline is
+    /// emitted once or per delta — and none of that is observable by
+    /// inspecting the renderer's fields. `render` stays the caller's
+    /// entry point so `mode::print` is unaffected.
+    fn render_to<W: Write>(&mut self, out: &mut W, event: &AgentEvent) -> io::Result<()> {
+        let out = &mut *out;
         match event {
             AgentEvent::Start { .. } => {
                 // Begin green text.
@@ -277,19 +290,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn render_text_delta_does_not_panic() {
+    fn text_deltas_accumulate_into_the_buffer_and_the_sink() {
         let mut r = StdoutRenderer::new();
-        r.render(&AgentEvent::TextDelta {
-            content_index: 0,
-            text: "hi".into(),
-        })
-        .unwrap();
-        r.render(&AgentEvent::Done {
-            finish_reason: FinishReason::Stop,
-            usage: Usage::default(),
-        })
-        .unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        for ev in [
+            text("hi"),
+            AgentEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ] {
+            r.render_to(&mut sink, &ev).unwrap();
+        }
+        // `buffer` is what `--output json` and the session record use.
         assert_eq!(r.buffer, "hi");
+        // Done emits a trailing newline so the next terminal write
+        // (the `✓ session saved` line) starts on its own line.
+        assert_eq!(strip_sgr(&String::from_utf8(sink).unwrap()), "hi\n");
     }
 
     /// Reasoning must not run into the answer.
@@ -300,60 +317,167 @@ mod tests {
     /// thing distinguishing them, and that survives neither a pipe nor
     /// a terminal that ignores it.
     ///
-    /// Asserts the state machine, not the bytes: `render` writes to
-    /// the process's real stdout, which a unit test can't capture
-    /// without threading a writer through the whole renderer.
+    /// Render a sequence into a buffer and return what a pipe would
+    /// receive, SGR sequences stripped — `-p` output is judged as
+    /// bytes, and the escapes are noise for every assertion here.
+    fn rendered(events: &[AgentEvent]) -> String {
+        let mut r = StdoutRenderer::new();
+        let mut out: Vec<u8> = Vec::new();
+        for ev in events {
+            r.render_to(&mut out, ev).expect("render_to");
+        }
+        strip_sgr(&String::from_utf8(out).expect("utf8"))
+    }
+
+    /// Drop `ESC [ … m` sequences. Deliberately hand-rolled: the point
+    /// is to assert on text a piped consumer sees, and pulling a crate
+    /// in for six lines would be worse.
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn thinking(text: &str) -> AgentEvent {
+        AgentEvent::ThinkingDelta {
+            content_index: 0,
+            text: text.into(),
+        }
+    }
+
+    fn text(t: &str) -> AgentEvent {
+        AgentEvent::TextDelta {
+            content_index: 0,
+            text: t.into(),
+        }
+    }
+
+    /// Regression: `-p` emitted
+    /// `That's a simple greeting.Hello, Tom! — from my-plugin`.
+    /// Thinking deltas carry no trailing newline, so the reply's first
+    /// token continued the line; dim SGR was the only thing telling
+    /// them apart, and it survives neither a pipe nor a terminal that
+    /// ignores it. Asserted on the bytes, because that is the artifact.
     #[test]
     fn a_reply_after_thinking_starts_on_its_own_line() {
+        let out = rendered(&[
+            thinking("That's a simple greeting."),
+            text("Hello, Tom!"),
+            text(" — from my-plugin"),
+        ]);
+        assert_eq!(
+            out, "That's a simple greeting.\nHello, Tom! — from my-plugin",
+            "reasoning and reply must be on separate lines"
+        );
+    }
+
+    /// Exactly one newline, on the first chunk only. A newline per
+    /// delta would break the reply at every token boundary — the
+    /// failure mode of the obvious fix.
+    #[test]
+    fn the_separator_is_emitted_once_not_per_delta() {
+        let out = rendered(&[
+            thinking("thinking"),
+            text("a"),
+            text("b"),
+            text("c"),
+        ]);
+        assert_eq!(out, "thinking\nabc");
+    }
+
+    /// No thinking, no separator. The common `-p` case has no
+    /// reasoning at all and must not gain a leading blank line.
+    #[test]
+    fn a_reply_without_thinking_gains_nothing() {
+        assert_eq!(rendered(&[text("hi")]), "hi");
+    }
+
+    /// Interleaved: a second thinking run after the reply resumes gets
+    /// its own separator when the reply comes back.
+    #[test]
+    fn each_thinking_run_gets_its_own_separator() {
+        let out = rendered(&[
+            thinking("first"),
+            text("A"),
+            thinking("second"),
+            text("B"),
+        ]);
+        assert_eq!(out, "first\nAsecond\nB");
+    }
+
+    /// The separator is display-only. `buffer` feeds `--output json`
+    /// and the saved session, so it must not gain a character the
+    /// model never emitted.
+    #[test]
+    fn the_separator_never_reaches_the_buffer() {
         let mut r = StdoutRenderer::new();
-        r.render(&AgentEvent::ThinkingDelta {
-            content_index: 0,
-            text: "That's a simple greeting.".into(),
-        })
-        .unwrap();
-        assert!(r.after_thinking, "thinking left the line open");
-
-        r.render(&AgentEvent::TextDelta {
-            content_index: 0,
-            text: "Hello, Tom!".into(),
-        })
-        .unwrap();
-        assert!(!r.after_thinking, "flag must clear on the first chunk");
-
-        // Mid-answer deltas must concatenate untouched — a newline per
-        // delta would break the reply at every token boundary.
-        r.render(&AgentEvent::TextDelta {
-            content_index: 0,
-            text: " — from my-plugin".into(),
-        })
-        .unwrap();
-        // The separator is display-only: `buffer` feeds `--output json`
-        // and the saved session, neither of which should gain a
-        // newline the model never emitted.
+        let mut sink: Vec<u8> = Vec::new();
+        for ev in [thinking("musing"), text("Hello, Tom!"), text(" — from my-plugin")] {
+            r.render_to(&mut sink, &ev).unwrap();
+        }
         assert_eq!(r.buffer, "Hello, Tom! — from my-plugin");
     }
 
-    /// A tool marker already opens with `\n`, so the flag must not
-    /// also insert one after the result — that would leave a blank
-    /// line between the tool card and the reply.
+    /// A tool marker already opens with `\n`, so the pending separator
+    /// must be consumed rather than added — otherwise a blank line
+    /// opens up between the reasoning and the tool card.
     #[test]
     fn a_tool_call_consumes_the_pending_separator() {
-        let mut r = StdoutRenderer::new();
-        r.render(&AgentEvent::ThinkingDelta {
-            content_index: 0,
-            text: "I should call greet.".into(),
-        })
-        .unwrap();
-        r.render(&AgentEvent::ToolCall {
-            content_index: 0,
-            call: crate::event::ToolCall {
-                id: "call_1".into(),
-                name: "greet".into(),
-                arguments: json!({"name": "Tom"}),
+        let out = rendered(&[
+            thinking("I should call greet."),
+            AgentEvent::ToolCall {
+                content_index: 0,
+                call: crate::event::ToolCall {
+                    id: "call_1".into(),
+                    name: "greet".into(),
+                    arguments: json!({"name": "Tom"}),
+                },
             },
-        })
-        .unwrap();
-        assert!(!r.after_thinking);
+        ]);
+        assert_eq!(
+            out, "I should call greet.\n[greet call_1] {\"name\":\"Tom\"}\n",
+            "expected exactly one newline between the reasoning and the marker"
+        );
+        assert!(!out.contains("\n\n"), "blank line opened up: {out:?}");
+    }
+
+    /// And a reply after a tool result still starts on its own line —
+    /// the marker's own trailing newline does that, so the renderer
+    /// must not add a second one.
+    #[test]
+    fn a_reply_after_a_tool_result_has_no_extra_blank_line() {
+        let out = rendered(&[
+            thinking("calling it"),
+            AgentEvent::ToolCall {
+                content_index: 0,
+                call: crate::event::ToolCall {
+                    id: "call_1".into(),
+                    name: "greet".into(),
+                    arguments: json!({"name": "Tom"}),
+                },
+            },
+            AgentEvent::ToolResult {
+                call_id: "call_1".into(),
+                tool_name: "greet".into(),
+                content: "Hello, Tom!".into(),
+                is_error: false,
+                elapsed_ms: 0,
+            },
+            text("Done."),
+        ]);
+        assert!(out.ends_with("Done."), "reply lost or misplaced: {out:?}");
+        assert!(!out.contains("\n\n"), "blank line opened up: {out:?}");
     }
 
     #[test]
@@ -462,29 +586,68 @@ mod tests {
     }
 
     #[test]
-    fn render_failed_tool_result_does_not_panic() {
-        let mut r = StdoutRenderer::new();
-        r.render(&AgentEvent::ToolResult {
+    fn a_failed_tool_result_names_the_tool_and_echoes_why() {
+        let out = rendered(&[AgentEvent::ToolResult {
             call_id: "call_1".into(),
             tool_name: "bash".into(),
             content: "bash: cargo: command not found".into(),
             is_error: true,
             elapsed_ms: 9,
-        })
-        .unwrap();
+        }]);
+        // The `✗` separator, not `→`: the marker's shape is how a
+        // reader scanning piped output spots the failure.
+        assert!(out.contains("[bash ✗ call_1  9ms]"), "{out:?}");
+        // A one-line error rides on the marker line rather than
+        // costing a second line.
+        assert!(out.contains("bash: cargo: command not found"), "{out:?}");
+        assert!(!out.contains("↳"), "one-liner should not get a gutter block: {out:?}");
+    }
+
+    /// A multi-line failure gets the `↳` gutter instead — compiler
+    /// output and stack traces are unreadable flattened onto the
+    /// marker line.
+    #[test]
+    fn a_multiline_failure_gets_a_gutter_block() {
+        let out = rendered(&[AgentEvent::ToolResult {
+            call_id: "call_2".into(),
+            tool_name: "bash".into(),
+            content: "error[E0609]: no field `x`\n  --> src/a.rs:3:9\n   |".into(),
+            is_error: true,
+            elapsed_ms: 12,
+        }]);
+        assert!(out.contains("[bash ✗ call_2  12ms]"), "{out:?}");
+        assert!(out.contains("↳ error[E0609]"), "{out:?}");
+        assert!(out.contains("↳   --> src/a.rs:3:9"), "{out:?}");
+    }
+
+    /// Success reports a byte count instead of the content: the model
+    /// consumed the output and the user did not see it, so the useful
+    /// fact is how much there was.
+    #[test]
+    fn a_successful_tool_result_reports_size_and_timing() {
+        let out = rendered(&[AgentEvent::ToolResult {
+            call_id: "call_3".into(),
+            tool_name: "read".into(),
+            content: "0123456789".into(),
+            is_error: false,
+            elapsed_ms: 1500,
+        }]);
+        // 10 bytes, and >=1s formats as seconds rather than 1500ms.
+        assert!(out.contains("[read → call_3  10 bytes  1.5s]"), "{out:?}");
     }
 
     #[test]
-    fn render_tool_call_does_not_panic() {
-        let mut r = StdoutRenderer::new();
-        r.render(&AgentEvent::ToolCall {
+    fn a_tool_call_marker_names_the_tool_and_previews_the_subject() {
+        let out = rendered(&[AgentEvent::ToolCall {
             content_index: 0,
             call: crate::event::ToolCall {
                 id: "c".into(),
                 name: "bash".into(),
                 arguments: json!({"command": "ls"}),
             },
-        })
-        .unwrap();
+        }]);
+        // Leading newline so the marker never continues a previous
+        // line; the arg preview is what makes a later failure legible.
+        assert_eq!(out, "\n[bash c] ls\n", "{out:?}");
     }
 }
