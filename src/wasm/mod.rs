@@ -24,6 +24,11 @@ pub struct PluginLoadSummary {
     /// Tools ready to register into `ToolRegistry`. Already wrapped
     /// so the agent loop can call them like any built-in tool.
     pub tools: Vec<std::sync::Arc<dyn crate::tool::Tool>>,
+    /// Slash commands the plugins advertised, still *candidates* —
+    /// `command::resolve_commands` decides which may actually
+    /// register, since a collision needs to see every claimant at
+    /// once and cannot be judged one plugin at a time.
+    pub commands: Vec<crate::command::PluginCommand>,
     /// How many `.wasm` files instantiated cleanly.
     pub loaded: usize,
     /// Per-file failures — path plus the reason. Non-fatal: a broken
@@ -50,6 +55,7 @@ impl PluginHost {
         cwd: &std::path::Path,
     ) -> PluginLoadSummary {
         let mut tools: Vec<std::sync::Arc<dyn crate::tool::Tool>> = Vec::new();
+        let mut commands: Vec<crate::command::PluginCommand> = Vec::new();
         let mut errors = Vec::new();
         let mut loaded = 0usize;
 
@@ -67,6 +73,7 @@ impl PluginHost {
                     .unwrap_or_default();
                 return PluginLoadSummary {
                     tools,
+                    commands,
                     loaded: 0,
                     errors: vec![(anchor, e)],
                 };
@@ -95,6 +102,20 @@ impl PluginHost {
                                 bridge.clone(),
                             )));
                         }
+                        // One handler per plugin, shared by its
+                        // commands — they all dispatch through the same
+                        // bridge, and the name is checked there.
+                        if !bridge.command_specs().is_empty() {
+                            let handler: std::sync::Arc<dyn crate::command::CommandHandler> =
+                                std::sync::Arc::new(host::WasmCommandHandler::new(bridge.clone()));
+                            for spec in bridge.command_specs() {
+                                commands.push(crate::command::PluginCommand {
+                                    spec,
+                                    plugin_name: plugin_name.clone(),
+                                    handler: handler.clone(),
+                                });
+                            }
+                        }
                         loaded += 1;
                     }
                     Err(e) => errors.push((path, e)),
@@ -104,6 +125,7 @@ impl PluginHost {
 
         PluginLoadSummary {
             tools,
+            commands,
             loaded,
             errors,
         }

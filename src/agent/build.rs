@@ -99,9 +99,10 @@ pub struct AgentBuildInputs {
     pub extensions: Vec<crate::config::ExtensionConfig>,
 }
 
-/// Load `[[extensions]]` into the registry. Failures are reported on
-/// stderr and skipped — a broken plugin must not stop nanopi from
-/// starting with the rest of its tools.
+/// Load `[[extensions]]` into the registry, returning the slash
+/// commands the plugins may register. Failures are reported on stderr
+/// and skipped — a broken plugin must not stop nanopi from starting
+/// with the rest of its tools.
 ///
 /// Compiled out entirely without the `wasm` feature, so the default
 /// build carries neither wasmtime nor this code path.
@@ -110,9 +111,9 @@ fn load_extensions(
     registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
     cwd: &std::path::Path,
-) {
+) -> Vec<crate::command::PluginCommand> {
     if extensions.is_empty() {
-        return;
+        return Vec::new();
     }
     let summary = crate::wasm::PluginHost::new().load_all(extensions, cwd);
     for (path, err) in &summary.errors {
@@ -129,6 +130,18 @@ fn load_extensions(
             eprintln!("nanopi: registered extension tool {name:?}");
         }
     }
+    // Commands are judged as a set, not one at a time: a name claimed
+    // by two plugins must register for neither, which is not decidable
+    // while looking at one plugin.
+    let resolved = crate::command::resolve_commands(summary.commands);
+    print_command_diagnostics(&resolved.diagnostics);
+    for cmd in &resolved.commands {
+        eprintln!(
+            "nanopi: registered extension command \"/{}\" from {:?}",
+            cmd.spec.name, cmd.plugin_name
+        );
+    }
+    resolved.commands
 }
 
 /// No-op stand-in for builds without the `wasm` feature. Warns once if
@@ -139,13 +152,23 @@ fn load_extensions(
     _registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
     _cwd: &std::path::Path,
-) {
+) -> Vec<crate::command::PluginCommand> {
     if !extensions.is_empty() {
         eprintln!(
             "nanopi: {} [[extensions]] entries ignored — this build has no \
              WASM support (rebuild with `--features wasm`)",
             extensions.len()
         );
+    }
+    Vec::new()
+}
+
+/// Print command-registry diagnostics to stderr. Kept out of
+/// `resolve_commands` so tests can inspect them without noise —
+/// same split as `print_skill_diagnostics`.
+pub fn print_command_diagnostics(diags: &[crate::command::CommandDiagnostic]) {
+    for d in diags {
+        eprintln!("nanopi: {}", d.message);
     }
 }
 
@@ -179,7 +202,7 @@ impl Agent {
         // from both the system prompt's tool list and the `tools` array
         // sent to the model, i.e. registered but uncallable.
         let mut registry = registry;
-        load_extensions(&mut registry, &extensions, &cwd);
+        let plugin_commands = load_extensions(&mut registry, &extensions, &cwd);
 
         let tool_names = registry.names();
         let LoadSkillsResult {
@@ -218,6 +241,7 @@ impl Agent {
             prompt_overrides,
             pending_follow_ups: initial_follow_up.into_iter().collect(),
             tool_exec_mode,
+            plugin_commands,
         };
         (agent, diagnostics)
     }
@@ -262,7 +286,7 @@ impl Agent {
         // plugin tools are registered but uncallable. Resumed sessions
         // used to skip plugin loading entirely, so `--continue` and
         // every TUI resume path silently lost every plugin tool.
-        load_extensions(&mut self.registry, extensions, &self.cwd);
+        self.plugin_commands = load_extensions(&mut self.registry, extensions, &self.cwd);
 
         // load_session rebuilds Context from JSONL messages only — it
         // never repopulates `tools`. Without this line, the first turn
@@ -576,6 +600,15 @@ mod tests {
             "ctx.tools must be built AFTER extensions register, else the \
              plugin tool is registered but uncallable"
         );
+        // Commands ride the same path — a resumed session that lost
+        // them would show an empty palette while the tools worked.
+        let mut cmds: Vec<&str> = agent
+            .plugin_commands
+            .iter()
+            .map(|c| c.spec.name.as_str())
+            .collect();
+        cmds.sort();
+        assert_eq!(cmds, vec!["explain", "todo"]);
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
