@@ -138,6 +138,27 @@ base_url = "https://api.openai.com/v1"
 #                   A star anywhere else ("api.*.com") is refused
 #                   rather than widened. Effective only when
 #                   allow_network = true.
+#   events          Lifecycle events this plugin may OBSERVE (v0.12.0).
+#                   Absent or empty grants NOTHING — a plugin exporting
+#                   `list-events` still receives no deliveries until its
+#                   requests appear here too. Delivery needs the event
+#                   in BOTH this list AND the plugin's own `list-events`
+#                   export; either alone is not enough. PI's eleven
+#                   event names (same vocabulary as [[hooks.*]] below):
+#                     tool_execution_start, tool_execution_end, input,
+#                     before_agent_start, turn_start, turn_end,
+#                     message_end, session_start, session_shutdown,
+#                     session_before_compact, session_compact
+#                   A subscriber is OBSERVE-ONLY — it cannot block or
+#                   transform, unlike a shell hook. But the grant is
+#                   real: a `tool_execution_start` subscriber sees every
+#                   tool call's arguments, and an `input` subscriber
+#                   sees every prompt verbatim — a bigger surface than
+#                   `allow_fs`. Combining `events` with
+#                   `allow_network = true` on the same plugin is warned
+#                   about at startup: it can exfiltrate whatever those
+#                   events carry. `/tools` lists every plugin currently
+#                   watching, under "Watching events".
 #
 # See docs/pi-vs-nanopi.md §4.3 and wit/nanopi-extension.wit for the
 # guest interface a plugin must export.
@@ -155,6 +176,12 @@ base_url = "https://api.openai.com/v1"
 # [[extensions]]
 # path = "~/.nanopi/extensions/"
 # max_files = 16
+
+# A plugin that only watches lifecycle events (e.g. an audit logger) —
+# no tools, no commands, just `events`.
+# [[extensions]]
+# path = "~/.nanopi/extensions/audit-watcher.wasm"
+# events = ["tool_execution_start", "session_start", "session_shutdown"]
 
 # ─── API key: pick ONE of the two below ─────────────────────────────
 
