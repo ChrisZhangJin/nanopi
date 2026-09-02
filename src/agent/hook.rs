@@ -178,6 +178,34 @@ pub fn validate_hooks(hooks: &[HookConfig]) -> Result<(), String> {
     Ok(())
 }
 
+/// v0.12.0 §2.3: the four hook keys retired in favor of PI's names have
+/// no alias and no dual-key parsing — a config using one of them is a
+/// hard load error. `HooksSection` carries `#[serde(deny_unknown_fields)]`
+/// so a retired (or simply misspelled) key surfaces as a
+/// `toml::de::Error` whose rendered text names the field. This function
+/// scans that rendered text for one of the four retired names and, if
+/// found, rewrites it into a message that names BOTH the retired key and
+/// its replacement, so the user does not have to cross-reference
+/// `docs/v0.12-events.md` §2.1 by hand. Any other unknown-field error
+/// (e.g. a genuine typo like `turn_startt`) returns `None` — the caller
+/// keeps serde's original message, which already lists the valid keys.
+pub fn retired_hook_key_error(err: &str) -> Option<String> {
+    const RETIRED: [(&str, &str); 4] = [
+        ("pre_tool_use", "tool_execution_start"),
+        ("post_tool_use", "tool_execution_end"),
+        ("user_prompt_submit", "input"),
+        ("session_end", "session_shutdown"),
+    ];
+    for (old, new) in RETIRED {
+        if err.contains(&format!("`{old}`")) {
+            return Some(format!(
+                "unknown hook event \"{old}\" — renamed to \"{new}\" in v0.12 (see docs/v0.12-events.md §2.1)"
+            ));
+        }
+    }
+    None
+}
+
 fn extract_env(extra: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = std::env::vars().collect();
     v.extend(extra.iter().map(|(k, val)| (k.clone(), val.clone())));
@@ -492,6 +520,33 @@ mod tests {
         let p = expand_command("~/foo/bar.sh");
         assert!(p.to_string_lossy().contains("foo/bar.sh"));
         assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn retired_hook_key_error_maps_all_four_retired_keys() {
+        let cases = [
+            ("pre_tool_use", "tool_execution_start"),
+            ("post_tool_use", "tool_execution_end"),
+            ("user_prompt_submit", "input"),
+            ("session_end", "session_shutdown"),
+        ];
+        for (old, new) in cases {
+            let raw = format!("unknown field `{old}`, expected one of `tool_execution_start`, `tool_execution_end`, `input`, `session_start`, `session_shutdown`");
+            let mapped = retired_hook_key_error(&raw)
+                .unwrap_or_else(|| panic!("expected a mapping for {old}"));
+            assert!(mapped.contains(old), "message should name the retired key: {mapped}");
+            assert!(mapped.contains(new), "message should name the replacement: {mapped}");
+            assert!(
+                mapped.contains("v0.12-events.md"),
+                "message should point at the spec: {mapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_hook_key_error_ignores_unrelated_errors() {
+        let raw = "unknown field `turn_startt`, expected one of `tool_execution_start`, `turn_start`, `turn_end`";
+        assert_eq!(retired_hook_key_error(raw), None);
     }
 
     #[test]

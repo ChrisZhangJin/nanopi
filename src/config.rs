@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::de::Error as _;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -255,9 +256,22 @@ fn load_one(path: &Path) -> Result<Config, ConfigError> {
         path: path.to_path_buf(),
         source: e,
     })?;
-    toml::from_str::<Config>(&text).map_err(|e| ConfigError::Toml {
-        path: path.to_path_buf(),
-        source: e,
+    toml::from_str::<Config>(&text).map_err(|e| {
+        // A retired [[hooks.*]] key (§2.3) surfaces here as a plain
+        // "unknown field" toml error. Rewrite it to name the
+        // replacement key, keeping the file path so the user knows
+        // which file to edit; any other parse error passes through
+        // verbatim.
+        if let Some(msg) = crate::agent::hook::retired_hook_key_error(&e.to_string()) {
+            return ConfigError::Toml {
+                path: path.to_path_buf(),
+                source: toml::de::Error::custom(msg),
+            };
+        }
+        ConfigError::Toml {
+            path: path.to_path_buf(),
+            source: e,
+        }
     })
 }
 
@@ -433,6 +447,52 @@ base_url = "https://project.example/v1"
         let _h = HomeGuard::new();
         let tmp = TempDir::new();
         tmp.write(".nanopi/config.toml", "this is not valid toml = === =");
+        let r = load_config(tmp.path());
+        assert!(matches!(r, Err(ConfigError::Toml { .. })));
+    }
+
+    /// v0.12.0 §2.3: a retired hook key is a hard load error naming both
+    /// the retired key and its replacement.
+    #[test]
+    fn retired_hook_key_is_a_hard_error_naming_the_replacement() {
+        let _g = lock();
+        let _h = HomeGuard::new();
+        let tmp = TempDir::new();
+        tmp.write(
+            ".nanopi/config.toml",
+            r#"
+[[hooks.pre_tool_use]]
+matcher = "*"
+command = "echo hi"
+"#,
+        );
+        let r = load_config(tmp.path());
+        let err = match r {
+            Err(ConfigError::Toml { source, .. }) => source.to_string(),
+            other => panic!("expected a Toml error, got {other:?}"),
+        };
+        assert!(err.contains("pre_tool_use"), "error should name the retired key: {err}");
+        assert!(
+            err.contains("tool_execution_start"),
+            "error should name the replacement: {err}"
+        );
+    }
+
+    /// A merely-misspelled hook key (never a shipped name) is still a
+    /// hard error — it just isn't rewritten by the retired-key table.
+    #[test]
+    fn misspelled_hook_key_is_still_an_error() {
+        let _g = lock();
+        let _h = HomeGuard::new();
+        let tmp = TempDir::new();
+        tmp.write(
+            ".nanopi/config.toml",
+            r#"
+[[hooks.turn_startt]]
+matcher = "*"
+command = "echo hi"
+"#,
+        );
         let r = load_config(tmp.path());
         assert!(matches!(r, Err(ConfigError::Toml { .. })));
     }

@@ -44,8 +44,17 @@ pub struct Settings {
     pub hooks: HooksSection,
 }
 
+/// `deny_unknown_fields` is what turns a retired hook key
+/// (`pre_tool_use`, `post_tool_use`, `user_prompt_submit`,
+/// `session_end`) into a parse error instead of a silently-ignored
+/// no-op. Both `config.toml` (via `Config`) and `settings.toml` (via
+/// `Settings`) deserialize into this same struct, so one attribute
+/// covers both surfaces. Per v0.12.0 §2.3 there is deliberately no
+/// alias to soften this — see `retired_hook_key_error` in
+/// `crate::agent::hook` for the error-message rewrite that names the
+/// replacement key.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HooksSection {
     #[serde(default)]
     pub tool_execution_start: Vec<HookConfig>,
@@ -194,9 +203,19 @@ fn load_one(path: &Path) -> Result<Settings, SettingsError> {
         path: path.to_path_buf(),
         source: e,
     })?;
-    toml::from_str(&text).map_err(|e| SettingsError::Toml {
-        path: path.to_path_buf(),
-        source: e,
+    toml::from_str(&text).map_err(|e: toml::de::Error| {
+        // See config.rs::load_one — same retired-key rewrite, applied
+        // here for settings.toml (the legacy hooks surface).
+        if let Some(msg) = crate::agent::hook::retired_hook_key_error(&e.to_string()) {
+            return SettingsError::Toml {
+                path: path.to_path_buf(),
+                source: <toml::de::Error as serde::de::Error>::custom(msg),
+            };
+        }
+        SettingsError::Toml {
+            path: path.to_path_buf(),
+            source: e,
+        }
     })
 }
 
@@ -269,6 +288,73 @@ timeout = 2000
         assert_eq!(h.tool_execution_start.len(), 1);
         assert_eq!(h.tool_execution_start[0].matcher, "bash");
         assert_eq!(h.tool_execution_end.len(), 1);
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0 §2.3: a retired hook key in settings.toml (the legacy
+    /// hooks surface) is a hard error naming both the retired key and
+    /// its replacement — same as config.toml.
+    #[test]
+    fn retired_hook_key_in_settings_toml_is_a_hard_error() {
+        let _guard = lock();
+        let dir = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &dir);
+        std::fs::write(
+            dir.join("settings.toml"),
+            r#"
+[[hooks.pre_tool_use]]
+matcher = "*"
+command = "echo hi"
+"#,
+        )
+        .unwrap();
+
+        let r = load_settings(&PathBuf::from("/tmp"));
+        let err = match r {
+            Err(SettingsError::Toml { source, .. }) => source.to_string(),
+            other => panic!("expected a Toml error, got {other:?}"),
+        };
+        assert!(err.contains("pre_tool_use"), "error should name the retired key: {err}");
+        assert!(
+            err.contains("tool_execution_start"),
+            "error should name the replacement: {err}"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A merely-misspelled hook key in settings.toml is still an error —
+    /// it just isn't rewritten by the retired-key table.
+    #[test]
+    fn misspelled_hook_key_in_settings_toml_is_still_an_error() {
+        let _guard = lock();
+        let dir = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &dir);
+        std::fs::write(
+            dir.join("settings.toml"),
+            r#"
+[[hooks.turn_startt]]
+matcher = "*"
+command = "echo hi"
+"#,
+        )
+        .unwrap();
+
+        let r = load_settings(&PathBuf::from("/tmp"));
+        assert!(matches!(r, Err(SettingsError::Toml { .. })));
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);

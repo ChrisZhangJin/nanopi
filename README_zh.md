@@ -41,7 +41,7 @@ Alpine 能跑，CentOS 6 能跑，`npm install` 跑不通的地方它也能跑�
 - 🧬 **PI-parity** —— 对齐 [Pi](https://github.com/earendil-works/pi) 的用户界面：JSONL 会话、hooks、skills、`-p`、`/fork`、`/resume`
 - 🔌 **多 provider** —— 任何 OpenAI 兼容端点（DeepSeek、ollama、vLLM …）以及原生 Anthropic
 - 🛠 **流式工具调用** —— `read` / `write` / `edit` / `bash`，在 ratatui TUI 里实时渲染
-- 🪝 **Claude Code 风格 hooks** —— `PreToolUse` / `PostToolUse` / `UserPromptSubmit` shell 钩子
+- 🪝 **Claude Code 协议的 hooks** —— JSON 走 stdin、退出码 2 表示拒绝的 shell 钩子，事件名沿用 PI 的命名（`tool_execution_start` / `tool_execution_end` / `input` / …）
 - 🧠 **Agent Skills** —— 遵循 [官方规范](https://agentskills.io/specification) 的 `SKILL.md` 发现 + `/skill:name` 展开
 
 ## 设计初衷 —— 为什么要做 nanopi
@@ -187,19 +187,30 @@ description: 亲切地和用户打招呼。用于问候场景。
 
 ## Hooks
 
-Shell hooks 会在工具调用前后触发，对齐 Claude Code 的 `PreToolUse` / `PostToolUse` / `UserPromptSubmit` 协议。配置写在 `~/.nanopi/settings.toml`：
+Shell hooks 会在工具调用前后触发，沿用 Claude Code 的 hook *协议*（JSON 走 stdin、退出码 2 表示拒绝、`tool_name` / `tool_input` / `hookSpecificOutput` 等字段）—— 但事件*名字*用的是 PI 的命名，不是 Claude Code 的。配置写在 `~/.nanopi/settings.toml`：
 
 ```toml
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "^bash$"
 command = "logger 'nanopi 即将执行 shell'"
 ```
 
-TOML key 是 snake_case（`pre_tool_use`，不是 `PreToolUse`）。完整协议见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 第 6 节。
+TOML key 是 snake_case（`tool_execution_start`，不是 `ToolExecutionStart`）。完整协议见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 第 6 节。
+
+### v0.12 改名
+
+nanopi 早期借用了 Claude Code 对四个钩子的命名。v0.12 把它们改成 PI 的命名，没有别名、也没有过渡期 —— 配置里如果还用左边的旧 key，启动时直接报错加载失败，错误信息会指出右边的新 key：
+
+| 旧 key（已停用 —— 硬错误） | 新 key |
+|---|---|
+| `pre_tool_use` | `tool_execution_start` |
+| `post_tool_use` | `tool_execution_end` |
+| `user_prompt_submit` | `input` |
+| `session_end` | `session_shutdown` |
 
 ### 生命周期事件（v0.11.0）
 
-除了 Claude Code 的三个，nanopi 还多四个对齐 Pi `before_agent_start` / `turn_start` / `turn_end` / `message_end` 的生命周期钩子：
+除了上面这几个走 Claude Code 协议的钩子，nanopi 还多四个对齐 Pi `before_agent_start` / `turn_start` / `turn_end` / `message_end` 的生命周期钩子：
 
 | Hook key | 触发时机 | 可阻断？ |
 |---|---|---|
