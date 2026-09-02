@@ -1157,6 +1157,115 @@ mod tests {
         assert_eq!(back.cwd.as_deref(), Some("/tmp/proj"));
         assert_eq!(back.session_id.as_deref(), Some("sess-1"));
     }
+
+    /// §4.1's byte-identity promise, exercised end-to-end for
+    /// `run_hooks`: a shell hook that dumps its stdin to a file must see
+    /// EXACTLY what `event_payload_json` builds for the same inputs. This
+    /// is what a WASM subscriber receives (`src/subscriber.rs`'s
+    /// `deliver_with` calls `event_payload_json`) — if either side ever
+    /// drifts from `build_hook_input`, this test catches it.
+    #[tokio::test]
+    async fn run_hooks_stdin_matches_event_payload_json_byte_for_byte() {
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("nanopi-byte-identity-{}", crate::util::uuid::v7()));
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: format!("cat > '{}'", marker.display()),
+            timeout: 2000,
+        };
+        let cwd = std::path::Path::new("/tmp");
+        let arguments = json!({"command": "ls -la", "cwd": "."});
+        let (_outcome, _transformed) = run_hooks(
+            &[hook],
+            HookEvent::ToolExecutionStart,
+            "bash",
+            Some("call-42"),
+            arguments.clone(),
+            cwd,
+            Some("sess-byte-identity"),
+        )
+        .await;
+        let dumped = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("hook did not write stdin to {}: {e}", marker.display()));
+        let _ = std::fs::remove_file(&marker);
+        let expected = event_payload_json(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            Some("call-42"),
+            &arguments,
+            cwd,
+            Some("sess-byte-identity"),
+        );
+        assert_eq!(
+            dumped.trim_end_matches('\n'),
+            expected,
+            "run_hooks's stdin must equal event_payload_json's output byte-for-byte"
+        );
+    }
+
+    /// Same promise, for the `run_session_hooks` path (session lifecycle
+    /// events never carry a tool_name / tool_call_id).
+    #[tokio::test]
+    async fn run_session_hooks_stdin_matches_event_payload_json_byte_for_byte() {
+        let mut marker = std::env::temp_dir();
+        marker.push(format!(
+            "nanopi-byte-identity-session-{}",
+            crate::util::uuid::v7()
+        ));
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: format!("cat > '{}'", marker.display()),
+            timeout: 2000,
+        };
+        let cwd = std::path::Path::new("/tmp");
+        let arguments = json!({"reason": "new"});
+        run_session_hooks(
+            &[hook],
+            HookEvent::SessionStart,
+            arguments.clone(),
+            "sess-byte-identity-2",
+            "sess-byte-identity-2",
+            cwd,
+        )
+        .await;
+        let dumped = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("hook did not write stdin to {}: {e}", marker.display()));
+        let _ = std::fs::remove_file(&marker);
+        let expected = event_payload_json(
+            HookEvent::SessionStart,
+            None,
+            None,
+            &arguments,
+            cwd,
+            Some("sess-byte-identity-2"),
+        );
+        assert_eq!(
+            dumped.trim_end_matches('\n'),
+            expected,
+            "run_session_hooks's stdin must equal event_payload_json's output byte-for-byte"
+        );
+    }
+
+    /// `--no-hooks` (`permission.hooks_active() == false`) must cut WASM
+    /// delivery too, not just shell hooks — the same leak v0.9.1 fixed
+    /// for session hooks. Every call site in `loop_.rs` wraps its
+    /// `deliver_with` call in the same `if self.permission.hooks_active()`
+    /// gate as the shell-hook call; this test asserts the gate condition
+    /// itself, at the seam reachable without a fake provider.
+    #[test]
+    fn no_hooks_gate_condition_prevents_delivery() {
+        use crate::agent::permission::{PermissionGate, TrustLevel};
+        let no_hooks_gate = PermissionGate::new(false, TrustLevel::Trusted);
+        assert!(
+            !no_hooks_gate.hooks_active(),
+            "a --no-hooks gate must report hooks_active() == false, \
+             which is the same condition every deliver_with call site checks"
+        );
+        let hooks_on_gate = PermissionGate::new(true, TrustLevel::Trusted);
+        assert!(hooks_on_gate.hooks_active());
+    }
 }
 /// `Input` hook is supported alongside ToolExecutionStart/ToolExecutionEnd.
 /// Round-trip its enum variant and env_var name.
