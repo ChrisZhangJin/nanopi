@@ -114,6 +114,11 @@ enum SlashCmd {
     Settings,
     /// v0.9.3: print the keybindings submenu (list of ActionId + spec + toml key).
     Keybindings,
+    /// v0.11.0: a command registered by a WASM plugin. Payload is the
+    /// command name; the handler is looked up in `App::commands_cache`
+    /// at dispatch time rather than carried here, so `SlashCmd` stays
+    /// `PartialEq` and cheap for the palette's filter.
+    Plugin(String),
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -231,19 +236,39 @@ fn skill_menu_items(skills: &[crate::resources::Skill]) -> Vec<MenuItem<SlashCmd
     skills
         .iter()
         .map(|s| {
-            // Truncate the description so long ones don't blow out
-            // the palette row (matches PI's autocomplete label rules
-            // in interactive-mode.ts prefixAutocompleteDescription).
-            let desc: String = s.description.chars().take(80).collect();
-            let desc = if s.description.chars().count() > 80 {
-                format!("{desc}…")
-            } else {
-                desc
-            };
             MenuItem::new(
                 format!("/skill:{}", s.name),
-                desc,
+                palette_desc(&s.description),
                 SlashCmd::Skill(s.name.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Truncate a description so a long one doesn't blow out the palette
+/// row. Matches PI's autocomplete label rules
+/// (interactive-mode.ts prefixAutocompleteDescription).
+fn palette_desc(desc: &str) -> String {
+    const MAX: usize = 80;
+    if desc.chars().count() <= MAX {
+        return desc.to_string();
+    }
+    let mut out: String = desc.chars().take(MAX).collect();
+    out.push('…');
+    out
+}
+
+/// One palette row per plugin command. The `[plugin]` suffix costs a
+/// little width but earns it: the collision rules refuse rather than
+/// rename, so when something is missing or misbehaving the user needs
+/// to know which plugin to look at.
+fn command_menu_items(cmds: &[crate::command::PluginCommand]) -> Vec<MenuItem<SlashCmd>> {
+    cmds.iter()
+        .map(|c| {
+            MenuItem::new(
+                format!("/{}", c.spec.name),
+                palette_desc(&format!("{} [{}]", c.spec.description, c.plugin_name)),
+                SlashCmd::Plugin(c.spec.name.clone()),
             )
         })
         .collect()
@@ -701,6 +726,21 @@ struct App {
     /// entries without reaching into the agent (which is behind an
     /// async lock). Refreshed by `refresh_status` after every rebuild.
     skills_cache: Vec<crate::resources::Skill>,
+    /// Snapshot of agent.plugin_commands, refreshed by `refresh_status`
+    /// alongside `skills_cache` and for the same reason. Always empty
+    /// in a build without `--features wasm`.
+    commands_cache: Vec<crate::command::PluginCommand>,
+    /// In-flight plugin command, run on the blocking pool.
+    ///
+    /// Not awaited inline: `handle_action` runs inside the `select!`
+    /// key arm, and a guest call there would freeze the ticker, the SSE
+    /// stream and key handling for up to the full epoch budget — longer
+    /// if a model-driven tool call already holds the plugin's mutex,
+    /// since epoch interruption cannot preempt a thread parked in
+    /// `lock()`. The main loop's tick polls this the same way it polls
+    /// `summarize_task`.
+    command_task:
+        Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
 }
 
 impl App {
@@ -758,6 +798,8 @@ impl App {
             extensions,
             last_skill_block: None,
             skills_cache: Vec::new(),
+            commands_cache: Vec::new(),
+            command_task: None,
         }
     }
 }
@@ -865,6 +907,17 @@ enum KeyAction {
     /// `SteerMessage::Steering` instead of starting a new turn.
     /// Matches Pi's behavior (type mid-stream → steer the agent).
     SteerTurn(String),
+    /// v0.11.0: the user picked a plugin command out of the palette.
+    RunPluginCommand {
+        name: String,
+        args: String,
+    },
+    /// v0.11.0: the blocking plugin-command task finished. Dispatched
+    /// by the main loop's tick, the same way `SummaryFinished` is.
+    PluginCommandFinished {
+        name: String,
+        outcome: Result<crate::command::CommandAction, String>,
+    },
     CancelTurn,
     Exit,
     Compact,
@@ -1296,8 +1349,13 @@ fn sync_palette(app: &mut App) {
     let first_line = slash_line(&full);
     if first_line.starts_with('/') {
         if app.palette.is_none() {
+            // Built-ins first, then skills, then plugin commands: a
+            // built-in always sorts above a plugin row, so even if the
+            // reserved-name guard ever failed the built-in stays
+            // reachable.
             let mut items = slash_items();
             items.extend(skill_menu_items(&app.skills_cache));
+            items.extend(command_menu_items(&app.commands_cache));
             app.palette = Some(MenuState::new(items));
         }
         if let Some(m) = app.palette.as_mut() {
@@ -1364,6 +1422,12 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Reload => KeyAction::Reload,
         SlashCmd::Settings => KeyAction::ShowSettings,
         SlashCmd::Keybindings => KeyAction::ShowKeybindings,
+        // `arg` is already the trimmed remainder after the first space,
+        // computed by the caller. Reusing it rather than reimplementing
+        // PI's split keeps plugin commands consistent with `/name`,
+        // `/export` and `/import`; a plugin command that treated
+        // whitespace differently would be the odd one out.
+        SlashCmd::Plugin(name) => KeyAction::RunPluginCommand { name, args: arg },
     }
 }
 
@@ -1432,6 +1496,34 @@ async fn run_app(
                         }
                     } else {
                         app.summarize_task = Some(task);
+                    }
+                }
+                // Same shape for a finished plugin command. It runs on
+                // the blocking pool precisely so this arm keeps running
+                // — awaiting the guest call inline would freeze the
+                // ticker, the stream, and key handling at once.
+                if let Some(task) = app.command_task.take() {
+                    if task.is_finished() {
+                        match task.await {
+                            Ok((name, outcome)) => {
+                                handle_action(
+                                    KeyAction::PluginCommandFinished { name, outcome },
+                                    app, term, &agent_slot,
+                                    &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                                ).await?;
+                            }
+                            Err(_join_err) => {
+                                app.status_note = None;
+                                insert_line(term, Line::from(vec![
+                                    Span::styled(
+                                        "[plugin command panicked]",
+                                        Style::default().fg(Color::Red),
+                                    ),
+                                ]))?;
+                            }
+                        }
+                    } else {
+                        app.command_task = Some(task);
                     }
                 }
                 // Redraw only when there's a live counter to update.
@@ -2710,29 +2802,134 @@ async fn handle_action(
             app.turn_started_at = Some(std::time::Instant::now());
         }
         KeyAction::SteerTurn(msg) => {
-            // v0.11.0: user typed mid-stream. Route into the running
-            // turn's steer channel so the agent picks it up at the
-            // next iteration boundary. Matches Pi's mid-stream typing.
-            //
-            // The send is attempted BEFORE the echo. It used to be the
-            // other way around, which meant the one case that can fail
-            // — the turn ending between the keypress and this dispatch,
-            // dropping the receiver — printed "[steer] ..." and then
-            // silently discarded the text. The user saw their message
-            // land and it was gone.
-            match try_steer(steer_tx.as_ref(), msg).await {
-                // Marked so it reads differently from a normal turn.
-                Ok(landed) => render_user_echo(term, &format!("[steer] {landed}"))?,
-                Err(missed) => {
-                    // Nothing left to steer. Queue it as the next turn
-                    // rather than throwing away something the user
-                    // typed — the turn-completion handler starts it.
-                    // Echoed as queued, not as a steer, so the
-                    // distinction is visible.
-                    render_user_echo(term, &format!("[queued] {missed}"))?;
-                    follow_up.push_back(missed);
+            steer_or_queue(term, steer_tx.as_ref(), follow_up, msg).await?;
+        }
+        KeyAction::RunPluginCommand { name, args } => {
+            let Some(cmd) = app
+                .commands_cache
+                .iter()
+                .find(|c| c.spec.name == name)
+                .cloned()
+            else {
+                // Only reachable if the cache went stale between the
+                // palette opening and Enter — a rebuild in between.
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
+                        format!("[/{name} is no longer registered]"),
+                        Style::default().fg(Color::Red),
+                    )]),
+                )?;
+                return Ok(());
+            };
+            if app.command_task.is_some() {
+                // Serializing is not cosmetic: the plugin's own mutex
+                // would serialize them anyway, and queueing two
+                // 30-second commands behind each other with no visible
+                // reason is worse than refusing the second.
+                app.status_note = Some("a plugin command is already running…".into());
+                return Ok(());
+            }
+            app.status_note = Some(format!("running /{name}…"));
+            let handler = cmd.handler.clone();
+            let task_name = name.clone();
+            app.command_task = Some(tokio::task::spawn_blocking(move || {
+                let outcome = handler.run(&task_name, &args);
+                (task_name, outcome)
+            }));
+        }
+        KeyAction::PluginCommandFinished { name, outcome } => {
+            app.status_note = None;
+            match outcome {
+                Ok(crate::command::CommandAction::Print(text)) => {
+                    // Straight to scrollback: never enters the context
+                    // and never reaches the session JSONL. Works
+                    // identically mid-stream, since nothing here
+                    // touches the agent.
+                    for line in text.lines() {
+                        insert_line(term, Line::from(line.to_string()))?;
+                    }
+                }
+                Ok(crate::command::CommandAction::SendUserMessage(text)) => {
+                    if app.status == Status::Streaming {
+                        steer_or_queue(term, steer_tx.as_ref(), follow_up, text).await?;
+                    } else {
+                        // Echo first, always. The user must see verbatim
+                        // what a plugin said on their behalf — dropping
+                        // this is what would make the feature a
+                        // security problem rather than a convenience.
+                        Box::pin(handle_action(
+                            KeyAction::StartTurn(text),
+                            app,
+                            term,
+                            agent_slot,
+                            ag_rx,
+                            steer_tx,
+                            follow_up,
+                            cancel,
+                            turn_task,
+                        ))
+                        .await?;
+                    }
+                }
+                Ok(crate::command::CommandAction::Error(msg)) => {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("[/{name}] {msg}"),
+                            Style::default().fg(Color::Red),
+                        )]),
+                    )?;
+                }
+                Err(e) => {
+                    // A plugin-side failure — trap, malformed payload.
+                    // Shown to the user, never forwarded to the model,
+                    // matching PI, where a throwing command handler is
+                    // swallowed rather than becoming a prompt.
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("[/{name} failed] {e}"),
+                            Style::default().fg(Color::Red),
+                        )]),
+                    )?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Route a mid-stream message into the running turn, or queue it as the
+/// next turn if the turn ended first.
+///
+/// Extracted so the plugin-command path can reach it: `handle_action`
+/// is `async`, so recursing into it would need boxing, and routing a
+/// plugin's `send_user_message` through `KeyAction::StartTurn` instead
+/// would hit its already-streaming early return and silently drop the
+/// text — the bug `SlashCmd::Skill` still has.
+///
+/// The send is attempted BEFORE the echo. It used to be the other way
+/// around, which meant the one case that can fail — the turn ending
+/// between the keypress and this dispatch, dropping the receiver —
+/// printed "[steer] ..." and then discarded the text. The user saw
+/// their message land and it was gone.
+async fn steer_or_queue(
+    term: &mut Term,
+    steer_tx: Option<&mpsc::Sender<SteerMessage>>,
+    follow_up: &mut std::collections::VecDeque<String>,
+    msg: String,
+) -> Result<()> {
+    match try_steer(steer_tx, msg).await {
+        // Marked so it reads differently from a normal turn.
+        Ok(landed) => render_user_echo(term, &format!("[steer] {landed}"))?,
+        Err(missed) => {
+            // Nothing left to steer. Queue it as the next turn rather
+            // than throwing away something the user typed — the
+            // turn-completion handler starts it. Echoed as queued, not
+            // as a steer, so the distinction is visible.
+            render_user_echo(term, &format!("[queued] {missed}"))?;
+            follow_up.push_back(missed);
         }
     }
     Ok(())
@@ -2919,21 +3116,34 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.cwd = a.cwd.clone();
         app.thinking = a.context.thinking;
         app.skills_cache = a.skills.clone();
+        app.commands_cache = a.plugin_commands.clone();
     }
 }
 
 /// `/reload` handler: re-reads `config.toml`, `settings.toml`, and
 /// re-discovers skills, then updates the live Agent in place. Mirrors
 /// PI's `session.reload()` (`agent-session.ts:2602`) minus the
-/// extension system and provider swap — nanopi has no extensions, and
-/// mid-session provider swaps stay behind `/model` to avoid
-/// accidentally dropping an in-flight streaming connection.
+/// extension system and provider swap — mid-session provider swaps
+/// stay behind `/model` to avoid accidentally dropping an in-flight
+/// streaming connection.
 ///
 /// What it touches: `agent.skills`, `agent.hooks`, `agent.context.
 /// system` (rebuilt via `compose_system_prompt` so newly installed
 /// skills appear in `<available_skills>`). What it does NOT touch:
 /// `agent.provider`, `agent.model`, `agent.base_url`, `agent.api_key`,
 /// session state, or messages.
+///
+/// `[[extensions]]` is deliberately NOT reloaded, and the report line
+/// says so rather than leaving the user to guess. Reloading is blocked,
+/// not merely skipped: `ToolRegistry` has no unregister, so a second
+/// `load_extensions` would hit `register_external`'s collision refusal
+/// for every tool and print a wall of spurious warnings; the
+/// `Arc<dyn Tool>` clones already handed out would keep the previous
+/// `ComponentBridge` alive, leaking a wasmtime `Store` and its epoch
+/// ticker thread per reload; and re-instantiating while a turn holds
+/// the bridge mutex hangs. Real hot-reload needs an unregister path
+/// plus a generation counter on the bridge — its own feature. Use
+/// `/new` or restart.
 async fn handle_reload(
     term: &mut Term,
     app: &mut App,
@@ -2996,7 +3206,8 @@ async fn handle_reload(
         term,
         L::from(vec![Span::styled(
             format!(
-                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s){}",
+                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s) · \
+                 extensions unchanged (use /new or restart){}",
                 if let Some(e) = &config_note {
                     format!(" · {e}")
                 } else {
@@ -4503,18 +4714,27 @@ mod tests {
         assert_eq!(got.as_deref().unwrap_err(), "hello");
     }
 
-    /// Slash commands mid-stream stay a no-op — steering the model
-    /// with "/compact" as a user message would be nonsense, and the
-    /// old behavior is the safer default there.
+    /// A slash command typed mid-stream resolves as a command rather
+    /// than being steered into the model as prose — "/compact" as a
+    /// user message would be nonsense.
+    ///
+    /// Pinned POSITIVELY to `Compact`. This used to assert only
+    /// `!matches!(got, SteerTurn(_))`, which is true of every other
+    /// variant too, so the test would have passed no matter which
+    /// command it dispatched — or if it silently did nothing. What
+    /// actually keeps `/compact` harmless here is downstream, not in
+    /// `interpret_key`: `StartTurn` takes the Agent out of its slot
+    /// while streaming, so the handler's `if let Some(a)` finds `None`
+    /// and no-ops.
     #[test]
-    fn slash_command_while_streaming_is_still_noop() {
+    fn slash_command_while_streaming_resolves_as_a_command() {
         let mut app = mkapp();
         app.status = Status::Streaming;
         seed_input(&mut app, "/compact");
         let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            !matches!(got, KeyAction::SteerTurn(_)),
-            "slash commands must not be routed into the steer channel, got {got:?}"
+            matches!(got, KeyAction::Compact),
+            "expected the palette to resolve /compact, got {got:?}"
         );
     }
 
@@ -4557,6 +4777,103 @@ mod tests {
         seed_input(&mut app, "/co");
         let m = app.palette.as_ref().unwrap();
         assert!(m.visible().iter().any(|it| it.label == "/compact"));
+    }
+
+    /// A plugin command with no wasm behind it — proof that the TUI
+    /// side needs nothing feature-gated. These tests run in the DEFAULT
+    /// build.
+    fn fake_command(name: &str, plugin: &str) -> crate::command::PluginCommand {
+        struct H;
+        impl crate::command::CommandHandler for H {
+            fn run(&self, _n: &str, _a: &str) -> Result<crate::command::CommandAction, String> {
+                Ok(crate::command::CommandAction::Print("ok".into()))
+            }
+        }
+        crate::command::PluginCommand {
+            spec: crate::command::CommandSpec {
+                name: name.into(),
+                description: "does a thing".into(),
+            },
+            plugin_name: std::sync::Arc::from(plugin),
+            handler: std::sync::Arc::new(H),
+        }
+    }
+
+    #[test]
+    fn a_plugin_command_appears_in_the_palette_and_dispatches() {
+        let mut app = mkapp();
+        app.commands_cache = vec![fake_command("todo", "demo")];
+        seed_input(&mut app, "/todo buy milk");
+
+        let m = app.palette.as_ref().expect("palette opens");
+        let row = m
+            .visible()
+            .into_iter()
+            .find(|it| it.label == "/todo")
+            .expect("the plugin row is offered");
+        assert!(
+            row.description.contains("[demo]"),
+            "the row must name its plugin: {}",
+            row.description
+        );
+
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match got {
+            KeyAction::RunPluginCommand { name, args } => {
+                assert_eq!(name, "todo");
+                assert_eq!(args, "buy milk");
+            }
+            other => panic!("expected RunPluginCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_command_with_no_argument_gets_an_empty_string() {
+        let mut app = mkapp();
+        app.commands_cache = vec![fake_command("todo", "demo")];
+        seed_input(&mut app, "/todo");
+        match interpret_key(&mut app, KeyEvent::from(KeyCode::Enter)) {
+            KeyAction::RunPluginCommand { args, .. } => assert_eq!(args, ""),
+            other => panic!("expected RunPluginCommand, got {other:?}"),
+        }
+    }
+
+    /// PI runs extension commands immediately even mid-stream
+    /// (`agent-session.ts:1119-1129`, checked before the isStreaming
+    /// queue branch), so this must dispatch rather than no-op.
+    ///
+    /// Asserted POSITIVELY. The older sibling below asserts only
+    /// `!matches!(got, SteerTurn(_))`, which passes while receiving
+    /// `KeyAction::Compact` — that is why it never caught anything.
+    #[test]
+    fn a_plugin_command_dispatches_mid_stream() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        app.commands_cache = vec![fake_command("todo", "demo")];
+        seed_input(&mut app, "/todo now");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(got, KeyAction::RunPluginCommand { .. }),
+            "a plugin command must run mid-stream, got {got:?}"
+        );
+    }
+
+    /// A built-in must win: `resolve_commands` refuses the name, so a
+    /// plugin row with that name should never be in the cache — but if
+    /// one ever were, the built-in still sorts first and stays
+    /// reachable.
+    #[test]
+    fn a_builtin_outranks_a_same_named_plugin_row() {
+        let mut app = mkapp();
+        app.commands_cache = vec![fake_command("compact", "rogue")];
+        seed_input(&mut app, "/compact");
+        assert!(
+            matches!(
+                interpret_key(&mut app, KeyEvent::from(KeyCode::Enter)),
+                KeyAction::Compact
+            ),
+            "the built-in must stay reachable"
+        );
     }
 
     /// `command::RESERVED_COMMAND_NAMES` is hand-maintained, and it has
