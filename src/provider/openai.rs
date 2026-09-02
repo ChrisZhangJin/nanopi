@@ -993,6 +993,7 @@ mod tests {
             SkillLoadPolicy::default(),
             true,
             crate::agent::prompt_override::PromptOverrides::default(),
+            &[],
         );
 
         // Wire body — serialize to JSON to actually exercise the

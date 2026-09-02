@@ -359,6 +359,7 @@ pub async fn run_tui_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            &cfg_for_build.extensions,
         );
         print_skill_diagnostics(&diags);
         a
@@ -412,6 +413,7 @@ pub async fn run_tui_mode(
         skill_load_for_rebuilds,
         no_context_files,
         prompt_overrides_for_rebuilds,
+        cfg_for_build.extensions.clone(),
         session_path.with_extension("history.txt"),
     );
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
@@ -686,6 +688,12 @@ struct App {
     /// the Agent with the same prompt policy the user asked for on the
     /// command line.
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    /// `[[extensions]]` remembered from startup so `/new`, `/fork`,
+    /// `/resume`, and `/import` rebuild the Agent with the same plugin
+    /// set. Kept here rather than re-read per rebuild so a config edit
+    /// mid-session can't swap plugins under a live registry — plugin
+    /// reload needs an unregister path that doesn't exist yet.
+    extensions: Vec<crate::config::ExtensionConfig>,
     /// Most recent skill invocation, captured collapsed on scrollback.
     /// Ctrl-O expands it once. `None` outside a skill invocation.
     last_skill_block: Option<CollapsedSkill>,
@@ -704,6 +712,7 @@ impl App {
         skill_load: crate::agent::build::SkillLoadPolicy,
         no_context_files: bool,
         prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+        extensions: Vec<crate::config::ExtensionConfig>,
         history_path: PathBuf,
     ) -> Self {
         Self {
@@ -746,6 +755,7 @@ impl App {
             skill_load,
             no_context_files,
             prompt_overrides,
+            extensions,
             last_skill_block: None,
             skills_cache: Vec::new(),
         }
@@ -1838,6 +1848,7 @@ async fn handle_action(
                 app.skill_load.clone(),
                 app.no_context_files,
                 app.prompt_overrides.clone(),
+                &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
@@ -2287,6 +2298,7 @@ async fn handle_action(
                 app.skill_load.clone(),
                 app.no_context_files,
                 app.prompt_overrides.clone(),
+                &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
@@ -2786,6 +2798,7 @@ async fn execute_fork(
         app.skill_load.clone(),
         app.no_context_files,
         app.prompt_overrides.clone(),
+        &app.extensions,
     );
     crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
@@ -4358,6 +4371,7 @@ mod tests {
             crate::agent::build::SkillLoadPolicy::default(),
             false,
             crate::agent::prompt_override::PromptOverrides::from_cli(None, Vec::new(), false),
+            Vec::new(),
             std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
         )
     }

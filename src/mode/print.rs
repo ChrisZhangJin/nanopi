@@ -147,6 +147,7 @@ pub async fn run_print_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            &cfg_for_build.extensions,
         );
         print_skill_diagnostics(&diags);
         a

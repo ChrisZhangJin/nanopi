@@ -245,6 +245,7 @@ impl Agent {
         skill_load: SkillLoadPolicy,
         no_context_files: bool,
         prompt_overrides: PromptOverrides,
+        extensions: &[crate::config::ExtensionConfig],
     ) -> Vec<SkillDiagnostic> {
         self.provider = provider;
         self.registry = registry;
@@ -255,6 +256,13 @@ impl Agent {
         self.api_key = api_key;
         self.no_context_files = no_context_files;
         self.prompt_overrides = prompt_overrides;
+
+        // Same ordering constraint as `build_fresh` above: extensions
+        // must register before `all_specs()` / `names()` are read, or
+        // plugin tools are registered but uncallable. Resumed sessions
+        // used to skip plugin loading entirely, so `--continue` and
+        // every TUI resume path silently lost every plugin tool.
+        load_extensions(&mut self.registry, extensions, &self.cwd);
 
         // load_session rebuilds Context from JSONL messages only — it
         // never repopulates `tools`. Without this line, the first turn
@@ -495,12 +503,78 @@ mod tests {
             SkillLoadPolicy::default(),
             true,
             PromptOverrides::default(),
+            &[],
         );
 
         assert_eq!(
             agent.context.tools.len(),
             expected,
             "hydrate_resumed must repopulate ctx.tools from the registry"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Regression: `hydrate_resumed` used not to call `load_extensions`
+    /// at all, so `--continue` and every TUI resume path came back with
+    /// zero plugin tools while a fresh session had them. The plugin was
+    /// configured, loaded fine, and was simply absent — which reads as
+    /// "the plugin broke", not "resume drops plugins".
+    ///
+    /// Asserts the extension tool is present AND that `ctx.tools` was
+    /// populated after registration, which is the ordering constraint
+    /// that makes it callable rather than merely registered.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn hydrate_resumed_loads_extensions() {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+
+        let _g = crate::TEST_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NANOPI_HOME");
+        let home = tmpdir("home");
+        std::env::set_var("NANOPI_HOME", &home);
+
+        let cwd = tmpdir("cwd");
+        let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+        let mut agent = Agent::load_session(&path, &cwd).expect("load");
+
+        let ext = crate::config::ExtensionConfig {
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/example-plugin.component.wasm"),
+            ..Default::default()
+        };
+        let baseline = ToolRegistry::standard().all_specs().len();
+        let _ = agent.hydrate_resumed(
+            Box::new(OpenAiProvider::new("", "", "")),
+            ToolRegistry::standard(),
+            PermissionGate::from_cli(false, None),
+            HooksConfig::default(),
+            "m".into(),
+            "http://x".into(),
+            "".into(),
+            SkillLoadPolicy::default(),
+            true,
+            PromptOverrides::default(),
+            std::slice::from_ref(&ext),
+        );
+
+        assert!(
+            agent.registry.names().iter().any(|n| n == "rot13"),
+            "resumed agent must carry the fixture plugin's tools; got {:?}",
+            agent.registry.names()
+        );
+        assert!(
+            agent.context.tools.len() > baseline,
+            "ctx.tools must be built AFTER extensions register, else the \
+             plugin tool is registered but uncallable"
         );
 
         if let Some(p) = prev {
@@ -701,6 +775,7 @@ mod tests {
                 SkillLoadPolicy::default(),
                 false,
                 overrides.clone(),
+                &[],
             );
 
             assert_eq!(
