@@ -4,15 +4,23 @@ milestone: v0.11.0
 milestone_name: milestone
 status: unknown
 last_updated: "2026-09-02T00:00:00.000Z"
-last_activity: "2026-09-02 - Stage A of v0.12 events: hook events renamed to PI names, honest session payloads, retired config keys refused."
+last_activity: "2026-09-02 - v0.12 events A+B: hook events renamed to PI names, honest session payloads, and WASM plugins observing all eleven lifecycle events."
 ---
 
 # Project State
 
-Last activity: 2026-09-02 — Stage A of the v0.12 event work: hook events
-renamed to PI's vocabulary, honest session payloads, retired keys refused
-(`7a15138`…`9caa4c5`). Stage B — WASM plugins as event subscribers — is
-designed in `docs/v0.12-events.md` and not yet implemented.
+Last activity: 2026-09-02 — Stages A and B of the v0.12 event work are
+both in: hook events renamed to PI's vocabulary with honest session payloads
+and retired keys refused (`7a15138`…`9caa4c5`), and WASM plugins can now
+observe all eleven lifecycle events under a config-granted,
+observe-only subscription (`5d2e90f`…`009f236`).
+
+The two extension systems can finally see the same events: shell hooks
+keep the veto, plugins get to watch, and both read one payload built
+once per event. What remains for v0.12 is a release decision, not a
+feature — `make bump VERSION=…` first, since `release.yml` hard-fails
+the whole matrix on a tag/VERSION mismatch *after* publishing an empty
+release.
 
 ## Current Focus
 
@@ -135,3 +143,4 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
 | — | v0.10.1 fixes cherry-picked onto this branch (Windows `~` expansion, MiniMax default, error-body flattening) | 2026-09-01 | `e9425b8`, `777eb8a`, `642f696` | — |
 | — | Plugin slash-command registration (WIT second world, non-gated `command` vocabulary, collision-refusing registry, TUI dispatch on the blocking pool) + two adjacent fixes: plugins now load on resumed sessions, and a leading space no longer sends a slash command to the model | 2026-09-02 | `4df493b`…`e9ce962` | — |
 | 260902-m0z | Stage A of the v0.12 event work: the four Claude-Code-named hook events take PI's names (`tool_execution_start` / `tool_execution_end` / `input` / `session_shutdown`), retired keys are a hard config error naming the replacement, `session_start`/`session_shutdown` carry PI's `reason` and fire on `/new` `/resume` `/fork` `/import`, and the session payload stops lying (`session_id` + `NANOPI_SESSION_ID` are the real id; the reason moved to `arguments.reason`) | 2026-09-02 | `7a15138`…`9caa4c5` | [260902-m0z-rename-hook-events-pi-names](./quick/260902-m0z-rename-hook-events-pi-names/) |
+| 260902-nms | Stage B of the v0.12 event work: WASM plugins observe lifecycle events. Third WIT world `extension-events` (`list-events` / `handle-event`), delivery at all eleven emit sites, config-granted subscriptions (both the plugin's request and the `events` grant must agree), observe-only with `try_lock`-and-drop so a busy plugin can never extend a turn, a 2s event epoch budget, `/tools` shows subscriptions, and a committed fixture + example plugin | 2026-09-02 | `5d2e90f`…`009f236` | [260902-nms-wasm-event-subscribers](./quick/260902-nms-wasm-event-subscribers/) |
