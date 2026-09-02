@@ -428,7 +428,7 @@ pub async fn run_tui_mode(
     {
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
-            a.fire_session_start().await;
+            a.fire_session_start("startup").await;
         }
     }
 
@@ -502,7 +502,7 @@ pub async fn run_tui_mode(
     {
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
-            a.fire_session_end().await;
+            a.fire_session_shutdown("quit").await;
         }
     }
 
@@ -1904,10 +1904,7 @@ async fn handle_action(
                 extensions: cfg_now.extensions,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
+            swap_agent_with_reason(agent_slot, new_agent, "new").await;
             app.session_id = new_header.id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
@@ -2021,10 +2018,7 @@ async fn handle_action(
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &path);
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
+            swap_agent_with_reason(agent_slot, new_agent, "resume").await;
             app.session_id = new_session_id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
@@ -2471,10 +2465,7 @@ async fn handle_action(
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &dest);
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
+            swap_agent_with_reason(agent_slot, new_agent, "import").await;
             app.session_id = new_session_id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
@@ -3069,6 +3060,34 @@ async fn recv_optional(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<Ag
     }
 }
 
+/// Swap the live Agent for `new_agent`, firing the session-lifecycle
+/// hooks in between (spec §2.2c). Used at all four agent-swap sites
+/// (`/new`, `/resume`, `/import`, fork).
+///
+/// Order is load-bearing: `session_shutdown` MUST fire on the OUTGOING
+/// agent, still installed in the slot, before the slot is swapped —
+/// one line late (swap first, fire second) and the shutdown payload
+/// would carry the incoming session's id instead of the outgoing one,
+/// silently misattributing the teardown to the wrong session for any
+/// audit or cleanup hook. `session_start` then fires on the
+/// newly-installed incoming agent. Holding the mutex guard across both
+/// `await`s is correct here: this all runs on one task, and the hook
+/// subprocess has no path back into `agent_slot`.
+async fn swap_agent_with_reason(
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    incoming_agent: Agent,
+    reason: &str,
+) {
+    let mut g = agent_slot.lock().await;
+    if let Some(outgoing) = g.as_ref() {
+        outgoing.fire_session_shutdown(reason).await;
+    }
+    g.replace(incoming_agent);
+    if let Some(incoming) = g.as_ref() {
+        incoming.fire_session_start(reason).await;
+    }
+}
+
 /// Finalize a fork: create the new session file, optionally append a
 /// BranchSummary entry with the LLM-generated text, load it as the
 /// active Agent (transplanting provider / permission / hooks from the
@@ -3157,10 +3176,7 @@ async fn execute_fork(
     crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
 
-    {
-        let mut g = agent_slot.lock().await;
-        *g = Some(new_agent);
-    }
+    swap_agent_with_reason(agent_slot, new_agent, "fork").await;
 
     app.session_id = new_session_id.to_string();
     app.usage = crate::event::Usage::default();
@@ -3317,11 +3333,11 @@ async fn handle_reload(
                 &a.prompt_overrides,
             ));
             let h = &a.hooks;
-            h.pre_tool_use.len()
-                + h.post_tool_use.len()
-                + h.user_prompt_submit.len()
+            h.tool_execution_start.len()
+                + h.tool_execution_end.len()
+                + h.input.len()
                 + h.session_start.len()
-                + h.session_end.len()
+                + h.session_shutdown.len()
         } else {
             0
         }
@@ -4680,6 +4696,7 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::hook::HookConfig;
 
     /// Tabs must be expanded to spaces before we hand a line to
     /// ratatui. Otherwise the terminal's own tab expansion paints
@@ -4750,6 +4767,174 @@ mod tests {
     fn input_scroll_window_handles_degenerate_visible() {
         // visible clamps to at least 1 so we never produce an empty box.
         assert_eq!(input_scroll_window(0, 1, 0), (0, 1));
+    }
+
+    // ─────── swap_agent_with_reason (Task 3, §2.2c) ───────
+
+    /// Test-only Provider — never called by these tests (they only
+    /// exercise `fire_session_shutdown` / `fire_session_start`, not
+    /// `run_turn`), so it can be a stub that panics if invoked.
+    struct DeadProvider;
+
+    #[async_trait::async_trait]
+    impl crate::agent::loop_::Provider for DeadProvider {
+        fn id(&self) -> &'static str {
+            "dead"
+        }
+        async fn stream_turn(
+            &self,
+            _ctx: &crate::agent::context::Context,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<crate::event::Usage, String> {
+            panic!("swap_agent_with_reason tests must not drive a turn");
+        }
+    }
+
+    fn tmp_dir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nanopi-tui-swap-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn agent_with_id(dir: &std::path::Path, session_id: &str, hooks: HooksConfig) -> Agent {
+        let session_path = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &session_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":2,\"id\":\"{session_id}\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"m\",\"base_url\":\"\"}}\n"
+            ),
+        )
+        .unwrap();
+        Agent {
+            context: crate::agent::context::Context::default(),
+            provider: Box::new(DeadProvider),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: session_id.to_string(),
+            cwd: dir.to_path_buf(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: crate::event::Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        }
+    }
+
+    /// The actual ordering assertion: `session_shutdown` fires against
+    /// the OUTGOING agent (session id A) BEFORE `session_start` fires
+    /// against the INCOMING one (session id B). A one-line-late
+    /// implementation (swap first, fire second) would still produce two
+    /// hook firings with the right event names and reason — only the
+    /// `session_id` on the first object catches the transposition.
+    #[tokio::test]
+    async fn swap_agent_with_reason_fires_shutdown_before_start_in_order() {
+        let dir = tmp_dir();
+        let transcript = dir.join("transcript.jsonl");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat >> {}\n", transcript.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let hooks = HooksConfig {
+            session_start: vec![hook_cfg.clone()],
+            session_shutdown: vec![hook_cfg],
+            ..Default::default()
+        };
+
+        let outgoing = agent_with_id(&dir, "session-A", hooks.clone());
+        let incoming = agent_with_id(&dir, "session-B", hooks);
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(outgoing)));
+
+        swap_agent_with_reason(&agent_slot, incoming, "new").await;
+
+        let text = std::fs::read_to_string(&transcript).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected exactly two hook firings, got:\n{text}");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+
+        // The load-bearing assertion: session_id on the FIRST firing is
+        // the OUTGOING agent's id, not the incoming one.
+        assert_eq!(first["event"], "session_shutdown");
+        assert_eq!(first["arguments"]["reason"], "new");
+        assert_eq!(first["session_id"], "session-A");
+
+        assert_eq!(second["event"], "session_start");
+        assert_eq!(second["arguments"]["reason"], "new");
+        assert_eq!(second["session_id"], "session-B");
+
+        let g = agent_slot.lock().await;
+        assert_eq!(g.as_ref().unwrap().session_id, "session-B");
+        drop(g);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--no-hooks` must still swap the agent but fire nothing.
+    #[tokio::test]
+    async fn swap_agent_with_reason_no_hooks_swaps_but_fires_nothing() {
+        let dir = tmp_dir();
+        let transcript = dir.join("transcript.jsonl");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat >> {}\n", transcript.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let hooks = HooksConfig {
+            session_start: vec![hook_cfg.clone()],
+            session_shutdown: vec![hook_cfg],
+            ..Default::default()
+        };
+
+        let mut outgoing = agent_with_id(&dir, "session-A", hooks.clone());
+        outgoing.permission = PermissionGate::from_cli(true /*no_hooks*/, None);
+        let mut incoming = agent_with_id(&dir, "session-B", hooks);
+        incoming.permission = PermissionGate::from_cli(true /*no_hooks*/, None);
+
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(outgoing)));
+
+        swap_agent_with_reason(&agent_slot, incoming, "new").await;
+
+        assert!(
+            !transcript.exists(),
+            "--no-hooks must suppress both session_shutdown and session_start"
+        );
+
+        let g = agent_slot.lock().await;
+        assert_eq!(g.as_ref().unwrap().session_id, "session-B");
+        drop(g);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

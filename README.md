@@ -42,7 +42,7 @@ Runs on Alpine, on CentOS 6, and anywhere `npm install` isn't an option.
 - 🧬 **PI-parity** — mirrors [Pi](https://github.com/earendil-works/pi)'s surface: JSONL sessions, hooks, skills, `-p`, `/fork`, `/resume`
 - 🔌 **Multi-provider** — any OpenAI-compatible endpoint (DeepSeek, ollama, vLLM, …) plus native Anthropic
 - 🛠 **Streaming tool calls** — `read` / `write` / `edit` / `bash`, rendered live in a ratatui TUI
-- 🪝 **Claude Code hooks** — `PreToolUse` / `PostToolUse` / `UserPromptSubmit` shell hooks
+- 🪝 **Claude Code-protocol hooks** — JSON-on-stdin, exit-2-to-block shell hooks, using PI's event names (`tool_execution_start` / `tool_execution_end` / `input` / …)
 - 🧠 **Agent Skills** — [spec-compliant](https://agentskills.io/specification) `SKILL.md` discovery + `/skill:name` expansion
 
 ## Background — why nanopi exists
@@ -192,19 +192,30 @@ Project beats global; the global file needs no trust gate (it's your own machine
 
 ## Hooks
 
-Shell hooks fire around tool calls, matching Claude Code's `PreToolUse` / `PostToolUse` / `UserPromptSubmit` protocol. Configure in `~/.nanopi/settings.toml`:
+Shell hooks fire around tool calls, using Claude Code's hook *protocol* (JSON on stdin, exit code 2 to block, `tool_name` / `tool_input` / `hookSpecificOutput` fields) — but PI's *event names*, not Claude Code's. Configure in `~/.nanopi/settings.toml`:
 
 ```toml
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "^bash$"
 command = "logger 'nanopi about to shell out'"
 ```
 
-Keys are `snake_case` (`pre_tool_use`, not `PreToolUse`). Full protocol in [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) §6.
+Keys are `snake_case` (`tool_execution_start`, not `ToolExecutionStart`). Full protocol in [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) §6.
+
+### Renamed in v0.12
+
+nanopi used to borrow Claude Code's names for four hooks. v0.12 renames them to PI's names, with no alias and no deprecation period — a config using an old key on the left fails to load at startup, and the error names the replacement on the right:
+
+| Old key (retired — hard error) | New key |
+|---|---|
+| `pre_tool_use` | `tool_execution_start` |
+| `post_tool_use` | `tool_execution_end` |
+| `user_prompt_submit` | `input` |
+| `session_end` | `session_shutdown` |
 
 ### Lifecycle events (v0.11.0)
 
-In addition to the Claude Code trio, nanopi exposes four lifecycle hooks that mirror Pi's `before_agent_start` / `turn_start` / `turn_end` / `message_end`:
+In addition to the Claude Code-protocol trio above, nanopi exposes four lifecycle hooks that mirror Pi's `before_agent_start` / `turn_start` / `turn_end` / `message_end`:
 
 | Hook key | Fires | Blockable? |
 |---|---|---|

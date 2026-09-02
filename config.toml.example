@@ -194,29 +194,55 @@ base_url = "https://api.openai.com/v1"
 #
 # All hook vectors are cumulative — multiple hooks of the same type
 # fire in declaration order.
+#
+# ── Renamed in v0.12 — the old keys are errors, not warnings ────────
+# nanopi used to borrow Claude Code's event names for four of these
+# hooks. v0.12 renames them to PI's names, with no alias and no
+# deprecation period: a config using one of the left-hand keys below
+# fails to load, and the error names the right-hand replacement.
+#
+#   old key               | new key
+#   -----------------------|------------------------
+#   pre_tool_use           | tool_execution_start
+#   post_tool_use          | tool_execution_end
+#   user_prompt_submit     | input
+#   session_end            | session_shutdown
+#
+# ── Session payload contract (all four session-lifecycle events) ────
+# session_start / session_shutdown / session_before_compact /
+# session_compact all send a JSON payload whose `arguments.reason`
+# names why the event fired (e.g. "startup", "quit", "new", "resume",
+# "fork", "import", "threshold", "manual") and whose `session_id` is
+# ALWAYS the real session id — never the reason. A hook that used to
+# read `session_id` to distinguish a compaction's cause must now read
+# `arguments.reason` instead.
 
 # Ex 1: veto dangerous rm invocations before bash runs them.
-# [[hooks.pre_tool_use]]
+# [[hooks.tool_execution_start]]
 # matcher = "^bash$"
 # command = "~/.nanopi/hooks/check-rm-rf.sh"
 # timeout = 5000
 
 # Ex 2: log every tool result to a file for later audit.
-# [[hooks.post_tool_use]]
+# [[hooks.tool_execution_end]]
 # matcher = "*"
 # command = "cat >> ~/.nanopi/tool-audit.log"
 
 # Ex 3: refuse prompts that contain a specific secret pattern.
-# [[hooks.user_prompt_submit]]
+# [[hooks.input]]
 # command = "~/.nanopi/hooks/redact-secrets.sh"
 
 # Ex 4: notify on session start (matcher defaults to "*"; session_id
-# is what the matcher runs against for session_* events).
+# is what the matcher runs against for session_* events — the
+# "reason" for the event, e.g. "startup" or "new", lives in
+# arguments.reason on the JSON payload, not in the matcher subject).
 # [[hooks.session_start]]
 # command = "echo \"[nanopi] session started at $(date)\" >> ~/.nanopi/sessions.log"
 
-# Ex 5: run cleanup on session exit.
-# [[hooks.session_end]]
+# Ex 5: run cleanup on session exit (also fires on /new, /resume,
+# /fork, /import — check arguments.reason if you only want the final
+# quit).
+# [[hooks.session_shutdown]]
 # command = "~/.nanopi/hooks/cleanup.sh"
 
 # ── v0.11.0 lifecycle hooks ─────────────────────────────────────────

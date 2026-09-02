@@ -6,18 +6,18 @@
 //!
 //! Example `~/.nanopi/config.toml`:
 //! ```toml
-//! [[hooks.pre_tool_use]]
+//! [[hooks.tool_execution_start]]
 //! matcher = "bash"
 //! type = "command"
 //! command = "~/.nanopi/hooks/check-rm-rf.sh"
 //! timeout = 5000
 //! ```
 //!
-//! The table keys are snake_case (`pre_tool_use`, `post_tool_use`,
-//! `session_start`, ...) — they are `HooksSection`'s field names, and
-//! there is no serde rename or alias. A CamelCase `[[hooks.PreToolUse]]`
-//! parses as an unrelated key and silently registers nothing; this doc
-//! comment claimed otherwise until v0.11.0.
+//! The table keys are snake_case (`tool_execution_start`,
+//! `tool_execution_end`, `session_start`, ...) — they are `HooksSection`'s
+//! field names, and there is no serde rename or alias. A CamelCase
+//! `[[hooks.ToolExecutionStart]]` parses as an unrelated key and silently
+//! registers nothing; this doc comment claimed otherwise until v0.11.0.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +25,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -42,11 +44,11 @@ pub enum HookError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
-    PreToolUse,
-    PostToolUse,
-    UserPromptSubmit,
+    ToolExecutionStart,
+    ToolExecutionEnd,
+    Input,
     SessionStart,
-    SessionEnd,
+    SessionShutdown,
     /// Fired once at the top of `run_turn`, BEFORE the user message is
     /// pushed to context. The only new-hook variant that supports
     /// Block (early return) and Transform (rewrite the prompt).
@@ -73,11 +75,11 @@ pub enum HookEvent {
 impl HookEvent {
     pub fn env_var(self) -> &'static str {
         match self {
-            HookEvent::PreToolUse => "PreToolUse",
-            HookEvent::PostToolUse => "PostToolUse",
-            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::ToolExecutionStart => "ToolExecutionStart",
+            HookEvent::ToolExecutionEnd => "ToolExecutionEnd",
+            HookEvent::Input => "Input",
             HookEvent::SessionStart => "SessionStart",
-            HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::SessionShutdown => "SessionShutdown",
             HookEvent::BeforeAgentStart => "BeforeAgentStart",
             HookEvent::TurnStart => "TurnStart",
             HookEvent::TurnEnd => "TurnEnd",
@@ -93,7 +95,7 @@ impl HookEvent {
 pub struct HookConfig {
     /// Regex matched against the tool name (or session_id for session_*).
     /// Empty or `*` = match all. Default when omitted is `"*"`, which is
-    /// the useful case for session_start / session_end where there's no
+    /// the useful case for session_start / session_shutdown where there's no
     /// tool name to match.
     #[serde(default = "default_matcher")]
     pub matcher: String,
@@ -174,6 +176,34 @@ pub fn validate_hooks(hooks: &[HookConfig]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// v0.12.0 §2.3: the four hook keys retired in favor of PI's names have
+/// no alias and no dual-key parsing — a config using one of them is a
+/// hard load error. `HooksSection` carries `#[serde(deny_unknown_fields)]`
+/// so a retired (or simply misspelled) key surfaces as a
+/// `toml::de::Error` whose rendered text names the field. This function
+/// scans that rendered text for one of the four retired names and, if
+/// found, rewrites it into a message that names BOTH the retired key and
+/// its replacement, so the user does not have to cross-reference
+/// `docs/v0.12-events.md` §2.1 by hand. Any other unknown-field error
+/// (e.g. a genuine typo like `turn_startt`) returns `None` — the caller
+/// keeps serde's original message, which already lists the valid keys.
+pub fn retired_hook_key_error(err: &str) -> Option<String> {
+    const RETIRED: [(&str, &str); 4] = [
+        ("pre_tool_use", "tool_execution_start"),
+        ("post_tool_use", "tool_execution_end"),
+        ("user_prompt_submit", "input"),
+        ("session_end", "session_shutdown"),
+    ];
+    for (old, new) in RETIRED {
+        if err.contains(&format!("`{old}`")) {
+            return Some(format!(
+                "unknown hook event \"{old}\" — renamed to \"{new}\" in v0.12 (see docs/v0.12-events.md §2.1)"
+            ));
+        }
+    }
+    None
 }
 
 fn extract_env(extra: &HashMap<String, String>) -> Vec<(String, String)> {
@@ -318,8 +348,8 @@ fn parse_json_decision(stdout: &str) -> Option<HookOutcome> {
 /// `tool_call_id` is the provider's id for the call in flight, and is
 /// `None` for the events that aren't about a tool. It was hardcoded to
 /// `None` at both call sites until v0.11.0, which made the payload
-/// field permanently null and left `post_tool_use` hooks unable to
-/// correlate a result with the `pre_tool_use` that preceded it.
+/// field permanently null and left `tool_execution_end` hooks unable to
+/// correlate a result with the `tool_execution_start` that preceded it.
 pub async fn run_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
@@ -385,18 +415,28 @@ pub async fn run_hooks(
 
 /// Run all session-lifecycle hooks. These don't have a tool_name and
 /// their outcome is advisory: a Block is reported on stderr, never
-/// enforced (a session start/end/compaction always proceeds).
+/// enforced (a session start/shutdown/compaction always proceeds).
 ///
-/// `subject` is what `matcher` is applied against, and it is NOT always
-/// a session id: `SessionStart` / `SessionEnd` pass the session id,
-/// while `SessionBeforeCompact` / `SessionCompact` pass the compaction
-/// reason (`"threshold"` or `"manual"`). Empty/`"*"` matches all.
-/// The `session_id` field of the payload carries `subject` for the same
-/// reason — a caller that has a real session id passes it here.
+/// Three separate things went into one field before v0.12 (`subject`
+/// doubling as `session_id`); after v0.12 they are three separate
+/// parameters, so no payload field lies:
+///
+/// | field | value |
+/// |---|---|
+/// | `session_id` (param) → payload `session_id` + `NANOPI_SESSION_ID` | the real session id, always |
+/// | `arguments` (param) → payload `arguments` | `{"reason": ...}` for all four session events |
+/// | `subject` → what `matcher` is tested against | session id for `SessionStart` / `SessionShutdown`; compaction reason (`"threshold"`/`"manual"`) for `SessionBeforeCompact` / `SessionCompact` — deliberately still overloaded |
+///
+/// A hook that used to read `session_id` to get `"threshold"` /
+/// `"manual"` for the compaction events must now read
+/// `arguments.reason` instead — `session_id` carries the real id there
+/// too now.
 pub async fn run_session_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
+    arguments: Value,
     subject: &str,
+    session_id: &str,
     cwd: &std::path::Path,
 ) {
     // v0.11.0 added the compaction events, which route through here;
@@ -405,7 +445,7 @@ pub async fn run_session_hooks(
     debug_assert!(matches!(
         event,
         HookEvent::SessionStart
-            | HookEvent::SessionEnd
+            | HookEvent::SessionShutdown
             | HookEvent::SessionBeforeCompact
             | HookEvent::SessionCompact
     ));
@@ -420,13 +460,13 @@ pub async fn run_session_hooks(
             event,
             tool_name: None,
             tool_call_id: None,
-            arguments: json!({}),
+            arguments: arguments.clone(),
             cwd: Some(cwd.display().to_string()),
-            session_id: Some(subject.to_string()),
+            session_id: Some(session_id.to_string()),
         };
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
-        env.insert("NANOPI_SESSION_ID".into(), subject.into());
+        env.insert("NANOPI_SESSION_ID".into(), session_id.into());
         env.insert("NANOPI_CWD".into(), cwd.display().to_string());
         report_advisory(event, &h.matcher, run_hook(h, &input, &env).await);
     }
@@ -480,6 +520,33 @@ mod tests {
         let p = expand_command("~/foo/bar.sh");
         assert!(p.to_string_lossy().contains("foo/bar.sh"));
         assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn retired_hook_key_error_maps_all_four_retired_keys() {
+        let cases = [
+            ("pre_tool_use", "tool_execution_start"),
+            ("post_tool_use", "tool_execution_end"),
+            ("user_prompt_submit", "input"),
+            ("session_end", "session_shutdown"),
+        ];
+        for (old, new) in cases {
+            let raw = format!("unknown field `{old}`, expected one of `tool_execution_start`, `tool_execution_end`, `input`, `session_start`, `session_shutdown`");
+            let mapped = retired_hook_key_error(&raw)
+                .unwrap_or_else(|| panic!("expected a mapping for {old}"));
+            assert!(mapped.contains(old), "message should name the retired key: {mapped}");
+            assert!(mapped.contains(new), "message should name the replacement: {mapped}");
+            assert!(
+                mapped.contains("v0.12-events.md"),
+                "message should point at the spec: {mapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_hook_key_error_ignores_unrelated_errors() {
+        let raw = "unknown field `turn_startt`, expected one of `tool_execution_start`, `turn_start`, `turn_end`";
+        assert_eq!(retired_hook_key_error(raw), None);
     }
 
     #[test]
@@ -653,7 +720,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({"command": "ls"}),
@@ -673,7 +740,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({}),
@@ -696,7 +763,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({}),
@@ -713,15 +780,15 @@ mod tests {
     #[test]
     fn session_events_env_var_names() {
         assert_eq!(HookEvent::SessionStart.env_var(), "SessionStart");
-        assert_eq!(HookEvent::SessionEnd.env_var(), "SessionEnd");
+        assert_eq!(HookEvent::SessionShutdown.env_var(), "SessionShutdown");
     }
 
     #[test]
     fn session_events_serialize_snake_case() {
         let s = serde_json::to_string(&HookEvent::SessionStart).unwrap();
         assert_eq!(s, "\"session_start\"");
-        let s = serde_json::to_string(&HookEvent::SessionEnd).unwrap();
-        assert_eq!(s, "\"session_end\"");
+        let s = serde_json::to_string(&HookEvent::SessionShutdown).unwrap();
+        assert_eq!(s, "\"session_shutdown\"");
         // Round-trip.
         let back: HookEvent = serde_json::from_str("\"session_start\"").unwrap();
         assert_eq!(back, HookEvent::SessionStart);
@@ -770,6 +837,8 @@ mod tests {
         run_session_hooks(
             &[hook],
             HookEvent::SessionStart,
+            json!({"reason": "startup"}),
+            "test-session-id",
             "test-session-id",
             std::path::Path::new("/tmp"),
         )
@@ -779,7 +848,7 @@ mod tests {
     }
 
     /// The compaction events route through `run_session_hooks` too, and
-    /// its `debug_assert!` originally listed only SessionStart/SessionEnd
+    /// its `debug_assert!` originally listed only SessionStart/SessionShutdown
     /// — so the first `session_before_compact` hook to fire would have
     /// panicked any debug build. `matcher` here is tested against the
     /// compaction reason, not a session id.
@@ -796,7 +865,9 @@ mod tests {
         run_session_hooks(
             &[hook.clone()],
             HookEvent::SessionBeforeCompact,
+            json!({"reason": "threshold"}),
             "threshold",
+            "real-session-id",
             std::path::Path::new("/tmp"),
         )
         .await;
@@ -806,7 +877,9 @@ mod tests {
         run_session_hooks(
             &[hook],
             HookEvent::SessionCompact,
+            json!({"reason": "manual"}),
             "manual",
+            "real-session-id",
             std::path::Path::new("/tmp"),
         )
         .await;
@@ -829,7 +902,9 @@ mod tests {
         };
         run_session_hooks(
             &[hook],
-            HookEvent::SessionEnd,
+            HookEvent::SessionShutdown,
+            json!({"reason": "quit"}),
+            "dev-1234",
             "dev-1234",
             std::path::Path::new("/tmp"),
         )
@@ -840,23 +915,23 @@ mod tests {
         );
     }
 }
-/// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
+/// `Input` hook is supported alongside ToolExecutionStart/ToolExecutionEnd.
 /// Round-trip its enum variant and env_var name.
 #[test]
-fn user_prompt_submit_event_round_trips() {
-    let v = HookEvent::UserPromptSubmit;
-    assert_eq!(v.env_var(), "UserPromptSubmit");
+fn input_event_round_trips() {
+    let v = HookEvent::Input;
+    assert_eq!(v.env_var(), "Input");
     let s = serde_json::to_string(&v).unwrap();
     let back: HookEvent = serde_json::from_str(&s).unwrap();
     assert_eq!(back, v);
 }
 
-/// `UserPromptSubmit` hooks don't have a tool_name, but the input
+/// `Input` hooks don't have a tool_name, but the input
 /// payload still has a `prompt` field carrying the user's text.
 #[test]
-fn user_prompt_submit_input_has_event_field() {
+fn input_hook_input_has_event_field() {
     let input = HookInput {
-        event: HookEvent::UserPromptSubmit,
+        event: HookEvent::Input,
         tool_name: None,
         tool_call_id: None,
         arguments: serde_json::Value::String("hi".into()),
@@ -864,6 +939,6 @@ fn user_prompt_submit_input_has_event_field() {
         session_id: None,
     };
     let s = serde_json::to_string(&input).unwrap();
-    assert!(s.contains("\"event\":\"user_prompt_submit\""), "got {s}");
+    assert!(s.contains("\"event\":\"input\""), "got {s}");
     assert!(s.contains("\"hi\""), "got {s}");
 }

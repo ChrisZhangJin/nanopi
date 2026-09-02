@@ -52,11 +52,11 @@ impl From<session::SessionError> for AgentError {
 /// Hook configuration for an Agent.
 #[derive(Debug, Clone, Default)]
 pub struct HooksConfig {
-    pub pre_tool_use: Vec<HookConfig>,
-    pub post_tool_use: Vec<HookConfig>,
-    pub user_prompt_submit: Vec<HookConfig>,
+    pub tool_execution_start: Vec<HookConfig>,
+    pub tool_execution_end: Vec<HookConfig>,
+    pub input: Vec<HookConfig>,
     pub session_start: Vec<HookConfig>,
-    pub session_end: Vec<HookConfig>,
+    pub session_shutdown: Vec<HookConfig>,
     /// NEW v0.11.0 lifecycle hooks (see docs/pi-vs-nanopi.md §4.3).
     /// BeforeAgentStart is the only new variant that supports Block /
     /// Transform; the other three are advisory only.
@@ -276,32 +276,47 @@ impl Agent {
     /// Fire all `session_start` hooks. Advisory — outcome is not enforced.
     /// Call once, after Agent construction, before the first turn.
     ///
+    /// `reason` is the session-start vocabulary: `startup|new|resume|fork|
+    /// import`. Diverges from PI (which has no `import`) because nanopi
+    /// supports importing a session from an external source; matches PI's
+    /// `startup|new|resume|fork` otherwise.
+    ///
     /// v0.9.1 fix: honors `--no-hooks` — previously session lifecycle
     /// hooks leaked through the emergency switch because only the
     /// tool-facing sites gated on `hooks_active()`.
-    pub async fn fire_session_start(&self) {
+    pub async fn fire_session_start(&self, reason: &str) {
         if !self.permission.hooks_active() {
             return;
         }
         run_session_hooks(
             &self.hooks.session_start,
             HookEvent::SessionStart,
+            serde_json::json!({"reason": reason}),
+            &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
         .await;
     }
 
-    /// Fire all `session_end` hooks. Advisory. Call before the process
+    /// Fire all `session_shutdown` hooks. Advisory. Call before the process
     /// exits (or before Agent is dropped in the interactive loop).
+    ///
+    /// `reason` is the session-shutdown vocabulary: `quit|new|resume|fork|
+    /// import`. Diverges from PI (which has no `reload` and no `import`)
+    /// — nanopi has no `reload` reason, and adds `import` for the same
+    /// reason as `fire_session_start`.
+    ///
     /// See `fire_session_start` for the `--no-hooks` note.
-    pub async fn fire_session_end(&self) {
+    pub async fn fire_session_shutdown(&self, reason: &str) {
         if !self.permission.hooks_active() {
             return;
         }
         run_session_hooks(
-            &self.hooks.session_end,
-            HookEvent::SessionEnd,
+            &self.hooks.session_shutdown,
+            HookEvent::SessionShutdown,
+            serde_json::json!({"reason": reason}),
+            &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
@@ -321,16 +336,20 @@ impl Agent {
         use crate::agent::compact::compact;
 
         // ── SessionBeforeCompact hook (v0.11.0) ──────────────────
-        // Advisory only — fires before compaction runs. matches
-        // against the compaction reason string ("threshold" or
-        // "manual").
+        // Advisory only — fires before compaction runs. `subject`
+        // (matcher target) is still the compaction reason string
+        // ("threshold" or "manual"); `session_id` is the real session
+        // id, carried honestly in the payload (v0.12.0 fix — this used
+        // to be the reason string, not the actual session id).
         if self.permission.hooks_active()
             && !self.hooks.session_before_compact.is_empty()
         {
             run_session_hooks(
                 &self.hooks.session_before_compact,
                 HookEvent::SessionBeforeCompact,
+                serde_json::json!({"reason": reason}),
                 reason,
+                &self.session_id.to_string(),
                 &self.cwd,
             )
             .await;
@@ -357,15 +376,18 @@ impl Agent {
         }
 
         // ── SessionCompact hook (v0.11.0) ──────────────────────────
-        // Fires after compaction completes. matcher is the
-        // compaction reason.
+        // Fires after compaction completes. `subject` (matcher target)
+        // is the compaction reason; `session_id` is the real session
+        // id, carried honestly in the payload.
         if self.permission.hooks_active()
             && !self.hooks.session_compact.is_empty()
         {
             run_session_hooks(
                 &self.hooks.session_compact,
                 HookEvent::SessionCompact,
+                serde_json::json!({"reason": reason}),
                 reason,
+                &self.session_id.to_string(),
                 &self.cwd,
             )
             .await;
@@ -457,7 +479,7 @@ impl Agent {
         // A rewritten prompt lands in `pre_start_msg` rather than being
         // applied directly: `effective_msg` is only born below, and
         // seeding it from here is what makes the two prompt hooks chain
-        // — BeforeAgentStart's output is UserPromptSubmit's input.
+        // — BeforeAgentStart's output is Input's input.
         let mut pre_start_msg: Option<String> = None;
         if self.permission.hooks_active() && !self.hooks.before_agent_start.is_empty() {
             let turn_label = self.turn_count.to_string();
@@ -497,7 +519,7 @@ impl Agent {
                     // `run_hooks` folds transforms into its accumulated
                     // args and still reports Allow when no hook blocked,
                     // so a rewrite usually arrives here rather than in
-                    // the Transform arm. Same fallback UserPromptSubmit
+                    // the Transform arm. Same fallback the Input hook
                     // uses; compare against `user_msg` so an unchanged
                     // echo doesn't count as a rewrite.
                     if let Some(v) = new_args
@@ -513,17 +535,17 @@ impl Agent {
             }
         }
 
-        // ── UserPromptSubmit hook (mirrors PI's beforeUserMessage) ────
+        // ── Input hook (mirrors PI's beforeUserMessage) ────
         // Allow user hooks to inspect / transform the raw prompt before
         // any skill-command expansion, and to block outright. Same
-        // Allow/Block/Transform semantics as pre_tool_use hooks; Block
-        // aborts the turn with a synthetic assistant marker so the user
-        // sees why. Transform mutates the prompt in place.
+        // Allow/Block/Transform semantics as tool_execution_start hooks;
+        // Block aborts the turn with a synthetic assistant marker so the
+        // user sees why. Transform mutates the prompt in place.
         let mut effective_msg = pre_start_msg.unwrap_or_else(|| user_msg.to_string());
-        if self.permission.hooks_active() && !self.hooks.user_prompt_submit.is_empty() {
+        if self.permission.hooks_active() && !self.hooks.input.is_empty() {
             let (outcome, new_args) = run_hooks(
-                &self.hooks.user_prompt_submit,
-                HookEvent::UserPromptSubmit,
+                &self.hooks.input,
+                HookEvent::Input,
                 // No tool name here, so `matcher` is tested against "" —
                 // only `*` (or an omitted matcher) can ever match. Any
                 // real regex silently never fires.
@@ -536,7 +558,7 @@ impl Agent {
             .await;
             match outcome {
                 HookOutcome::Block { reason } => {
-                    let marker = format!("[UserPromptSubmit hook blocked the prompt: {reason}]");
+                    let marker = format!("[Input hook blocked the prompt: {reason}]");
                     let _ = tx
                         .send(AgentEvent::Error {
                             error: marker.clone(),
@@ -564,7 +586,7 @@ impl Agent {
         }
 
         // ── /skill:name expansion (mirrors PI's _expandSkillCommand) ──
-        // Runs AFTER the UserPromptSubmit hook so a hook that rewrites
+        // Runs AFTER the Input hook so a hook that rewrites
         // the prompt into a /skill: call still triggers expansion.
         // Emits SkillInvocation so the TUI can render its own card.
         if let Some(expansion) =
@@ -1405,12 +1427,12 @@ async fn run_one_tool(
     hooks: HooksConfig,
     tx: mpsc::Sender<AgentEvent>,
 ) -> ToolCallOutcome {
-    // PreToolUse hooks.
+    // ToolExecutionStart hooks.
     let mut effective_args = call.arguments.clone();
-    if permission.hooks_active() && !hooks.pre_tool_use.is_empty() {
+    if permission.hooks_active() && !hooks.tool_execution_start.is_empty() {
         let (outcome, transformed) = run_hooks(
-            &hooks.pre_tool_use,
-            HookEvent::PreToolUse,
+            &hooks.tool_execution_start,
+            HookEvent::ToolExecutionStart,
             &call.name,
             Some(call.id.as_str()),
             call.arguments.clone(),
@@ -1420,7 +1442,7 @@ async fn run_one_tool(
         .await;
         effective_args = transformed.unwrap_or(call.arguments.clone());
         if let HookOutcome::Block { reason } = outcome {
-            if permission.should_honor_pretooluse_block() {
+            if permission.should_honor_tool_execution_start_block() {
                 let result_text = format!("blocked by hook: {reason}");
                 let _ = session::append_entry(
                     &session_path,
@@ -1486,9 +1508,9 @@ async fn run_one_tool(
         },
     );
 
-    // PostToolUse hooks. Payload mirrors Claude Code's PostToolUse
+    // ToolExecutionEnd hooks. Payload mirrors Claude Code's post-tool-use
     // wire schema so hooks can inspect what actually happened —
-    // `tool_input` (final args after any PreToolUse transform) and
+    // `tool_input` (final args after any ToolExecutionStart transform) and
     // `tool_response` (content + is_error + duration_ms).
     //
     // v0.9.1 fix: previously passed `Value::Object(Default::default())`
@@ -1500,7 +1522,7 @@ async fn run_one_tool(
     // P1 ordering: hooks fire BEFORE the ToolResult event is emitted,
     // so the post-hook content/is_error is what the renderer sees
     // (and what the next LLM turn sees in the context).
-    if permission.hooks_active() && !hooks.post_tool_use.is_empty() {
+    if permission.hooks_active() && !hooks.tool_execution_end.is_empty() {
         let post_payload = serde_json::json!({
             "tool_input": effective_args,
             "tool_response": {
@@ -1510,8 +1532,8 @@ async fn run_one_tool(
             },
         });
         let (_outcome, new_args) = run_hooks(
-            &hooks.post_tool_use,
-            HookEvent::PostToolUse,
+            &hooks.tool_execution_end,
+            HookEvent::ToolExecutionEnd,
             &call.name,
             Some(call.id.as_str()),
             post_payload,
@@ -1519,7 +1541,7 @@ async fn run_one_tool(
             Some(&session_id.to_string()),
         )
         .await;
-        // P1: post_tool_use Transform replaces the tool result content.
+        // P1: tool_execution_end Transform replaces the tool result content.
         //
         // `run_hooks` always returns `HookOutcome::Allow` — transforms
         // are accumulated into `current_args` which becomes `new_args`.
@@ -1597,7 +1619,7 @@ mod tests {
             timeout: 2000,
         };
         let hooks = HooksConfig {
-            pre_tool_use: vec![pre_hook],
+            tool_execution_start: vec![pre_hook],
             ..Default::default()
         };
         let mut agent = Agent {
@@ -1658,14 +1680,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression: v0.9.1 PostToolUse used to be called with
+    /// Regression: v0.9.1 ToolExecutionEnd used to be called with
     /// `Value::Object(Default::default())` (empty `{}`) — hooks
     /// couldn't see what the tool actually did. Fix populates the
     /// payload with `tool_input` (final args) and `tool_response`
     /// (content / is_error / duration_ms). This test writes the
     /// hook stdin JSON to disk and asserts every field is present.
     #[tokio::test]
-    async fn post_tool_use_hook_receives_input_and_response() {
+    async fn tool_execution_end_hook_receives_input_and_response() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tmp();
@@ -1692,7 +1714,7 @@ mod tests {
             timeout: 3000,
         };
         let hooks = HooksConfig {
-            post_tool_use: vec![post_hook],
+            tool_execution_end: vec![post_hook],
             ..Default::default()
         };
         let mut agent = Agent {
@@ -1737,7 +1759,7 @@ mod tests {
             std::fs::read_to_string(&stdin_dump).expect("hook must have written its stdin JSON");
         let v: serde_json::Value = serde_json::from_str(&dumped).expect("stdin was JSON");
 
-        assert_eq!(v["event"], "post_tool_use");
+        assert_eq!(v["event"], "tool_execution_end");
         assert_eq!(v["tool_name"], "bash");
         // tool_input carries the (post-transform) tool arguments.
         assert_eq!(v["arguments"]["tool_input"]["command"], "echo hi");
@@ -1753,14 +1775,14 @@ mod tests {
         assert_eq!(v["arguments"]["tool_response"]["is_error"], false);
         assert!(v["arguments"]["tool_response"]["duration_ms"].is_u64());
         // v0.11.0: was hardcoded `None` at every call site, so this
-        // field was permanently null and a post_tool_use hook had no
-        // way to pair a result with its pre_tool_use.
+        // field was permanently null and a tool_execution_end hook had no
+        // way to pair a result with its tool_execution_start.
         assert_eq!(v["tool_call_id"], "call_pt");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1 regression: post_tool_use hook can rewrite the tool's output
+    /// P1 regression: tool_execution_end hook can rewrite the tool's output
     /// content via `{"updated_input":{"content":"..."}}`. Previously
     /// the hook's return was discarded (`let _ = run_hooks(...)`),
     /// so redact / log-scrubbing / result-truncation plugins were
@@ -1768,7 +1790,7 @@ mod tests {
     /// result `content` and `is_error` (image attachments keep their
     /// original handling).
     #[tokio::test]
-    async fn post_tool_use_hook_can_transform_result() {
+    async fn tool_execution_end_hook_can_transform_result() {
         let dir = tmp();
         let session_path = dir.join("s.jsonl");
         std::fs::write(&session_path, "").unwrap();
@@ -1782,7 +1804,7 @@ mod tests {
             timeout: 2000,
         };
         let hooks = HooksConfig {
-            post_tool_use: vec![post_hook],
+            tool_execution_end: vec![post_hook],
             ..Default::default()
         };
         let mut agent = Agent {
@@ -1867,7 +1889,7 @@ mod tests {
     /// `run_hooks`' rewritten args were dropped on the floor, so a hook
     /// returning `updated_input.prompt` was silently inert even though
     /// the payload ships `prompt` specifically for it. Fix mirrors
-    /// UserPromptSubmit and seeds `effective_msg` from the result.
+    /// Input and seeds `effective_msg` from the result.
     #[tokio::test]
     async fn before_agent_start_hook_can_transform_prompt() {
         let dir = tmp();
@@ -1938,12 +1960,12 @@ mod tests {
     }
 
     /// The two prompt hooks must chain: BeforeAgentStart runs first and
-    /// its rewritten text is what UserPromptSubmit receives. The second
+    /// its rewritten text is what Input receives. The second
     /// hook here only emits a rewrite when it sees the first hook's
     /// output, so a passing assert proves the ordering, not just that
     /// each hook fired.
     #[tokio::test]
-    async fn before_agent_start_output_feeds_user_prompt_submit() {
+    async fn before_agent_start_output_feeds_input() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tmp();
@@ -1971,7 +1993,7 @@ mod tests {
                     .into(),
                 timeout: 2000,
             }],
-            user_prompt_submit: vec![HookConfig {
+            input: vec![HookConfig {
                 matcher: "*".into(),
                 kind: "command".into(),
                 command: ups_script.display().to_string(),
@@ -2025,7 +2047,7 @@ mod tests {
             .expect("user message in context");
         assert_eq!(
             user_text, "CHAINED",
-            "UserPromptSubmit must see BeforeAgentStart's rewrite, got {user_text:?}"
+            "Input must see BeforeAgentStart's rewrite, got {user_text:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2713,7 +2735,7 @@ mod tests {
     }
 
     /// Regression: v0.9.1 discovered `--no-hooks` didn't gate the
-    /// session lifecycle hooks — SessionStart and SessionEnd fired
+    /// session lifecycle hooks — SessionStart and SessionShutdown fired
     /// regardless. Fix guarded both on `permission.hooks_active()`.
     /// This test writes a marker file from a session_start hook and
     /// asserts the marker never appears when `--no-hooks` is set.
@@ -2737,7 +2759,7 @@ mod tests {
         )
         .unwrap();
 
-        // Same hook wired for both session_start and session_end.
+        // Same hook wired for both session_start and session_shutdown.
         let hook_cfg = HookConfig {
             matcher: "*".into(),
             kind: "command".into(),
@@ -2758,7 +2780,7 @@ mod tests {
             permission: PermissionGate::from_cli(true /*no_hooks*/, None),
             hooks: HooksConfig {
                 session_start: vec![hook_cfg.clone()],
-                session_end: vec![hook_cfg],
+                session_shutdown: vec![hook_cfg],
                 ..Default::default()
             },
             model: "m".into(),
@@ -2773,12 +2795,120 @@ mod tests {
             plugin_commands: Vec::new(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
-        agent.fire_session_start().await;
-        agent.fire_session_end().await;
+        agent.fire_session_start("startup").await;
+        agent.fire_session_shutdown("quit").await;
 
         assert!(
             !marker.exists(),
-            "--no-hooks must disable both session_start and session_end"
+            "--no-hooks must disable both session_start and session_shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0: session_start payload must carry an honest `reason` in
+    /// `arguments` and the real session id in `session_id`.
+    #[tokio::test]
+    async fn session_start_payload_carries_reason_and_real_session_id() {
+        let dir = tmp();
+        let out = dir.join("payload.json");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat > {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"m\",\"base_url\":\"\"}\n",
+        )
+        .unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let session_id = uuid::v7().to_string();
+
+        let agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: session_id.clone(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig {
+                session_start: vec![hook_cfg],
+                ..Default::default()
+            },
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+        agent.fire_session_start("startup").await;
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["arguments"]["reason"], "startup");
+        assert_eq!(payload["session_id"], session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0 regression: compaction hook payloads must carry the real
+    /// session id, not the compaction reason string, in `session_id`.
+    /// Previously `session_id` held `"threshold"`/`"manual"` — a lie.
+    #[tokio::test]
+    async fn compact_now_session_hooks_carry_real_session_id_not_reason() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let out = dir.join("compact_payload.json");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat > {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        agent.hooks.session_before_compact = vec![hook_cfg];
+        let session_id = agent.session_id.clone();
+
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+
+        agent.compact_now(None, "threshold").await;
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["arguments"]["reason"], "threshold");
+        assert_eq!(
+            payload["session_id"], session_id,
+            "session_id must be the real session id, not the reason string"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
