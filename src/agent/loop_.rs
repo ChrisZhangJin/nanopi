@@ -12,7 +12,9 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::agent::context::Context;
-use crate::agent::hook::{run_hooks, run_session_hooks, HookConfig, HookEvent, HookOutcome};
+use crate::agent::hook::{
+    event_payload_json, run_hooks, run_session_hooks, HookConfig, HookEvent, HookOutcome,
+};
 use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, FinishReason, SteerMessage, ToolCall, Usage};
 use crate::provider::openai::OpenAiProvider;
@@ -124,6 +126,12 @@ pub struct Agent {
     /// any `cfg(feature = "wasm")`. Empty in a build without the
     /// feature, and in print mode, which has no command palette.
     pub plugin_commands: Vec<crate::command::PluginCommand>,
+    /// Lifecycle-event subscribers registered by WASM plugins — the
+    /// granted ∩ requested intersection computed at load time. Held
+    /// here for the same non-gated reason as `plugin_commands`: keeps
+    /// `mode::tui` free of `cfg(feature = "wasm")`. Empty in a build
+    /// without the feature.
+    pub event_subscribers: crate::subscriber::EventSubscribers,
     /// When true, AGENTS.md / CLAUDE.md discovery is skipped entirely
     /// (CLI `--no-context-files` / `-nc`). Stashed here so `/reload` can
     /// rebuild the system prompt with the same policy. Mirrors PI's
@@ -269,6 +277,7 @@ impl Agent {
             // plugins — `load_session` only replays JSONL and knows
             // nothing about config.
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         })
     }
@@ -288,15 +297,29 @@ impl Agent {
         if !self.permission.hooks_active() {
             return;
         }
+        let arguments = serde_json::json!({"reason": reason});
         run_session_hooks(
             &self.hooks.session_start,
             HookEvent::SessionStart,
-            serde_json::json!({"reason": reason}),
+            arguments.clone(),
             &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
         .await;
+        let session_id = self.session_id.to_string();
+        let cwd = self.cwd.clone();
+        self.event_subscribers.deliver_with(HookEvent::SessionStart, || {
+                event_payload_json(
+                    HookEvent::SessionStart,
+                    None,
+                    None,
+                    &arguments,
+                    &cwd,
+                    Some(&session_id),
+                )
+            })
+            .await;
     }
 
     /// Fire all `session_shutdown` hooks. Advisory. Call before the process
@@ -312,15 +335,29 @@ impl Agent {
         if !self.permission.hooks_active() {
             return;
         }
+        let arguments = serde_json::json!({"reason": reason});
         run_session_hooks(
             &self.hooks.session_shutdown,
             HookEvent::SessionShutdown,
-            serde_json::json!({"reason": reason}),
+            arguments.clone(),
             &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
         .await;
+        let session_id = self.session_id.to_string();
+        let cwd = self.cwd.clone();
+        self.event_subscribers.deliver_with(HookEvent::SessionShutdown, || {
+                event_payload_json(
+                    HookEvent::SessionShutdown,
+                    None,
+                    None,
+                    &arguments,
+                    &cwd,
+                    Some(&session_id),
+                )
+            })
+            .await;
     }
 
     /// Force a compaction pass regardless of threshold. Bound to `/compact`
@@ -341,18 +378,32 @@ impl Agent {
         // ("threshold" or "manual"); `session_id` is the real session
         // id, carried honestly in the payload (v0.12.0 fix — this used
         // to be the reason string, not the actual session id).
-        if self.permission.hooks_active()
-            && !self.hooks.session_before_compact.is_empty()
-        {
-            run_session_hooks(
-                &self.hooks.session_before_compact,
-                HookEvent::SessionBeforeCompact,
-                serde_json::json!({"reason": reason}),
-                reason,
-                &self.session_id.to_string(),
-                &self.cwd,
-            )
-            .await;
+        if self.permission.hooks_active() {
+            let arguments = serde_json::json!({"reason": reason});
+            if !self.hooks.session_before_compact.is_empty() {
+                run_session_hooks(
+                    &self.hooks.session_before_compact,
+                    HookEvent::SessionBeforeCompact,
+                    arguments.clone(),
+                    reason,
+                    &self.session_id.to_string(),
+                    &self.cwd,
+                )
+                .await;
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::SessionBeforeCompact, || {
+                    event_payload_json(
+                        HookEvent::SessionBeforeCompact,
+                        None,
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
         }
 
         if let Some(tx) = tx {
@@ -379,18 +430,32 @@ impl Agent {
         // Fires after compaction completes. `subject` (matcher target)
         // is the compaction reason; `session_id` is the real session
         // id, carried honestly in the payload.
-        if self.permission.hooks_active()
-            && !self.hooks.session_compact.is_empty()
-        {
-            run_session_hooks(
-                &self.hooks.session_compact,
-                HookEvent::SessionCompact,
-                serde_json::json!({"reason": reason}),
-                reason,
-                &self.session_id.to_string(),
-                &self.cwd,
-            )
-            .await;
+        if self.permission.hooks_active() {
+            let arguments = serde_json::json!({"reason": reason});
+            if !self.hooks.session_compact.is_empty() {
+                run_session_hooks(
+                    &self.hooks.session_compact,
+                    HookEvent::SessionCompact,
+                    arguments.clone(),
+                    reason,
+                    &self.session_id.to_string(),
+                    &self.cwd,
+                )
+                .await;
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::SessionCompact, || {
+                    event_payload_json(
+                        HookEvent::SessionCompact,
+                        None,
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
         }
 
         let _ = session::append_entry(
@@ -481,58 +546,74 @@ impl Agent {
         // seeding it from here is what makes the two prompt hooks chain
         // — BeforeAgentStart's output is Input's input.
         let mut pre_start_msg: Option<String> = None;
-        if self.permission.hooks_active() && !self.hooks.before_agent_start.is_empty() {
+        if self.permission.hooks_active() {
             let turn_label = self.turn_count.to_string();
-            let (outcome, new_args) = run_hooks(
-                &self.hooks.before_agent_start,
-                HookEvent::BeforeAgentStart,
-                &turn_label,
-                None,
-                serde_json::json!({
-                    "turn_count": self.turn_count,
-                    "prompt": user_msg,
-                }),
-                &self.cwd,
-                Some(&self.session_id.to_string()),
-            )
-            .await;
-            match outcome {
-                HookOutcome::Block { reason } => {
-                    let marker =
-                        format!("[BeforeAgentStart hook blocked the turn: {reason}]");
-                    let _ = tx
-                        .send(AgentEvent::Error {
-                            error: marker.clone(),
-                        })
-                        .await;
-                    return Ok(marker);
-                }
-                HookOutcome::Transform { new_arguments } => {
-                    // Only the `prompt` key is honored — the payload
-                    // also carries `turn_count`, which is ours, not the
-                    // hook's, to rewrite.
-                    if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
-                        pre_start_msg = Some(v.to_string());
+            let arguments = serde_json::json!({
+                "turn_count": self.turn_count,
+                "prompt": user_msg,
+            });
+            if !self.hooks.before_agent_start.is_empty() {
+                let (outcome, new_args) = run_hooks(
+                    &self.hooks.before_agent_start,
+                    HookEvent::BeforeAgentStart,
+                    &turn_label,
+                    None,
+                    arguments.clone(),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+                match outcome {
+                    HookOutcome::Block { reason } => {
+                        let marker =
+                            format!("[BeforeAgentStart hook blocked the turn: {reason}]");
+                        let _ = tx
+                            .send(AgentEvent::Error {
+                                error: marker.clone(),
+                            })
+                            .await;
+                        return Ok(marker);
                     }
-                }
-                HookOutcome::Allow => {
-                    // `run_hooks` folds transforms into its accumulated
-                    // args and still reports Allow when no hook blocked,
-                    // so a rewrite usually arrives here rather than in
-                    // the Transform arm. Same fallback the Input hook
-                    // uses; compare against `user_msg` so an unchanged
-                    // echo doesn't count as a rewrite.
-                    if let Some(v) = new_args
-                        .as_ref()
-                        .and_then(|a| a.get("prompt"))
-                        .and_then(|v| v.as_str())
-                    {
-                        if v != user_msg {
+                    HookOutcome::Transform { new_arguments } => {
+                        // Only the `prompt` key is honored — the payload
+                        // also carries `turn_count`, which is ours, not the
+                        // hook's, to rewrite.
+                        if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
                             pre_start_msg = Some(v.to_string());
+                        }
+                    }
+                    HookOutcome::Allow => {
+                        // `run_hooks` folds transforms into its accumulated
+                        // args and still reports Allow when no hook blocked,
+                        // so a rewrite usually arrives here rather than in
+                        // the Transform arm. Same fallback the Input hook
+                        // uses; compare against `user_msg` so an unchanged
+                        // echo doesn't count as a rewrite.
+                        if let Some(v) = new_args
+                            .as_ref()
+                            .and_then(|a| a.get("prompt"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if v != user_msg {
+                                pre_start_msg = Some(v.to_string());
+                            }
                         }
                     }
                 }
             }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::BeforeAgentStart, || {
+                    event_payload_json(
+                        HookEvent::BeforeAgentStart,
+                        Some(&turn_label),
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
         }
 
         // ── Input hook (mirrors PI's beforeUserMessage) ────
@@ -542,47 +623,65 @@ impl Agent {
         // Block aborts the turn with a synthetic assistant marker so the
         // user sees why. Transform mutates the prompt in place.
         let mut effective_msg = pre_start_msg.unwrap_or_else(|| user_msg.to_string());
-        if self.permission.hooks_active() && !self.hooks.input.is_empty() {
-            let (outcome, new_args) = run_hooks(
-                &self.hooks.input,
-                HookEvent::Input,
-                // No tool name here, so `matcher` is tested against "" —
-                // only `*` (or an omitted matcher) can ever match. Any
-                // real regex silently never fires.
-                "",
-                None,
-                serde_json::json!({ "prompt": effective_msg }),
-                &self.cwd,
-                Some(&self.session_id.to_string()),
-            )
-            .await;
-            match outcome {
-                HookOutcome::Block { reason } => {
-                    let marker = format!("[Input hook blocked the prompt: {reason}]");
-                    let _ = tx
-                        .send(AgentEvent::Error {
-                            error: marker.clone(),
-                        })
-                        .await;
-                    return Ok(marker);
-                }
-                HookOutcome::Transform { new_arguments } => {
-                    if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
-                        effective_msg = v.to_string();
+        if self.permission.hooks_active() {
+            // Pre-transform arguments — shared byte-for-byte by the
+            // shell-hook call and the WASM delivery below, per §4.1.
+            let arguments = serde_json::json!({ "prompt": effective_msg });
+            if !self.hooks.input.is_empty() {
+                let (outcome, new_args) = run_hooks(
+                    &self.hooks.input,
+                    HookEvent::Input,
+                    // No tool name here, so `matcher` is tested against "" —
+                    // only `*` (or an omitted matcher) can ever match. Any
+                    // real regex silently never fires.
+                    "",
+                    None,
+                    arguments.clone(),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+                match outcome {
+                    HookOutcome::Block { reason } => {
+                        let marker = format!("[Input hook blocked the prompt: {reason}]");
+                        let _ = tx
+                            .send(AgentEvent::Error {
+                                error: marker.clone(),
+                            })
+                            .await;
+                        return Ok(marker);
                     }
-                }
-                HookOutcome::Allow => {
-                    if let Some(v) = new_args
-                        .as_ref()
-                        .and_then(|a| a.get("prompt"))
-                        .and_then(|v| v.as_str())
-                    {
-                        if v != effective_msg {
+                    HookOutcome::Transform { new_arguments } => {
+                        if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
                             effective_msg = v.to_string();
+                        }
+                    }
+                    HookOutcome::Allow => {
+                        if let Some(v) = new_args
+                            .as_ref()
+                            .and_then(|a| a.get("prompt"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if v != effective_msg {
+                                effective_msg = v.to_string();
+                            }
                         }
                     }
                 }
             }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::Input, || {
+                    event_payload_json(
+                        HookEvent::Input,
+                        Some(""),
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
         }
 
         // ── /skill:name expansion (mirrors PI's _expandSkillCommand) ──
@@ -718,25 +817,41 @@ impl Agent {
             // Advisory only — a Block is reported on stderr but does not
             // abort the iteration. matcher applied to turn_count (as
             // string).
-            if self.permission.hooks_active() && !self.hooks.turn_start.is_empty() {
+            if self.permission.hooks_active() {
                 let turn_label = self.turn_count.to_string();
-                let (outcome, _) = run_hooks(
-                    &self.hooks.turn_start,
-                    HookEvent::TurnStart,
-                    &turn_label,
-                    None,
-                    serde_json::json!({
-                        "turn_count": self.turn_count,
-                        "iteration": iteration_idx,
-                    }),
-                    &self.cwd,
-                    Some(&self.session_id.to_string()),
-                )
-                .await;
-                crate::agent::hook::report_advisory_outcome(
-                    HookEvent::TurnStart,
-                    outcome,
-                );
+                let arguments = serde_json::json!({
+                    "turn_count": self.turn_count,
+                    "iteration": iteration_idx,
+                });
+                if !self.hooks.turn_start.is_empty() {
+                    let (outcome, _) = run_hooks(
+                        &self.hooks.turn_start,
+                        HookEvent::TurnStart,
+                        &turn_label,
+                        None,
+                        arguments.clone(),
+                        &self.cwd,
+                        Some(&self.session_id.to_string()),
+                    )
+                    .await;
+                    crate::agent::hook::report_advisory_outcome(
+                        HookEvent::TurnStart,
+                        outcome,
+                    );
+                }
+                let session_id = self.session_id.to_string();
+                let cwd = self.cwd.clone();
+                self.event_subscribers.deliver_with(HookEvent::TurnStart, || {
+                        event_payload_json(
+                            HookEvent::TurnStart,
+                            Some(&turn_label),
+                            None,
+                            &arguments,
+                            &cwd,
+                            Some(&session_id),
+                        )
+                    })
+                    .await;
             }
 
             // Set up a forward channel: provider pushes to `forward_tx`,
@@ -1039,26 +1154,42 @@ impl Agent {
             // ── TurnEnd hook (v0.11.0) ──────────────────────────────────
             // Advisory only — fired at the bottom of each iteration. A
             // Block is reported on stderr and otherwise ignored.
-            if self.permission.hooks_active() && !self.hooks.turn_end.is_empty() {
+            if self.permission.hooks_active() {
                 let turn_label = self.turn_count.to_string();
-                let (outcome, _) = run_hooks(
-                    &self.hooks.turn_end,
-                    HookEvent::TurnEnd,
-                    &turn_label,
-                    None,
-                    serde_json::json!({
-                        "turn_count": self.turn_count,
-                        "iteration": iteration_idx,
-                        "had_tool_calls": had_tool_calls,
-                    }),
-                    &self.cwd,
-                    Some(&self.session_id.to_string()),
-                )
-                .await;
-                crate::agent::hook::report_advisory_outcome(
-                    HookEvent::TurnEnd,
-                    outcome,
-                );
+                let arguments = serde_json::json!({
+                    "turn_count": self.turn_count,
+                    "iteration": iteration_idx,
+                    "had_tool_calls": had_tool_calls,
+                });
+                if !self.hooks.turn_end.is_empty() {
+                    let (outcome, _) = run_hooks(
+                        &self.hooks.turn_end,
+                        HookEvent::TurnEnd,
+                        &turn_label,
+                        None,
+                        arguments.clone(),
+                        &self.cwd,
+                        Some(&self.session_id.to_string()),
+                    )
+                    .await;
+                    crate::agent::hook::report_advisory_outcome(
+                        HookEvent::TurnEnd,
+                        outcome,
+                    );
+                }
+                let session_id = self.session_id.to_string();
+                let cwd = self.cwd.clone();
+                self.event_subscribers.deliver_with(HookEvent::TurnEnd, || {
+                        event_payload_json(
+                            HookEvent::TurnEnd,
+                            Some(&turn_label),
+                            None,
+                            &arguments,
+                            &cwd,
+                            Some(&session_id),
+                        )
+                    })
+                    .await;
             }
         }
         // ── MessageEnd hook (v0.11.0) ───────────────────────────────────
@@ -1066,25 +1197,41 @@ impl Agent {
         // just before post-turn compaction. Advisory only — a Block is
         // reported on stderr but does not abort the turn (which has
         // already ended anyway).
-        if self.permission.hooks_active() && !self.hooks.message_end.is_empty() {
+        if self.permission.hooks_active() {
             let turn_label = self.turn_count.to_string();
-            let (outcome, _) = run_hooks(
-                &self.hooks.message_end,
-                HookEvent::MessageEnd,
-                &turn_label,
-                None,
-                serde_json::json!({
-                    "turn_count": self.turn_count,
-                    "response_length": final_text.len(),
-                }),
-                &self.cwd,
-                Some(&self.session_id.to_string()),
-            )
-            .await;
-            crate::agent::hook::report_advisory_outcome(
-                HookEvent::MessageEnd,
-                outcome,
-            );
+            let arguments = serde_json::json!({
+                "turn_count": self.turn_count,
+                "response_length": final_text.len(),
+            });
+            if !self.hooks.message_end.is_empty() {
+                let (outcome, _) = run_hooks(
+                    &self.hooks.message_end,
+                    HookEvent::MessageEnd,
+                    &turn_label,
+                    None,
+                    arguments.clone(),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+                crate::agent::hook::report_advisory_outcome(
+                    HookEvent::MessageEnd,
+                    outcome,
+                );
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::MessageEnd, || {
+                    event_payload_json(
+                        HookEvent::MessageEnd,
+                        Some(&turn_label),
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
         }
         // Post-turn compaction check. Matches PI (`agent-session.ts`
         // `_handlePostAgentRun`). Firing here means the user sees the
@@ -1121,6 +1268,7 @@ impl Agent {
         let session_id = self.session_id.clone();
         let permission = self.permission.clone();
         let hooks = self.hooks.clone();
+        let subscribers = self.event_subscribers.clone();
 
         // Keep id/name copies so we can synthesize cancelled results if
         // the whole batch gets dropped mid-flight (the calls Vec itself
@@ -1165,6 +1313,7 @@ impl Agent {
                 let session_id = session_id.clone();
                 let permission = permission.clone();
                 let hooks = hooks.clone();
+                let subscribers = subscribers.clone();
                 let tx = tx.clone();
                 let done = completed.clone();
                 async move {
@@ -1181,6 +1330,7 @@ impl Agent {
                             cwd.clone(),
                             permission.clone(),
                             hooks.clone(),
+                            subscribers.clone(),
                             tx.clone(),
                         )
                         .await;
@@ -1425,48 +1575,70 @@ async fn run_one_tool(
     cwd: PathBuf,
     permission: PermissionGate,
     hooks: HooksConfig,
+    subscribers: crate::subscriber::EventSubscribers,
     tx: mpsc::Sender<AgentEvent>,
 ) -> ToolCallOutcome {
-    // ToolExecutionStart hooks.
+    // ToolExecutionStart hooks. `hook::PER_DELTA_EVENTS` (message_update,
+    // tool_execution_update) are the two per-delta events that will never
+    // be plugin-deliverable (§5.2) — this is the nearest per-tool-call
+    // site to anchor that comment against.
     let mut effective_args = call.arguments.clone();
-    if permission.hooks_active() && !hooks.tool_execution_start.is_empty() {
-        let (outcome, transformed) = run_hooks(
-            &hooks.tool_execution_start,
-            HookEvent::ToolExecutionStart,
-            &call.name,
-            Some(call.id.as_str()),
-            call.arguments.clone(),
-            &cwd,
-            Some(&session_id.to_string()),
-        )
-        .await;
-        effective_args = transformed.unwrap_or(call.arguments.clone());
-        if let HookOutcome::Block { reason } = outcome {
-            if permission.should_honor_tool_execution_start_block() {
-                let result_text = format!("blocked by hook: {reason}");
-                let _ = session::append_entry(
-                    &session_path,
-                    &SessionEntry::ToolResult {
-                        tool_call_id: call.id.clone(),
-                        timestamp: time::now_iso8601(),
-                        content: result_text.clone(),
-                        is_error: true,
-                        images: Vec::new(),
-                    },
-                );
-                let _ = tx
-                    .send(AgentEvent::TextDelta {
-                        content_index: 0,
-                        text: format!("\n[{} blocked: {}]\n", call.name, reason),
-                    })
-                    .await;
-                return ToolCallOutcome {
-                    call_id: call.id,
-                    content: result_text,
+    if permission.hooks_active() {
+        let mut block: Option<String> = None;
+        if !hooks.tool_execution_start.is_empty() {
+            let (outcome, transformed) = run_hooks(
+                &hooks.tool_execution_start,
+                HookEvent::ToolExecutionStart,
+                &call.name,
+                Some(call.id.as_str()),
+                call.arguments.clone(),
+                &cwd,
+                Some(&session_id.to_string()),
+            )
+            .await;
+            effective_args = transformed.unwrap_or(call.arguments.clone());
+            if let HookOutcome::Block { reason } = outcome {
+                if permission.should_honor_tool_execution_start_block() {
+                    block = Some(reason);
+                }
+            }
+        }
+        let session_id_str = session_id.to_string();
+        subscribers.deliver_with(HookEvent::ToolExecutionStart, || {
+                event_payload_json(
+                    HookEvent::ToolExecutionStart,
+                    Some(&call.name),
+                    Some(call.id.as_str()),
+                    &call.arguments,
+                    &cwd,
+                    Some(&session_id_str),
+                )
+            })
+            .await;
+        if let Some(reason) = block {
+            let result_text = format!("blocked by hook: {reason}");
+            let _ = session::append_entry(
+                &session_path,
+                &SessionEntry::ToolResult {
+                    tool_call_id: call.id.clone(),
+                    timestamp: time::now_iso8601(),
+                    content: result_text.clone(),
                     is_error: true,
                     images: Vec::new(),
-                };
-            }
+                },
+            );
+            let _ = tx
+                .send(AgentEvent::TextDelta {
+                    content_index: 0,
+                    text: format!("\n[{} blocked: {}]\n", call.name, reason),
+                })
+                .await;
+            return ToolCallOutcome {
+                call_id: call.id,
+                content: result_text,
+                is_error: true,
+                images: Vec::new(),
+            };
         }
     }
 
@@ -1522,7 +1694,7 @@ async fn run_one_tool(
     // P1 ordering: hooks fire BEFORE the ToolResult event is emitted,
     // so the post-hook content/is_error is what the renderer sees
     // (and what the next LLM turn sees in the context).
-    if permission.hooks_active() && !hooks.tool_execution_end.is_empty() {
+    if permission.hooks_active() {
         let post_payload = serde_json::json!({
             "tool_input": effective_args,
             "tool_response": {
@@ -1531,38 +1703,52 @@ async fn run_one_tool(
                 "duration_ms": elapsed.as_millis() as u64,
             },
         });
-        let (_outcome, new_args) = run_hooks(
-            &hooks.tool_execution_end,
-            HookEvent::ToolExecutionEnd,
-            &call.name,
-            Some(call.id.as_str()),
-            post_payload,
-            &cwd,
-            Some(&session_id.to_string()),
-        )
-        .await;
-        // P1: tool_execution_end Transform replaces the tool result content.
-        //
-        // `run_hooks` always returns `HookOutcome::Allow` — transforms
-        // are accumulated into `current_args` which becomes `new_args`.
-        // So we just look at whether `new_args` was rewritten, not at
-        // the outcome enum.
-        //
-        // Hook emits
-        //   {"decision":"allow","updated_input":{"content":"...","is_error":true}}
-        // → `run_hooks` replaces the whole `current_args` with
-        //   `{"content":"...","is_error":true}` → `new_args` holds that.
-        if let Some(v) = new_args.as_ref() {
-            // Only apply if the rewrite is structurally different from
-            // the original payload — it must have a `content` key at
-            // the top level (not nested under `tool_response`).
-            if let Some(new_content) = v.get("content").and_then(|v| v.as_str()) {
-                content = new_content.to_string();
-            }
-            if let Some(new_is_error) = v.get("is_error").and_then(|v| v.as_bool()) {
-                is_error = new_is_error;
+        if !hooks.tool_execution_end.is_empty() {
+            let (_outcome, new_args) = run_hooks(
+                &hooks.tool_execution_end,
+                HookEvent::ToolExecutionEnd,
+                &call.name,
+                Some(call.id.as_str()),
+                post_payload.clone(),
+                &cwd,
+                Some(&session_id.to_string()),
+            )
+            .await;
+            // P1: tool_execution_end Transform replaces the tool result content.
+            //
+            // `run_hooks` always returns `HookOutcome::Allow` — transforms
+            // are accumulated into `current_args` which becomes `new_args`.
+            // So we just look at whether `new_args` was rewritten, not at
+            // the outcome enum.
+            //
+            // Hook emits
+            //   {"decision":"allow","updated_input":{"content":"...","is_error":true}}
+            // → `run_hooks` replaces the whole `current_args` with
+            //   `{"content":"...","is_error":true}` → `new_args` holds that.
+            if let Some(v) = new_args.as_ref() {
+                // Only apply if the rewrite is structurally different from
+                // the original payload — it must have a `content` key at
+                // the top level (not nested under `tool_response`).
+                if let Some(new_content) = v.get("content").and_then(|v| v.as_str()) {
+                    content = new_content.to_string();
+                }
+                if let Some(new_is_error) = v.get("is_error").and_then(|v| v.as_bool()) {
+                    is_error = new_is_error;
+                }
             }
         }
+        let session_id_str = session_id.to_string();
+        subscribers.deliver_with(HookEvent::ToolExecutionEnd, || {
+                event_payload_json(
+                    HookEvent::ToolExecutionEnd,
+                    Some(&call.name),
+                    Some(call.id.as_str()),
+                    &post_payload,
+                    &cwd,
+                    Some(&session_id_str),
+                )
+            })
+            .await;
     }
 
     // Stream a structured ToolResult so the TUI can render one green
@@ -1641,6 +1827,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1736,6 +1923,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1826,6 +2014,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -1928,6 +2117,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2022,6 +2212,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2087,6 +2278,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::Sequential,
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2217,6 +2409,7 @@ mod tests {
                 pending_follow_ups: Default::default(),
                 tool_exec_mode: mode,
                 plugin_commands: Vec::new(),
+                event_subscribers: Default::default(),
                 prompt_overrides:
                     crate::agent::prompt_override::PromptOverrides::default(),
             };
@@ -2317,6 +2510,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2379,6 +2573,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -2458,6 +2653,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2559,6 +2755,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         (agent, dir)
@@ -2705,6 +2902,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -2793,6 +2991,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         agent.fire_session_start("startup").await;
@@ -2859,6 +3058,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
         agent.fire_session_start("startup").await;
@@ -3320,6 +3520,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -3387,6 +3588,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -3507,6 +3709,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
 
@@ -3651,6 +3854,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -3711,6 +3915,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
         };
 
         agent.run_turn("go", &tx, None, Some(steer_rx)).await.unwrap();
@@ -3764,6 +3969,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: mode,
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         }
     }

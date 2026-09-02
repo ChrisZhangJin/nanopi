@@ -111,9 +111,9 @@ fn load_extensions(
     registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
     cwd: &std::path::Path,
-) -> Vec<crate::command::PluginCommand> {
+) -> (Vec<crate::command::PluginCommand>, crate::subscriber::EventSubscribers) {
     if extensions.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Default::default());
     }
     let summary = crate::wasm::PluginHost::new().load_all(extensions, cwd);
     for (path, err) in &summary.errors {
@@ -141,7 +141,8 @@ fn load_extensions(
             cmd.spec.name, cmd.plugin_name
         );
     }
-    resolved.commands
+    let event_subscribers = crate::subscriber::EventSubscribers::from_subscribers(summary.subscribers);
+    (resolved.commands, event_subscribers)
 }
 
 /// No-op stand-in for builds without the `wasm` feature. Warns once if
@@ -152,7 +153,7 @@ fn load_extensions(
     _registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
     _cwd: &std::path::Path,
-) -> Vec<crate::command::PluginCommand> {
+) -> (Vec<crate::command::PluginCommand>, crate::subscriber::EventSubscribers) {
     if !extensions.is_empty() {
         eprintln!(
             "nanopi: {} [[extensions]] entries ignored — this build has no \
@@ -160,7 +161,7 @@ fn load_extensions(
             extensions.len()
         );
     }
-    Vec::new()
+    (Vec::new(), Default::default())
 }
 
 /// Print command-registry diagnostics to stderr. Kept out of
@@ -202,7 +203,7 @@ impl Agent {
         // from both the system prompt's tool list and the `tools` array
         // sent to the model, i.e. registered but uncallable.
         let mut registry = registry;
-        let plugin_commands = load_extensions(&mut registry, &extensions, &cwd);
+        let (plugin_commands, event_subscribers) = load_extensions(&mut registry, &extensions, &cwd);
 
         let tool_names = registry.names();
         let LoadSkillsResult {
@@ -242,6 +243,7 @@ impl Agent {
             pending_follow_ups: initial_follow_up.into_iter().collect(),
             tool_exec_mode,
             plugin_commands,
+            event_subscribers,
         };
         (agent, diagnostics)
     }
@@ -286,7 +288,10 @@ impl Agent {
         // plugin tools are registered but uncallable. Resumed sessions
         // used to skip plugin loading entirely, so `--continue` and
         // every TUI resume path silently lost every plugin tool.
-        self.plugin_commands = load_extensions(&mut self.registry, extensions, &self.cwd);
+        let (plugin_commands, event_subscribers) =
+            load_extensions(&mut self.registry, extensions, &self.cwd);
+        self.plugin_commands = plugin_commands;
+        self.event_subscribers = event_subscribers;
 
         // load_session rebuilds Context from JSONL messages only — it
         // never repopulates `tools`. Without this line, the first turn

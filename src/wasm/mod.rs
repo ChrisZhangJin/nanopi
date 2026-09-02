@@ -29,6 +29,11 @@ pub struct PluginLoadSummary {
     /// register, since a collision needs to see every claimant at
     /// once and cannot be judged one plugin at a time.
     pub commands: Vec<crate::command::PluginCommand>,
+    /// Lifecycle-event subscribers each successfully-loaded plugin
+    /// registered, ready to fold into `crate::subscriber::EventSubscribers`.
+    /// Empty for a plugin whose `list-events` ∩ config `events` is empty
+    /// (including plugins that export no `list-events` at all).
+    pub subscribers: Vec<crate::subscriber::Subscriber>,
     /// How many `.wasm` files instantiated cleanly.
     pub loaded: usize,
     /// Per-file failures — path plus the reason. Non-fatal: a broken
@@ -56,6 +61,7 @@ impl PluginHost {
     ) -> PluginLoadSummary {
         let mut tools: Vec<std::sync::Arc<dyn crate::tool::Tool>> = Vec::new();
         let mut commands: Vec<crate::command::PluginCommand> = Vec::new();
+        let mut subscribers: Vec<crate::subscriber::Subscriber> = Vec::new();
         let mut errors = Vec::new();
         let mut loaded = 0usize;
 
@@ -74,6 +80,7 @@ impl PluginHost {
                 return PluginLoadSummary {
                     tools,
                     commands,
+                    subscribers,
                     loaded: 0,
                     errors: vec![(anchor, e)],
                 };
@@ -92,6 +99,26 @@ impl PluginHost {
                     cfg.path.display()
                 );
             }
+            // Same idea for `events` + `allow_network`: a plugin that
+            // both observes lifecycle events and can reach the network
+            // can exfiltrate whatever those events carry — worth a
+            // startup warning even though both capabilities are
+            // individually opt-in (`docs/v0.12-events.md` §5.1).
+            if !cfg.events.is_empty() && cfg.allow_network {
+                eprintln!(
+                    "nanopi: {} has both `events` and `allow_network = true` — \
+                     this plugin can observe lifecycle events AND reach the \
+                     network, and could exfiltrate event payloads. Grant both \
+                     only if you trust the plugin.",
+                    cfg.path.display()
+                );
+            }
+            let (events_granted, refusal_reports) = crate::agent::hook::parse_event_grants(&cfg.events);
+            for report in &refusal_reports {
+                eprintln!("nanopi: {}: {report}", cfg.path.display());
+            }
+            let events_granted: Vec<String> =
+                events_granted.into_iter().map(|s| s.to_string()).collect();
             for path in self.resolve_paths(std::slice::from_ref(cfg)) {
                 match engine.load(
                     &path,
@@ -99,6 +126,7 @@ impl PluginHost {
                     cwd.to_path_buf(),
                     cfg.allow_fs,
                     cfg.allow_network,
+                    events_granted.clone(),
                 ) {
                     Ok((bridge, specs)) => {
                         let plugin_name: std::sync::Arc<str> = path
@@ -130,6 +158,37 @@ impl PluginHost {
                                 });
                             }
                         }
+                        for unsatisfied in bridge.unsatisfied_event_requests() {
+                            eprintln!(
+                                "nanopi: {} requested event {unsatisfied:?} but the config's \
+                                 `events` did not grant it — not delivered.",
+                                path.display()
+                            );
+                        }
+                        let subscribed = bridge.event_subscriptions();
+                        if !subscribed.is_empty() {
+                            let events: Vec<&'static str> = subscribed
+                                .iter()
+                                .filter_map(|e| {
+                                    crate::agent::hook::EVENT_NAMES
+                                        .iter()
+                                        .find(|&&n| n == e.as_str())
+                                        .copied()
+                                })
+                                .collect();
+                            eprintln!(
+                                "nanopi: {} registered for events: {}",
+                                path.display(),
+                                events.join(", ")
+                            );
+                            let handler: std::sync::Arc<dyn crate::subscriber::EventHandler> =
+                                std::sync::Arc::new(host::WasmEventHandler::new(bridge.clone()));
+                            subscribers.push(crate::subscriber::Subscriber {
+                                plugin_name: plugin_name.clone(),
+                                events,
+                                handler,
+                            });
+                        }
                         loaded += 1;
                     }
                     Err(e) => errors.push((path, e)),
@@ -140,6 +199,7 @@ impl PluginHost {
         PluginLoadSummary {
             tools,
             commands,
+            subscribers,
             loaded,
             errors,
         }
@@ -279,6 +339,7 @@ mod tests {
             allow_network: false,
             allow_fs: false,
             url_allowlist: Vec::new(),
+            events: Vec::new(),
         };
         let got = PluginHost::new().resolve_paths(&[cfg]);
         assert_eq!(got.len(), 2);

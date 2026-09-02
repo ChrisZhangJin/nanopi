@@ -192,6 +192,15 @@ Project beats global; the global file needs no trust gate (it's your own machine
 
 ## Hooks
 
+nanopi has two extension systems, and as of v0.12.0 they can both see every lifecycle event — the difference is what they're allowed to do with it:
+
+| | add tools | add commands | see events | veto / transform | hold state | cost per fire |
+|---|---|---|---|---|---|---|
+| shell hooks | ✗ | ✗ | ✓ (11) | ✓ | ✗ — fresh process | fork + exec |
+| WASM plugins | ✓ | ✓ | ✓ (11, opt-in, observe-only) | ✗ | ✓ — `Store` persists | one function call |
+
+In one sentence: **WASM plugins observe, shell hooks can refuse** — see [`docs/v0.12-events.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.12-events.md) §8 for why nanopi keeps both instead of merging into one system like PI's `ExtensionAPI`.
+
 Shell hooks fire around tool calls, using Claude Code's hook *protocol* (JSON on stdin, exit code 2 to block, `tool_name` / `tool_input` / `hookSpecificOutput` fields) — but PI's *event names*, not Claude Code's. Configure in `~/.nanopi/settings.toml`:
 
 ```toml
@@ -261,6 +270,19 @@ A plugin exports two required functions, and optionally two more ([`wit/nanopi-e
 `print` goes straight to your scrollback: the model never sees it and it never enters the session transcript. `send_user_message` starts a turn as if you had typed it — always echoed verbatim first, so a plugin cannot put words in your mouth invisibly; typed mid-stream it steers the running turn instead, exactly like your own typing. `error` is shown to you and, like a trap, is never forwarded to the model.
 
 The two command exports live in a second WIT world, `extension-commands`, which `include`s the first. A tool-only plugin keeps targeting `extension` and keeps building unchanged — WIT cannot express an optional export, so widening the original world would have broken every existing plugin's *source* even though the host still loads its compiled *binary*.
+
+**Watching lifecycle events (v0.12.0).** A third, opt-in WIT world, `extension-events`, `include`s `extension-commands` and adds two more exports:
+
+| Export | Signature | Purpose |
+|---|---|---|
+| `list-events` | `() -> string` | *Optional.* JSON array of PI event names the plugin wants to observe. |
+| `handle-event` | `(event: string, payload-json: string) -> string` | *Optional.* Called for every event both requested here AND granted by config. Return value is ignored — this is observe-only, a plugin cannot veto or transform through it. |
+
+Delivery needs **both lists to agree**: the plugin's `list-events` and the config's `[[extensions]].events` (`config.toml.example` documents the full grant syntax). Either alone grants nothing — an unsatisfied request (exported but not granted) is reported at load, so a plugin that looks like it should be receiving events but isn't says why. The payload handed to `handle-event` is byte-identical to what a shell hook receives on stdin for the same event — same `HookInput` JSON, same builder.
+
+This is a bigger grant than it might look: an `input` subscriber sees every prompt verbatim, and a `tool_execution_start` subscriber sees every tool call's arguments — bigger than `allow_fs`. Combining `events` with `allow_network = true` on one plugin is warned about at startup, because it turns the plugin into a channel that can exfiltrate whatever those events carry. **Do not fetch from an event handler** — `host-http-get` is still reachable from `handle-event`, but a slow or hostile fetch there is bounded by the fetch's own 10s timeout stacked on top of the event budget below, not by epoch interruption (epoch instrumentation cannot preempt a running host function).
+
+Guest code in `handle-event` gets a 2s wall-clock budget — much tighter than a tool call's 30s, since an event handler sits on the turn's critical path and fires far more often. Delivery is **drop-on-busy, never blocking**: if a plugin's `Store` is already busy with an in-flight tool call, the event for that instant is dropped rather than queued, so one busy plugin can never stall an emit for the rest of the agent loop. Dropped events are counted per plugin and logged. `/tools` lists every plugin currently subscribed, under a "Watching events" section — the same inventory that already answers "what can the model call" now also answers "what is watching me".
 
 And may import these host functions:
 

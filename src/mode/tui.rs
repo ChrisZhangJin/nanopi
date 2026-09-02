@@ -285,6 +285,35 @@ fn command_menu_items(cmds: &[crate::command::PluginCommand]) -> Vec<MenuItem<Sl
         .collect()
 }
 
+/// `/tools`'s "who's watching me" section (§5.1 / §9 of
+/// `docs/v0.12-events.md`): the callable-tools list only answers "what
+/// can the model call", not "what is observing every turn" — a plugin
+/// with no exported tools but a `list-events` subscription would
+/// otherwise be invisible from `/tools`. Returns an empty `Vec` when
+/// nothing is subscribed, so the section is omitted entirely rather than
+/// growing a permanently-empty heading.
+fn subscriptions_section(subs: &[(String, Vec<String>)]) -> Vec<Line<'static>> {
+    if subs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Watching events ({} plugins)", subs.len()),
+        Style::default()
+            .fg(Color::Indexed(108))
+            .add_modifier(Modifier::BOLD),
+    )])];
+    for (plugin, events) in subs {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {plugin:<20}"),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(events.join(", "), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
+}
+
 const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
 
 /// Max input content lines shown at once when no overlay menu is open.
@@ -750,6 +779,12 @@ struct App {
     /// alongside `skills_cache` and for the same reason. Always empty
     /// in a build without `--features wasm`.
     commands_cache: Vec<crate::command::PluginCommand>,
+    /// Snapshot of agent.event_subscribers.subscriptions(), refreshed by
+    /// `refresh_status` alongside `commands_cache`. `(plugin_name, sorted
+    /// event names)` per plugin, non-gated (`src/subscriber.rs`), so this
+    /// field carries no WASM feature gate into `tui.rs`. Always empty in
+    /// a build without `--features wasm`.
+    subscriptions_cache: Vec<(String, Vec<String>)>,
     /// In-flight plugin command, run on the blocking pool.
     ///
     /// Not awaited inline: `handle_action` runs inside the `select!`
@@ -819,6 +854,7 @@ impl App {
             last_skill_block: None,
             skills_cache: Vec::new(),
             commands_cache: Vec::new(),
+            subscriptions_cache: Vec::new(),
             command_task: None,
         }
     }
@@ -2684,6 +2720,18 @@ async fn handle_action(
                 )?;
             }
             insert_line(term, Line::from(""))?;
+
+            // §5.1: the inventory above answers "what can the model
+            // call" — this section answers "what is watching me", which
+            // is the other half of a plugin's blast radius and just as
+            // worth an operator's attention. Nothing printed when no
+            // plugin subscribed to any event.
+            for line in subscriptions_section(&app.subscriptions_cache) {
+                insert_line(term, line)?;
+            }
+            if !app.subscriptions_cache.is_empty() {
+                insert_line(term, Line::from(""))?;
+            }
         }
         KeyAction::OpenForkPicker => {
             // Tree-aware picker: walk the parent_id chain upward from
@@ -3260,6 +3308,7 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.thinking = a.context.thinking;
         app.skills_cache = a.skills.clone();
         app.commands_cache = a.plugin_commands.clone();
+        app.subscriptions_cache = a.event_subscribers.subscriptions();
     }
 }
 
@@ -4708,6 +4757,37 @@ mod tests {
             .collect()
     }
 
+    /// One flattened string per rendered `Line`, for assertions that
+    /// don't care about per-span styling.
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn subscriptions_section_is_empty_when_nothing_subscribed() {
+        assert!(subscriptions_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn subscriptions_section_lists_header_and_one_line_per_plugin() {
+        let subs = vec![
+            ("watcher".to_string(), vec!["turn_end".to_string(), "turn_start".to_string()]),
+            ("logger".to_string(), vec!["input".to_string()]),
+        ];
+        let lines = subscriptions_section(&subs);
+        let texts = line_texts(&lines);
+        assert_eq!(texts.len(), 3, "header + one line per plugin");
+        assert!(texts[0].contains("Watching events"));
+        assert!(texts[0].contains("2"), "header should count the plugins");
+        assert!(texts[1].contains("watcher"));
+        assert!(texts[1].contains("turn_end, turn_start"));
+        assert!(texts[2].contains("logger"));
+        assert!(texts[2].contains("input"));
+    }
+
     #[test]
     fn wrap_chars_one_column_per_char() {
         // CJK counts as ONE column here (unlike unicode-width), so a run
@@ -4825,6 +4905,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         }
     }

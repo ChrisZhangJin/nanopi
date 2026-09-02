@@ -74,6 +74,30 @@ impl crate::command::CommandHandler for WasmCommandHandler {
     }
 }
 
+/// Dispatches one lifecycle event to the plugin's `handle-event` export.
+///
+/// Mirrors [`WasmCommandHandler`] exactly: sync, no `async_trait`, so
+/// `crate::subscriber` — which defines [`crate::subscriber::EventHandler`]
+/// — stays free of `cfg(feature = "wasm")`. The bridge itself owns the
+/// `try_lock`-drops-rather-than-waits behavior (`docs/v0.12-events.md`
+/// §5.2); this type is just the seam between the non-gated subscriber
+/// table and the gated bridge.
+pub struct WasmEventHandler {
+    bridge: Arc<dyn WasmExecuteBridge>,
+}
+
+impl WasmEventHandler {
+    pub fn new(bridge: Arc<dyn WasmExecuteBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+impl crate::subscriber::EventHandler for WasmEventHandler {
+    fn handle_event(&self, event: &str, payload_json: &str) {
+        self.bridge.handle_event(event, payload_json);
+    }
+}
+
 #[async_trait]
 impl Tool for WasmTool {
     fn spec(&self) -> ToolSpec {
@@ -164,6 +188,36 @@ pub trait WasmExecuteBridge: Send + Sync {
         _args: &str,
     ) -> Result<crate::command::CommandAction, String> {
         Err(format!("plugin exports no command {name:?}"))
+    }
+
+    /// Lifecycle events this plugin will actually receive: the
+    /// intersection of its `list-events` export and the config's
+    /// `[[extensions]].events` grant, fixed at load time (never
+    /// re-derived — a plugin cannot expand its own grant mid-session).
+    /// Empty for a component with no `list-events`, which is the
+    /// default and the common case.
+    fn event_subscriptions(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Events this plugin's `list-events` requested but the config did
+    /// not grant. Purely for the load-time report (`docs/v0.12-events.md`
+    /// §6) — nothing dispatches against this list.
+    fn unsatisfied_event_requests(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Deliver one lifecycle event. Observe-only: the return value (if
+    /// any) is discarded (§3). Must never block the caller waiting on a
+    /// busy plugin — implementations use `try_lock` and drop rather than
+    /// wait.
+    fn handle_event(&self, _event: &str, _payload_json: &str) {}
+
+    /// How many deliveries were dropped because the plugin was still
+    /// busy with a previous call. Monotonically increasing for the life
+    /// of the bridge.
+    fn dropped_events(&self) -> u64 {
+        0
     }
 }
 

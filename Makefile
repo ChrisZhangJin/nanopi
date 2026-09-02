@@ -22,8 +22,15 @@ PLUGIN_SRC   := examples/wasm-plugin
 PLUGIN_WASM  := $(PLUGIN_SRC)/target/wasm32-wasip1/release/nanopi_example_plugin.wasm
 PLUGIN_OUT   := dist/nanopi-example-plugin.component.wasm
 
+# Same three-step recipe as `plugin` below, targeting `extension-events`
+# instead of `extension-commands` — this plugin also subscribes to
+# lifecycle events.
+EVENTS_SRC   := examples/wasm-plugin-events
+EVENTS_WASM  := $(EVENTS_SRC)/target/wasm32-wasip1/release/nanopi_events_plugin.wasm
+EVENTS_OUT   := dist/nanopi-events-plugin.component.wasm
+
 .PHONY: all check clean ensure-target ensure-tools build pack \
-        wasm wasm-debug build-wasm plugin test-wasm \
+        wasm wasm-debug build-wasm plugin plugin-events test-wasm \
         ensure-wasm-tools ensure-musl-cc
 
 all: pack
@@ -180,6 +187,18 @@ plugin: ensure-wasm-tools
 	@echo
 	@echo "built $(PLUGIN_OUT) — exports:"
 	@wasm-tools component wit $(PLUGIN_OUT) | grep -E '^\s+export' || true
+
+plugin-events: ensure-wasm-tools
+	cargo build --manifest-path $(EVENTS_SRC)/Cargo.toml \
+		--target wasm32-wasip1 --release
+	@mkdir -p dist
+	wasm-tools component embed wit/ $(EVENTS_WASM) \
+		-o dist/embedded-events.wasm --world extension-events
+	wasm-tools component new dist/embedded-events.wasm -o $(EVENTS_OUT)
+	@rm -f dist/embedded-events.wasm
+	@echo
+	@echo "built $(EVENTS_OUT) — exports:"
+	@wasm-tools component wit $(EVENTS_OUT) | grep -E '^\s+export' || true
 
 ensure-wasm-tools:
 	@command -v wasm-tools >/dev/null 2>&1 || { \

@@ -16,11 +16,22 @@
 //!       Returns a JSON array of `{name, description, parameters}`.
 //!   - `execute-tool: func(name: string, args-json: string) -> string`
 //!       Returns a JSON object `{content, is_error}`.
+//!   - `list-commands: func() -> string` (optional)
+//!       Returns a JSON array of `{name, description}`.
+//!   - `execute-command: func(name: string, args: string) -> string` (optional)
+//!       Returns a one-key JSON object tagging a `CommandAction` variant.
+//!   - `list-events: func() -> string` (optional)
+//!       Returns a JSON array of event names this plugin wants delivered.
+//!       Delivery also requires the config's `[[extensions]].events` to
+//!       grant the same name — the intersection is fixed at load time.
+//!   - `handle-event: func(event: string, payload-json: string) -> string` (optional)
+//!       Return value is discarded by the host; observe-only.
 //! Strings rather than WIT records keep the ABI to one primitive type,
 //! which is what makes the hand-rolled binding tractable.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use serde::Deserialize;
 use wasmtime::component::{Component, Linker};
@@ -405,6 +416,19 @@ const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// unbounded hang.
 const EPOCH_BUDGET_TICKS: u64 = 30;
 
+/// Guest wall-clock budget for one `handle-event` call, in epoch ticks.
+///
+/// Deliberately much smaller than `EPOCH_BUDGET_TICKS`: a tool call is
+/// user-waited-on and happens once per explicit request, but event
+/// delivery fires on every turn's critical path — reusing the 30s tool
+/// budget here would add up to 30s of latency to every single turn.
+/// `host-http-get`'s own 10s timeout is additive on top of this budget
+/// (it bounds host code, this bounds guest code), so a misbehaving
+/// handler that fetches is still bounded at roughly 12s worst case, not
+/// unboundedly. Event handlers should not fetch at all — see the
+/// warning in `wit/nanopi-extension.wit`.
+const EVENT_EPOCH_BUDGET_TICKS: u64 = 2;
+
 /// One running wasmtime engine; threadsafe, cheap to clone (internally
 /// `Arc`-refcounted).
 pub struct PluginEngine {
@@ -504,6 +528,7 @@ impl PluginEngine {
         cwd: PathBuf,
         allow_fs: bool,
         allow_network: bool,
+        events_granted: Vec<String>,
     ) -> Result<(Arc<dyn WasmExecuteBridge>, Vec<ToolSpec>), String> {
         let bytes = std::fs::read(wasm_path)
             .map_err(|e| format!("read {} failed: {e}", wasm_path.display()))?;
@@ -730,10 +755,77 @@ impl PluginEngine {
             None => (Vec::new(), None),
         };
 
+        // Lifecycle events are OPTIONAL, same shape as commands, with
+        // one deliberate difference: once a plugin advertises ANY event
+        // via `list-events`, missing `handle-event` is an authoring bug
+        // (case 4 below), not a soft degrade — unlike commands, there is
+        // no "just don't dispatch" fallback that makes sense once the
+        // plugin has said "deliver me these".
+        //
+        // 1. Export missing → soft (`.ok()`), same backward-compat
+        //    guarantee as `list-commands`.
+        // 2. `list-events` traps → hard.
+        // 3. Malformed JSON → hard.
+        // 4. Events requested but no `handle-event` → hard.
+        //
+        // The granted ∩ requested intersection is computed HERE, once,
+        // at load time — never re-derived later. This is what makes a
+        // plugin's `list-events` unable to self-expand its own grant:
+        // `events_granted` comes from the config, `requested` from the
+        // guest, and only their intersection is ever dispatched to.
+        let (event_subscriptions, unsatisfied_event_requests, handle_event) = match instance
+            .get_typed_func::<(), (String,)>(&mut store, "list-events")
+            .ok()
+        {
+            Some(list_events) => {
+                store.set_epoch_deadline(self.budget_ticks);
+                let (json,) = list_events
+                    .call(&mut store, ())
+                    .map_err(|e| format!("list-events trapped: {e}"))?;
+                list_events
+                    .post_return(&mut store)
+                    .map_err(|e| format!("list-events post_return failed: {e}"))?;
+                let requested = parse_event_requests(&json)?;
+                let subscriptions: Vec<String> = requested
+                    .iter()
+                    .filter(|e| events_granted.iter().any(|g| g == *e))
+                    .cloned()
+                    .collect();
+                let unsatisfied: Vec<String> = requested
+                    .iter()
+                    .filter(|e| !events_granted.iter().any(|g| g == *e))
+                    .cloned()
+                    .collect();
+                let handle = if requested.is_empty() {
+                    None
+                } else {
+                    Some(
+                        instance
+                            .get_typed_func::<(String, String), (String,)>(
+                                &mut store,
+                                "handle-event",
+                            )
+                            .map_err(|e| {
+                                format!(
+                                    "{} exports events but not `handle-event`: {e}",
+                                    wasm_path.display()
+                                )
+                            })?,
+                    )
+                };
+                (subscriptions, unsatisfied, handle)
+            }
+            None => (Vec::new(), Vec::new(), None),
+        };
+
         let bridge: Arc<dyn WasmExecuteBridge> = Arc::new(ComponentBridge {
             specs: specs.clone(),
             command_specs,
             budget_ticks: self.budget_ticks,
+            event_subscriptions,
+            unsatisfied_event_requests,
+            event_budget_ticks: EVENT_EPOCH_BUDGET_TICKS,
+            dropped_events: AtomicU64::new(0),
             rebuild: PluginRebuild {
                 engine: self.engine.clone(),
                 component,
@@ -751,10 +843,30 @@ impl PluginEngine {
                 store,
                 execute,
                 execute_command,
+                handle_event,
             }),
         });
         Ok((bridge, specs))
     }
+}
+
+/// Upper bound on how many events one plugin may request via
+/// `list-events`. There are only 11 lifecycle events total
+/// (`crate::agent::hook::EVENT_NAMES`), so this is generous headroom,
+/// not a meaningful limit — it exists to reject a plugin returning
+/// obvious garbage rather than to police a legitimate use.
+const MAX_EVENTS_PER_PLUGIN: usize = 32;
+
+fn parse_event_requests(json: &str) -> Result<Vec<String>, String> {
+    let wire: Vec<String> = serde_json::from_str(json)
+        .map_err(|e| format!("list-events returned invalid JSON: {e} (got {json:?})"))?;
+    if wire.len() > MAX_EVENTS_PER_PLUGIN {
+        return Err(format!(
+            "list-events returned {} events, more than the {MAX_EVENTS_PER_PLUGIN} allowed",
+            wire.len()
+        ));
+    }
+    Ok(wire)
 }
 
 /// What `list-tools` returns, before conversion to `ToolSpec`.
@@ -852,12 +964,19 @@ type ExecuteFunc = wasmtime::component::TypedFunc<(String, String), (String,)>;
 /// tools and commands are separate namespaces and the two handles must
 /// never be swapped.
 type CommandFunc = wasmtime::component::TypedFunc<(String, String), (String,)>;
+/// Same signature again, distinct alias for the same reason as
+/// `CommandFunc`: events are a third namespace, and the handle must
+/// never be swapped with the other two.
+type EventFunc = wasmtime::component::TypedFunc<(String, String), (String,)>;
 
 struct BridgeInner {
     store: Store<PluginState>,
     execute: ExecuteFunc,
     /// `None` when the component exports no `execute-command`.
     execute_command: Option<CommandFunc>,
+    /// `None` when the component exports no `handle-event`, or exports
+    /// `list-events` returning an empty list.
+    handle_event: Option<EventFunc>,
 }
 
 struct ComponentBridge {
@@ -867,6 +986,20 @@ struct ComponentBridge {
     /// Copied off the engine so `execute_tool` can re-arm the deadline
     /// without reaching back for it.
     budget_ticks: u64,
+    /// Granted ∩ requested, fixed at load — see the comment at the
+    /// `list-events` call site in `PluginEngine::load`. Never re-read
+    /// from the guest after load; a plugin cannot expand its own grant
+    /// mid-session.
+    event_subscriptions: Vec<String>,
+    /// Requested \ granted, kept only for the load-time report.
+    unsatisfied_event_requests: Vec<String>,
+    /// Guest budget for one `handle-event` call, in epoch ticks. Smaller
+    /// than `budget_ticks` — see `EVENT_EPOCH_BUDGET_TICKS`.
+    event_budget_ticks: u64,
+    /// Deliveries skipped because the plugin was still busy with a
+    /// previous call (`try_lock` returned `WouldBlock`). Never resets
+    /// for the life of the bridge.
+    dropped_events: AtomicU64,
     /// Everything needed to stand a fresh instance back up after a
     /// trap. A trapped component instance cannot be re-entered — every
     /// later call returns "cannot enter component instance" — so
@@ -923,10 +1056,18 @@ impl PluginRebuild {
         let execute_command = instance
             .get_typed_func::<(String, String), (String,)>(&mut store, "execute-command")
             .ok();
+        // `.ok()` again, and NOT re-calling `list-events`, for the same
+        // two reasons as `execute_command` above: a plugin must not be
+        // able to change its subscription set mid-session, and recovery
+        // should spend as little epoch budget as possible.
+        let handle_event = instance
+            .get_typed_func::<(String, String), (String,)>(&mut store, "handle-event")
+            .ok();
         Ok(BridgeInner {
             store,
             execute,
             execute_command,
+            handle_event,
         })
     }
 }
@@ -1064,11 +1205,116 @@ impl WasmExecuteBridge for ComponentBridge {
             }
         })
     }
+
+    fn event_subscriptions(&self) -> Vec<String> {
+        self.event_subscriptions.clone()
+    }
+
+    fn unsatisfied_event_requests(&self) -> Vec<String> {
+        self.unsatisfied_event_requests.clone()
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    fn handle_event(&self, event: &str, payload_json: &str) {
+        if !self.event_subscriptions.iter().any(|e| e == event) {
+            return;
+        }
+        // Observe-only, non-blocking: a busy plugin must never make the
+        // caller (the turn's critical path) wait. `try_lock` rather than
+        // `lock` is the entire point of this method existing separately
+        // from `execute_tool`'s blocking lock.
+        let mut guard = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "nanopi: dropped event delivery, plugin busy [event={event}]"
+                );
+                return;
+            }
+            // Poisoned must NOT be treated as busy — that would leave
+            // delivery silently stopped forever after one panicking
+            // call. Recover exactly like `execute_tool` does.
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        let inner = &mut *guard;
+        let Some(handle_event) = inner.handle_event.as_ref() else {
+            // Not reachable in normal operation (`event_subscriptions`
+            // is only non-empty when `handle-event` resolved at load),
+            // but a post-trap rebuild could in principle come back
+            // without it — defensive, not a bug report.
+            return;
+        };
+        // Smaller budget than tool calls — see `EVENT_EPOCH_BUDGET_TICKS`.
+        inner.store.set_epoch_deadline(self.event_budget_ticks);
+        let called = handle_event.call(
+            &mut inner.store,
+            (event.to_string(), payload_json.to_string()),
+        );
+        match called {
+            Ok((_out,)) => {
+                // Return value is discarded by design (§3) — only
+                // `post_return` matters, to release the call frame.
+                if let Err(e) = handle_event.post_return(&mut inner.store) {
+                    eprintln!(
+                        "nanopi: handle-event post_return failed, resetting plugin [event={event}]: {e}"
+                    );
+                    Self::reset(inner, &self.rebuild, self.budget_ticks);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "nanopi: handle-event trapped, resetting plugin [event={event}]: {e}"
+                );
+                Self::reset(inner, &self.rebuild, self.budget_ticks);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Event delivery must use a smaller epoch budget than tool calls —
+    /// events fire on every turn's critical path, tool calls do not.
+    #[test]
+    fn the_event_budget_is_smaller_than_the_tool_budget() {
+        assert!(
+            EVENT_EPOCH_BUDGET_TICKS < EPOCH_BUDGET_TICKS,
+            "event budget ({EVENT_EPOCH_BUDGET_TICKS}) must be smaller than the tool budget ({EPOCH_BUDGET_TICKS})"
+        );
+    }
+
+    #[test]
+    fn parse_event_requests_reads_json_array() {
+        let requested = parse_event_requests(r#"["turn_start", "input"]"#).expect("valid");
+        assert_eq!(requested, vec!["turn_start".to_string(), "input".to_string()]);
+    }
+
+    #[test]
+    fn parse_event_requests_accepts_empty_list() {
+        assert!(parse_event_requests("[]").expect("valid").is_empty());
+    }
+
+    #[test]
+    fn parse_event_requests_rejects_garbage() {
+        let err = parse_event_requests("not json").unwrap_err();
+        assert!(err.contains("invalid JSON"), "{err}");
+    }
+
+    #[test]
+    fn parse_event_requests_caps_the_count() {
+        let many: String = (0..MAX_EVENTS_PER_PLUGIN + 1)
+            .map(|i| format!("\"e{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = parse_event_requests(&format!("[{many}]")).unwrap_err();
+        assert!(err.contains("more than the"), "{err}");
+    }
 
     #[test]
     fn parse_tool_specs_reads_json_array() {
@@ -1209,7 +1455,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, specs) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false)
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, Vec::new())
             .expect("runaway fixture must still LOAD — only execute-tool spins");
         assert_eq!(specs.len(), 1, "fixture advertises one tool");
 
@@ -1245,7 +1491,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false)
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, Vec::new())
             .expect("example fixture loads");
 
         for i in 0..3 {
@@ -1558,7 +1804,7 @@ mod tests {
             .join("tests/fixtures/example-plugin.component.wasm");
         let engine = PluginEngine::new().expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false)
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, Vec::new())
             .expect("example fixture loads");
 
         let good = r#"{"text":"abc"}"#;
@@ -1591,7 +1837,7 @@ mod tests {
         std::fs::write(&p, b"definitely not a wasm component").unwrap();
         // `unwrap_err()` needs the Ok half to be Debug, and
         // `Arc<dyn WasmExecuteBridge>` isn't — match instead.
-        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false) {
+        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, Vec::new()) {
             Ok(_) => panic!("garbage bytes must not compile as a component"),
             Err(e) => assert!(e.contains("compile"), "got {e}"),
         }

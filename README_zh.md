@@ -187,6 +187,15 @@ description: 亲切地和用户打招呼。用于问候场景。
 
 ## Hooks
 
+nanopi 有两套扩展机制，从 v0.12.0 起两者都能看到全部生命周期事件 —— 区别在于拿到事件之后能做什么：
+
+| | 加工具 | 加命令 | 能看事件 | 能否决 / 改写 | 能保状态 | 每次触发的开销 |
+|---|---|---|---|---|---|---|
+| shell hooks | ✗ | ✗ | ✓（11 个） | ✓ | ✗ —— 每次都是新进程 | fork + exec |
+| WASM 插件 | ✓ | ✓ | ✓（11 个，选择性加入，只能观察） | ✗ | ✓ —— `Store` 常驻 | 一次函数调用 |
+
+一句话说清楚：**WASM 插件只能观察，shell hooks 能拒绝** —— 为什么 nanopi 保留两套而不像 PI 那样合并成一个 `ExtensionAPI`，见 [`docs/v0.12-events.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.12-events.md) 第 8 节。
+
 Shell hooks 会在工具调用前后触发，沿用 Claude Code 的 hook *协议*（JSON 走 stdin、退出码 2 表示拒绝、`tool_name` / `tool_input` / `hookSpecificOutput` 等字段）—— 但事件*名字*用的是 PI 的命名，不是 Claude Code 的。配置写在 `~/.nanopi/settings.toml`：
 
 ```toml
@@ -256,6 +265,19 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 `print` 直接写进你的 scrollback：模型看不到，也不进会话记录。`send_user_message` 会像你自己输入一样开启一轮对话 —— 但**总是先原样回显**，插件无法在你不知情的情况下替你说话；流式输出中途调用则转为转向（steer）当前这轮，和你自己打字的行为完全一致。`error` 只展示给你，和 trap 一样绝不转发给模型。
 
 两个命令导出放在第二个 WIT world `extension-commands` 里，它 `include` 了第一个。只提供工具的插件继续用 `extension`，源码一行都不用改 —— WIT 无法表达「可选导出」，直接扩宽原来的 world 会让所有已有插件的*源码*编译不过，尽管宿主仍然能加载它们编译好的*二进制*。
+
+**订阅生命周期事件（v0.12.0）。** 第三个、同样是可选加入的 WIT world `extension-events`，`include` 了 `extension-commands`，再加两个导出：
+
+| 导出 | 签名 | 用途 |
+|---|---|---|
+| `list-events` | `() -> string` | *可选。* 插件想观察的 PI 事件名称，JSON 数组。 |
+| `handle-event` | `(event: string, payload-json: string) -> string` | *可选。* 每当某个事件同时满足「这里请求过」和「config 授予过」，就会被调用一次。返回值被忽略 —— 这是纯观察，插件无法通过它否决或改写任何东西。 |
+
+投递需要**两份名单同时点头**：插件的 `list-events` 导出，加上 config 里 `[[extensions]].events` 的授权（完整语法见 `config.toml.example`）。任何一边缺席都不会投递 —— 如果插件请求了但 config 没授权，加载时会报出来，所以「看起来该收到事件却没收到」的插件能知道原因。`handle-event` 拿到的 payload 和 shell hook 在 stdin 上收到的是逐字节相同的 —— 同一份 `HookInput` JSON，同一个构造函数。
+
+这个授权比看起来的要重：`input` 订阅者能看到每一条原始 prompt，`tool_execution_start` 订阅者能看到每次工具调用的全部参数 —— 比 `allow_fs` 的授权面还大。同一个插件如果同时打开 `events` 和 `allow_network = true`，启动时会警告，因为这等于给了它一条能把这些事件内容外泄出去的通道。**不要在事件处理器里发起网络请求** —— `handle-event` 里仍然能调用 `host-http-get`，但一次慢请求或恶意请求的耗时上限是它自己的 10 秒超时叠加下面的事件预算，而不是 epoch 中断能管的范围（epoch 插桩没法打断正在执行的宿主函数）。
+
+`handle-event` 里的 guest 代码只有 2 秒的墙钟预算 —— 比工具调用的 30 秒紧得多，因为事件处理器就卡在每个 turn 的关键路径上，触发频率也高得多。投递策略是**忙则丢弃，绝不阻塞**：如果某个插件的 `Store` 正被一次工具调用占用，这一刻的事件会被直接丢弃，不会排队，所以一个卡住的插件永远不会拖慢整个 agent 循环的其他投递。丢弃的事件按插件计数并写日志。`/tools` 会在「Watching events」这个小节里列出当前订阅了事件的每个插件 —— 同一份清单，原本回答「模型能调用什么」，现在也回答「谁在盯着我」。
 
 可以导入这些宿主函数：
 
