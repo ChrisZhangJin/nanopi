@@ -1123,10 +1123,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     // /name can act immediately without a capture
                     // step (PI parity, see interactive-mode.ts:5701).
                     let full = app.input.as_string();
-                    let arg = full
-                        .lines()
-                        .next()
-                        .unwrap_or("")
+                    let arg = slash_line(&full)
                         .split_once(' ')
                         .map(|(_, rest)| rest.trim().to_string())
                         .unwrap_or_default();
@@ -1151,8 +1148,33 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     return KeyAction::Nothing;
                 }
                 // The palette's filter is driven externally by
-                // sync_palette, so it is never a free-text menu.
+                // sync_palette, so it is never a free-text menu and
+                // ChosenRaw never fires.
                 MenuAction::Nothing | MenuAction::ChosenRaw(_) => {
+                    // Enter on a filter that matches nothing means the
+                    // user is writing prose, not invoking a command —
+                    // "/etc/nginx/nginx.conf is misconfigured" is a
+                    // question, not a typo. Send it, matching PI, where
+                    // an unmatched `/word` falls through to the LLM as
+                    // an ordinary message and there is no
+                    // "unknown command" error anywhere
+                    // (`agent-session.ts:1122-1129` runs the extension
+                    // lookup, then lets unhandled text continue).
+                    //
+                    // Before slash_line() trimmed for the palette, a
+                    // leading space was the only way to send such a
+                    // line; that accident is gone, so this is the
+                    // replacement — and it also frees the user from
+                    // being stuck on "(no matches)" with text they
+                    // cannot submit.
+                    if k.code == KeyCode::Enter
+                        && app.palette.as_ref().is_some_and(|m| m.is_empty())
+                    {
+                        let text = app.input.as_string();
+                        app.palette = None;
+                        app.input.clear();
+                        return submit_or_chat(app, text);
+                    }
                     return KeyAction::Nothing;
                 }
             }
@@ -1232,38 +1254,46 @@ async fn try_steer(
 /// exit, compact, or a chat turn. Extracted so the Submit path in
 /// interpret_key stays readable now that capture modes have their
 /// own branches.
+/// Only ever sees text the palette declined, so it no longer needs to
+/// recognise command names. It used to carry its own list of three
+/// (`/quit`, `/exit`, `/compact`) — a third source of truth beside
+/// `slash_items()` and `dispatch_slash`, and the reason a leading space
+/// routed the other fourteen commands to the model. The palette is now
+/// the only thing that resolves a command; anything reaching here is
+/// prose, including prose that happens to start with `/`.
 fn submit_or_chat(app: &App, text: String) -> KeyAction {
-    if app.status == Status::Streaming {
-        // v0.11.0: mid-stream Enter steers the running turn instead of
-        // silently doing nothing. Slash commands are NOT steered —
-        // they'd be meaningless as a user message to the model, and
-        // the old no-op behavior is the safer default for them.
-        let t = text.trim();
-        if t.is_empty() || t.starts_with('/') {
-            return KeyAction::Nothing;
-        }
-        return KeyAction::SteerTurn(t.to_string());
-    }
     let t = text.trim();
     if t.is_empty() {
-        KeyAction::Nothing
-    } else if t == "/quit" || t == "/exit" {
-        KeyAction::Exit
-    } else if t == "/compact" {
-        KeyAction::Compact
-    } else {
-        KeyAction::StartTurn(t.to_string())
+        return KeyAction::Nothing;
     }
+    if app.status == Status::Streaming {
+        // v0.11.0: mid-stream Enter steers the running turn instead of
+        // silently doing nothing.
+        return KeyAction::SteerTurn(t.to_string());
+    }
+    KeyAction::StartTurn(t.to_string())
 }
 
-/// Sync palette state with the input buffer: open if first line
+/// The single line every slash path parses: the first line of the
+/// buffer, with leading whitespace removed.
+///
+/// Everything that inspects slash input MUST go through this.
+/// `sync_palette` used to test the raw line while `submit_or_chat`
+/// trimmed, so one leading space closed the palette and handed
+/// `" /session"` to `submit_or_chat` — which knew only three command
+/// names and forwarded the other fourteen to the model as chat text.
+fn slash_line(input: &str) -> &str {
+    input.lines().next().unwrap_or("").trim_start()
+}
+
+/// Sync palette state with the input buffer: open if the first line
 /// starts with `/`, else close. Also refreshes the filter query. When
 /// skills are loaded, their `/skill:<name>` entries are appended to
 /// the built-in list — mirrors PI's autocomplete provider
 /// (interactive-mode.ts:649-661).
 fn sync_palette(app: &mut App) {
     let full = app.input.as_string();
-    let first_line = full.lines().next().unwrap_or("");
+    let first_line = slash_line(&full);
     if first_line.starts_with('/') {
         if app.palette.is_none() {
             let mut items = slash_items();
@@ -4527,6 +4557,83 @@ mod tests {
         seed_input(&mut app, "/co");
         let m = app.palette.as_ref().unwrap();
         assert!(m.visible().iter().any(|it| it.label == "/compact"));
+    }
+
+    /// Regression: `sync_palette` tested the untrimmed first line while
+    /// `submit_or_chat` trimmed, so one leading space closed the palette
+    /// and `" /session"` was sent to the model as chat text. `/compact`
+    /// happened to survive only because it was one of three names
+    /// `submit_or_chat` hardcoded; the other fourteen leaked.
+    #[test]
+    fn a_leading_space_still_resolves_the_command() {
+        for text in [" /session", "  /session", "\t/session"] {
+            let mut app = mkapp();
+            seed_input(&mut app, text);
+            assert!(
+                app.palette.is_some(),
+                "palette must open for {text:?} — leading whitespace is not meaningful"
+            );
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            assert!(
+                matches!(got, KeyAction::ShowSessionInfo),
+                "{text:?} must run /session, got {got:?}"
+            );
+        }
+    }
+
+    /// The argument splitter has to trim the same way the palette does,
+    /// or `" /name x"` splits at the leading space and yields the whole
+    /// line as the argument.
+    #[test]
+    fn a_leading_space_does_not_corrupt_the_argument() {
+        let mut app = mkapp();
+        seed_input(&mut app, "  /name my-experiment");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match got {
+            KeyAction::ApplyName(n) => assert_eq!(n, "my-experiment"),
+            other => panic!("expected ApplyName(\"my-experiment\"), got {other:?}"),
+        }
+    }
+
+    /// Trimming for the palette closed the accidental escape hatch that
+    /// a leading space used to provide, so an unmatched `/…` line must
+    /// fall through to the model instead of leaving the user stuck on
+    /// "(no matches)" with text they cannot submit. Matches PI, which
+    /// has no "unknown command" error — `/typo` silently becomes a
+    /// prompt.
+    #[test]
+    fn an_unmatched_slash_line_is_sent_as_chat() {
+        for text in [
+            "/etc/nginx/nginx.conf is misconfigured",
+            " /usr/bin/env is missing",
+            "/nosuchcommand",
+        ] {
+            let mut app = mkapp();
+            seed_input(&mut app, text);
+            assert!(app.palette.is_some(), "palette opens for {text:?}");
+            assert!(
+                app.palette.as_ref().unwrap().is_empty(),
+                "{text:?} must match no command"
+            );
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            match got {
+                KeyAction::StartTurn(sent) => assert_eq!(sent, text.trim()),
+                other => panic!("expected {text:?} to be sent as chat, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fall-through must not hijack a line that *does* match — a
+    /// prefix like `/comp` still resolves rather than being chatted.
+    #[test]
+    fn a_partial_command_still_resolves_rather_than_chatting() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/comp");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(got, KeyAction::Compact),
+            "expected /comp to resolve to /compact, got {got:?}"
+        );
     }
 
     #[test]
