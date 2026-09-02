@@ -8,10 +8,22 @@
 /// wit-bindgen build step. If this interface grows, switch to
 /// wit-bindgen.
 ///
+/// `extension-commands` adds two more string-in/string-out exports and
+/// no imports, so that budget still holds — it is not a reason to
+/// reach for wit-bindgen.
+///
 /// The exports are on the world directly, not inside an interface.
 /// An interface would namespace them as
 /// `nanopi:extension/tool-api#list-tools`, and the host resolves
 /// root exports by bare name.
+///
+/// TWO WORLDS, on purpose. WIT cannot express an optional export:
+/// `wasm-tools component new` fails if a declared export is missing.
+/// Adding the command exports to `extension` would therefore break
+/// every existing plugin *source* on upgrade, even though the host
+/// happily loads the old *binaries* (it resolves `list-commands`
+/// optionally). Keep tool-only plugins on `extension`; target
+/// `extension-commands` only when you actually register commands.
 ///
 /// Canonical ABI: WIT Component Model (wasmtime 19+).
 
@@ -83,4 +95,65 @@ world extension {
     /// reported to the model as a failed tool call; it does not take
     /// down nanopi.
     export execute-tool: func(name: string, args-json: string) -> string;
+}
+
+/// `extension` plus user-invocable slash commands.
+///
+/// A tool is something the *model* decides to call; a command is
+/// something the *user* types. Plugins that only provide tools should
+/// keep targeting `extension` — see the note at the top of this file.
+world extension-commands {
+    include extension;
+
+    /// Return the slash commands this plugin provides, as a JSON array:
+    ///
+    ///   [ { "name": "todo", "description": "Show the TODO list" } ]
+    ///
+    /// Called once at load time, and never again — a plugin cannot
+    /// change its command set mid-session.
+    ///
+    /// OPTIONAL from the host's side: a component that does not export
+    /// this loads normally and registers zero commands. That is what
+    /// keeps `extension`-targeted plugins working.
+    ///
+    /// Names may not contain whitespace, `:` or `/`, and are refused
+    /// rather than renamed on collision: a name already taken by a
+    /// built-in command does not register, and if two plugins claim the
+    /// same name then NEITHER registers. Both cases print a warning
+    /// naming the plugin(s). A refused command does not affect that
+    /// plugin's other commands or any of its tools.
+    ///
+    /// Commands are surfaced in interactive (TUI) mode only — `nanopi
+    /// -p` has no command palette. A plugin's tools still work there.
+    export list-commands: func() -> string;
+
+    /// Run one of the commands from `list-commands`.
+    ///
+    /// `args` is RAW TEXT: everything the user typed after the first
+    /// space, `""` if they typed none. Deliberately not `args-json` —
+    /// a slash command's argument is a line of prose, not a JSON
+    /// object, and pre-parsing it would be a lie. Note that leading and
+    /// trailing whitespace is trimmed, matching every built-in command.
+    ///
+    /// Returns a single-key JSON action object, exactly one of:
+    ///
+    ///   { "print":             "text for the user's scrollback" }
+    ///   { "send_user_message": "text to start a turn with" }
+    ///   { "error":             "what went wrong" }
+    ///
+    /// `print` and `error` never reach the model. `send_user_message`
+    /// is the sandbox-safe stand-in for PI's `pi.sendUserMessage()`:
+    /// PI ignores the handler's return value and lets the handler call
+    /// back into the host, which here would mean a new import. Returning
+    /// the intent as data instead keeps the import list at three. The
+    /// text is always echoed to the user verbatim before it is sent, so
+    /// nothing is said on their behalf invisibly. Invoked mid-stream it
+    /// steers the running turn, or queues as a follow-up if it arrives
+    /// too late — the same path a typed message takes.
+    ///
+    /// A trap, a malformed payload, or an `error` action is shown to
+    /// the user and NOT forwarded to the model — matching PI, where a
+    /// throwing command handler is swallowed rather than becoming a
+    /// prompt.
+    export execute-command: func(name: string, args: string) -> string;
 }

@@ -1,14 +1,21 @@
 # nanopi WASM plugin — worked example
 
-Three tools (`wordcount`, `rot13`, `readfile`) exported as a WebAssembly component
-that nanopi loads at startup and offers to the model alongside `bash`
-and `read`.
+Four tools (`wordcount`, `rot13`, `readfile`, `fetch`) and two slash
+commands (`/todo`, `/explain`), exported as a WebAssembly component
+that nanopi loads at startup.
 
-The first two are pure computation, deliberately trivial — the point
-is the wiring. `readfile` shows the other half: how a plugin reaches
+A **tool** is something the model decides to call; it shows up
+alongside `bash` and `read`. A **command** is something the user types;
+it shows up in the `/` palette. `wordcount` and `rot13` are pure
+computation, deliberately trivial — the point is the wiring.
+`readfile` and `fetch` show the other half: how a plugin reaches
 outside itself, and what happens when the user hasn't granted that
 capability. Replace the bodies in `src/lib.rs` with whatever your
 plugin actually does.
+
+Because this plugin registers commands it targets the
+`extension-commands` world. A tool-only plugin should target
+`extension` instead — see `examples/wasm-plugin-minimal`.
 
 ## Prerequisites
 
@@ -36,7 +43,7 @@ cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
 # 2. embed the WIT world into the module
 wasm-tools component embed wit/ \
   examples/wasm-plugin/target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
-  -o /tmp/embedded.wasm --world extension
+  -o /tmp/embedded.wasm --world extension-commands
 
 # 3. wrap it as a component
 wasm-tools component new /tmp/embedded.wasm \
@@ -61,6 +68,8 @@ should print
 
 ```wit
 world root {
+  export list-commands: func() -> string;
+  export execute-command: func(name: string, args: string) -> string;
   export list-tools: func() -> string;
   export execute-tool: func(name: string, args-json: string) -> string;
 }
@@ -99,21 +108,33 @@ Then ask for one:
 > rot13 the string "Hello, World"
 ```
 
+For the commands, type `/` and look for `/todo` and `/explain` in the
+palette. `/todo` prints straight to your scrollback and the model never
+sees it; `/explain rust lifetimes` starts a turn on your behalf, echoed
+verbatim first so nothing is said invisibly.
+
 If you instead see `[[extensions]] entries ignored — this build has no
 WASM support`, the binary was built without `--features wasm`.
 
 ## What the host expects
 
-Two exports, three optional imports. Full definitions in
+Two required exports, two optional ones, three optional imports. Full
+definitions in
 [`../../wit/nanopi-extension.wit`](../../wit/nanopi-extension.wit).
 
-| Direction | Function | Signature |
-|---|---|---|
-| export | `list-tools` | `() -> string` |
-| export | `execute-tool` | `(name: string, args-json: string) -> string` |
-| import | `host-log` | `(level: u8, message: string)` |
-| import | `host-fs-read` | `(path: string) -> string` |
-| import | `host-http-get` | `(url: string) -> string` |
+| Direction | Function | Signature | |
+|---|---|---|---|
+| export | `list-tools` | `() -> string` | required |
+| export | `execute-tool` | `(name: string, args-json: string) -> string` | required |
+| export | `list-commands` | `() -> string` | optional |
+| export | `execute-command` | `(name: string, args: string) -> string` | optional |
+| import | `host-log` | `(level: u8, message: string)` | |
+| import | `host-fs-read` | `(path: string) -> string` | |
+| import | `host-http-get` | `(url: string) -> string` | |
+
+The command exports are optional in the host, which resolves them with
+a soft miss — that is what lets an `extension`-world plugin keep
+loading unchanged.
 
 Note the asymmetry: an **export** returning a string returns a pointer
 to a `(ptr, len)` pair, while an **import** returning one takes the
@@ -220,3 +241,13 @@ skipped with a warning rather than blocking startup.
 
 A plugin may not register a tool name that already exists — collisions
 are reported and skipped, so a plugin cannot quietly replace `bash`.
+
+Commands are stricter, and the two rules differ. A **tool** collision
+is first-wins: the tool already registered stays, the newcomer is
+skipped. A **command** collision refuses *both* claimants — if two
+plugins each register `/deploy`, neither gets it, because silently
+picking a winner would mean typing `/deploy` runs whichever plugin
+happened to load first. A command colliding with a built-in like
+`/compact` is simply skipped. Every case prints a warning naming the
+plugin(s), and never affects that plugin's other commands or its
+tools.

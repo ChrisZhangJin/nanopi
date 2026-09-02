@@ -11,14 +11,22 @@
 //! exist to show the other half — how a plugin reaches outside itself,
 //! and what happens when the user hasn't granted that capability.
 //!
+//! Plus two slash commands the *user* can type:
+//!   - `/todo`    — prints to the scrollback, never seen by the model
+//!   - `/explain` — starts a turn on the user's behalf
+//!
 //! Build (from the repo root, so `wit/` resolves):
 //!   cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
 //!     --target wasm32-wasip1 --release
 //!   wasm-tools component embed wit/ \
 //!     examples/wasm-plugin/target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
-//!     -o /tmp/embedded.wasm --world extension
+//!     -o /tmp/embedded.wasm --world extension-commands
 //!   wasm-tools component new /tmp/embedded.wasm \
 //!     -o nanopi-example-plugin.component.wasm
+//!
+//! Note `--world extension-commands`, not `extension`: this plugin
+//! registers slash commands. A tool-only plugin keeps using
+//! `--world extension` — see the two-world note in `wit/`.
 //!
 //! The `embed` step is not optional — `component new` on a bare module
 //! yields a component with an empty world, and the host then fails to
@@ -376,6 +384,95 @@ fn dispatch(name: &str, args_json: &str) -> String {
         // answer rather than trap.
         other => err_result(&format!("unknown tool {other:?}")),
     }
+}
+
+// ── Slash commands ──────────────────────────────────────────────────
+//
+// A tool is something the *model* decides to call; a command is
+// something the *user* types. Commands live in the
+// `extension-commands` world — a plugin that only provides tools
+// should keep targeting `extension` and skip this section entirely.
+
+/// `list-commands: func() -> string`
+///
+/// Optional from the host's side: omit it and the plugin still loads
+/// with zero commands. Names are refused, not renamed, when they
+/// collide with a built-in or with another plugin — so pick something
+/// specific.
+#[export_name = "list-commands"]
+pub unsafe extern "C" fn list_commands() -> *mut u8 {
+    reset_arena();
+    let specs = r#"[
+  {
+    "name": "todo",
+    "description": "Show this plugin's TODO list, or echo a note back."
+  },
+  {
+    "name": "explain",
+    "description": "Ask the model to explain something, from a canned prompt."
+  }
+]"#;
+    string_result(specs.to_string())
+}
+
+/// `execute-command: func(name: string, args: string) -> string`
+///
+/// Note `args` is raw text, not JSON — and, exactly as in
+/// `execute_tool`, `reset_arena()` must NOT be called here: both
+/// strings live in our arena, put there by the host's `cabi_realloc`.
+#[export_name = "execute-command"]
+pub unsafe extern "C" fn execute_command(
+    name_ptr: *const u8,
+    name_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+) -> *mut u8 {
+    let name = read_string(name_ptr, name_len);
+    let args = read_string(args_ptr, args_len);
+
+    string_result(dispatch_command(&name, &args))
+}
+
+fn dispatch_command(name: &str, args: &str) -> String {
+    match name {
+        // Returns `print`: the text lands in the user's scrollback and
+        // is never shown to the model. Echoing `args` back verbatim
+        // also demonstrates that the host does not tokenize it.
+        "todo" => {
+            if args.is_empty() {
+                print_action("todo: (1) wire the plugin (2) ship it")
+            } else {
+                print_action(&format!("todo: noted — {args}"))
+            }
+        }
+        // Returns `send_user_message`: nanopi starts a turn with this
+        // text as if the user had typed it, echoing it verbatim first.
+        // Mid-stream it steers the running turn instead.
+        "explain" => {
+            if args.is_empty() {
+                error_action("usage: /explain <topic>")
+            } else {
+                send_user_message_action(&format!(
+                    "Explain {args} to me, briefly, and cite the source files."
+                ))
+            }
+        }
+        // Unreachable in practice — the host checks the name against
+        // list-commands first — but answer rather than trap.
+        other => error_action(&format!("unknown command {other:?}")),
+    }
+}
+
+fn print_action(text: &str) -> String {
+    serde_json::json!({ "print": text }).to_string()
+}
+
+fn send_user_message_action(text: &str) -> String {
+    serde_json::json!({ "send_user_message": text }).to_string()
+}
+
+fn error_action(text: &str) -> String {
+    serde_json::json!({ "error": text }).to_string()
 }
 
 fn ok_result(content: &str) -> String {

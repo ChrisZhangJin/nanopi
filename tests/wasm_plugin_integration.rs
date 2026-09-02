@@ -21,10 +21,21 @@
 //!   --target wasm32-wasip1 --release
 //! wasm-tools component embed wit/ \
 //!   examples/wasm-plugin/target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
-//!   -o /tmp/embedded.wasm --world extension
+//!   -o /tmp/embedded.wasm --world extension-commands
 //! wasm-tools component new /tmp/embedded.wasm \
 //!   -o tests/fixtures/example-plugin.component.wasm
 //! ```
+//!
+//! Note `--world extension-commands` — this fixture registers slash
+//! commands. `wit/` now declares two worlds, so `--world` is no longer
+//! optional here.
+//!
+//! TWO FIXTURES, TWO WORLDS, ON PURPOSE. `runaway-plugin` stays on
+//! `--world extension` and must keep doing so: besides being the
+//! hang-breaker fixture, it is the only committed component WITHOUT
+//! `list-commands`, and therefore the only end-to-end proof that the
+//! host resolves that export optionally. Retarget it and the
+//! backward-compatibility test below silently stops testing anything.
 
 #![cfg(feature = "wasm")]
 

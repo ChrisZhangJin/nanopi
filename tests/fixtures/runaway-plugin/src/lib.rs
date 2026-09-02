@@ -21,6 +21,13 @@
 //!   -o tests/fixtures/runaway-plugin.component.wasm
 //! ```
 //!
+//! KEEP `--world extension`, NOT `extension-commands`. This component
+//! now does double duty: hang breaker, and the only committed plugin
+//! WITHOUT `list-commands` — which makes it the only end-to-end proof
+//! that the host resolves that export optionally rather than requiring
+//! it. Retarget it and that backward-compatibility guarantee stops
+//! being tested, silently.
+//!
 //! See `.planning/reference/wasm-toolchain-notes.md` for the
 //! box-specific gotchas (`wasm32-wasip1` is installed by hand and does
 //! not appear in `rustup target list`).

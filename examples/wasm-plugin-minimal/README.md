@@ -38,6 +38,11 @@ wasm-tools component new /tmp/embedded.wasm \
   -o nanopi-minimal-plugin.component.wasm
 ```
 
+Note `--world extension`, not `extension-commands`: this plugin only provides
+tools. Slash commands live in the wider world — see `examples/wasm-plugin` if
+you want a `/command` the user can type. Targeting `extension` also means this
+source keeps building unchanged as the command world grows.
+
 Three steps, none optional. Skipping `embed` produces a component with an empty
 world; the host then can't find `list-tools` and rejects it as "not a nanopi
 extension". Don't `cd` into this directory to build either — `embed wit/`
