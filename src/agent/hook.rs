@@ -4,14 +4,20 @@
 //! communicate back: exit code 2 = block, or `{"decision":"block"}` on
 //! stdout. See `docs/v0.5-research.md` §6 for the wire protocol.
 //!
-//! Example `~/.nanopi/settings.toml`:
+//! Example `~/.nanopi/config.toml`:
 //! ```toml
-//! [[hooks.PreToolUse]]
+//! [[hooks.pre_tool_use]]
 //! matcher = "bash"
 //! type = "command"
 //! command = "~/.nanopi/hooks/check-rm-rf.sh"
 //! timeout = 5000
 //! ```
+//!
+//! The table keys are snake_case (`pre_tool_use`, `post_tool_use`,
+//! `session_start`, ...) — they are `HooksSection`'s field names, and
+//! there is no serde rename or alias. A CamelCase `[[hooks.PreToolUse]]`
+//! parses as an unrelated key and silently registers nothing; this doc
+//! comment claimed otherwise until v0.11.0.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -287,10 +293,17 @@ fn parse_json_decision(stdout: &str) -> Option<HookOutcome> {
 
 /// Convenience: run all matching hooks for a given event. Stops on the
 /// first Block. Returns the final outcome (Allow if no hook blocks).
+///
+/// `tool_call_id` is the provider's id for the call in flight, and is
+/// `None` for the events that aren't about a tool. It was hardcoded to
+/// `None` at both call sites until v0.11.0, which made the payload
+/// field permanently null and left `post_tool_use` hooks unable to
+/// correlate a result with the `pre_tool_use` that preceded it.
 pub async fn run_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
     tool_name: &str,
+    tool_call_id: Option<&str>,
     arguments: Value,
     cwd: &std::path::Path,
     session_id: Option<&str>,
@@ -306,7 +319,7 @@ pub async fn run_hooks(
         let input = HookInput {
             event,
             tool_name: Some(tool_name.to_string()),
-            tool_call_id: None,
+            tool_call_id: tool_call_id.map(|s| s.to_string()),
             arguments: current_args.clone(),
             cwd: Some(cwd.display().to_string()),
             session_id: session_id.map(|s| s.to_string()),
@@ -315,6 +328,9 @@ pub async fn run_hooks(
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
         env.insert("NANOPI_TOOL_NAME".into(), tool_name.into());
         env.insert("NANOPI_CWD".into(), cwd.display().to_string());
+        if let Some(id) = tool_call_id {
+            env.insert("NANOPI_TOOL_CALL_ID".into(), id.into());
+        }
         if let Some(s) = session_id {
             env.insert("NANOPI_SESSION_ID".into(), s.into());
         }
@@ -346,26 +362,37 @@ pub async fn run_hooks(
     (HookOutcome::Allow, Some(current_args))
 }
 
-/// Run all `session_start` or `session_end` hooks. These don't have a
-/// tool_name and their outcome (allow/block) is advisory: a Block just
-/// gets logged, not enforced (a session start/end always proceeds).
-/// `matcher` on session hooks is applied against the session_id so users
-/// can scope by prefix; empty/"*" matches all.
+/// Run all session-lifecycle hooks. These don't have a tool_name and
+/// their outcome is advisory: a Block is reported on stderr, never
+/// enforced (a session start/end/compaction always proceeds).
+///
+/// `subject` is what `matcher` is applied against, and it is NOT always
+/// a session id: `SessionStart` / `SessionEnd` pass the session id,
+/// while `SessionBeforeCompact` / `SessionCompact` pass the compaction
+/// reason (`"threshold"` or `"manual"`). Empty/`"*"` matches all.
+/// The `session_id` field of the payload carries `subject` for the same
+/// reason — a caller that has a real session id passes it here.
 pub async fn run_session_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
-    session_id: &str,
+    subject: &str,
     cwd: &std::path::Path,
 ) {
+    // v0.11.0 added the compaction events, which route through here;
+    // the old assert covered only start/end and would have panicked a
+    // debug build the first time a `session_before_compact` hook fired.
     debug_assert!(matches!(
         event,
-        HookEvent::SessionStart | HookEvent::SessionEnd
+        HookEvent::SessionStart
+            | HookEvent::SessionEnd
+            | HookEvent::SessionBeforeCompact
+            | HookEvent::SessionCompact
     ));
     for h in hooks {
         if h.kind != "command" {
             continue;
         }
-        if !matcher_matches(&h.matcher, session_id) {
+        if !matcher_matches(&h.matcher, subject) {
             continue;
         }
         let input = HookInput {
@@ -374,14 +401,52 @@ pub async fn run_session_hooks(
             tool_call_id: None,
             arguments: json!({}),
             cwd: Some(cwd.display().to_string()),
-            session_id: Some(session_id.to_string()),
+            session_id: Some(subject.to_string()),
         };
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
-        env.insert("NANOPI_SESSION_ID".into(), session_id.into());
+        env.insert("NANOPI_SESSION_ID".into(), subject.into());
         env.insert("NANOPI_CWD".into(), cwd.display().to_string());
-        // Fire and forget: outcome is advisory. Errors are swallowed.
-        let _ = run_hook(h, &input, &env).await;
+        report_advisory(event, &h.matcher, run_hook(h, &input, &env).await);
+    }
+}
+
+/// Say on stderr that an advisory hook wanted to block, or errored.
+///
+/// Advisory call sites used to drop the outcome on the floor while
+/// their comments promised "Block is logged, not enforced" — nothing
+/// logged it, so a hook that blocked (or timed out, which surfaces as
+/// Block) was indistinguishable from one that ran clean. Note that a
+/// timeout still costs its full `timeout` in wall clock before landing
+/// here.
+///
+/// `eprintln!` rather than `tracing::warn!` on purpose: nothing in this
+/// binary initializes a tracing subscriber, so a `warn!` would go
+/// nowhere — the same trap `run_hooks`'s error arm already documents.
+pub(crate) fn report_advisory(
+    event: HookEvent,
+    matcher: &str,
+    outcome: Result<HookOutcome, HookError>,
+) {
+    match outcome {
+        Ok(o) => report_advisory_outcome(event, o),
+        Err(e) => eprintln!(
+            "nanopi: {} hook errored [matcher={matcher} error={e}]",
+            event.env_var()
+        ),
+    }
+}
+
+/// `report_advisory` for the call sites that go through `run_hooks`,
+/// which folds errors into `Allow` itself and hands back one outcome
+/// for the whole chain.
+pub(crate) fn report_advisory_outcome(event: HookEvent, outcome: HookOutcome) {
+    if let HookOutcome::Block { reason } = outcome {
+        eprintln!(
+            "nanopi: {} hook asked to block; ignored (advisory event) \
+             [reason={reason}]",
+            event.env_var()
+        );
     }
 }
 
@@ -690,6 +755,41 @@ mod tests {
         .await;
         assert!(marker.exists(), "session_start hook should have run");
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// The compaction events route through `run_session_hooks` too, and
+    /// its `debug_assert!` originally listed only SessionStart/SessionEnd
+    /// — so the first `session_before_compact` hook to fire would have
+    /// panicked any debug build. `matcher` here is tested against the
+    /// compaction reason, not a session id.
+    #[tokio::test]
+    async fn compaction_events_are_accepted_and_match_on_reason() {
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("nanopi-compact-hook-{}", crate::util::uuid::v7()));
+        let hook = HookConfig {
+            matcher: "^threshold$".into(),
+            kind: "command".into(),
+            command: format!("touch '{}'", marker.display()),
+            timeout: 2000,
+        };
+        run_session_hooks(
+            &[hook.clone()],
+            HookEvent::SessionBeforeCompact,
+            "threshold",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(marker.exists(), "reason should have matched the matcher");
+        let _ = std::fs::remove_file(&marker);
+
+        run_session_hooks(
+            &[hook],
+            HookEvent::SessionCompact,
+            "manual",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(!marker.exists(), "a different reason must not match");
     }
 
     #[tokio::test]

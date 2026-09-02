@@ -465,6 +465,7 @@ impl Agent {
                 &self.hooks.before_agent_start,
                 HookEvent::BeforeAgentStart,
                 &turn_label,
+                None,
                 serde_json::json!({
                     "turn_count": self.turn_count,
                     "prompt": user_msg,
@@ -523,7 +524,11 @@ impl Agent {
             let (outcome, new_args) = run_hooks(
                 &self.hooks.user_prompt_submit,
                 HookEvent::UserPromptSubmit,
-                "", // no tool name for prompt submit
+                // No tool name here, so `matcher` is tested against "" —
+                // only `*` (or an omitted matcher) can ever match. Any
+                // real regex silently never fires.
+                "",
+                None,
                 serde_json::json!({ "prompt": effective_msg }),
                 &self.cwd,
                 Some(&self.session_id.to_string()),
@@ -688,14 +693,16 @@ impl Agent {
             }
 
             // ── TurnStart hook (v0.11.0) ────────────────────────────────
-            // Advisory only — Block is logged but does not abort the
-            // iteration. matcher applied to turn_count (as string).
+            // Advisory only — a Block is reported on stderr but does not
+            // abort the iteration. matcher applied to turn_count (as
+            // string).
             if self.permission.hooks_active() && !self.hooks.turn_start.is_empty() {
                 let turn_label = self.turn_count.to_string();
-                run_hooks(
+                let (outcome, _) = run_hooks(
                     &self.hooks.turn_start,
                     HookEvent::TurnStart,
                     &turn_label,
+                    None,
                     serde_json::json!({
                         "turn_count": self.turn_count,
                         "iteration": iteration_idx,
@@ -704,6 +711,10 @@ impl Agent {
                     Some(&self.session_id.to_string()),
                 )
                 .await;
+                crate::agent::hook::report_advisory_outcome(
+                    HookEvent::TurnStart,
+                    outcome,
+                );
             }
 
             // Set up a forward channel: provider pushes to `forward_tx`,
@@ -1004,13 +1015,15 @@ impl Agent {
             }
 
             // ── TurnEnd hook (v0.11.0) ──────────────────────────────────
-            // Advisory only — fired at the bottom of each iteration.
+            // Advisory only — fired at the bottom of each iteration. A
+            // Block is reported on stderr and otherwise ignored.
             if self.permission.hooks_active() && !self.hooks.turn_end.is_empty() {
                 let turn_label = self.turn_count.to_string();
-                run_hooks(
+                let (outcome, _) = run_hooks(
                     &self.hooks.turn_end,
                     HookEvent::TurnEnd,
                     &turn_label,
+                    None,
                     serde_json::json!({
                         "turn_count": self.turn_count,
                         "iteration": iteration_idx,
@@ -1020,18 +1033,24 @@ impl Agent {
                     Some(&self.session_id.to_string()),
                 )
                 .await;
+                crate::agent::hook::report_advisory_outcome(
+                    HookEvent::TurnEnd,
+                    outcome,
+                );
             }
         }
         // ── MessageEnd hook (v0.11.0) ───────────────────────────────────
         // Fires once after the for-loop completes (all tool rounds done),
-        // just before post-turn compaction. Advisory only — Block is
-        // logged but does not abort the turn (which has already ended).
+        // just before post-turn compaction. Advisory only — a Block is
+        // reported on stderr but does not abort the turn (which has
+        // already ended anyway).
         if self.permission.hooks_active() && !self.hooks.message_end.is_empty() {
             let turn_label = self.turn_count.to_string();
-            run_hooks(
+            let (outcome, _) = run_hooks(
                 &self.hooks.message_end,
                 HookEvent::MessageEnd,
                 &turn_label,
+                None,
                 serde_json::json!({
                     "turn_count": self.turn_count,
                     "response_length": final_text.len(),
@@ -1040,6 +1059,10 @@ impl Agent {
                 Some(&self.session_id.to_string()),
             )
             .await;
+            crate::agent::hook::report_advisory_outcome(
+                HookEvent::MessageEnd,
+                outcome,
+            );
         }
         // Post-turn compaction check. Matches PI (`agent-session.ts`
         // `_handlePostAgentRun`). Firing here means the user sees the
@@ -1389,6 +1412,7 @@ async fn run_one_tool(
             &hooks.pre_tool_use,
             HookEvent::PreToolUse,
             &call.name,
+            Some(call.id.as_str()),
             call.arguments.clone(),
             &cwd,
             Some(&session_id.to_string()),
@@ -1489,6 +1513,7 @@ async fn run_one_tool(
             &hooks.post_tool_use,
             HookEvent::PostToolUse,
             &call.name,
+            Some(call.id.as_str()),
             post_payload,
             &cwd,
             Some(&session_id.to_string()),
@@ -1727,6 +1752,10 @@ mod tests {
         );
         assert_eq!(v["arguments"]["tool_response"]["is_error"], false);
         assert!(v["arguments"]["tool_response"]["duration_ms"].is_u64());
+        // v0.11.0: was hardcoded `None` at every call site, so this
+        // field was permanently null and a post_tool_use hook had no
+        // way to pair a result with its pre_tool_use.
+        assert_eq!(v["tool_call_id"], "call_pt");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
