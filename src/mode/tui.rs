@@ -4559,6 +4559,34 @@ mod tests {
         assert!(m.visible().iter().any(|it| it.label == "/compact"));
     }
 
+    /// `command::RESERVED_COMMAND_NAMES` is hand-maintained, and it has
+    /// to be: plugin commands are registered inside `Agent::build_fresh`,
+    /// which knows nothing about the TUI and also runs in print mode.
+    /// This guard is what makes that safe. Without it the two lists drift
+    /// and a plugin silently shadows a built-in — exactly the bug PI has,
+    /// where `/debug` and friends are dispatched but missing from
+    /// `BUILTIN_SLASH_COMMANDS`, so they never autocomplete and never
+    /// participate in conflict warnings.
+    #[test]
+    fn reserved_command_names_match_the_builtin_palette() {
+        use std::collections::BTreeSet;
+
+        let from_palette: BTreeSet<String> = slash_items()
+            .iter()
+            .map(|it| it.label.trim_start_matches('/').to_string())
+            .collect();
+        let reserved: BTreeSet<String> = crate::command::RESERVED_COMMAND_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            from_palette, reserved,
+            "add/remove a built-in slash command and RESERVED_COMMAND_NAMES \
+             must move with it, or a plugin can claim the name"
+        );
+    }
+
     /// Regression: `sync_palette` tested the untrimmed first line while
     /// `submit_or_chat` trimmed, so one leading space closed the palette
     /// and `" /session"` was sent to the model as chat text. `/compact`

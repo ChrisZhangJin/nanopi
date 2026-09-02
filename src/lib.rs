@@ -2,6 +2,7 @@
 //!
 //! `main.rs` is a thin shim that dispatches to `mode::*`. All real logic lives here.
 
+pub mod command;
 pub mod config;
 pub mod event;
 pub mod keys;
