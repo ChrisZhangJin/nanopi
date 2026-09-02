@@ -276,32 +276,47 @@ impl Agent {
     /// Fire all `session_start` hooks. Advisory — outcome is not enforced.
     /// Call once, after Agent construction, before the first turn.
     ///
+    /// `reason` is the session-start vocabulary: `startup|new|resume|fork|
+    /// import`. Diverges from PI (which has no `import`) because nanopi
+    /// supports importing a session from an external source; matches PI's
+    /// `startup|new|resume|fork` otherwise.
+    ///
     /// v0.9.1 fix: honors `--no-hooks` — previously session lifecycle
     /// hooks leaked through the emergency switch because only the
     /// tool-facing sites gated on `hooks_active()`.
-    pub async fn fire_session_start(&self) {
+    pub async fn fire_session_start(&self, reason: &str) {
         if !self.permission.hooks_active() {
             return;
         }
         run_session_hooks(
             &self.hooks.session_start,
             HookEvent::SessionStart,
+            serde_json::json!({"reason": reason}),
+            &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
         .await;
     }
 
-    /// Fire all `session_end` hooks. Advisory. Call before the process
+    /// Fire all `session_shutdown` hooks. Advisory. Call before the process
     /// exits (or before Agent is dropped in the interactive loop).
+    ///
+    /// `reason` is the session-shutdown vocabulary: `quit|new|resume|fork|
+    /// import`. Diverges from PI (which has no `reload` and no `import`)
+    /// — nanopi has no `reload` reason, and adds `import` for the same
+    /// reason as `fire_session_start`.
+    ///
     /// See `fire_session_start` for the `--no-hooks` note.
-    pub async fn fire_session_end(&self) {
+    pub async fn fire_session_shutdown(&self, reason: &str) {
         if !self.permission.hooks_active() {
             return;
         }
         run_session_hooks(
             &self.hooks.session_shutdown,
             HookEvent::SessionShutdown,
+            serde_json::json!({"reason": reason}),
+            &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
@@ -321,16 +336,20 @@ impl Agent {
         use crate::agent::compact::compact;
 
         // ── SessionBeforeCompact hook (v0.11.0) ──────────────────
-        // Advisory only — fires before compaction runs. matches
-        // against the compaction reason string ("threshold" or
-        // "manual").
+        // Advisory only — fires before compaction runs. `subject`
+        // (matcher target) is still the compaction reason string
+        // ("threshold" or "manual"); `session_id` is the real session
+        // id, carried honestly in the payload (v0.12.0 fix — this used
+        // to be the reason string, not the actual session id).
         if self.permission.hooks_active()
             && !self.hooks.session_before_compact.is_empty()
         {
             run_session_hooks(
                 &self.hooks.session_before_compact,
                 HookEvent::SessionBeforeCompact,
+                serde_json::json!({"reason": reason}),
                 reason,
+                &self.session_id.to_string(),
                 &self.cwd,
             )
             .await;
@@ -357,15 +376,18 @@ impl Agent {
         }
 
         // ── SessionCompact hook (v0.11.0) ──────────────────────────
-        // Fires after compaction completes. matcher is the
-        // compaction reason.
+        // Fires after compaction completes. `subject` (matcher target)
+        // is the compaction reason; `session_id` is the real session
+        // id, carried honestly in the payload.
         if self.permission.hooks_active()
             && !self.hooks.session_compact.is_empty()
         {
             run_session_hooks(
                 &self.hooks.session_compact,
                 HookEvent::SessionCompact,
+                serde_json::json!({"reason": reason}),
                 reason,
+                &self.session_id.to_string(),
                 &self.cwd,
             )
             .await;
@@ -2773,12 +2795,120 @@ mod tests {
             plugin_commands: Vec::new(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         };
-        agent.fire_session_start().await;
-        agent.fire_session_end().await;
+        agent.fire_session_start("startup").await;
+        agent.fire_session_shutdown("quit").await;
 
         assert!(
             !marker.exists(),
             "--no-hooks must disable both session_start and session_shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0: session_start payload must carry an honest `reason` in
+    /// `arguments` and the real session id in `session_id`.
+    #[tokio::test]
+    async fn session_start_payload_carries_reason_and_real_session_id() {
+        let dir = tmp();
+        let out = dir.join("payload.json");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat > {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"m\",\"base_url\":\"\"}\n",
+        )
+        .unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let session_id = uuid::v7().to_string();
+
+        let agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: session_id.clone(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig {
+                session_start: vec![hook_cfg],
+                ..Default::default()
+            },
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+        agent.fire_session_start("startup").await;
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["arguments"]["reason"], "startup");
+        assert_eq!(payload["session_id"], session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0 regression: compaction hook payloads must carry the real
+    /// session id, not the compaction reason string, in `session_id`.
+    /// Previously `session_id` held `"threshold"`/`"manual"` — a lie.
+    #[tokio::test]
+    async fn compact_now_session_hooks_carry_real_session_id_not_reason() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let out = dir.join("compact_payload.json");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat > {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        agent.hooks.session_before_compact = vec![hook_cfg];
+        let session_id = agent.session_id.clone();
+
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+
+        agent.compact_now(None, "threshold").await;
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["arguments"]["reason"], "threshold");
+        assert_eq!(
+            payload["session_id"], session_id,
+            "session_id must be the real session id, not the reason string"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

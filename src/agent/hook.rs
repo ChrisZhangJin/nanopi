@@ -25,7 +25,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -385,18 +387,28 @@ pub async fn run_hooks(
 
 /// Run all session-lifecycle hooks. These don't have a tool_name and
 /// their outcome is advisory: a Block is reported on stderr, never
-/// enforced (a session start/end/compaction always proceeds).
+/// enforced (a session start/shutdown/compaction always proceeds).
 ///
-/// `subject` is what `matcher` is applied against, and it is NOT always
-/// a session id: `SessionStart` / `SessionShutdown` pass the session id,
-/// while `SessionBeforeCompact` / `SessionCompact` pass the compaction
-/// reason (`"threshold"` or `"manual"`). Empty/`"*"` matches all.
-/// The `session_id` field of the payload carries `subject` for the same
-/// reason — a caller that has a real session id passes it here.
+/// Three separate things went into one field before v0.12 (`subject`
+/// doubling as `session_id`); after v0.12 they are three separate
+/// parameters, so no payload field lies:
+///
+/// | field | value |
+/// |---|---|
+/// | `session_id` (param) → payload `session_id` + `NANOPI_SESSION_ID` | the real session id, always |
+/// | `arguments` (param) → payload `arguments` | `{"reason": ...}` for all four session events |
+/// | `subject` → what `matcher` is tested against | session id for `SessionStart` / `SessionShutdown`; compaction reason (`"threshold"`/`"manual"`) for `SessionBeforeCompact` / `SessionCompact` — deliberately still overloaded |
+///
+/// A hook that used to read `session_id` to get `"threshold"` /
+/// `"manual"` for the compaction events must now read
+/// `arguments.reason` instead — `session_id` carries the real id there
+/// too now.
 pub async fn run_session_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
+    arguments: Value,
     subject: &str,
+    session_id: &str,
     cwd: &std::path::Path,
 ) {
     // v0.11.0 added the compaction events, which route through here;
@@ -420,13 +432,13 @@ pub async fn run_session_hooks(
             event,
             tool_name: None,
             tool_call_id: None,
-            arguments: json!({}),
+            arguments: arguments.clone(),
             cwd: Some(cwd.display().to_string()),
-            session_id: Some(subject.to_string()),
+            session_id: Some(session_id.to_string()),
         };
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
-        env.insert("NANOPI_SESSION_ID".into(), subject.into());
+        env.insert("NANOPI_SESSION_ID".into(), session_id.into());
         env.insert("NANOPI_CWD".into(), cwd.display().to_string());
         report_advisory(event, &h.matcher, run_hook(h, &input, &env).await);
     }
@@ -770,6 +782,8 @@ mod tests {
         run_session_hooks(
             &[hook],
             HookEvent::SessionStart,
+            json!({"reason": "startup"}),
+            "test-session-id",
             "test-session-id",
             std::path::Path::new("/tmp"),
         )
@@ -796,7 +810,9 @@ mod tests {
         run_session_hooks(
             &[hook.clone()],
             HookEvent::SessionBeforeCompact,
+            json!({"reason": "threshold"}),
             "threshold",
+            "real-session-id",
             std::path::Path::new("/tmp"),
         )
         .await;
@@ -806,7 +822,9 @@ mod tests {
         run_session_hooks(
             &[hook],
             HookEvent::SessionCompact,
+            json!({"reason": "manual"}),
             "manual",
+            "real-session-id",
             std::path::Path::new("/tmp"),
         )
         .await;
@@ -830,6 +848,8 @@ mod tests {
         run_session_hooks(
             &[hook],
             HookEvent::SessionShutdown,
+            json!({"reason": "quit"}),
+            "dev-1234",
             "dev-1234",
             std::path::Path::new("/tmp"),
         )

@@ -175,7 +175,7 @@ pub async fn run_print_mode(
     };
 
     // Fire session_start hooks before the first turn.
-    agent.fire_session_start().await;
+    agent.fire_session_start("startup").await;
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
     let message_owned = message.to_string();
@@ -185,7 +185,7 @@ pub async fn run_print_mode(
             let r = agent.run_turn(message_owned.as_str(), &tx, None, None).await;
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
-            agent.fire_session_end().await;
+            agent.fire_session_shutdown("quit").await;
             r
         })
     };

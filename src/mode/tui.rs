@@ -428,7 +428,7 @@ pub async fn run_tui_mode(
     {
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
-            a.fire_session_start().await;
+            a.fire_session_start("startup").await;
         }
     }
 
@@ -502,7 +502,7 @@ pub async fn run_tui_mode(
     {
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
-            a.fire_session_end().await;
+            a.fire_session_shutdown("quit").await;
         }
     }
 
