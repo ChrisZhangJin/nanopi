@@ -3802,6 +3802,16 @@ mod tests {
         /// land in the same places, just not in the order the model
         /// asked for.
         journal: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// How many calls are inside `execute` right now.
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// High-water mark of `in_flight`. This, not wall clock, is what
+        /// the grouping tests assert on: "2 calls took less than 750ms"
+        /// infers overlap from a stopwatch, and a loaded machine running
+        /// the rest of the suite in parallel can blow that budget while
+        /// the calls really were concurrent. Watching the counter
+        /// answers the actual question — did two of these run at once —
+        /// with no timing assumption at all.
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl crate::tool::Tool for SlowWriteTool {
@@ -3817,15 +3827,19 @@ mod tests {
             args: serde_json::Value,
             ctx: &crate::tool::ToolContext,
         ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            use std::sync::atomic::Ordering;
             let path = args["path"].as_str().unwrap_or_default().to_string();
             let abs = crate::tool::resolve_in_cwd(&ctx.cwd, &path)
                 .map_err(crate::tool::ToolError::Execution)?;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
             // Read-modify-write straddling a yield: appends its own tag
             // to whatever it saw. Two of these racing lose a tag.
             let before = std::fs::read_to_string(&abs).unwrap_or_default();
             tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             let tag = args["content"].as_str().unwrap_or("?");
             std::fs::write(&abs, format!("{before}{tag}")).unwrap();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.journal
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3840,21 +3854,28 @@ mod tests {
     }
 
     /// Registry whose `write` is the slow stand-in above, plus the
-    /// completion journal it writes into. Built from `new()` rather than
-    /// `standard()` so `register_external` does not hit the
-    /// anti-shadowing refusal.
+    /// completion journal and the concurrency watermark it writes into.
+    /// Built from `new()` rather than `standard()` so `register_external`
+    /// does not hit the anti-shadowing refusal.
     #[allow(clippy::type_complexity)]
     fn slow_write_registry(
         delay_ms: u64,
-    ) -> (ToolRegistry, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    ) -> (
+        ToolRegistry,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let journal = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut r = ToolRegistry::new();
         r.register_external(std::sync::Arc::new(SlowWriteTool {
             delay_ms,
             journal: journal.clone(),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: peak.clone(),
         }))
         .expect("fresh registry has no `write` to shadow");
-        (r, journal)
+        (r, journal, peak)
     }
 
     /// The over-serialization guard. Two `write` calls to DIFFERENT
@@ -3871,10 +3892,10 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "").unwrap();
 
         let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
-        agent.registry = slow_write_registry(400).0;
+        let (registry, _journal, peak) = slow_write_registry(100);
+        agent.registry = registry;
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 
-        let start = std::time::Instant::now();
         agent
             .execute_tool_calls(
                 vec![
@@ -3894,11 +3915,11 @@ mod tests {
             )
             .await
             .expect("execute");
-        let elapsed = start.elapsed();
         while rx.try_recv().is_ok() {}
 
         let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
         let b = std::fs::read_to_string(dir.join("b.txt")).unwrap();
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -3906,32 +3927,32 @@ mod tests {
             ("A", "B"),
             "both writes must land"
         );
-        assert!(
-            elapsed < std::time::Duration::from_millis(750),
-            "two writes to different paths must run in parallel; took \
-             {elapsed:?} for 2×400ms, which is serial — the mutation key \
-             is over-matching and grouping unrelated files together"
+        assert_eq!(
+            peak, 2,
+            "two writes to different paths must be in flight at once; peak \
+             concurrency was {peak} — the mutation key is over-matching and \
+             grouping unrelated files together"
         );
     }
 
     /// The other side of the same coin: two `write` calls to the SAME
     /// file share a key, so the pipeline must serialize them.
     ///
-    /// Both assertions matter. The timing one proves they did not
-    /// overlap; the content one proves the serialization actually
-    /// prevented the lost update, and that the calls ran in the order
-    /// the model emitted them rather than whatever order the executor
-    /// found convenient.
+    /// Both assertions matter. The concurrency watermark proves they
+    /// did not overlap; the content one proves the serialization
+    /// actually prevented the lost update, and that the calls ran in
+    /// the order the model emitted them rather than whatever order the
+    /// executor found convenient.
     #[tokio::test]
     async fn parallel_writes_to_one_path_are_serialized_in_order() {
         let dir = tmp();
         std::fs::write(dir.join("a.txt"), "").unwrap();
 
         let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
-        agent.registry = slow_write_registry(400).0;
+        let (registry, _journal, peak) = slow_write_registry(100);
+        agent.registry = registry;
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 
-        let start = std::time::Instant::now();
         agent
             .execute_tool_calls(
                 vec![
@@ -3953,10 +3974,10 @@ mod tests {
             )
             .await
             .expect("execute");
-        let elapsed = start.elapsed();
         while rx.try_recv().is_ok() {}
 
         let got = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -3964,10 +3985,10 @@ mod tests {
             "same-file writes must serialize in model order; {got:?} means \
              the second call snapshotted the file before the first wrote"
         );
-        assert!(
-            elapsed >= std::time::Duration::from_millis(750),
-            "expected two serialized 400ms writes, got {elapsed:?} — they \
-             overlapped, so the two spellings did not share a key"
+        assert_eq!(
+            peak, 1,
+            "the two spellings must share a key and never overlap; peak \
+             concurrency was {peak}"
         );
     }
 
@@ -4087,7 +4108,7 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "").unwrap();
 
         let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Sequential);
-        let (registry, journal) = slow_write_registry(50);
+        let (registry, journal, _peak) = slow_write_registry(50);
         agent.registry = registry;
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 

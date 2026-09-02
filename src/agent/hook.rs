@@ -207,9 +207,30 @@ pub async fn run_hook(
 
     let mut child = cmd.spawn()?;
 
+    // A hook that never reads its stdin — `exit 0`, a bare `touch`,
+    // anything that just wants the NANOPI_* env vars — exits while we
+    // are still writing, and the write lands on a closed pipe. That is
+    // the hook working exactly as intended, so EPIPE is not an error
+    // here: swallow it and go on to collect the exit code, which is
+    // what actually decides allow vs block.
+    //
+    // Propagating it (the `?` this replaced) made every such hook a
+    // coin flip between running and "failing open" on a spawn error,
+    // depending on whether the child won the race. It reproduced as
+    // ~30% flake across the hook tests and would have been far worse
+    // in the field, where a blocking guard silently degrading to allow
+    // is the whole thing you installed it to prevent.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input_json.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
+        let wrote = async {
+            stdin.write_all(input_json.as_bytes()).await?;
+            stdin.write_all(b"\n").await
+        }
+        .await;
+        match wrote {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(HookError::Spawn(e)),
+        }
         let _ = stdin.shutdown().await;
     }
 

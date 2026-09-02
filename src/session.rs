@@ -881,6 +881,20 @@ mod tests {
 
     #[test]
     fn roundtrip_all_entry_types() {
+        // `new_session` resolves its directory from $NANOPI_HOME, so this
+        // needs the process-wide lock and a home of its own like every
+        // other session test. Without them it landed in whatever home
+        // the settings tests had just pointed the env var at — and when
+        // those tests then deleted that directory, `append_entry`
+        // (append + create) rebuilt the file without its header line, so
+        // the read below failed with NotASession maybe one run in twenty.
+        // It was also writing into the developer's real
+        // ~/.nanopi/sessions whenever it won that race.
+        let _guard = lock();
+        let home = home_tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &home);
+
         let cwd = tmp();
         let (path, header) = new_session(&cwd, "test-model", "https://api.example/v1").unwrap();
         assert!(path.exists());
@@ -949,6 +963,12 @@ mod tests {
         matches!(entries[4], SessionEntry::ModelChange { .. });
 
         // Cleanup
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
