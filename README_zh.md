@@ -223,12 +223,20 @@ cargo build --release --features wasm
 path = "~/.nanopi/extensions/my-tool.wasm"
 ```
 
-插件需要导出两个函数（见 [`wit/nanopi-extension.wit`](https://github.com/ChrisZhangJin/nanopi/blob/main/wit/nanopi-extension.wit)）：
+插件需要导出两个函数，另有两个可选（见 [`wit/nanopi-extension.wit`](https://github.com/ChrisZhangJin/nanopi/blob/main/wit/nanopi-extension.wit)）：
 
 | 导出 | 签名 | 用途 |
 |---|---|---|
 | `list-tools` | `() -> string` | 返回 `{name, description, parameters}` 的 JSON 数组。加载时调用一次。`parameters` 是 JSON Schema，原样交给模型。 |
 | `execute-tool` | `(name: string, args-json: string) -> string` | 执行工具，返回 `{"content": "...", "is_error": false}`。 |
+| `list-commands` | `() -> string` | *可选。* 返回 `{name, description}` 的 JSON 数组 —— 用户可以敲的 slash 命令。 |
+| `execute-command` | `(name: string, args: string) -> string` | *可选。* 执行命令，返回 `{"print": "..."}`、`{"send_user_message": "..."}`、`{"error": "..."}` 三者之一。 |
+
+**工具 vs 命令。** 工具是*模型*决定调用的；命令是*你*敲的。命令出现在 `/` 面板里并标注来源插件，且仅限交互模式 —— `nanopi -p` 没有命令面板，但插件的工具在那里照常可用。
+
+`print` 直接写进你的 scrollback：模型看不到，也不进会话记录。`send_user_message` 会像你自己输入一样开启一轮对话 —— 但**总是先原样回显**，插件无法在你不知情的情况下替你说话；流式输出中途调用则转为转向（steer）当前这轮，和你自己打字的行为完全一致。`error` 只展示给你，和 trap 一样绝不转发给模型。
+
+两个命令导出放在第二个 WIT world `extension-commands` 里，它 `include` 了第一个。只提供工具的插件继续用 `extension`，源码一行都不用改 —— WIT 无法表达「可选导出」，直接扩宽原来的 world 会让所有已有插件的*源码*编译不过，尽管宿主仍然能加载它们编译好的*二进制*。
 
 可以导入这些宿主函数：
 
@@ -256,11 +264,15 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 **同名冲突。** 插件不能注册已存在的工具名。冲突会被报告并跳过，所以插件无法悄悄替换 `bash`。
 
+命令更严格，两条规则确实不同。**工具**冲突是先到先得：已注册的留下，后来的被跳过。**命令**冲突则两边都拒绝 —— 如果两个插件都注册 `/deploy`，谁都拿不到，因为默默挑一个赢家意味着 `/deploy` 执行的是「碰巧先加载」的那个插件。命令名撞上 `/compact` 这类内置命令时同样跳过。每种情况都会打印点名到插件的警告，且不影响该插件的其他命令和任何工具。
+
+插件按 Agent 加载一次 —— 启动时，以及 `/new`、`/resume`、`/fork`、`/import` 时。`/reload` **刻意不**重新读取 `[[extensions]]`，并会在输出里说明；在活跃的注册表下热替换插件需要一条目前还不存在的注销路径。
+
 ## 版本
 
 | 版本 | 状态 | 体积 | 说明 |
 |---|---|---|---|
-| **v0.11.0** | 当前 | ~1.6 MB | WASM 扩展，带门控的 `host-fs-read` / `host-http-get`；Pi 生命周期钩子（`before_agent_start`、`turn_start`、`turn_end`、`message_end`）；流式中途转向；可配置的工具执行模式 |
+| **v0.11.0** | 当前 | ~1.6 MB | WASM 扩展，带门控的 `host-fs-read` / `host-http-get`，以及插件注册的 slash 命令；Pi 生命周期钩子（`before_agent_start`、`turn_start`、`turn_end`、`message_end`）；流式中途转向；可配置的工具执行模式 |
 | v0.10.0 | 已发布 | 1.6 MB | 自定义 system prompt（`--system-prompt`、`SYSTEM.md`）；显式 `api_kind` 优先于 vendor 嗅探；`-p` 模式工具失败可读；发布产物 UPX 压缩 |
 | v0.9.x | 已发布 | ~3.9 MB | 首次运行向导，`/settings` + `/keybindings`，8 个 vendor 分发，重试封装（0.9.2–0.9.3）；v0.9.1 修了 v0.9.0 的 tool-loop bug |
 | v0.9.0 | 已发布 | ~4.0 MB | Skills（PI-parity），`--skill`/`--no-skills`，折叠 TUI 卡片，`UserPromptSubmit` hook |

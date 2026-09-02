@@ -228,12 +228,20 @@ Then declare the components in `config.toml`:
 path = "~/.nanopi/extensions/my-tool.wasm"
 ```
 
-A plugin exports two functions ([`wit/nanopi-extension.wit`](https://github.com/ChrisZhangJin/nanopi/blob/main/wit/nanopi-extension.wit)):
+A plugin exports two required functions, and optionally two more ([`wit/nanopi-extension.wit`](https://github.com/ChrisZhangJin/nanopi/blob/main/wit/nanopi-extension.wit)):
 
 | Export | Signature | Purpose |
 |---|---|---|
 | `list-tools` | `() -> string` | JSON array of `{name, description, parameters}`. Called once at load. `parameters` is a JSON Schema handed to the model verbatim. |
 | `execute-tool` | `(name: string, args-json: string) -> string` | Runs a tool, returns `{"content": "...", "is_error": false}`. |
+| `list-commands` | `() -> string` | *Optional.* JSON array of `{name, description}` — slash commands the user can type. |
+| `execute-command` | `(name: string, args: string) -> string` | *Optional.* Runs a command, returns one of `{"print": "..."}`, `{"send_user_message": "..."}`, `{"error": "..."}`. |
+
+**Tools vs commands.** A tool is something the *model* decides to call; a command is something *you* type. Commands show up in the `/` palette with the plugin's name attached, and are interactive-mode only — `nanopi -p` has no palette, though the plugin's tools still work there.
+
+`print` goes straight to your scrollback: the model never sees it and it never enters the session transcript. `send_user_message` starts a turn as if you had typed it — always echoed verbatim first, so a plugin cannot put words in your mouth invisibly; typed mid-stream it steers the running turn instead, exactly like your own typing. `error` is shown to you and, like a trap, is never forwarded to the model.
+
+The two command exports live in a second WIT world, `extension-commands`, which `include`s the first. A tool-only plugin keeps targeting `extension` and keeps building unchanged — WIT cannot express an optional export, so widening the original world would have broken every existing plugin's *source* even though the host still loads its compiled *binary*.
 
 And may import these host functions:
 
@@ -261,11 +269,15 @@ The budget applies to **guest** code only. Epoch interruption is instrumentation
 
 **Name collisions.** A plugin may not register a tool whose name already exists. Collisions are reported and skipped, so a plugin cannot quietly replace `bash`.
 
+Commands are stricter, and the two rules genuinely differ. A **tool** collision is first-wins: the tool already registered stays and the newcomer is skipped. A **command** collision refuses *both* claimants — if two plugins each register `/deploy`, neither gets it, because silently picking a winner would mean `/deploy` runs whichever plugin happened to load first. A command whose name belongs to a built-in like `/compact` is skipped. Every case prints a warning naming the plugin(s), and never affects that plugin's other commands or any of its tools.
+
+Plugins are loaded once per Agent — at startup, and on `/new`, `/resume`, `/fork`, `/import`. `/reload` deliberately does **not** re-read `[[extensions]]`, and says so; swapping plugins under a live registry needs an unregister path that doesn't exist yet.
+
 ## Versions
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.11.0** | current | ~1.6 MB | WASM extensions with gated `host-fs-read` / `host-http-get`; Pi lifecycle hooks (`before_agent_start`, `turn_start`, `turn_end`, `message_end`); mid-stream steering; configurable tool exec mode |
+| **v0.11.0** | current | ~1.6 MB | WASM extensions with gated `host-fs-read` / `host-http-get` and plugin-registered slash commands; Pi lifecycle hooks (`before_agent_start`, `turn_start`, `turn_end`, `message_end`); mid-stream steering; configurable tool exec mode |
 | v0.10.0 | released | 1.6 MB | Custom system prompt (`--system-prompt`, `SYSTEM.md`); explicit `api_kind` beats the vendor sniff; readable tool failures in `-p`; UPX-packed release |
 | v0.9.x | released | ~3.9 MB | First-run wizard, `/settings` + `/keybindings`, 8-vendor dispatch, retry envelope (0.9.2–0.9.3); v0.9.1 fixed the v0.9.0 tool loop |
 | v0.9.0 | released | ~4.0 MB | Skills (PI-parity), `--skill`/`--no-skills`, folded TUI card, `UserPromptSubmit` hook |

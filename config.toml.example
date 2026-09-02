@@ -96,6 +96,17 @@ base_url = "https://api.openai.com/v1"
 # model like any other tool. A plugin may not shadow an existing tool
 # name; collisions are reported and skipped.
 #
+# A component may also export slash commands (`list-commands` /
+# `execute-command`), which appear in the `/` palette tagged with the
+# plugin's name. Those are interactive-mode only — `nanopi -p` has no
+# palette, though the plugin's tools still work there. Command
+# collisions are refused rather than renamed: a name belonging to a
+# built-in is skipped, and a name claimed by two plugins registers
+# for neither.
+#
+# Plugins load once per Agent — at startup and on /new, /resume,
+# /fork, /import. `/reload` does NOT re-read this section.
+#
 # Fields:
 #   path            .wasm file or directory. Supports ~ and $HOME.
 #   max_files       Cap when path is a directory. Default 64.
