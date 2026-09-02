@@ -279,6 +279,7 @@ mod tests {
             allow_network: false,
             allow_fs: false,
             url_allowlist: Vec::new(),
+            events: Vec::new(),
         };
         let got = PluginHost::new().resolve_paths(&[cfg]);
         assert_eq!(got.len(), 2);

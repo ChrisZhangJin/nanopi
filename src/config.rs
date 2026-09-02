@@ -172,6 +172,26 @@ pub struct ExtensionConfig {
     ///
     /// Effective only when `allow_network = true`.
     pub url_allowlist: Vec<String>,
+
+    /// v0.12.0: lifecycle events this plugin is GRANTED, as PI's names
+    /// (`tool_execution_start`, not `pre_tool_use` — see
+    /// `docs/v0.12-events.md` §2.1). Absent or empty grants nothing.
+    ///
+    /// Delivery requires the event to be in BOTH this list and the
+    /// plugin's own `list-events` — the config grants, the plugin only
+    /// asks (§4.2). Validation of the names themselves happens at plugin
+    /// load, not here (see `agent::hook::parse_event_grants`), so an
+    /// unknown or retired name in this list is never a config-load error
+    /// in the stock (non-wasm) binary.
+    ///
+    /// This grant is a LARGER capability jump than `allow_fs` or
+    /// `allow_network`: a `tool_execution_start` subscriber sees every
+    /// tool call's arguments, and an `input` subscriber sees every
+    /// prompt the user types — previously a plugin saw only what the
+    /// model chose to hand it as tool arguments. Combined with
+    /// `allow_network = true` this is an exfiltration channel, which is
+    /// why that combination warns at plugin load (§5.1).
+    pub events: Vec<String>,
 }
 
 impl Default for ExtensionConfig {
@@ -182,6 +202,7 @@ impl Default for ExtensionConfig {
             allow_network: false,
             allow_fs: false,
             url_allowlist: Vec::new(),
+            events: Vec::new(),
         }
     }
 }

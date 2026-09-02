@@ -88,6 +88,160 @@ impl HookEvent {
             HookEvent::SessionCompact => "SessionCompact",
         }
     }
+
+    /// v0.12.0 §2.1: PI's name for this event — the WASM `events` grant,
+    /// `list-events`, and `handle-event`'s `event` argument all use this
+    /// string. It is, by construction, exactly what
+    /// `serde_json::to_string(&self)` produces minus the surrounding
+    /// quotes: Stage A (v0.12.0) made the config keys and `HookEvent`'s
+    /// serde names PI's names, so there is ONE vocabulary. The two-column
+    /// translation table an earlier draft of `docs/v0.12-events.md` §2.1
+    /// implied (Claude Code name on the shell side, PI name on the WASM
+    /// side) does not exist and is not needed — this accessor is just the
+    /// existing snake_case serialization, spelled out so callers don't
+    /// have to round-trip through `serde_json`.
+    pub fn pi_name(self) -> &'static str {
+        match self {
+            HookEvent::ToolExecutionStart => "tool_execution_start",
+            HookEvent::ToolExecutionEnd => "tool_execution_end",
+            HookEvent::Input => "input",
+            HookEvent::SessionStart => "session_start",
+            HookEvent::SessionShutdown => "session_shutdown",
+            HookEvent::BeforeAgentStart => "before_agent_start",
+            HookEvent::TurnStart => "turn_start",
+            HookEvent::TurnEnd => "turn_end",
+            HookEvent::MessageEnd => "message_end",
+            HookEvent::SessionBeforeCompact => "session_before_compact",
+            HookEvent::SessionCompact => "session_compact",
+        }
+    }
+}
+
+/// The eleven PI event names deliverable to WASM plugins, in
+/// `docs/v0.12-events.md` §7's table order. This is the vocabulary
+/// `parse_event_grants` validates config-supplied `events` entries
+/// against, and what a plugin's `list-events` intersects with.
+pub const EVENT_NAMES: [&str; 11] = [
+    "tool_execution_start",
+    "tool_execution_end",
+    "input",
+    "before_agent_start",
+    "turn_start",
+    "turn_end",
+    "message_end",
+    "session_start",
+    "session_shutdown",
+    "session_before_compact",
+    "session_compact",
+];
+
+/// v0.12.0 §5.2: these two PI events fire per streaming delta — hundreds
+/// of boundary crossings per turn — and are therefore PERMANENTLY
+/// undeliverable to WASM plugins. Neither has an emit site in nanopi
+/// yet (both are among the twenty PI events §2 lists as "no nanopi
+/// counterpart"), so this const IS the emit-site note §9 asks for: a
+/// future author wiring up `message_update` or `tool_execution_update`
+/// should find this list and keep the rule, not silently make either one
+/// deliverable to plugins.
+pub const PER_DELTA_EVENTS: [&str; 2] = ["message_update", "tool_execution_update"];
+
+/// The four hook keys retired in v0.12 in favor of PI's names, shared by
+/// `retired_hook_key_error` (config-key errors) and `parse_event_grants`
+/// (WASM `events` grant errors) so the two surfaces cannot drift apart.
+const RETIRED_EVENT_NAMES: [(&str, &str); 4] = [
+    ("pre_tool_use", "tool_execution_start"),
+    ("post_tool_use", "tool_execution_end"),
+    ("user_prompt_submit", "input"),
+    ("session_end", "session_shutdown"),
+];
+
+/// v0.12.0 §4.2 / §5.1: validate a plugin's config-granted `events` list
+/// against the PI vocabulary. Returns the accepted names (deduped, as
+/// `&'static str` drawn from [`EVENT_NAMES`]) plus a human-readable
+/// refusal report for every entry that was not granted, so a caller can
+/// print "requested but refused" diagnostics at plugin load.
+///
+/// This is where the grant is validated, deliberately NOT at
+/// `Config::load` — see plan decision D5: `[[extensions]]` (and now
+/// `events`) must stay ignored-with-a-warning in the stock binary, so an
+/// unknown `events` entry cannot be a config-load hard error. Living here
+/// in the non-gated `hook.rs` keeps it unit-testable in both builds; only
+/// the WASM layer calls it.
+pub fn parse_event_grants(granted: &[String]) -> (Vec<&'static str>, Vec<String>) {
+    let mut accepted: Vec<&'static str> = Vec::new();
+    let mut reports: Vec<String> = Vec::new();
+    for g in granted {
+        if let Some(&name) = EVENT_NAMES.iter().find(|&&n| n == g.as_str()) {
+            if !accepted.contains(&name) {
+                accepted.push(name);
+            }
+            continue;
+        }
+        if let Some((old, new)) = RETIRED_EVENT_NAMES.iter().find(|(old, _)| *old == g.as_str()) {
+            reports.push(format!(
+                "unknown event {old:?} — did you mean {new:?}? (see docs/v0.12-events.md §2.1)"
+            ));
+            continue;
+        }
+        if PER_DELTA_EVENTS.contains(&g.as_str()) {
+            reports.push(format!(
+                "event {g:?} fires per streaming delta and is permanently undeliverable to \
+                 plugins (see docs/v0.12-events.md §5.2)"
+            ));
+            continue;
+        }
+        reports.push(format!(
+            "unknown event {g:?} — valid names: {}",
+            EVENT_NAMES.join(", ")
+        ));
+    }
+    (accepted, reports)
+}
+
+/// Build the `HookInput` shared by both `run_hooks` and `run_session_hooks`
+/// and by [`event_payload_json`] — the single point that makes the WASM
+/// event payload structurally, not coincidentally, byte-identical to a
+/// shell hook's stdin.
+fn build_hook_input(
+    event: HookEvent,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    arguments: &Value,
+    cwd: &std::path::Path,
+    session_id: Option<&str>,
+) -> HookInput {
+    HookInput {
+        event,
+        tool_name: tool_name.map(|s| s.to_string()),
+        tool_call_id: tool_call_id.map(|s| s.to_string()),
+        arguments: arguments.clone(),
+        cwd: Some(cwd.display().to_string()),
+        session_id: session_id.map(|s| s.to_string()),
+    }
+}
+
+/// v0.12.0 §4.0 / §4.3: the payload handed to a WASM plugin's
+/// `handle-event`, serialized from the SAME `HookInput` a shell hook
+/// receives on stdin — see [`build_hook_input`]. Byte-identity is
+/// structural, not asserted: both `run_hooks` and `run_session_hooks`
+/// build their stdin JSON through this same path.
+pub fn event_payload_json(
+    event: HookEvent,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    arguments: &Value,
+    cwd: &std::path::Path,
+    session_id: Option<&str>,
+) -> String {
+    serde_json::to_string(&build_hook_input(
+        event,
+        tool_name,
+        tool_call_id,
+        arguments,
+        cwd,
+        session_id,
+    ))
+    .expect("serialize HookInput")
 }
 
 /// One hook definition (parsed from settings.toml).
@@ -190,13 +344,7 @@ pub fn validate_hooks(hooks: &[HookConfig]) -> Result<(), String> {
 /// (e.g. a genuine typo like `turn_startt`) returns `None` — the caller
 /// keeps serde's original message, which already lists the valid keys.
 pub fn retired_hook_key_error(err: &str) -> Option<String> {
-    const RETIRED: [(&str, &str); 4] = [
-        ("pre_tool_use", "tool_execution_start"),
-        ("post_tool_use", "tool_execution_end"),
-        ("user_prompt_submit", "input"),
-        ("session_end", "session_shutdown"),
-    ];
-    for (old, new) in RETIRED {
+    for (old, new) in RETIRED_EVENT_NAMES {
         if err.contains(&format!("`{old}`")) {
             return Some(format!(
                 "unknown hook event \"{old}\" — renamed to \"{new}\" in v0.12 (see docs/v0.12-events.md §2.1)"
@@ -367,14 +515,14 @@ pub async fn run_hooks(
         if !matcher_matches(&h.matcher, tool_name) {
             continue;
         }
-        let input = HookInput {
+        let input = build_hook_input(
             event,
-            tool_name: Some(tool_name.to_string()),
-            tool_call_id: tool_call_id.map(|s| s.to_string()),
-            arguments: current_args.clone(),
-            cwd: Some(cwd.display().to_string()),
-            session_id: session_id.map(|s| s.to_string()),
-        };
+            Some(tool_name),
+            tool_call_id,
+            &current_args,
+            cwd,
+            session_id,
+        );
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
         env.insert("NANOPI_TOOL_NAME".into(), tool_name.into());
@@ -456,14 +604,7 @@ pub async fn run_session_hooks(
         if !matcher_matches(&h.matcher, subject) {
             continue;
         }
-        let input = HookInput {
-            event,
-            tool_name: None,
-            tool_call_id: None,
-            arguments: arguments.clone(),
-            cwd: Some(cwd.display().to_string()),
-            session_id: Some(session_id.to_string()),
-        };
+        let input = build_hook_input(event, None, None, &arguments, cwd, Some(session_id));
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
         env.insert("NANOPI_SESSION_ID".into(), session_id.into());
@@ -913,6 +1054,108 @@ mod tests {
             !marker.exists(),
             "hook should NOT fire for non-matching session id"
         );
+    }
+
+    /// `pi_name()` must equal the serde snake_case serialization minus
+    /// quotes, for all eleven variants — this is what makes "one
+    /// vocabulary" (§2.1) a checked fact rather than an assertion.
+    #[test]
+    fn pi_name_matches_serde_snake_case_for_all_variants() {
+        let variants = [
+            HookEvent::ToolExecutionStart,
+            HookEvent::ToolExecutionEnd,
+            HookEvent::Input,
+            HookEvent::SessionStart,
+            HookEvent::SessionShutdown,
+            HookEvent::BeforeAgentStart,
+            HookEvent::TurnStart,
+            HookEvent::TurnEnd,
+            HookEvent::MessageEnd,
+            HookEvent::SessionBeforeCompact,
+            HookEvent::SessionCompact,
+        ];
+        for v in variants {
+            let serde_name = serde_json::to_string(&v).unwrap();
+            let expected = serde_name.trim_matches('"');
+            assert_eq!(v.pi_name(), expected, "{v:?}");
+        }
+        assert_eq!(variants.len(), EVENT_NAMES.len());
+    }
+
+    #[test]
+    fn parse_event_grants_accepts_a_valid_name() {
+        let (accepted, reports) =
+            parse_event_grants(&["tool_execution_start".to_string()]);
+        assert_eq!(accepted, vec!["tool_execution_start"]);
+        assert!(reports.is_empty(), "{reports:?}");
+    }
+
+    #[test]
+    fn parse_event_grants_refuses_a_retired_name() {
+        let (accepted, reports) = parse_event_grants(&["pre_tool_use".to_string()]);
+        assert!(accepted.is_empty());
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("pre_tool_use"), "{}", reports[0]);
+        assert!(
+            reports[0].contains("tool_execution_start"),
+            "{}",
+            reports[0]
+        );
+        assert!(reports[0].contains("v0.12-events.md"), "{}", reports[0]);
+    }
+
+    #[test]
+    fn parse_event_grants_refuses_per_delta_events() {
+        for name in ["message_update", "tool_execution_update"] {
+            let (accepted, reports) = parse_event_grants(&[name.to_string()]);
+            assert!(accepted.is_empty(), "{name}");
+            assert_eq!(reports.len(), 1, "{name}");
+            assert!(
+                reports[0].contains("streaming delta") && reports[0].contains("undeliverable"),
+                "{}",
+                reports[0]
+            );
+        }
+    }
+
+    #[test]
+    fn parse_event_grants_refuses_nonsense_and_lists_valid_names() {
+        let (accepted, reports) = parse_event_grants(&["nonsense".to_string()]);
+        assert!(accepted.is_empty());
+        assert_eq!(reports.len(), 1);
+        for name in EVENT_NAMES {
+            assert!(reports[0].contains(name), "{}", reports[0]);
+        }
+    }
+
+    #[test]
+    fn parse_event_grants_empty_grants_nothing_and_reports_nothing() {
+        let (accepted, reports) = parse_event_grants(&[]);
+        assert!(accepted.is_empty());
+        assert!(reports.is_empty());
+    }
+
+    /// The WASM payload builder and a shell hook's stdin must be
+    /// structurally identical — `event_payload_json`'s output parses
+    /// back into the same `HookInput` fields.
+    #[test]
+    fn event_payload_json_round_trips_into_hook_input() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        let json = event_payload_json(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            Some("call-1"),
+            &json!({"command": "ls"}),
+            cwd,
+            Some("sess-1"),
+        );
+        let back: HookInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event, HookEvent::ToolExecutionStart);
+        assert_eq!(back.tool_name.as_deref(), Some("bash"));
+        assert_eq!(back.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(back.arguments, json!({"command": "ls"}));
+        assert_eq!(back.cwd.as_deref(), Some("/tmp/proj"));
+        assert_eq!(back.session_id.as_deref(), Some("sess-1"));
     }
 }
 /// `Input` hook is supported alongside ToolExecutionStart/ToolExecutionEnd.

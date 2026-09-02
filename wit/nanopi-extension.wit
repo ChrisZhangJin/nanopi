@@ -17,13 +17,23 @@
 /// `nanopi:extension/tool-api#list-tools`, and the host resolves
 /// root exports by bare name.
 ///
-/// TWO WORLDS, on purpose. WIT cannot express an optional export:
+/// A LINEAR LADDER, on purpose. WIT cannot express an optional export:
 /// `wasm-tools component new` fails if a declared export is missing.
 /// Adding the command exports to `extension` would therefore break
 /// every existing plugin *source* on upgrade, even though the host
 /// happily loads the old *binaries* (it resolves `list-commands`
 /// optionally). Keep tool-only plugins on `extension`; target
-/// `extension-commands` only when you actually register commands.
+/// `extension-commands` only when you actually register commands;
+/// target `extension-events` only when you also want to observe
+/// lifecycle events:
+///
+///   extension  ⊂  extension-commands  ⊂  extension-events
+///
+/// A lattice (tools, tools+commands, tools+events, tools+commands+events)
+/// was considered and refused: that shape is four worlds today and eight
+/// after the next feature. An events-but-no-commands plugin pays the
+/// accepted cost of stubbing `list-commands` / `execute-command` with
+/// two-line returns (see `docs/v0.12-events.md` §4.1).
 ///
 /// Canonical ABI: WIT Component Model (wasmtime 19+).
 
@@ -156,4 +166,38 @@ world extension-commands {
     /// throwing command handler is swallowed rather than becoming a
     /// prompt.
     export execute-command: func(name: string, args: string) -> string;
+}
+
+/// `extension-commands` plus lifecycle event delivery.
+world extension-events {
+    include extension-commands;
+
+    /// Which events this plugin WANTS, as a JSON array of names:
+    ///   ["pre_tool_use", "turn_start"]
+    ///
+    /// Called once at load. Requesting an event is not the same as
+    /// receiving it — the config's `events` grant must ALSO name it.
+    /// Anything not in both this list and the config's `events` list is
+    /// never delivered (see `docs/v0.12-events.md` §4.2).
+    export list-events: func() -> string;
+
+    /// One event. `event` is PI's name for it — `tool_execution_start`,
+    /// not the shell layer's `pre_tool_use`.
+    ///
+    /// `payload-json` is byte-identical to what a shell hook receives on
+    /// stdin for the same event, so a plugin and a hook see exactly the
+    /// same thing.
+    ///
+    /// The return value is IGNORED. `handle-event` is observe-only —
+    /// return `"{}"`.
+    ///
+    /// A 2s epoch budget applies to GUEST code only: a handler that
+    /// calls `host-http-get` is bounded by that function's own 10s
+    /// timeout on top, so ~12s worst case. Do NOT fetch from an event
+    /// handler.
+    ///
+    /// Delivery is DROPPED WITHOUT WAITING if this plugin is already
+    /// inside another guest call (a tool execution, or another event
+    /// delivery) — the host uses `try_lock`, never a blocking lock.
+    export handle-event: func(event: string, payload-json: string) -> string;
 }
