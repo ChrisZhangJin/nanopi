@@ -41,6 +41,7 @@
 
 use std::path::PathBuf;
 
+use nanopi::command::CommandAction;
 use nanopi::wasm::loader::PluginEngine;
 
 fn fixture() -> PathBuf {
@@ -507,4 +508,164 @@ fn http_get_does_not_follow_redirect_off_the_allowlist() {
         "redirect was followed off the allowlist: {}",
         out.content
     );
+}
+
+// ── Slash commands ──────────────────────────────────────────────────
+
+/// The whole command path against a real component: `list-commands`
+/// reaches the host, and each of the three action shapes round-trips.
+#[test]
+fn loads_and_executes_slash_commands() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _specs) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false)
+        .expect("example component must load");
+
+    let mut cmds: Vec<String> = bridge.command_specs().into_iter().map(|c| c.name).collect();
+    cmds.sort();
+    assert_eq!(cmds, vec!["explain", "todo"]);
+
+    // Descriptions are what the palette shows, so an empty one is a
+    // silent quality failure the same way a tool description is.
+    let todo = bridge
+        .command_specs()
+        .into_iter()
+        .find(|c| c.name == "todo")
+        .unwrap();
+    assert!(todo.description.contains("TODO"), "{}", todo.description);
+
+    match bridge.execute_command("todo", "").expect("todo call") {
+        CommandAction::Print(t) => assert!(t.contains("todo:"), "{t}"),
+        other => panic!("expected Print, got {other:?}"),
+    }
+    match bridge
+        .execute_command("explain", "lifetimes")
+        .expect("explain call")
+    {
+        CommandAction::SendUserMessage(t) => assert!(t.contains("lifetimes"), "{t}"),
+        other => panic!("expected SendUserMessage, got {other:?}"),
+    }
+    // A user-level failure is an in-band action, not an Err.
+    match bridge.execute_command("explain", "").expect("explain call") {
+        CommandAction::Error(t) => assert!(t.contains("usage"), "{t}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+/// `args` is raw text, deliberately not JSON. Interior runs of spaces
+/// must survive — proving the host hands the line through rather than
+/// tokenizing it.
+#[test]
+fn command_args_reach_the_guest_verbatim() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false)
+        .expect("load");
+
+    match bridge
+        .execute_command("todo", "a b  c   d")
+        .expect("todo call")
+    {
+        CommandAction::Print(t) => assert!(t.ends_with("a b  c   d"), "{t}"),
+        other => panic!("expected Print, got {other:?}"),
+    }
+}
+
+/// An unknown name is refused host-side, without entering the guest —
+/// the command namespace is checked against `list-commands`, never
+/// against the tool list.
+#[test]
+fn an_unknown_command_is_refused_without_entering_the_guest() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false)
+        .expect("load");
+
+    let err = bridge.execute_command("nope", "").unwrap_err();
+    assert!(err.contains("nope"), "{err}");
+
+    // A *tool* name must not be reachable as a command, or the two
+    // namespaces would leak into each other.
+    let err = bridge.execute_command("rot13", "").unwrap_err();
+    assert!(err.contains("rot13"), "{err}");
+}
+
+/// The backward-compatibility guarantee, end to end: `runaway-plugin`
+/// targets `--world extension` and exports no `list-commands`, so the
+/// host's optional resolution must let it load with zero commands
+/// rather than rejecting it. If this ever fails, check that the fixture
+/// was not regenerated against `extension-commands`.
+#[test]
+fn a_component_without_list_commands_still_loads() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runaway-plugin.component.wasm");
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, specs) = engine
+        .load(&path, Vec::new(), std::env::temp_dir(), false, false)
+        .expect("a command-less component must still load");
+
+    assert!(!specs.is_empty(), "its tools still register");
+    assert!(
+        bridge.command_specs().is_empty(),
+        "and it advertises no commands"
+    );
+}
+
+/// Tools and commands share one instance and one mutex, so a trap on
+/// either side must leave the other usable. Both directions, because
+/// only the tool→command direction catches a `PluginRebuild::build`
+/// that forgot to re-resolve `execute-command` — whose failure mode is
+/// silent: the palette keeps advertising a command that can no longer
+/// run.
+#[test]
+fn a_trap_on_either_side_leaves_the_other_callable() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false)
+        .expect("load");
+
+    // Baseline.
+    assert!(bridge.execute_command("todo", "").is_ok());
+
+    // Blow the guest's 1 MiB arena from the tool side.
+    let huge = "x".repeat(3 * 1024 * 1024);
+    let err = bridge
+        .execute_tool("rot13", &format!(r#"{{"text":"{huge}"}}"#))
+        .unwrap_err();
+    assert!(err.contains("trapped"), "{err}");
+
+    // …a command still works, which only holds if the rebuild
+    // re-resolved `execute-command`.
+    match bridge.execute_command("todo", "after tool trap") {
+        Ok(CommandAction::Print(t)) => assert!(t.contains("after tool trap"), "{t}"),
+        other => panic!("command must survive a tool trap, got {other:?}"),
+    }
+
+    // Now the other direction: trap from the command side.
+    let err = bridge.execute_command("todo", &huge).unwrap_err();
+    assert!(err.contains("trapped"), "{err}");
+
+    let out = bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect("tool must survive a command trap");
+    assert_eq!(out.content, "nop");
+}
+
+/// The epoch deadline is consumed when reached, so every guest entry
+/// has to re-arm it. Calling a tool and then a command proves the
+/// command path does its own arming — without it, the second call
+/// enters a store whose deadline already elapsed and traps instantly.
+#[test]
+fn the_command_path_rearms_the_epoch_deadline() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false)
+        .expect("load");
+
+    bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect("tool call");
+    bridge
+        .execute_command("todo", "")
+        .expect("a command after a tool must not trap on a stale deadline");
 }

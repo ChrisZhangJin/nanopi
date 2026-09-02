@@ -35,6 +35,31 @@ impl WasmTool {
     }
 }
 
+/// Dispatches one plugin slash command to the plugin's
+/// `execute-command` export.
+///
+/// Mirrors [`WasmTool`], minus the async. `WasmTool::execute` owns the
+/// `spawn_blocking` hop because `Tool` is an async trait driven by the
+/// agent loop; for a command the hop belongs to the TUI, which needs
+/// the `JoinHandle` anyway to keep drawing while the guest runs. Being
+/// sync also keeps `async_trait` out of the non-gated
+/// [`crate::command`] module.
+pub struct WasmCommandHandler {
+    bridge: Arc<dyn WasmExecuteBridge>,
+}
+
+impl WasmCommandHandler {
+    pub fn new(bridge: Arc<dyn WasmExecuteBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+impl crate::command::CommandHandler for WasmCommandHandler {
+    fn run(&self, name: &str, args: &str) -> Result<crate::command::CommandAction, String> {
+        self.bridge.execute_command(name, args)
+    }
+}
+
 #[async_trait]
 impl Tool for WasmTool {
     fn spec(&self) -> ToolSpec {
@@ -81,13 +106,44 @@ impl Tool for WasmTool {
     }
 }
 
-/// Plugin-side bridge surface. Phase 2 just exposes execute; phase 4
-/// adds host_log bridge.
+/// Plugin-side bridge surface: everything the rest of nanopi is allowed
+/// to ask a loaded component to do.
+///
+/// The command half carries default bodies so an implementor that only
+/// deals in tools — `NoopBridge` below, the fakes in tests — stays
+/// untouched, and so a component with no `list-commands` needs no
+/// special case at the call site.
 pub trait WasmExecuteBridge: Send + Sync {
     /// Synchronously invoke a plugin tool and return its output.
     /// Plugin errors surface as `Err(...)` so `WasmTool::execute`
     /// can mark `is_error=true` for the renderer.
     fn execute_tool(&self, name: &str, args_json: &str) -> Result<ToolOutput, String>;
+
+    /// Slash commands this plugin advertised at load time. Empty for a
+    /// component that does not export `list-commands`, which is the
+    /// common case and the reason this has a default.
+    ///
+    /// Read off the bridge rather than returned from `load` because the
+    /// bridge is also what dispatches them — keeping name and dispatch
+    /// together is what makes `execute_command`'s name check
+    /// trustworthy. Tool specs go the other way because they must reach
+    /// `ToolRegistry` at load time and are fatal if malformed.
+    fn command_specs(&self) -> Vec<crate::command::CommandSpec> {
+        Vec::new()
+    }
+
+    /// Synchronously run one of `command_specs()`. `args` is raw text.
+    ///
+    /// `Err` is a plugin-side failure — a trap, a malformed payload. An
+    /// in-band `CommandAction::Error` is the plugin reporting a
+    /// user-level problem, which is a normal outcome, not a fault.
+    fn execute_command(
+        &self,
+        name: &str,
+        _args: &str,
+    ) -> Result<crate::command::CommandAction, String> {
+        Err(format!("plugin exports no command {name:?}"))
+    }
 }
 
 /// A no-op bridge used in tests and as the default when no plugin is
@@ -104,6 +160,61 @@ impl WasmExecuteBridge for NoopBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandAction, CommandHandler, CommandSpec};
+
+    /// A bridge that answers commands but has no wasm behind it —
+    /// the cheapest seam for exercising the command path.
+    struct CommandBridge(Result<CommandAction, String>);
+
+    impl WasmExecuteBridge for CommandBridge {
+        fn execute_tool(&self, _name: &str, _args_json: &str) -> Result<ToolOutput, String> {
+            Err("not a tool bridge".into())
+        }
+        fn command_specs(&self) -> Vec<CommandSpec> {
+            vec![CommandSpec {
+                name: "todo".into(),
+                description: "the list".into(),
+            }]
+        }
+        fn execute_command(&self, _name: &str, _args: &str) -> Result<CommandAction, String> {
+            self.0.clone()
+        }
+    }
+
+    /// Pins the trait's default bodies. A future implementor that
+    /// forgets the command half must degrade to "no commands", not to
+    /// a panic or a phantom command.
+    #[test]
+    fn the_bridge_defaults_mean_no_commands() {
+        assert!(NoopBridge.command_specs().is_empty());
+        let err = NoopBridge.execute_command("todo", "").unwrap_err();
+        assert!(
+            err.contains("todo"),
+            "the name belongs in the message: {err}"
+        );
+    }
+
+    #[test]
+    fn the_handler_passes_every_action_through_unchanged() {
+        for action in [
+            CommandAction::Print("printed".into()),
+            CommandAction::SendUserMessage("asked".into()),
+            CommandAction::Error("refused".into()),
+        ] {
+            let h = WasmCommandHandler::new(Arc::new(CommandBridge(Ok(action.clone()))));
+            assert_eq!(h.run("todo", "args").unwrap(), action);
+        }
+    }
+
+    /// A plugin-side failure stays an `Err`. It must NOT be silently
+    /// turned into `CommandAction::Error`, because the two mean
+    /// different things: one is the plugin reporting a user-level
+    /// problem, the other is the plugin itself misbehaving.
+    #[test]
+    fn a_bridge_failure_surfaces_as_err() {
+        let h = WasmCommandHandler::new(Arc::new(CommandBridge(Err("trapped".into()))));
+        assert_eq!(h.run("todo", "").unwrap_err(), "trapped");
+    }
 
     /// Smoke: a WasmTool with NoopBridge returns is_error=true
     /// instead of panicking when invoked.

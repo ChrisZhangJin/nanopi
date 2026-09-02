@@ -572,8 +572,63 @@ impl PluginEngine {
                 )
             })?;
 
+        // Slash commands are OPTIONAL. Four distinctions here, each
+        // easy to invert and each with a different failure mode:
+        //
+        // 1. Export missing → soft. This `.ok()` is the entire
+        //    backward-compatibility guarantee for components built
+        //    against the older `extension` world, including both
+        //    committed fixtures.
+        // 2. `list-commands` traps → hard. A trapped instance is
+        //    permanently un-enterable, so swallowing it would leave
+        //    `execute-tool` failing forever with "cannot enter
+        //    component instance" for reasons unrelated to commands.
+        // 3. Malformed JSON → hard, matching `parse_tool_specs`. A
+        //    plugin lying about its command list is an authoring bug
+        //    and the author has to see it. The cost is real: a typo
+        //    here also costs the user that plugin's tools.
+        // 4. Commands advertised but no `execute-command` → hard.
+        let (command_specs, execute_command) = match instance
+            .get_typed_func::<(), (String,)>(&mut store, "list-commands")
+            .ok()
+        {
+            Some(list_commands) => {
+                // Re-arm: the `list-tools` call above consumed the
+                // deadline, and a store past its deadline traps on
+                // entry.
+                store.set_epoch_deadline(self.budget_ticks);
+                let (json,) = list_commands
+                    .call(&mut store, ())
+                    .map_err(|e| format!("list-commands trapped: {e}"))?;
+                list_commands
+                    .post_return(&mut store)
+                    .map_err(|e| format!("list-commands post_return failed: {e}"))?;
+                let cmds = parse_command_specs(&json)?;
+                let exec = if cmds.is_empty() {
+                    None
+                } else {
+                    Some(
+                        instance
+                            .get_typed_func::<(String, String), (String,)>(
+                                &mut store,
+                                "execute-command",
+                            )
+                            .map_err(|e| {
+                                format!(
+                                    "{} exports commands but not `execute-command`: {e}",
+                                    wasm_path.display()
+                                )
+                            })?,
+                    )
+                };
+                (cmds, exec)
+            }
+            None => (Vec::new(), None),
+        };
+
         let bridge: Arc<dyn WasmExecuteBridge> = Arc::new(ComponentBridge {
             specs: specs.clone(),
+            command_specs,
             budget_ticks: self.budget_ticks,
             rebuild: PluginRebuild {
                 engine: self.engine.clone(),
@@ -591,6 +646,7 @@ impl PluginEngine {
             inner: Mutex::new(BridgeInner {
                 store,
                 execute,
+                execute_command,
             }),
         });
         Ok((bridge, specs))
@@ -614,6 +670,66 @@ struct WireToolOutput {
     is_error: bool,
 }
 
+/// What `list-commands` returns, before conversion to `CommandSpec`.
+#[derive(Debug, Deserialize)]
+struct WireCommandSpec {
+    name: String,
+    description: String,
+}
+
+/// What `execute-command` returns.
+///
+/// Externally tagged, so the payload must be a one-key object. An
+/// unknown key matches no variant and a second key is trailing data —
+/// both land as "invalid JSON", which is the intent: the action shape
+/// is closed, not extensible by a plugin guessing.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCommandAction {
+    Print(String),
+    SendUserMessage(String),
+    Error(String),
+}
+
+/// Upper bound on how many commands one plugin may add to the palette.
+/// Not a security control — a 500-row palette is simply unusable.
+const MAX_COMMANDS_PER_PLUGIN: usize = 64;
+/// Matches `resources::MAX_DESCRIPTION_LENGTH`; the palette truncates
+/// for display anyway, this just stops a plugin parking a novel in
+/// memory for the session.
+const MAX_COMMAND_DESCRIPTION: usize = 1024;
+/// Cap on a single action payload. A plugin returning 10 MB of `print`
+/// would otherwise be rendered into scrollback a line at a time.
+const MAX_ACTION_PAYLOAD: usize = 64 * 1024;
+
+fn parse_command_specs(json: &str) -> Result<Vec<crate::command::CommandSpec>, String> {
+    let wire: Vec<WireCommandSpec> = serde_json::from_str(json)
+        .map_err(|e| format!("list-commands returned invalid JSON: {e} (got {json:?})"))?;
+    if wire.len() > MAX_COMMANDS_PER_PLUGIN {
+        return Err(format!(
+            "list-commands returned {} commands, more than the {MAX_COMMANDS_PER_PLUGIN} allowed",
+            wire.len()
+        ));
+    }
+    Ok(wire
+        .into_iter()
+        .map(|w| crate::command::CommandSpec {
+            name: w.name,
+            description: truncate_chars(w.description, MAX_COMMAND_DESCRIPTION),
+        })
+        .collect())
+}
+
+/// Truncate on a char boundary, appending an ellipsis when cut.
+fn truncate_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 fn parse_tool_specs(json: &str) -> Result<Vec<ToolSpec>, String> {
     let wire: Vec<WireToolSpec> = serde_json::from_str(json)
         .map_err(|e| format!("list-tools returned invalid JSON: {e} (got {json:?})"))?;
@@ -628,14 +744,22 @@ fn parse_tool_specs(json: &str) -> Result<Vec<ToolSpec>, String> {
 }
 
 type ExecuteFunc = wasmtime::component::TypedFunc<(String, String), (String,)>;
+/// Same signature as `ExecuteFunc`, deliberately a distinct alias:
+/// tools and commands are separate namespaces and the two handles must
+/// never be swapped.
+type CommandFunc = wasmtime::component::TypedFunc<(String, String), (String,)>;
 
 struct BridgeInner {
     store: Store<PluginState>,
     execute: ExecuteFunc,
+    /// `None` when the component exports no `execute-command`.
+    execute_command: Option<CommandFunc>,
 }
 
 struct ComponentBridge {
     specs: Vec<ToolSpec>,
+    /// Fixed at load. Never re-read — see `PluginRebuild::build`.
+    command_specs: Vec<crate::command::CommandSpec>,
     /// Copied off the engine so `execute_tool` can re-arm the deadline
     /// without reaching back for it.
     budget_ticks: u64,
@@ -661,8 +785,15 @@ struct PluginRebuild {
 }
 
 impl PluginRebuild {
-    /// Fresh store + instance + `execute-tool` handle. Same shape as
-    /// the tail of `PluginEngine::load`.
+    /// Fresh store + instance + export handles, for recovering from a
+    /// trap. Similar to the tail of `PluginEngine::load` but
+    /// deliberately does LESS: it never re-calls `list-commands`.
+    ///
+    /// Two reasons. A plugin must not be able to change its command set
+    /// mid-session — that would slip past the collision check the
+    /// registry already ran — and the recovery path should spend as
+    /// little of the guest's epoch budget as possible, since the whole
+    /// point is getting back to a usable instance.
     fn build(&self, budget_ticks: u64) -> Result<BridgeInner, String> {
         let mut store = Store::new(
             &self.engine,
@@ -681,7 +812,18 @@ impl PluginRebuild {
         let execute = instance
             .get_typed_func::<(String, String), (String,)>(&mut store, "execute-tool")
             .map_err(|e| format!("re-resolve execute-tool failed: {e}"))?;
-        Ok(BridgeInner { store, execute })
+        // `.ok()`, not `?`: a tool-only component must still recover
+        // from a trap. Forgetting this line degrades silently — after
+        // any trap every command would report "no longer exports
+        // execute-command" while the palette kept advertising it.
+        let execute_command = instance
+            .get_typed_func::<(String, String), (String,)>(&mut store, "execute-command")
+            .ok();
+        Ok(BridgeInner {
+            store,
+            execute,
+            execute_command,
+        })
     }
 }
 
@@ -755,6 +897,69 @@ impl WasmExecuteBridge for ComponentBridge {
             images: Vec::new(),
         })
     }
+
+    fn command_specs(&self) -> Vec<crate::command::CommandSpec> {
+        self.command_specs.clone()
+    }
+
+    fn execute_command(
+        &self,
+        name: &str,
+        args: &str,
+    ) -> Result<crate::command::CommandAction, String> {
+        // Checked against `command_specs`, never `specs`: the two are
+        // separate namespaces, and merging them would let a command
+        // name reach `execute-tool` or the reverse.
+        if !self.command_specs.iter().any(|s| s.name == name) {
+            return Err(format!("plugin does not export command {name:?}"));
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.budget_ticks);
+        let Some(execute_command) = inner.execute_command.as_ref() else {
+            // Only reachable when a post-trap rebuild came back without
+            // the export — see `PluginRebuild::build`.
+            return Err(
+                "plugin no longer exports `execute-command` after trap recovery".to_string(),
+            );
+        };
+        let called = execute_command.call(
+            &mut inner.store,
+            (name.to_string(), args.to_string()),
+        );
+
+        let out_json = match called {
+            Ok((out,)) => match execute_command.post_return(&mut inner.store) {
+                Ok(()) => out,
+                Err(e) => {
+                    Self::reset(inner, &self.rebuild, self.budget_ticks);
+                    return Err(format!("execute-command post_return failed: {e}"));
+                }
+            },
+            Err(e) => {
+                Self::reset(inner, &self.rebuild, self.budget_ticks);
+                return Err(format!("execute-command trapped: {e}"));
+            }
+        };
+
+        let wire: WireCommandAction = serde_json::from_str(&out_json).map_err(|e| {
+            format!("execute-command returned invalid JSON: {e} (got {out_json:?})")
+        })?;
+        Ok(match wire {
+            WireCommandAction::Print(t) => {
+                crate::command::CommandAction::Print(truncate_chars(t, MAX_ACTION_PAYLOAD))
+            }
+            WireCommandAction::SendUserMessage(t) => {
+                crate::command::CommandAction::SendUserMessage(truncate_chars(
+                    t,
+                    MAX_ACTION_PAYLOAD,
+                ))
+            }
+            WireCommandAction::Error(t) => {
+                crate::command::CommandAction::Error(truncate_chars(t, MAX_ACTION_PAYLOAD))
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +977,82 @@ mod tests {
         assert_eq!(specs[0].name, "query");
         assert_eq!(specs[1].description, "ping a host");
         assert_eq!(specs[0].parameters["type"], "object");
+    }
+
+    #[test]
+    fn parse_command_specs_reads_json_array() {
+        let json = r#"[
+            {"name":"todo","description":"show the list"},
+            {"name":"deploy","description":"ship it"}
+        ]"#;
+        let cmds = parse_command_specs(json).expect("valid");
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].name, "todo");
+        assert_eq!(cmds[1].description, "ship it");
+    }
+
+    #[test]
+    fn parse_command_specs_accepts_empty_list() {
+        assert!(parse_command_specs("[]").expect("valid").is_empty());
+    }
+
+    #[test]
+    fn parse_command_specs_rejects_garbage() {
+        let err = parse_command_specs("not json").unwrap_err();
+        assert!(err.contains("invalid JSON"), "got {err}");
+        // The raw payload is echoed so a plugin author can see what
+        // their guest actually emitted.
+        assert!(err.contains("not json"), "got {err}");
+    }
+
+    #[test]
+    fn parse_command_specs_caps_the_count_and_the_description() {
+        let many: String = (0..MAX_COMMANDS_PER_PLUGIN + 1)
+            .map(|i| format!(r#"{{"name":"c{i}","description":"d"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = parse_command_specs(&format!("[{many}]")).unwrap_err();
+        assert!(err.contains("more than the"), "got {err}");
+
+        let long = "x".repeat(MAX_COMMAND_DESCRIPTION + 50);
+        let one = parse_command_specs(&format!(r#"[{{"name":"c","description":"{long}"}}]"#))
+            .expect("valid");
+        assert_eq!(
+            one[0].description.chars().count(),
+            MAX_COMMAND_DESCRIPTION + 1,
+            "truncated plus the ellipsis"
+        );
+    }
+
+    /// The action shape is closed: exactly one known key, no more.
+    #[test]
+    fn wire_command_action_accepts_only_a_single_known_key() {
+        for (json, want) in [
+            (r#"{"print":"hi"}"#, "print"),
+            (r#"{"send_user_message":"hi"}"#, "send"),
+            (r#"{"error":"nope"}"#, "error"),
+        ] {
+            let got: WireCommandAction =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{json} -> {e}"));
+            match (got, want) {
+                (WireCommandAction::Print(_), "print") => {}
+                (WireCommandAction::SendUserMessage(_), "send") => {}
+                (WireCommandAction::Error(_), "error") => {}
+                (other, _) => panic!("{json} parsed as {other:?}"),
+            }
+        }
+        for bad in [
+            "{}",
+            r#"{"printt":"typo"}"#,
+            r#"{"print":"a","error":"b"}"#,
+            r#"{"print":1}"#,
+            r#""just a string""#,
+        ] {
+            assert!(
+                serde_json::from_str::<WireCommandAction>(bad).is_err(),
+                "{bad} should not parse"
+            );
+        }
     }
 
     #[test]
