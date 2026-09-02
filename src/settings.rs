@@ -48,15 +48,15 @@ pub struct Settings {
 #[serde(default)]
 pub struct HooksSection {
     #[serde(default)]
-    pub pre_tool_use: Vec<HookConfig>,
+    pub tool_execution_start: Vec<HookConfig>,
     #[serde(default)]
-    pub post_tool_use: Vec<HookConfig>,
+    pub tool_execution_end: Vec<HookConfig>,
     #[serde(default)]
-    pub user_prompt_submit: Vec<HookConfig>,
+    pub input: Vec<HookConfig>,
     #[serde(default)]
     pub session_start: Vec<HookConfig>,
     #[serde(default)]
-    pub session_end: Vec<HookConfig>,
+    pub session_shutdown: Vec<HookConfig>,
     /// NEW v0.11.0 lifecycle hooks (see docs/pi-vs-nanopi.md §4.3).
     #[serde(default)]
     pub before_agent_start: Vec<HookConfig>,
@@ -76,11 +76,11 @@ pub struct HooksSection {
 impl From<Settings> for HooksConfig {
     fn from(s: Settings) -> Self {
         HooksConfig {
-            pre_tool_use: s.hooks.pre_tool_use,
-            post_tool_use: s.hooks.post_tool_use,
-            user_prompt_submit: s.hooks.user_prompt_submit,
+            tool_execution_start: s.hooks.tool_execution_start,
+            tool_execution_end: s.hooks.tool_execution_end,
+            input: s.hooks.input,
             session_start: s.hooks.session_start,
-            session_end: s.hooks.session_end,
+            session_shutdown: s.hooks.session_shutdown,
             before_agent_start: s.hooks.before_agent_start,
             turn_start: s.hooks.turn_start,
             turn_end: s.hooks.turn_end,
@@ -100,13 +100,13 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     // v0.6+: hooks in config.toml (global + local) come first.
     match crate::config::load_config(cwd) {
         Ok(cfg) => {
-            hooks.pre_tool_use.extend(cfg.hooks.pre_tool_use);
-            hooks.post_tool_use.extend(cfg.hooks.post_tool_use);
+            hooks.tool_execution_start.extend(cfg.hooks.tool_execution_start);
+            hooks.tool_execution_end.extend(cfg.hooks.tool_execution_end);
             hooks
-                .user_prompt_submit
-                .extend(cfg.hooks.user_prompt_submit);
+                .input
+                .extend(cfg.hooks.input);
             hooks.session_start.extend(cfg.hooks.session_start);
-            hooks.session_end.extend(cfg.hooks.session_end);
+            hooks.session_shutdown.extend(cfg.hooks.session_shutdown);
             hooks.before_agent_start.extend(cfg.hooks.before_agent_start);
             hooks.turn_start.extend(cfg.hooks.turn_start);
             hooks.turn_end.extend(cfg.hooks.turn_end);
@@ -128,11 +128,11 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     if let Some(p) = global_path {
         if p.exists() {
             let s = load_one(&p)?;
-            hooks.pre_tool_use.extend(s.hooks.pre_tool_use);
-            hooks.post_tool_use.extend(s.hooks.post_tool_use);
-            hooks.user_prompt_submit.extend(s.hooks.user_prompt_submit);
+            hooks.tool_execution_start.extend(s.hooks.tool_execution_start);
+            hooks.tool_execution_end.extend(s.hooks.tool_execution_end);
+            hooks.input.extend(s.hooks.input);
             hooks.session_start.extend(s.hooks.session_start);
-            hooks.session_end.extend(s.hooks.session_end);
+            hooks.session_shutdown.extend(s.hooks.session_shutdown);
             hooks.before_agent_start.extend(s.hooks.before_agent_start);
             hooks.turn_start.extend(s.hooks.turn_start);
             hooks.turn_end.extend(s.hooks.turn_end);
@@ -147,11 +147,11 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     let local_path = cwd.join(".nanopi").join("settings.toml");
     if local_path.exists() {
         let s = load_one(&local_path)?;
-        hooks.pre_tool_use.extend(s.hooks.pre_tool_use);
-        hooks.post_tool_use.extend(s.hooks.post_tool_use);
-        hooks.user_prompt_submit.extend(s.hooks.user_prompt_submit);
+        hooks.tool_execution_start.extend(s.hooks.tool_execution_start);
+        hooks.tool_execution_end.extend(s.hooks.tool_execution_end);
+        hooks.input.extend(s.hooks.input);
         hooks.session_start.extend(s.hooks.session_start);
-        hooks.session_end.extend(s.hooks.session_end);
+        hooks.session_shutdown.extend(s.hooks.session_shutdown);
         hooks.before_agent_start.extend(s.hooks.before_agent_start);
         hooks.turn_start.extend(s.hooks.turn_start);
         hooks.turn_end.extend(s.hooks.turn_end);
@@ -167,12 +167,12 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     }
 
     // Validate regex matchers up front; surface errors at startup.
-    crate::agent::hook::validate_hooks(&hooks.pre_tool_use).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.post_tool_use).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.user_prompt_submit)
+    crate::agent::hook::validate_hooks(&hooks.tool_execution_start).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.tool_execution_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.input)
         .map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.session_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(&hooks.session_shutdown).map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.before_agent_start)
         .map_err(SettingsError::Matcher)?;
     crate::agent::hook::validate_hooks(&hooks.turn_start).map_err(SettingsError::Matcher)?;
@@ -237,12 +237,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_home);
         let _ = std::fs::remove_dir_all(&tmp_cwd);
 
-        assert!(h.pre_tool_use.is_empty());
-        assert!(h.post_tool_use.is_empty());
+        assert!(h.tool_execution_start.is_empty());
+        assert!(h.tool_execution_end.is_empty());
     }
 
     #[test]
-    fn loads_pre_tool_use() {
+    fn loads_tool_execution_start() {
         let _guard = lock();
         let dir = tmp();
         let prev = std::env::var_os("NANOPI_HOME");
@@ -250,13 +250,13 @@ mod tests {
         std::fs::write(
             dir.join("settings.toml"),
             r#"
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "bash"
 type = "command"
 command = "/bin/true"
 timeout = 1000
 
-[[hooks.post_tool_use]]
+[[hooks.tool_execution_end]]
 matcher = "*"
 type = "command"
 command = "/bin/true"
@@ -266,9 +266,9 @@ timeout = 2000
         .unwrap();
 
         let h = load_settings(&PathBuf::from("/tmp")).unwrap();
-        assert_eq!(h.pre_tool_use.len(), 1);
-        assert_eq!(h.pre_tool_use[0].matcher, "bash");
-        assert_eq!(h.post_tool_use.len(), 1);
+        assert_eq!(h.tool_execution_start.len(), 1);
+        assert_eq!(h.tool_execution_start[0].matcher, "bash");
+        assert_eq!(h.tool_execution_end.len(), 1);
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);
@@ -285,11 +285,11 @@ timeout = 2000
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", &dir);
 
-        // Legacy settings.toml — one pre_tool_use hook.
+        // Legacy settings.toml — one tool_execution_start hook.
         std::fs::write(
             dir.join("settings.toml"),
             r#"
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "legacy"
 type = "command"
 command = "/bin/true"
@@ -297,11 +297,11 @@ timeout = 1000
 "#,
         )
         .unwrap();
-        // New config.toml — one pre_tool_use hook plus a session_start.
+        // New config.toml — one tool_execution_start hook plus a session_start.
         std::fs::write(
             dir.join("config.toml"),
             r#"
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "modern"
 type = "command"
 command = "/bin/true"
@@ -325,9 +325,9 @@ command = "/bin/true"
         let _ = std::fs::remove_dir_all(&dir);
 
         // Both hooks present, config.toml first, settings.toml appended.
-        assert_eq!(h.pre_tool_use.len(), 2);
-        assert_eq!(h.pre_tool_use[0].matcher, "modern");
-        assert_eq!(h.pre_tool_use[1].matcher, "legacy");
+        assert_eq!(h.tool_execution_start.len(), 2);
+        assert_eq!(h.tool_execution_start[0].matcher, "modern");
+        assert_eq!(h.tool_execution_start[1].matcher, "legacy");
         assert_eq!(h.session_start.len(), 1);
     }
 
@@ -388,7 +388,7 @@ timeout = 1000
         std::fs::write(
             dir.join("settings.toml"),
             r#"
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "[bad"
 type = "command"
 command = "/bin/true"

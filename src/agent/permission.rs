@@ -54,10 +54,10 @@ impl PermissionGate {
         Self::new(!no_hooks, trust)
     }
 
-    /// Decide whether a PreToolUse block decision should be honored.
-    /// Always true now that per-call yolo bypass is gone; `--no-hooks`
-    /// is the way to opt out of hook enforcement entirely.
-    pub fn should_honor_pretooluse_block(&self) -> bool {
+    /// Decide whether a ToolExecutionStart block decision should be
+    /// honored. Always true now that per-call yolo bypass is gone;
+    /// `--no-hooks` is the way to opt out of hook enforcement entirely.
+    pub fn should_honor_tool_execution_start_block(&self) -> bool {
         true
     }
 
@@ -140,9 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn pretooluse_block_always_honored() {
+    fn tool_execution_start_block_always_honored() {
         let p = PermissionGate::from_cli(false, None);
-        assert!(p.should_honor_pretooluse_block());
+        assert!(p.should_honor_tool_execution_start_block());
     }
 
     #[test]

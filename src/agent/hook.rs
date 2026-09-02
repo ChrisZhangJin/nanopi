@@ -6,18 +6,18 @@
 //!
 //! Example `~/.nanopi/config.toml`:
 //! ```toml
-//! [[hooks.pre_tool_use]]
+//! [[hooks.tool_execution_start]]
 //! matcher = "bash"
 //! type = "command"
 //! command = "~/.nanopi/hooks/check-rm-rf.sh"
 //! timeout = 5000
 //! ```
 //!
-//! The table keys are snake_case (`pre_tool_use`, `post_tool_use`,
-//! `session_start`, ...) — they are `HooksSection`'s field names, and
-//! there is no serde rename or alias. A CamelCase `[[hooks.PreToolUse]]`
-//! parses as an unrelated key and silently registers nothing; this doc
-//! comment claimed otherwise until v0.11.0.
+//! The table keys are snake_case (`tool_execution_start`,
+//! `tool_execution_end`, `session_start`, ...) — they are `HooksSection`'s
+//! field names, and there is no serde rename or alias. A CamelCase
+//! `[[hooks.ToolExecutionStart]]` parses as an unrelated key and silently
+//! registers nothing; this doc comment claimed otherwise until v0.11.0.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,11 +42,11 @@ pub enum HookError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
-    PreToolUse,
-    PostToolUse,
-    UserPromptSubmit,
+    ToolExecutionStart,
+    ToolExecutionEnd,
+    Input,
     SessionStart,
-    SessionEnd,
+    SessionShutdown,
     /// Fired once at the top of `run_turn`, BEFORE the user message is
     /// pushed to context. The only new-hook variant that supports
     /// Block (early return) and Transform (rewrite the prompt).
@@ -73,11 +73,11 @@ pub enum HookEvent {
 impl HookEvent {
     pub fn env_var(self) -> &'static str {
         match self {
-            HookEvent::PreToolUse => "PreToolUse",
-            HookEvent::PostToolUse => "PostToolUse",
-            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::ToolExecutionStart => "ToolExecutionStart",
+            HookEvent::ToolExecutionEnd => "ToolExecutionEnd",
+            HookEvent::Input => "Input",
             HookEvent::SessionStart => "SessionStart",
-            HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::SessionShutdown => "SessionShutdown",
             HookEvent::BeforeAgentStart => "BeforeAgentStart",
             HookEvent::TurnStart => "TurnStart",
             HookEvent::TurnEnd => "TurnEnd",
@@ -93,7 +93,7 @@ impl HookEvent {
 pub struct HookConfig {
     /// Regex matched against the tool name (or session_id for session_*).
     /// Empty or `*` = match all. Default when omitted is `"*"`, which is
-    /// the useful case for session_start / session_end where there's no
+    /// the useful case for session_start / session_shutdown where there's no
     /// tool name to match.
     #[serde(default = "default_matcher")]
     pub matcher: String,
@@ -318,8 +318,8 @@ fn parse_json_decision(stdout: &str) -> Option<HookOutcome> {
 /// `tool_call_id` is the provider's id for the call in flight, and is
 /// `None` for the events that aren't about a tool. It was hardcoded to
 /// `None` at both call sites until v0.11.0, which made the payload
-/// field permanently null and left `post_tool_use` hooks unable to
-/// correlate a result with the `pre_tool_use` that preceded it.
+/// field permanently null and left `tool_execution_end` hooks unable to
+/// correlate a result with the `tool_execution_start` that preceded it.
 pub async fn run_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
@@ -388,7 +388,7 @@ pub async fn run_hooks(
 /// enforced (a session start/end/compaction always proceeds).
 ///
 /// `subject` is what `matcher` is applied against, and it is NOT always
-/// a session id: `SessionStart` / `SessionEnd` pass the session id,
+/// a session id: `SessionStart` / `SessionShutdown` pass the session id,
 /// while `SessionBeforeCompact` / `SessionCompact` pass the compaction
 /// reason (`"threshold"` or `"manual"`). Empty/`"*"` matches all.
 /// The `session_id` field of the payload carries `subject` for the same
@@ -405,7 +405,7 @@ pub async fn run_session_hooks(
     debug_assert!(matches!(
         event,
         HookEvent::SessionStart
-            | HookEvent::SessionEnd
+            | HookEvent::SessionShutdown
             | HookEvent::SessionBeforeCompact
             | HookEvent::SessionCompact
     ));
@@ -653,7 +653,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({"command": "ls"}),
@@ -673,7 +673,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({}),
@@ -696,7 +696,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({}),
@@ -713,15 +713,15 @@ mod tests {
     #[test]
     fn session_events_env_var_names() {
         assert_eq!(HookEvent::SessionStart.env_var(), "SessionStart");
-        assert_eq!(HookEvent::SessionEnd.env_var(), "SessionEnd");
+        assert_eq!(HookEvent::SessionShutdown.env_var(), "SessionShutdown");
     }
 
     #[test]
     fn session_events_serialize_snake_case() {
         let s = serde_json::to_string(&HookEvent::SessionStart).unwrap();
         assert_eq!(s, "\"session_start\"");
-        let s = serde_json::to_string(&HookEvent::SessionEnd).unwrap();
-        assert_eq!(s, "\"session_end\"");
+        let s = serde_json::to_string(&HookEvent::SessionShutdown).unwrap();
+        assert_eq!(s, "\"session_shutdown\"");
         // Round-trip.
         let back: HookEvent = serde_json::from_str("\"session_start\"").unwrap();
         assert_eq!(back, HookEvent::SessionStart);
@@ -779,7 +779,7 @@ mod tests {
     }
 
     /// The compaction events route through `run_session_hooks` too, and
-    /// its `debug_assert!` originally listed only SessionStart/SessionEnd
+    /// its `debug_assert!` originally listed only SessionStart/SessionShutdown
     /// — so the first `session_before_compact` hook to fire would have
     /// panicked any debug build. `matcher` here is tested against the
     /// compaction reason, not a session id.
@@ -829,7 +829,7 @@ mod tests {
         };
         run_session_hooks(
             &[hook],
-            HookEvent::SessionEnd,
+            HookEvent::SessionShutdown,
             "dev-1234",
             std::path::Path::new("/tmp"),
         )
@@ -840,23 +840,23 @@ mod tests {
         );
     }
 }
-/// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
+/// `Input` hook is supported alongside ToolExecutionStart/ToolExecutionEnd.
 /// Round-trip its enum variant and env_var name.
 #[test]
-fn user_prompt_submit_event_round_trips() {
-    let v = HookEvent::UserPromptSubmit;
-    assert_eq!(v.env_var(), "UserPromptSubmit");
+fn input_event_round_trips() {
+    let v = HookEvent::Input;
+    assert_eq!(v.env_var(), "Input");
     let s = serde_json::to_string(&v).unwrap();
     let back: HookEvent = serde_json::from_str(&s).unwrap();
     assert_eq!(back, v);
 }
 
-/// `UserPromptSubmit` hooks don't have a tool_name, but the input
+/// `Input` hooks don't have a tool_name, but the input
 /// payload still has a `prompt` field carrying the user's text.
 #[test]
-fn user_prompt_submit_input_has_event_field() {
+fn input_hook_input_has_event_field() {
     let input = HookInput {
-        event: HookEvent::UserPromptSubmit,
+        event: HookEvent::Input,
         tool_name: None,
         tool_call_id: None,
         arguments: serde_json::Value::String("hi".into()),
@@ -864,6 +864,6 @@ fn user_prompt_submit_input_has_event_field() {
         session_id: None,
     };
     let s = serde_json::to_string(&input).unwrap();
-    assert!(s.contains("\"event\":\"user_prompt_submit\""), "got {s}");
+    assert!(s.contains("\"event\":\"input\""), "got {s}");
     assert!(s.contains("\"hi\""), "got {s}");
 }

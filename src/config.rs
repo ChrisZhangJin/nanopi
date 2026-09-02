@@ -270,11 +270,11 @@ fn load_one(path: &Path) -> Result<Config, ConfigError> {
 /// not overrides.
 fn merge(a: Config, b: Config) -> Config {
     let mut hooks = HooksSection {
-        pre_tool_use: a.hooks.pre_tool_use,
-        post_tool_use: a.hooks.post_tool_use,
-        user_prompt_submit: a.hooks.user_prompt_submit,
+        tool_execution_start: a.hooks.tool_execution_start,
+        tool_execution_end: a.hooks.tool_execution_end,
+        input: a.hooks.input,
         session_start: a.hooks.session_start,
-        session_end: a.hooks.session_end,
+        session_shutdown: a.hooks.session_shutdown,
         before_agent_start: a.hooks.before_agent_start,
         turn_start: a.hooks.turn_start,
         turn_end: a.hooks.turn_end,
@@ -282,11 +282,11 @@ fn merge(a: Config, b: Config) -> Config {
         session_before_compact: a.hooks.session_before_compact,
         session_compact: a.hooks.session_compact,
     };
-    hooks.pre_tool_use.extend(b.hooks.pre_tool_use);
-    hooks.post_tool_use.extend(b.hooks.post_tool_use);
-    hooks.user_prompt_submit.extend(b.hooks.user_prompt_submit);
+    hooks.tool_execution_start.extend(b.hooks.tool_execution_start);
+    hooks.tool_execution_end.extend(b.hooks.tool_execution_end);
+    hooks.input.extend(b.hooks.input);
     hooks.session_start.extend(b.hooks.session_start);
-    hooks.session_end.extend(b.hooks.session_end);
+    hooks.session_shutdown.extend(b.hooks.session_shutdown);
     hooks.before_agent_start.extend(b.hooks.before_agent_start);
     hooks.turn_start.extend(b.hooks.turn_start);
     hooks.turn_end.extend(b.hooks.turn_end);
@@ -490,7 +490,7 @@ model = "cfg-model"
 base_url = "https://cfg.example/v1"
 api_key = "sk-inline-secret"
 
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = "bash"
 type = "command"
 command = "/bin/true"
@@ -505,8 +505,8 @@ command = "/bin/true"
         let c = load_config(tmp.path()).unwrap();
         assert_eq!(c.model.as_deref(), Some("cfg-model"));
         assert_eq!(c.api_key.as_deref(), Some("sk-inline-secret"));
-        assert_eq!(c.hooks.pre_tool_use.len(), 1);
-        assert_eq!(c.hooks.pre_tool_use[0].matcher, "bash");
+        assert_eq!(c.hooks.tool_execution_start.len(), 1);
+        assert_eq!(c.hooks.tool_execution_start[0].matcher, "bash");
         assert_eq!(c.hooks.session_start.len(), 1);
     }
 
@@ -515,7 +515,7 @@ command = "/bin/true"
         use crate::agent::hook::HookConfig;
         let a = Config {
             hooks: HooksSection {
-                pre_tool_use: vec![HookConfig {
+                tool_execution_start: vec![HookConfig {
                     matcher: "a".into(),
                     kind: "command".into(),
                     command: "x".into(),
@@ -527,7 +527,7 @@ command = "/bin/true"
         };
         let b = Config {
             hooks: HooksSection {
-                pre_tool_use: vec![HookConfig {
+                tool_execution_start: vec![HookConfig {
                     matcher: "b".into(),
                     kind: "command".into(),
                     command: "y".into(),
@@ -538,9 +538,9 @@ command = "/bin/true"
             ..Config::builtin_defaults()
         };
         let m = merge(a, b);
-        assert_eq!(m.hooks.pre_tool_use.len(), 2);
-        assert_eq!(m.hooks.pre_tool_use[0].matcher, "a");
-        assert_eq!(m.hooks.pre_tool_use[1].matcher, "b");
+        assert_eq!(m.hooks.tool_execution_start.len(), 2);
+        assert_eq!(m.hooks.tool_execution_start[0].matcher, "a");
+        assert_eq!(m.hooks.tool_execution_start[1].matcher, "b");
     }
 
     #[test]

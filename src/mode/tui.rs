@@ -3317,11 +3317,11 @@ async fn handle_reload(
                 &a.prompt_overrides,
             ));
             let h = &a.hooks;
-            h.pre_tool_use.len()
-                + h.post_tool_use.len()
-                + h.user_prompt_submit.len()
+            h.tool_execution_start.len()
+                + h.tool_execution_end.len()
+                + h.input.len()
                 + h.session_start.len()
-                + h.session_end.len()
+                + h.session_shutdown.len()
         } else {
             0
         }

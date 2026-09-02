@@ -242,7 +242,7 @@ mod tests {
 # User's preferred defaults — DO NOT delete this comment.
 thinking_level = \"medium\"
 
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = \"Bash\"
 command = \"echo hello\"
 ",
@@ -261,7 +261,7 @@ command = \"echo hello\"
             after
         );
         assert!(
-            after.contains("[[hooks.pre_tool_use]]"),
+            after.contains("[[hooks.tool_execution_start]]"),
             "hooks section lost:\n{}",
             after
         );
