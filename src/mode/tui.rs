@@ -4825,6 +4825,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
         }
     }
