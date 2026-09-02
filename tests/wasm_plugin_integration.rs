@@ -30,12 +30,37 @@
 //! commands. `wit/` now declares two worlds, so `--world` is no longer
 //! optional here.
 //!
-//! TWO FIXTURES, TWO WORLDS, ON PURPOSE. `runaway-plugin` stays on
+//! A third fixture, `events-plugin.component.wasm`, is built from
+//! `examples/wasm-plugin-events` and targets `--world extension-events`
+//! — the top of the ladder, adding `list-events` / `handle-event` to
+//! everything `example-plugin.component.wasm` already exports. To
+//! regenerate it after changing `examples/wasm-plugin-events`:
+//!
+//! ```bash
+//! cargo build --manifest-path examples/wasm-plugin-events/Cargo.toml \
+//!   --target wasm32-wasip1 --release
+//! wasm-tools component embed wit/ \
+//!   examples/wasm-plugin-events/target/wasm32-wasip1/release/nanopi_events_plugin.wasm \
+//!   -o /tmp/embedded-events.wasm --world extension-events
+//! wasm-tools component new /tmp/embedded-events.wasm \
+//!   -o tests/fixtures/events-plugin.component.wasm
+//! ```
+//!
+//! (`make plugin-events` runs the same three steps and copies the
+//! result to `dist/`; `tests/fixtures/events-plugin.component.wasm` is
+//! that same output, committed.)
+//!
+//! THREE FIXTURES, THREE WORLDS, ON PURPOSE. `runaway-plugin` stays on
 //! `--world extension` and must keep doing so: besides being the
 //! hang-breaker fixture, it is the only committed component WITHOUT
 //! `list-commands`, and therefore the only end-to-end proof that the
 //! host resolves that export optionally. Retarget it and the
 //! backward-compatibility test below silently stops testing anything.
+//! `example-plugin.component.wasm` stays on `--world extension-commands`
+//! for the same reason in reverse: it is the only committed component
+//! WITHOUT `list-events` / `handle-event`, proving those two exports
+//! are equally optional. Retargeting it to `extension-events` would
+//! remove that proof.
 
 #![cfg(feature = "wasm")]
 
@@ -47,6 +72,11 @@ use nanopi::wasm::loader::PluginEngine;
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/example-plugin.component.wasm")
+}
+
+fn events_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/events-plugin.component.wasm")
 }
 
 /// The whole path: compile the component, read its tool list, call
@@ -81,6 +111,31 @@ fn loads_real_component_and_executes_its_tools() {
         .execute_tool("wordcount", r#"{"text":"one two three"}"#)
         .expect("wordcount call");
     assert!(out.content.starts_with("3 words"), "{}", out.content);
+    assert!(!out.is_error);
+}
+
+/// The events fixture loads through the CURRENT loader unchanged, and
+/// its three tools are listed — proving the extra `list-events` /
+/// `handle-event` exports are invisible to a host that isn't yet
+/// looking for them. This is the backward-compatibility guarantee in
+/// reverse: `unknown_tool_name_is_rejected`'s fixture proves an old
+/// host tolerates a plugin missing new exports; this test proves a
+/// plugin WITH those new exports still works against the old host.
+#[test]
+fn events_fixture_loads_through_the_current_loader() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, specs) = engine
+        .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false)
+        .expect("events component must load");
+
+    let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["busy", "events_seen", "greet"]);
+
+    let out = bridge
+        .execute_tool("greet", r#"{"name":"nanopi"}"#)
+        .expect("greet call");
+    assert!(out.content.contains("nanopi"), "{}", out.content);
     assert!(!out.is_error);
 }
 
