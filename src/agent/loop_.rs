@@ -1647,7 +1647,22 @@ async fn run_one_tool(
             })
             .await;
         if let Some(reason) = block {
-            let result_text = format!("blocked by hook: {reason}");
+            // Self-explanatory on purpose. The system prompt never
+            // mentions that hooks exist, so `blocked by hook: X` left
+            // the model guessing what a "hook" was — in manual testing
+            // it twice concluded a sandbox was intercepting bash, and
+            // once went looking for `.claude/settings.json`, i.e. a
+            // different product's config. Naming the mechanism and
+            // ruling out the wrong hypothesis costs one line and saves
+            // a turn of investigation.
+            //
+            // The hook's own reason is preserved verbatim and last, so
+            // a hook author's message stays the most visible part.
+            let result_text = format!(
+                "blocked by a user-configured `tool_execution_start` hook — this is a \
+                 policy refusal from the user's nanopi configuration, not a sandbox or \
+                 environment failure. Hook's reason: {reason}"
+            );
             let _ = session::append_entry(
                 &session_path,
                 &SessionEntry::ToolResult {
@@ -2398,6 +2413,65 @@ mod tests {
             }
             Ok(Usage::default())
         }
+    }
+
+    /// A blocked tool call must tell the model WHAT blocked it.
+    ///
+    /// The system prompt never mentions hooks, so `blocked by hook: X`
+    /// left the model to guess. In manual testing it twice decided a
+    /// sandbox was intercepting bash, and once went hunting for
+    /// `.claude/settings.json` — another product's config file. The
+    /// message now names the mechanism and rules out the environment
+    /// hypothesis, while keeping the hook author's own reason last and
+    /// verbatim.
+    #[tokio::test]
+    async fn a_blocked_call_explains_itself_to_the_model() {
+        let dir = tmp();
+        let session_path = dir.join("blocked-msg.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let hooks = HooksConfig {
+            tool_execution_start: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: "sh -c 'cat >/dev/null; echo policy-says-no >&2; exit 2'".into(),
+                timeout: 4000,
+            }],
+            ..Default::default()
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        let outcome = run_one_tool(
+            ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+            },
+            ToolRegistry::standard(),
+            session_path,
+            uuid::v7().to_string(),
+            dir.clone(),
+            PermissionGate::from_cli(false, None),
+            hooks,
+            Default::default(),
+            tx,
+        )
+        .await;
+
+        assert!(outcome.is_error, "a blocked call is an error result");
+        let c = &outcome.content;
+        // The hook's own words survive, and stay the tail of the line.
+        assert!(c.contains("policy-says-no"), "{c}");
+        // The mechanism is named, so "hook" is not an unexplained noun.
+        assert!(c.contains("tool_execution_start"), "{c}");
+        assert!(c.contains("user-configured"), "{c}");
+        // And the wrong hypothesis is pre-empted.
+        assert!(
+            c.contains("not a sandbox or environment failure"),
+            "the message must rule out the environment theory: {c}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
