@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::agent::context::Context;
 use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
 use crate::provider::sse::SseStream;
+use crate::provider::think_tags::{InlineThinkSplitter, Segment};
 
 #[derive(Debug, Error)]
 pub enum OpenAiError {
@@ -199,6 +200,12 @@ pub struct OpenAiProvider {
     /// v0.9.3: optional vendor for reasoning_effort / thinking-block
     /// emission. If `None`, request body omits reasoning params.
     pub vendor: Option<Box<dyn crate::vendor::Vendor>>,
+    /// Route `delta.content` through `InlineThinkSplitter`, reclassifying
+    /// `<think>…</think>` spans as `ThinkingDelta` instead of `TextDelta`.
+    /// Set from `vendor.inlines_think_tags()` in `with_vendor`, and
+    /// overridable via `with_inline_think` (the `Config::inline_think_tags`
+    /// escape hatch). Default `false`.
+    pub split_inline_think: bool,
 }
 
 impl OpenAiProvider {
@@ -215,12 +222,22 @@ impl OpenAiProvider {
                 .build()
                 .expect("build reqwest client"),
             vendor: None,
+            split_inline_think: false,
         }
     }
 
-    /// v0.9.3: attach a vendor.
+    /// v0.9.3: attach a vendor. Also sets `split_inline_think` from the
+    /// vendor's `inlines_think_tags()` — read it BEFORE the vendor moves
+    /// into the struct.
     pub fn with_vendor(mut self, vendor: Box<dyn crate::vendor::Vendor>) -> Self {
+        self.split_inline_think = vendor.inlines_think_tags();
         self.vendor = Some(vendor);
+        self
+    }
+
+    /// Config escape hatch for `split_inline_think`: `Config::inline_think_tags`.
+    pub fn with_inline_think(mut self, on: bool) -> Self {
+        self.split_inline_think = on;
         self
     }
 }
@@ -566,6 +583,7 @@ impl OpenAiProvider {
             let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
             let mut started = false;
             let mut usage_local = Usage::default();
+            let mut splitter = InlineThinkSplitter::new();
 
             let mut stream = Box::pin(sse);
             while let Some(event) = stream.next().await {
@@ -603,12 +621,28 @@ impl OpenAiProvider {
                     let delta = &choice.delta;
                     if let Some(t) = &delta.content {
                         if !t.is_empty() {
-                            let _ = tx
-                                .send(AgentEvent::TextDelta {
-                                    content_index: choice.index,
-                                    text: t.clone(),
-                                })
-                                .await;
+                            if self.split_inline_think {
+                                for seg in splitter.push(t) {
+                                    let ev = match seg {
+                                        Segment::Text(text) => AgentEvent::TextDelta {
+                                            content_index: choice.index,
+                                            text,
+                                        },
+                                        Segment::Think(text) => AgentEvent::ThinkingDelta {
+                                            content_index: choice.index,
+                                            text,
+                                        },
+                                    };
+                                    let _ = tx.send(ev).await;
+                                }
+                            } else {
+                                let _ = tx
+                                    .send(AgentEvent::TextDelta {
+                                        content_index: choice.index,
+                                        text: t.clone(),
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     if let Some(t) = &delta.reasoning_content {
@@ -636,6 +670,26 @@ impl OpenAiProvider {
                             choice.index,
                         )
                         .await;
+                        // Drain any buffered splitter state BEFORE Done —
+                        // an event arriving after Done is a reordering
+                        // bug. finish() resets state, so a second drain
+                        // after the loop (stream closed without an
+                        // explicit finish_reason) is harmless.
+                        if self.split_inline_think {
+                            for seg in splitter.finish() {
+                                let ev = match seg {
+                                    Segment::Text(text) => AgentEvent::TextDelta {
+                                        content_index: choice.index,
+                                        text,
+                                    },
+                                    Segment::Think(text) => AgentEvent::ThinkingDelta {
+                                        content_index: choice.index,
+                                        text,
+                                    },
+                                };
+                                let _ = tx.send(ev).await;
+                            }
+                        }
                         let finish = match fr.as_str() {
                             "stop" => FinishReason::Stop,
                             "tool_calls" | "function_call" => FinishReason::ToolCalls,
@@ -671,6 +725,24 @@ impl OpenAiProvider {
 
             // Stream closed without an explicit finish_reason; emit Done with what we have.
             flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, 0).await;
+            // Drain any splitter state still buffered (unclosed <think>,
+            // partial delimiter prefix) so nothing is lost. Harmless if
+            // the finish_reason branch above already drained it.
+            if self.split_inline_think {
+                for seg in splitter.finish() {
+                    let ev = match seg {
+                        Segment::Text(text) => AgentEvent::TextDelta {
+                            content_index: 0,
+                            text,
+                        },
+                        Segment::Think(text) => AgentEvent::ThinkingDelta {
+                            content_index: 0,
+                            text,
+                        },
+                    };
+                    let _ = tx.send(ev).await;
+                }
+            }
             final_usage = usage_local;
             break 'retry;
         }

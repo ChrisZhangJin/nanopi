@@ -176,6 +176,37 @@ fn run_p(port: u16, args: &[&str]) -> String {
     strip_sgr(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Like [`run_p`], but writes a `.nanopi/config.toml` with `provider =
+/// "<provider>"` before running — the way `run_p` can't reach a vendor
+/// gate, since there is no `--provider` CLI flag (only `config.toml`).
+///
+/// `extra_config` is appended verbatim to the same file (e.g.
+/// `inline_think_tags = false`), so callers can exercise the escape
+/// hatch without a second helper.
+fn run_p_with_provider(port: u16, provider: &str, extra_config: &str, args: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!("nanopi-p-e2e-provider-{port}"));
+    std::fs::create_dir_all(dir.join(".nanopi")).expect("cfg dir");
+    std::fs::write(
+        dir.join(".nanopi/config.toml"),
+        format!("provider = \"{provider}\"\n{extra_config}\n"),
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(&dir)
+        .args(["-p", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-hooks", "--no-skills", "--no-context-files"])
+        .args(args)
+        .env("NANOPI_HOME", dir.join("home"))
+        .output()
+        .expect("run nanopi -p");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    strip_sgr(&String::from_utf8_lossy(&out.stdout))
+}
+
 fn strip_sgr(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
@@ -437,4 +468,113 @@ fn a_hook_rewrite_is_visible_to_the_user_and_the_model() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The bug this plan fixes, end to end: a `<think>` opener split across
+/// two `content` deltas must still be recognized, rendered as thinking
+/// (not the reply), and never leak the literal tag into stdout. This is
+/// the test that would have caught the reported bug.
+#[test]
+fn inline_think_split_across_two_content_deltas() {
+    let port = spawn_sse_server(vec![
+        delta("content", "<thi"),
+        delta("content", "nk>reasoning</think>ANSWER"),
+        finish("stop"),
+    ]);
+
+    let out = run_p_with_provider(port, "xiaomi", "", &["greet Tom"]);
+
+    assert!(out.contains("ANSWER"), "answer missing: {out:?}");
+    assert!(
+        !out.contains("reasoningANSWER"),
+        "reasoning ran into the reply: {out:?}"
+    );
+    assert!(
+        !out.contains("<think>"),
+        "the literal opener leaked into stdout: {out:?}"
+    );
+    assert!(
+        !out.contains("</think>"),
+        "the literal closer leaked into stdout: {out:?}"
+    );
+}
+
+/// The same stream, `--output json`: the envelope's assistant text must
+/// be exactly the answer — no reasoning, no literal tag.
+#[test]
+fn inline_think_excluded_from_json_envelope() {
+    let port = spawn_sse_server(vec![
+        delta("content", "<thi"),
+        delta("content", "nk>reasoning</think>ANSWER"),
+        finish("stop"),
+    ]);
+
+    let out = run_p_with_provider(
+        port,
+        "xiaomi",
+        "",
+        &["--output", "json", "greet Tom"],
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+
+    let assistant = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| {
+            m.iter()
+                .rev()
+                .find(|e| e.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        })
+        .and_then(|e| e.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_else(|| panic!("no assistant message in envelope: {v}"));
+
+    assert_eq!(
+        assistant, "ANSWER",
+        "JSON content must be the answer alone — no inlined reasoning"
+    );
+    assert!(
+        !v.to_string().contains("reasoning"),
+        "reasoning leaked into the JSON envelope: {v}"
+    );
+    assert!(
+        !v.to_string().contains("think"),
+        "the literal tag leaked into the JSON envelope: {v}"
+    );
+}
+
+/// The gate is real: without a vendor that inlines think tags, the same
+/// stream renders the literal `<think>` verbatim.
+#[test]
+fn inline_think_untouched_for_other_vendors() {
+    let port = spawn_sse_server(vec![
+        delta("content", "<thi"),
+        delta("content", "nk>reasoning</think>ANSWER"),
+        finish("stop"),
+    ]);
+
+    // No provider override, no vendor-matching base_url/model → sniff
+    // falls all the way through to FallbackVendor, which does not inline
+    // think tags.
+    let out = run_p(port, &["greet Tom"]);
+
+    assert!(
+        out.contains("<think>"),
+        "the gate ate the tag for a non-gated vendor: {out:?}"
+    );
+}
+
+/// A stream that ends inside an unclosed `<think>` must still deliver
+/// everything it carried — the no-loss invariant, exercised end to end.
+#[test]
+fn inline_think_unclosed_still_delivers() {
+    let port = spawn_sse_server(vec![
+        delta("content", "before<think>dangling"),
+        finish("stop"),
+    ]);
+
+    let out = run_p_with_provider(port, "xiaomi", "", &["greet Tom"]);
+
+    assert!(out.contains("before"), "lost text before the tag: {out:?}");
 }

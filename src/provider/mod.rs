@@ -85,21 +85,32 @@ pub fn effective_kind(
 /// then does the vendor get to choose the transport (that's what keeps
 /// MinimaxVendor's Anthropic-only gateway working out of the box, while
 /// still honoring an explicit `api_kind`).
+/// `inline_think_tags` is `Config::inline_think_tags` — the escape hatch
+/// for `Vendor::inlines_think_tags`. `None` defers to the vendor;
+/// `Some(_)` is final. Only meaningful for the OpenAI-compat transport;
+/// ignored for Anthropic (which already gets reasoning via its own
+/// `thinking` block).
 pub fn build(
     kind: Option<ApiKind>,
     base_url: &str,
     api_key: &str,
     model: &str,
     vendor: Option<Box<dyn crate::vendor::Vendor>>,
+    inline_think_tags: Option<bool>,
 ) -> Box<dyn Provider> {
     let effective = effective_kind(kind, vendor.as_deref(), base_url);
     match effective {
         ApiKind::Openai => {
             let p = openai::OpenAiProvider::new(base_url, api_key, model);
-            Box::new(match vendor {
+            let p = match vendor {
                 Some(v) => p.with_vendor(v),
                 None => p,
-            })
+            };
+            let p = match inline_think_tags {
+                Some(on) => p.with_inline_think(on),
+                None => p,
+            };
+            Box::new(p)
         }
         ApiKind::Anthropic => {
             let p = anthropic::AnthropicProvider::new(base_url, api_key, model);
@@ -152,16 +163,16 @@ mod tests {
     #[test]
     fn vendor_transport_wins_when_config_is_silent() {
         let v: Box<dyn crate::vendor::Vendor> = Box::new(crate::vendor::MinimaxVendor);
-        let p = build(None, "https://x", "k", "minimax-M3", Some(v));
+        let p = build(None, "https://x", "k", "minimax-M3", Some(v), None);
         assert_eq!(p.id(), "anthropic");
 
         // Vendor agrees with config → no surprise, still Anthropic.
         let v: Box<dyn crate::vendor::Vendor> = Box::new(crate::vendor::MinimaxVendor);
-        let p = build(Some(ApiKind::Anthropic), "https://x", "k", "minimax-M3", Some(v));
+        let p = build(Some(ApiKind::Anthropic), "https://x", "k", "minimax-M3", Some(v), None);
         assert_eq!(p.id(), "anthropic");
 
         // No vendor, no config → OpenAI-compat default.
-        let p = build(None, "https://x", "k", "gpt-4o", None);
+        let p = build(None, "https://x", "k", "gpt-4o", None, None);
         assert_eq!(p.id(), "openai");
     }
 
@@ -174,7 +185,7 @@ mod tests {
         let base = "https://token-plan-cn.xiaomimimo.com/anthropic";
         let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5");
         assert_eq!(v.id(), "xiaomi", "base_url sniff still picks Xiaomi");
-        let p = build(Some(ApiKind::Anthropic), base, "k", "mimo-v2.5", Some(v));
+        let p = build(Some(ApiKind::Anthropic), base, "k", "mimo-v2.5", Some(v), None);
         assert_eq!(p.id(), "anthropic");
     }
 
@@ -188,14 +199,14 @@ mod tests {
             "https://token-plan-sgp.xiaomimimo.com/anthropic/",
         ] {
             let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5-pro");
-            let p = build(None, base, "k", "mimo-v2.5-pro", Some(v));
+            let p = build(None, base, "k", "mimo-v2.5-pro", Some(v), None);
             assert_eq!(p.id(), "anthropic", "{base} should route Anthropic-native");
         }
 
         // The OpenAI-compat surface on the same host stays OpenAI.
         let base = "https://token-plan-cn.xiaomimimo.com/v1";
         let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5-pro");
-        let p = build(None, base, "k", "mimo-v2.5-pro", Some(v));
+        let p = build(None, base, "k", "mimo-v2.5-pro", Some(v), None);
         assert_eq!(p.id(), "openai");
     }
 
@@ -205,7 +216,7 @@ mod tests {
     fn explicit_openai_overrides_anthropic_surface_url() {
         let base = "https://token-plan-cn.xiaomimimo.com/anthropic";
         let v = crate::vendor::pick_vendor(None, Some(base), "mimo-v2.5");
-        let p = build(Some(ApiKind::Openai), base, "k", "mimo-v2.5", Some(v));
+        let p = build(Some(ApiKind::Openai), base, "k", "mimo-v2.5", Some(v), None);
         assert_eq!(p.id(), "openai");
     }
 }
