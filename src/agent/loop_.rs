@@ -2110,6 +2110,256 @@ mod tests {
     /// Delivery cannot change the outcome (observe-only is in the
     /// `EventHandler` signature), so delivering costs nothing but a
     /// blind spot is real.
+    /// Every emit site must actually deliver.
+    ///
+    /// The `deliver_with` mechanism is unit-tested in `subscriber`, and
+    /// two sites are pinned by the blocking-hook test below — but
+    /// nothing asserted that each of the eleven `run_hooks` sites has a
+    /// matching delivery. A missing `deliver_with` at one site is
+    /// completely silent: the plugin just never hears about that event
+    /// and there is no error anywhere to notice.
+    ///
+    /// So run a real turn that goes through a tool round and assert the
+    /// exact set of events a turn CAN produce. The two compaction
+    /// events are not reachable from `run_turn` without crossing the
+    /// threshold, so they are asserted separately below.
+    #[tokio::test]
+    async fn a_turn_delivers_every_event_it_can_reach() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: &str, _payload: &str) {
+                self.seen.lock().unwrap().push(event.to_string());
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+            plugin_name: Arc::from("watcher"),
+            events: crate::agent::hook::EVENT_NAMES.to_vec(),
+            handler: recorder.clone(),
+        }]);
+
+        let dir = tmp();
+        let session_path = dir.join("all-events.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProviderForEvents {
+                step: Arc::new(AtomicUsize::new(0)),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            event_subscribers: subs,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.fire_session_start("startup").await;
+        agent.run_turn("go", &tx, None, None).await.unwrap();
+        agent.fire_session_shutdown("quit").await;
+
+        let seen = recorder.seen.lock().unwrap().clone();
+        for expected in [
+            "session_start",
+            "before_agent_start",
+            "input",
+            "turn_start",
+            "tool_execution_start",
+            "tool_execution_end",
+            "turn_end",
+            "message_end",
+            "session_shutdown",
+        ] {
+            assert!(
+                seen.iter().any(|e| e == expected),
+                "{expected} was never delivered; a turn produced {seen:?}"
+            );
+        }
+
+        // Ordering that a subscriber can rely on: the turn is bracketed,
+        // and a tool's start precedes its end.
+        let pos = |name: &str| seen.iter().position(|e| e == name).unwrap();
+        assert!(pos("session_start") < pos("before_agent_start"));
+        assert!(pos("before_agent_start") < pos("input"));
+        assert!(pos("input") < pos("turn_start"));
+        assert!(pos("tool_execution_start") < pos("tool_execution_end"));
+        assert!(pos("message_end") < pos("session_shutdown"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two events the turn test cannot reach. Together with it,
+    /// all eleven are covered.
+    #[tokio::test]
+    async fn compaction_delivers_both_of_its_events() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: &str, payload: &str) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("{event}:{payload}"));
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+            plugin_name: Arc::from("watcher"),
+            events: crate::agent::hook::EVENT_NAMES.to_vec(),
+            handler: recorder.clone(),
+        }]);
+
+        let dir = tmp();
+        let session_path = dir.join("compaction-events.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "summary".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            event_subscribers: subs,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+        // Enough tail that find_compact_boundary actually cuts —
+        // otherwise `compact` returns None, the function returns before
+        // the SessionCompact site, and the test would be asserting the
+        // wrong thing. Same sizing as compact_now_emits_start_and_end.
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.compact_now(Some(&tx), "manual").await;
+
+        let seen = recorder.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|e| e.starts_with("session_before_compact:")),
+            "session_before_compact not delivered; got {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| e.starts_with("session_compact:")),
+            "session_compact not delivered; got {seen:?}"
+        );
+        // The reason rides in arguments, and session_id is the real id —
+        // the payload-honesty fix, asserted through the plugin surface
+        // rather than only the shell one.
+        assert!(
+            seen.iter().any(|e| e.contains(r#""reason":"manual""#)),
+            "reason missing from the compaction payload: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| e.contains(r#""session_id":"manual""#)),
+            "session_id is carrying the reason again: {seen:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two-step provider for `a_turn_delivers_every_event_it_can_reach`:
+    /// a tool round, then a plain answer.
+    struct SteppedProviderForEvents {
+        step: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for SteppedProviderForEvents {
+        fn id(&self) -> &'static str {
+            "stepped-events"
+        }
+        async fn stream_turn(
+            &self,
+            _ctx: &Context,
+            tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<Usage, String> {
+            let step = self
+                .step
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx
+                .send(AgentEvent::Start {
+                    message_id: "m".into(),
+                })
+                .await;
+            if step == 0 {
+                let _ = tx
+                    .send(AgentEvent::ToolCall {
+                        content_index: 0,
+                        call: ToolCall {
+                            id: "c1".into(),
+                            name: "ls".into(),
+                            arguments: json!({}),
+                        },
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Usage::default(),
+                    })
+                    .await;
+            } else {
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: "done".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::Stop,
+                        usage: Usage::default(),
+                    })
+                    .await;
+            }
+            Ok(Usage::default())
+        }
+    }
+
     #[tokio::test]
     async fn a_blocking_hook_still_delivers_the_event_to_subscribers() {
         use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};

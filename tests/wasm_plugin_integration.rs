@@ -997,3 +997,49 @@ fn the_command_path_rearms_the_epoch_deadline() {
         .execute_command("todo", "")
         .expect("a command after a tool must not trap on a stale deadline");
 }
+
+/// The event epoch budget must actually interrupt guest code.
+///
+/// Everything else about the budget was asserted structurally — a
+/// `const` assertion that 2 < 30. That proves the number is smaller,
+/// not that it is enforced, and "enforced" is the whole claim: an event
+/// fires on the critical path of every turn, so a handler that never
+/// returns would wedge every turn rather than one tool call.
+///
+/// The fixture spins on an unbounded volatile loop when the payload
+/// carries the spin sentinel. Only the deadline can end it, so if the
+/// budget were not wired this test would hang rather than fail — which
+/// is why the assertion is on elapsed time, with a ceiling far below
+/// the 30s tool budget so a wrongly-inherited tool budget also fails.
+#[test]
+fn a_runaway_event_handler_is_bounded_by_the_event_budget() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            vec!["input".to_string()],
+        )
+        .expect("events component must load");
+
+    let started = std::time::Instant::now();
+    bridge.handle_event("input", "spin please nanopi-test-spin forever");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "handler ran {elapsed:?} — the event budget (2s) does not look enforced; \
+         15s is chosen to sit between it and the 30s tool budget, so inheriting \
+         the tool budget fails here too"
+    );
+
+    // A blown deadline is a trap, and a trap must leave the plugin
+    // usable — same contract as the trap test above.
+    let out = bridge
+        .execute_tool("greet", r#"{"name":"nanopi"}"#)
+        .expect("greet call after the deadline trap");
+    assert!(!out.is_error, "{}", out.content);
+}

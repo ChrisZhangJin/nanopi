@@ -177,6 +177,13 @@ static mut COUNT_INPUT: u64 = 0;
 /// "some string", so the check is a plain substring match.
 const TEST_TRAP_MARKER: &str = "nanopi-test-trap";
 
+/// Payload sentinel that makes `handle-event` spin forever, so a test
+/// can prove the event epoch budget actually interrupts guest code
+/// rather than merely being a smaller number than the tool budget.
+/// Unbounded on purpose: a bounded loop would prove nothing about the
+/// deadline, only about the loop.
+const TEST_SPIN_MARKER: &str = "nanopi-test-spin";
+
 // ═══ Canonical ABI exports ═══════════════════════════════════════════
 
 #[export_name = "list-tools"]
@@ -334,6 +341,15 @@ pub unsafe extern "C" fn handle_event(
 
     if payload.contains(TEST_TRAP_MARKER) {
         core::arch::wasm32::unreachable();
+    }
+
+    if payload.contains(TEST_SPIN_MARKER) {
+        // Volatile so opt-level=z + LTO cannot fold it away. Only the
+        // epoch deadline ends this.
+        let mut sink: u8 = 0;
+        loop {
+            core::ptr::write_volatile(&mut sink, sink.wrapping_add(1));
+        }
     }
 
     match event.as_str() {
