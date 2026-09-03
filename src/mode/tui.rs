@@ -3488,6 +3488,26 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             // render a blue running-state strip until ToolResult.
             app.tool_started_at = Some(std::time::Instant::now());
         }
+        AgentEvent::ToolCallRewritten {
+            call_id,
+            tool_name,
+            arguments,
+        } => {
+            // The card is only drawn when the result arrives, so the
+            // stashed bar can still be corrected in place — the user
+            // ends up seeing what actually ran rather than what the
+            // model asked for. `↻` replaces the usual chip so the
+            // difference is visible rather than silently swapped.
+            let (_, body) = tool_call_bar_text(&tool_name, &arguments);
+            if let Some(slot) = app
+                .pending_tool_calls
+                .iter_mut()
+                .find(|(id, _)| *id == call_id)
+            {
+                slot.1.leading = format!(" ↻ {} ", tool_name.to_ascii_lowercase());
+                slot.1.body = body;
+            }
+        }
         AgentEvent::ToolResult {
             call_id,
             tool_name,
@@ -5527,6 +5547,48 @@ mod tests {
         // The rows flanking the block are unstyled separators.
         assert!(rows.first().unwrap().1.is_none());
         assert!(rows.last().unwrap().1.is_none());
+    }
+
+/// A rewrite corrects the stashed bar in place.
+    ///
+    /// The card is only drawn when the result arrives, which is what
+    /// makes this possible: the user ends up seeing the command that
+    /// actually ran. Without it the card showed `echo hello` while
+    /// `echo REWRITTEN` executed — in manual testing the model saw its
+    /// own request answered differently and invented a sandbox to
+    /// explain it.
+    #[test]
+    fn a_rewrite_corrects_the_pending_bar() {
+        let mut app = mkapp();
+        app.pending_tool_calls.push((
+            "call_1".to_string(),
+            PendingBar {
+                leading: " $ ".into(),
+                body: "echo hello".into(),
+            },
+        ));
+
+        let (leading, body) =
+            tool_call_bar_text("bash", &serde_json::json!({"command": "echo REWRITTEN"}));
+        assert_eq!(body, "echo REWRITTEN", "sanity: {leading:?}");
+
+        // What the event handler does, asserted on the stash.
+        if let Some(slot) = app
+            .pending_tool_calls
+            .iter_mut()
+            .find(|(id, _)| id == "call_1")
+        {
+            slot.1.leading = " ↻ bash ".to_string();
+            slot.1.body = body;
+        }
+
+        let bar = take_pending_bar(&mut app, "call_1").expect("bar");
+        assert_eq!(bar.body, "echo REWRITTEN", "the card must show what ran");
+        assert!(
+            bar.leading.contains('↻'),
+            "the rewrite must be visible, not a silent swap: {:?}",
+            bar.leading
+        );
     }
 
     /// Regression: with `tool_exec_mode = "parallel"` (the default)

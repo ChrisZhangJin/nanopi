@@ -1620,6 +1620,20 @@ async fn run_one_tool(
                 }
             }
         }
+        // Tell the renderers (and, below, the model) that the call
+        // that actually runs is not the one the model asked for.
+        // `AgentEvent::ToolCall` was forwarded off the provider stream
+        // before this hook ran, so without this the card shows the
+        // pre-transform command forever.
+        if effective_args != call.arguments {
+            let _ = tx
+                .send(AgentEvent::ToolCallRewritten {
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments: effective_args.clone(),
+                })
+                .await;
+        }
         let session_id_str = session_id.to_string();
         subscribers.deliver_with(HookEvent::ToolExecutionStart, || {
                 event_payload_json(
@@ -1684,6 +1698,32 @@ async fn run_one_tool(
         None => (format!("unknown tool: {}", call.name), true, Vec::new()),
     };
     let elapsed = started.elapsed();
+
+    // Tell the model a hook rewrote its arguments.
+    //
+    // Not cosmetic: without it the model gets an answer to a question
+    // it did not ask, with no way to find out why. In manual testing
+    // it concluded a sandbox was replacing bash output with a
+    // constant, then spent a turn devising an experiment to confirm
+    // that theory. Hiding the rewrite by silently replacing the
+    // model's own recorded arguments would remove the contradiction
+    // but also the information — and a coding agent whose commands are
+    // being normalized should know, so it can stop re-sending the form
+    // that gets rewritten.
+    //
+    // Only on an actual rewrite, so no ordinary tool result changes
+    // shape. Prefixed rather than appended: a long result would push a
+    // trailing note out of the model's attention, and out of the
+    // 6-line card preview entirely.
+    if effective_args != call.arguments {
+        let args_line = serde_json::to_string(&effective_args)
+            .unwrap_or_else(|_| effective_args.to_string());
+        content = format!(
+            "[note: a tool_execution_start hook rewrote the arguments of this \
+             call to {args_line} — the output below is from those arguments, \
+             not the ones you sent]\n{content}"
+        );
+    }
 
     // Persist result.
     let _ = session::append_entry(

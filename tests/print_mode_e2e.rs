@@ -354,3 +354,87 @@ fn one_failing_tool_does_not_abort_the_batch() {
     );
     assert!(out.contains("handled"), "turn did not finish: {out:?}");
 }
+
+/// A `tool_execution_start` hook rewriting the arguments must be
+/// visible to BOTH sides.
+///
+/// This is the manual-test finding: the card/marker showed the command
+/// the model asked for while a different one ran, so the model saw its
+/// own request answered differently and invented a sandbox to explain
+/// it. End-to-end because the two halves live in different layers —
+/// the `↻` marker in the renderer, the note in the agent loop.
+#[test]
+fn a_hook_rewrite_is_visible_to_the_user_and_the_model() {
+    let dir = std::env::temp_dir().join("nanopi-rewrite-e2e");
+    std::fs::create_dir_all(dir.join(".nanopi")).expect("cfg dir");
+    let hook = dir.join("rewrite.sh");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ncat > /dev/null\necho '{\"decision\":\"allow\",\"updated_input\":{\"command\":\"echo REWRITTEN\"}}'\n",
+    )
+    .expect("hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        dir.join(".nanopi/config.toml"),
+        format!(
+            "[[hooks.tool_execution_start]]\nmatcher = \"^bash$\"\ncommand = \"{}\"\n",
+            hook.display()
+        ),
+    )
+    .expect("config");
+
+    let port = spawn_sse_server_seq(vec![
+        vec![
+            tool_call_delta(0, "call_a", "bash", r#"{"command":"echo hello"}"#),
+            finish("tool_calls"),
+        ],
+        vec![delta("content", "ok")],
+    ]);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(&dir)
+        .args(["-p", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "k"])
+        .args(["--no-skills", "--no-context-files"])
+        .arg("run it")
+        .env("NANOPI_HOME", dir.join("home"))
+        .output()
+        .expect("run");
+    let stdout = strip_sgr(&String::from_utf8_lossy(&out.stdout));
+
+    // User side: the original marker, then the rewrite marker naming
+    // what actually ran.
+    assert!(
+        stdout.contains("[bash call_a] echo hello"),
+        "original marker missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("[bash ↻ call_a] echo REWRITTEN"),
+        "rewrite marker missing: {stdout:?}"
+    );
+
+    // Model side: the note rides on the tool result, so the session
+    // transcript carries it.
+    let sessions = dir.join("home/sessions");
+    let mut found_note = false;
+    if let Ok(rd) = std::fs::read_dir(&sessions) {
+        for e in rd.flatten() {
+            let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+            if text.contains("rewrote the arguments of this call") {
+                found_note = true;
+            }
+        }
+    }
+    assert!(
+        found_note,
+        "the model was never told its arguments were rewritten; \
+         session dir {sessions:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

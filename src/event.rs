@@ -26,6 +26,24 @@ pub enum AgentEvent {
     /// the call block is closed, then emit one `ToolCall` with parsed args.
     ToolCall { content_index: u32, call: ToolCall },
 
+    /// A `tool_execution_start` hook rewrote a call's arguments.
+    ///
+    /// `ToolCall` above is forwarded straight off the provider stream,
+    /// so it necessarily carries what the MODEL asked for — the hook
+    /// has not run yet. Without this event the card would keep showing
+    /// `echo hello` while `echo REWRITTEN` actually ran, which is
+    /// exactly what happened in manual testing: the model saw its own
+    /// request come back with a different answer and invented a
+    /// sandbox to explain it, then spent a turn investigating.
+    ///
+    /// Emitted only when the arguments actually changed, so the common
+    /// case costs nothing.
+    ToolCallRewritten {
+        call_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
+
     /// A tool call finished. Emitted by `Agent::execute_tool_calls`
     /// after the local tool ran, NOT by any provider. Carries the
     /// output content, error flag, and wall-clock duration so the

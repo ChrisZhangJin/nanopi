@@ -191,6 +191,25 @@ impl StdoutRenderer {
                 )?;
                 out.flush()?;
             }
+            AgentEvent::ToolCallRewritten {
+                call_id,
+                tool_name,
+                arguments,
+            } => {
+                // `-p` printed the original marker the moment the
+                // provider emitted the call, so unlike the TUI it
+                // cannot be corrected in place — say so on its own
+                // line instead.
+                self.after_thinking = false;
+                write!(
+                    out,
+                    "\x1b[33m[{} ↻ {}] {}\x1b[0m\n",
+                    tool_name,
+                    short_call_id(call_id),
+                    arg_preview(tool_name, arguments)
+                )?;
+                out.flush()?;
+            }
             AgentEvent::ToolResult {
                 call_id,
                 tool_name,
@@ -427,6 +446,35 @@ mod tests {
             r.render_to(&mut sink, &ev).unwrap();
         }
         assert_eq!(r.buffer, "Hello, Tom! — from my-plugin");
+    }
+
+/// A rewrite gets its own marker in `-p`.
+    ///
+    /// Unlike the TUI, `-p` already printed the original marker the
+    /// moment the provider emitted the call, so it cannot be corrected
+    /// in place — the `↻` line is how a reader of a piped log learns
+    /// that what ran differs from what was asked.
+    #[test]
+    fn a_rewritten_call_gets_its_own_marker() {
+        let out = rendered(&[
+            AgentEvent::ToolCall {
+                content_index: 0,
+                call: crate::event::ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "echo hello"}),
+                },
+            },
+            AgentEvent::ToolCallRewritten {
+                call_id: "call_1".into(),
+                tool_name: "bash".into(),
+                arguments: json!({"command": "echo REWRITTEN"}),
+            },
+        ]);
+        // The original is still on the record — a piped log should show
+        // both what was asked and what ran.
+        assert!(out.contains("[bash call_1] echo hello"), "{out:?}");
+        assert!(out.contains("[bash ↻ call_1] echo REWRITTEN"), "{out:?}");
     }
 
     /// A tool marker already opens with `\n`, so the pending separator
