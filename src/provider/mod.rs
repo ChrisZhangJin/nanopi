@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod openai;
 pub mod retry;
 pub mod sse;
+pub mod think_tags;
 
 use crate::agent::loop_::Provider;
 
