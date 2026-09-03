@@ -39,7 +39,7 @@ Alpine 能跑，CentOS 6 能跑，`npm install` 跑不通的地方它也能跑�
   Alpine 和其他一切环境
 - 🪶 **~4 MB 静态二进制** —— musl + LTO + strip（下载体积 1.6 MB，UPX 压缩后）
 - 🧬 **PI-parity** —— 对齐 [Pi](https://github.com/earendil-works/pi) 的用户界面：JSONL 会话、hooks、skills、`-p`、`/fork`、`/resume`
-- 🔌 **多 provider** —— 任何 OpenAI 兼容端点（DeepSeek、ollama、vLLM …）以及原生 Anthropic
+- 🔌 **多 provider** —— 任何 OpenAI 兼容端点（DeepSeek、ollama、vLLM …）以及原生 Anthropic；`config.toml` 里的 `provider` / `api_kind` 可以在 base_url 嗅探不够用时显式指定厂商和协议。对于把推理过程内联成 `<think>…</think>` 字面标签塞进回复文本的厂商（小米 MiMo、MiniMax），nanopi 会把它拆出来按思考渲染 —— `inline_think_tags = true | false` 可覆盖每个厂商的默认值。
 - 🛠 **流式工具调用** —— `read` / `write` / `edit` / `bash`，在 ratatui TUI 里实时渲染
 - 🪝 **Claude Code 协议的 hooks** —— JSON 走 stdin、退出码 2 表示拒绝的 shell 钩子，事件名沿用 PI 的命名（`tool_execution_start` / `tool_execution_end` / `input` / …）
 - 🧠 **Agent Skills** —— 遵循 [官方规范](https://agentskills.io/specification) 的 `SKILL.md` 发现 + `/skill:name` 展开
