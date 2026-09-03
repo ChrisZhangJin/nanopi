@@ -57,8 +57,8 @@ pub async fn run_print_mode(
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
-    // `config.inline_think_tags` — escape hatch for
-    // `Vendor::inlines_think_tags`. `None` defers to the vendor.
+    // `config.inline_think_tags` — escape hatch for the inline
+    // `<think>` splitter (on by default). `None` leaves it on.
     inline_think_tags: Option<bool>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();

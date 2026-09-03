@@ -86,10 +86,11 @@ pub fn effective_kind(
 /// MinimaxVendor's Anthropic-only gateway working out of the box, while
 /// still honoring an explicit `api_kind`).
 /// `inline_think_tags` is `Config::inline_think_tags` — the escape hatch
-/// for `Vendor::inlines_think_tags`. `None` defers to the vendor;
-/// `Some(_)` is final. Only meaningful for the OpenAI-compat transport;
-/// ignored for Anthropic (which already gets reasoning via its own
-/// `thinking` block).
+/// for the inline `<think>…</think>` splitter (`provider::think_tags`),
+/// which is on by default for every OpenAI-wire vendor. `None` leaves
+/// the default on; `Some(_)` is final. Only meaningful for the
+/// OpenAI-compat transport; ignored for Anthropic (which already gets
+/// reasoning via its own `thinking` block).
 pub fn build(
     kind: Option<ApiKind>,
     base_url: &str,

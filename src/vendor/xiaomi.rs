@@ -18,5 +18,4 @@ impl Vendor for XiaomiVendor {
         let m = model.to_ascii_lowercase();
         m.contains("mimo") || m.contains("thinking")
     }
-    fn inlines_think_tags(&self) -> bool { true }
 }

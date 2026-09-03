@@ -28,5 +28,4 @@ impl Vendor for MinimaxVendor {
         let budget = level.budget_tokens();
         body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
     }
-    fn inlines_think_tags(&self) -> bool { true }
 }

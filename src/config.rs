@@ -72,11 +72,12 @@ pub struct Config {
     #[serde(default)]
     pub provider: Option<String>,
 
-    /// Escape hatch for `Vendor::inlines_think_tags`. `None` (default)
-    /// defers to the vendor (true for xiaomi/minimax, false otherwise).
-    /// `Some(true)` forces the `<think>…</think>` splitter on — e.g. for
-    /// an unlisted gateway proxying mimo. `Some(false)` forces it off,
-    /// so a model's literal `<think>` mentions render as plain text.
+    /// Escape hatch for the inline `<think>…</think>` splitter (see
+    /// `provider::think_tags` for the position rule it applies). `None`
+    /// (default) leaves it on — every OpenAI-wire vendor gets a LEADING
+    /// `<think>` block reclassified as reasoning. `Some(true)` is a
+    /// no-op. `Some(false)` forces it off entirely, so even a leading
+    /// `<think>` renders as plain text.
     #[serde(default)]
     pub inline_think_tags: Option<bool>,
 

@@ -547,21 +547,23 @@ fn inline_think_excluded_from_json_envelope() {
 /// The gate is real: without a vendor that inlines think tags, the same
 /// stream renders the literal `<think>` verbatim.
 #[test]
-fn inline_think_untouched_for_other_vendors() {
+fn inline_think_mid_answer_reaches_stdout_literally() {
     let port = spawn_sse_server(vec![
-        delta("content", "<thi"),
-        delta("content", "nk>reasoning</think>ANSWER"),
+        delta("content", "ANSWER first, "),
+        delta("content", "then <think>reasoning</think> more"),
         finish("stop"),
     ]);
 
     // No provider override, no vendor-matching base_url/model → sniff
-    // falls all the way through to FallbackVendor, which does not inline
-    // think tags.
+    // falls through to FallbackVendor. The splitter is on by default
+    // regardless of vendor now (position rule, not a vendor gate) — but
+    // this `<think>` arrives AFTER other text, so it's not a leading
+    // block and must render literally.
     let out = run_p(port, &["greet Tom"]);
 
     assert!(
-        out.contains("<think>"),
-        "the gate ate the tag for a non-gated vendor: {out:?}"
+        out.contains("<think>reasoning</think>"),
+        "a non-leading <think> block must render literally: {out:?}"
     );
 }
 
@@ -577,4 +579,29 @@ fn inline_think_unclosed_still_delivers() {
     let out = run_p_with_provider(port, "xiaomi", "", &["greet Tom"]);
 
     assert!(out.contains("before"), "lost text before the tag: {out:?}");
+}
+
+/// `inline_think_tags = false` in config.toml is the escape hatch: it
+/// disables the splitter entirely, so even a genuinely LEADING `<think>`
+/// block (which would otherwise be reclassified as reasoning) renders as
+/// plain text.
+#[test]
+fn inline_think_tags_false_disables_splitting_even_for_leading_block() {
+    let port = spawn_sse_server(vec![
+        delta("content", "<thi"),
+        delta("content", "nk>reasoning</think>ANSWER"),
+        finish("stop"),
+    ]);
+
+    let out = run_p_with_provider(
+        port,
+        "xiaomi",
+        "inline_think_tags = false",
+        &["greet Tom"],
+    );
+
+    assert!(
+        out.contains("<think>reasoning</think>"),
+        "escape hatch should leave a leading block untouched: {out:?}"
+    );
 }

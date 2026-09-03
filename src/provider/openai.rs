@@ -201,10 +201,13 @@ pub struct OpenAiProvider {
     /// emission. If `None`, request body omits reasoning params.
     pub vendor: Option<Box<dyn crate::vendor::Vendor>>,
     /// Route `delta.content` through `InlineThinkSplitter`, reclassifying
-    /// `<think>…</think>` spans as `ThinkingDelta` instead of `TextDelta`.
-    /// Set from `vendor.inlines_think_tags()` in `with_vendor`, and
-    /// overridable via `with_inline_think` (the `Config::inline_think_tags`
-    /// escape hatch). Default `false`.
+    /// a LEADING `<think>…</think>` span as `ThinkingDelta` instead of
+    /// `TextDelta` (see `provider::think_tags` for the position rule).
+    /// On by default for every vendor on the OpenAI wire — `<think>` is a
+    /// model-level convention, not a vendor-specific one, so there's no
+    /// vendor gate here anymore. Overridable via `with_inline_think` (the
+    /// `Config::inline_think_tags` escape hatch): `Some(false)` disables
+    /// splitting entirely, `Some(true)` is a no-op (already the default).
     pub split_inline_think: bool,
 }
 
@@ -222,15 +225,14 @@ impl OpenAiProvider {
                 .build()
                 .expect("build reqwest client"),
             vendor: None,
-            split_inline_think: false,
+            split_inline_think: true,
         }
     }
 
-    /// v0.9.3: attach a vendor. Also sets `split_inline_think` from the
-    /// vendor's `inlines_think_tags()` — read it BEFORE the vendor moves
-    /// into the struct.
+    /// v0.9.3: attach a vendor. `split_inline_think` is no longer set
+    /// from the vendor (see the position rule in `provider::think_tags`)
+    /// — it's already on by default from `new()`.
     pub fn with_vendor(mut self, vendor: Box<dyn crate::vendor::Vendor>) -> Self {
-        self.split_inline_think = vendor.inlines_think_tags();
         self.vendor = Some(vendor);
         self
     }

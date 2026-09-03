@@ -348,8 +348,8 @@ pub async fn run_tui_mode(
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
-    // `config.inline_think_tags` — escape hatch for
-    // `Vendor::inlines_think_tags`. `None` defers to the vendor.
+    // `config.inline_think_tags` — escape hatch for the inline
+    // `<think>` splitter (on by default). `None` leaves it on.
     inline_think_tags: Option<bool>,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
@@ -701,8 +701,8 @@ struct App {
     /// v0.9.3: cached `config.provider` string used by every
     /// `pick_vendor()` call at Agent build. Populated at startup.
     cfg_provider: Option<String>,
-    /// `config.inline_think_tags` — escape hatch for
-    /// `Vendor::inlines_think_tags`, threaded to every follow-up
+    /// `config.inline_think_tags` — escape hatch for the inline
+    /// `<think>` splitter (on by default), threaded to every follow-up
     /// `provider::build()` call the same way `cfg_provider` is.
     inline_think_tags: Option<bool>,
     /// v0.9.3: id from `pick_vendor` at last Agent build. `None`
