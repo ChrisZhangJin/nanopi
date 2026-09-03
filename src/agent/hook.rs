@@ -1273,6 +1273,67 @@ mod tests {
     /// is what a WASM subscriber receives (`src/subscriber.rs`'s
     /// `deliver_with` calls `event_payload_json`) — if either side ever
     /// drifts from `build_hook_input`, this test catches it.
+    /// Transforms accumulate: hook N sees hook N-1's rewrite.
+    ///
+    /// This is what makes a chain of hooks a pipeline rather than a
+    /// race, and nothing pinned it. The manual case that was supposed
+    /// to cover it could not: its inline `sh -c 'echo {"a":"b"}'`
+    /// had the inner shell strip the double quotes, so the hook
+    /// emitted `{a:b}`, the JSON parse failed, and BOTH hooks silently
+    /// degraded to plain allow — the test passed nothing and looked
+    /// like a product bug.
+    #[tokio::test]
+    async fn transforms_accumulate_across_hooks() {
+        let dir = std::env::temp_dir().join(format!("nanopi-xf-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Script files, not inline `sh -c` — quoting JSON through two
+        // levels of shell is exactly what broke the manual version.
+        let mut hooks = Vec::new();
+        for step in ["STEP1", "STEP2"] {
+            let path = dir.join(format!("{step}.sh"));
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncat > /dev/null\necho '{{\"decision\":\"allow\",\"updated_input\":{{\"command\":\"echo {step}\"}}}}'\n"
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            hooks.push(HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: path.display().to_string(),
+                timeout: 4000,
+            });
+        }
+
+        let (outcome, args) = run_hooks(
+            &hooks,
+            HookEvent::ToolExecutionStart,
+            "bash",
+            None,
+            json!({"command": "echo ORIGINAL"}),
+            &dir,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, HookOutcome::Allow);
+        let args = args.expect("a transform happened");
+        assert_eq!(
+            args.get("command").and_then(|v| v.as_str()),
+            Some("echo STEP2"),
+            "the LAST hook's rewrite must win, having seen the first's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn run_hooks_stdin_matches_event_payload_json_byte_for_byte() {
         let mut marker = std::env::temp_dir();
