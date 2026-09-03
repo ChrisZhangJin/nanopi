@@ -46,6 +46,30 @@ pub trait Vendor: Send + Sync + std::fmt::Debug {
     fn write_thinking(&self, body: &mut Value, level: ThinkingLevel, _model: &str) {
         body["reasoning_effort"] = json!(openai_effort_string(level));
     }
+
+    /// Does this vendor inline its reasoning as literal `<think>…</think>`
+    /// tags inside `delta.content` on the OpenAI-compatible wire, rather
+    /// than using `reasoning_content` or a separate protocol field?
+    ///
+    /// Observed for Xiaomi MiMo and MiniMax. When true, `OpenAiProvider`
+    /// routes `delta.content` through `InlineThinkSplitter` and emits
+    /// `ThinkingDelta` for the enclosed spans instead of `TextDelta`, so
+    /// reasoning stops polluting the answer, the context, the session
+    /// transcript, and `--output json`.
+    ///
+    /// Defaults to `false` — every other vendor, including an absent
+    /// vendor (`vendor: None`), is unaffected.
+    ///
+    /// Stated failure mode (see plan D2): with this on, a model that
+    /// legitimately writes a literal `<think>` tag in its ANSWER (e.g.
+    /// helping the user author a prompt) has that span misclassified as
+    /// reasoning and dropped from the transcript. Bounded by: only two
+    /// vendors default to true; `Config::inline_think_tags = Some(false)`
+    /// turns it off entirely; fenced code is not special-cased, so a
+    /// `<think>` inside a code block is eaten too. That is an accepted,
+    /// narrow cost — a fence-aware parser is out of scope and would
+    /// itself be a source of silent loss.
+    fn inlines_think_tags(&self) -> bool { false }
 }
 
 /// True when a base_url addresses a gateway's Anthropic-protocol
@@ -295,5 +319,20 @@ mod tests {
     #[test]
     fn pick_vendor_no_signal_returns_fallback() {
         assert_eq!(pick_vendor(None, None, "some-random-model").id(), "fallback");
+    }
+
+    /// Only the two vendors observed inlining `<think>` in `delta.content`
+    /// default the gate on; every other vendor stays false.
+    #[test]
+    fn inlines_think_tags_true_only_for_xiaomi_and_minimax() {
+        assert!(XiaomiVendor.inlines_think_tags());
+        assert!(MinimaxVendor.inlines_think_tags());
+
+        assert!(!OpenAiVendor.inlines_think_tags());
+        assert!(!AnthropicVendor.inlines_think_tags());
+        assert!(!DeepSeekVendor.inlines_think_tags());
+        assert!(!ZaiVendor.inlines_think_tags());
+        assert!(!QwenVendor.inlines_think_tags());
+        assert!(!FallbackVendor.inlines_think_tags());
     }
 }

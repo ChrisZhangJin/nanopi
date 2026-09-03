@@ -72,6 +72,14 @@ pub struct Config {
     #[serde(default)]
     pub provider: Option<String>,
 
+    /// Escape hatch for `Vendor::inlines_think_tags`. `None` (default)
+    /// defers to the vendor (true for xiaomi/minimax, false otherwise).
+    /// `Some(true)` forces the `<think>…</think>` splitter on — e.g. for
+    /// an unlisted gateway proxying mimo. `Some(false)` forces it off,
+    /// so a model's literal `<think>` mentions render as plain text.
+    #[serde(default)]
+    pub inline_think_tags: Option<bool>,
+
     #[serde(default)]
     pub trust: TrustConfig,
 
@@ -236,6 +244,7 @@ impl Config {
             api_key: None,
             api_kind: None,
             provider: None,
+            inline_think_tags: None,
             trust: TrustConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
@@ -344,6 +353,7 @@ fn merge(a: Config, b: Config) -> Config {
         api_key: b.api_key.or(a.api_key),
         api_kind: b.api_kind.or(a.api_kind),
         provider: b.provider.or(a.provider),
+        inline_think_tags: b.inline_think_tags.or(a.inline_think_tags),
         trust: TrustConfig {
             default: b.trust.default.or(a.trust.default),
         },
@@ -534,6 +544,7 @@ command = "echo hi"
             api_key: None,
             api_kind: None,
             provider: None,
+            inline_think_tags: None,
             trust: TrustConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
@@ -547,6 +558,7 @@ command = "echo hi"
             api_key: None,
             api_kind: None,
             provider: None,
+            inline_think_tags: None,
             trust: TrustConfig::default(),
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),

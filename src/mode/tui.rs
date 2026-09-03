@@ -348,6 +348,9 @@ pub async fn run_tui_mode(
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    // `config.inline_think_tags` — escape hatch for
+    // `Vendor::inlines_think_tags`. `None` defers to the vendor.
+    inline_think_tags: Option<bool>,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -391,6 +394,7 @@ pub async fn run_tui_mode(
             Some(base_url),
             model,
         )),
+        inline_think_tags,
     );
     let registry = ToolRegistry::standard();
 
@@ -489,6 +493,7 @@ pub async fn run_tui_mode(
     // later pick_vendor() (model swap, /new, /fork) reads it from there,
     // and it used to sit at None forever, silently ignoring the field.
     app.cfg_provider = cfg_provider.clone();
+    app.inline_think_tags = inline_think_tags;
     let initial_vendor = crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), model);
     app.vendor_id = Some(initial_vendor.id().to_string());
     // Prime the skills cache from the just-built agent so the very
@@ -696,6 +701,10 @@ struct App {
     /// v0.9.3: cached `config.provider` string used by every
     /// `pick_vendor()` call at Agent build. Populated at startup.
     cfg_provider: Option<String>,
+    /// `config.inline_think_tags` — escape hatch for
+    /// `Vendor::inlines_think_tags`, threaded to every follow-up
+    /// `provider::build()` call the same way `cfg_provider` is.
+    inline_think_tags: Option<bool>,
     /// v0.9.3: id from `pick_vendor` at last Agent build. `None`
     /// before first build; `Some("fallback")` when no signal matched.
     /// Footer suppresses the fallback string.
@@ -822,6 +831,7 @@ impl App {
             api_kind,
             bindings: crate::keys::KeyBindings::default(),
             cfg_provider: None,
+            inline_think_tags: None,
             vendor_id: None,
             usage: crate::event::Usage::default(),
             context_chars: 0,
@@ -1870,7 +1880,7 @@ async fn handle_action(
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let new_provider =
-                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&a.base_url), &new_model)));
+                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&a.base_url), &new_model)), app.inline_think_tags);
                 a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();
@@ -1924,7 +1934,7 @@ async fn handle_action(
             let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
                 cwd: cwd.clone(),
                 registry,
-                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model))),
+                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags),
                 session_path: new_path,
                 session_id: new_header.id.clone(),
                 permission,
@@ -2035,7 +2045,7 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
             let registry = crate::tool::ToolRegistry::standard();
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
@@ -2482,7 +2492,7 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
             let registry = crate::tool::ToolRegistry::standard();
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
@@ -3205,7 +3215,7 @@ async fn execute_fork(
             return Ok(());
         }
     };
-    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
     let registry = crate::tool::ToolRegistry::standard();
     new_agent.context.tools = registry.all_specs();
     let diags = new_agent.hydrate_resumed(
@@ -3274,7 +3284,7 @@ async fn spawn_summarize_task(
             None => return,
         }
     };
-    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
     let cut_off = pending.cut_off.clone();
     let task = tokio::spawn(async move {
         match crate::agent::branch_summary::summarize_branch(

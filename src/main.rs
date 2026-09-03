@@ -398,6 +398,7 @@ async fn main() -> ExitCode {
             skill_load.clone(),
             args.no_context_files,
             prompt_overrides.clone(),
+            cfg.inline_think_tags,
         )
         .await
     } else {
@@ -417,6 +418,7 @@ async fn main() -> ExitCode {
             skill_load.clone(),
             args.no_context_files,
             prompt_overrides.clone(),
+            cfg.inline_think_tags,
         )
         .await
     };

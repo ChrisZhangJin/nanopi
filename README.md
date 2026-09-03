@@ -40,7 +40,7 @@ Runs on Alpine, on CentOS 6, and anywhere `npm install` isn't an option.
 - 🪶 **~4 MB static binary** — musl + LTO + strip (the download is 1.6 MB,
   UPX-packed)
 - 🧬 **PI-parity** — mirrors [Pi](https://github.com/earendil-works/pi)'s surface: JSONL sessions, hooks, skills, `-p`, `/fork`, `/resume`
-- 🔌 **Multi-provider** — any OpenAI-compatible endpoint (DeepSeek, ollama, vLLM, …) plus native Anthropic
+- 🔌 **Multi-provider** — any OpenAI-compatible endpoint (DeepSeek, ollama, vLLM, …) plus native Anthropic; `provider` / `api_kind` in `config.toml` pick the vendor and wire protocol explicitly when the base_url sniff isn't enough. For vendors that inline reasoning as literal `<think>…</think>` in the reply text (Xiaomi MiMo, MiniMax), it's split out and rendered as thinking — `inline_think_tags = true | false` overrides the default per vendor.
 - 🛠 **Streaming tool calls** — `read` / `write` / `edit` / `bash`, rendered live in a ratatui TUI
 - 🪝 **Claude Code-protocol hooks** — JSON-on-stdin, exit-2-to-block shell hooks, using PI's event names (`tool_execution_start` / `tool_execution_end` / `input` / …)
 - 🧠 **Agent Skills** — [spec-compliant](https://agentskills.io/specification) `SKILL.md` discovery + `/skill:name` expansion
