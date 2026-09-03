@@ -444,7 +444,47 @@ pub async fn run_hook(
         return Ok(decision);
     }
 
-    // exit 0 (or any other code) with no decision = allow.
+    // Any other non-zero exit with no decision: allow, but SAY SO.
+    //
+    // This is where a misconfigured hook goes to die quietly. nanopi
+    // runs hooks through `bash -c`, so a bad `command` does not fail
+    // the spawn — bash starts fine and exits 127. Neither 2 nor JSON,
+    // so it lands here, and before this warning existed the user got
+    // zero protection and zero signal:
+    //
+    //   127  path typo'd, or the file is not there
+    //   126  the file is there but not executable — no chmod +x
+    //     1  the script itself errored
+    //
+    // Someone installing a `check-rm-rf.sh` and forgetting `chmod +x`
+    // is the case that matters: a security hook silently doing
+    // nothing. Claude Code's protocol treats non-0/non-2 as an error
+    // too, so allowing without a word was not even protocol-faithful.
+    //
+    // Deliberately not a Block: turning a broken hook into a refusal
+    // would make a typo wedge every tool call, which is worse than
+    // failing open with a warning. Fail-open is the documented
+    // contract; being quiet about it was the defect.
+    if exit_code != 0 {
+        let hint = match exit_code {
+            127 => " (127 = command not found — check the path)",
+            126 => " (126 = not executable — chmod +x?)",
+            _ => "",
+        };
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            let head: String = detail.chars().take(200).collect();
+            format!(" stderr={head:?}")
+        };
+        eprintln!(
+            "nanopi: {} hook exited {exit_code}{hint} with no decision \
+             — allowing the call. command={:?}{detail}",
+            input.event.env_var(),
+            hook.command
+        );
+    }
     Ok(HookOutcome::Allow)
 }
 
@@ -700,6 +740,75 @@ mod tests {
     fn expand_command_absolute_passthrough() {
         let p = expand_command("/usr/local/bin/hook.sh");
         assert_eq!(p.to_string_lossy(), "/usr/local/bin/hook.sh");
+    }
+
+    /// A misconfigured hook must not fail silently.
+    ///
+    /// Found in manual testing: a hook whose `command` points at a
+    /// missing file allowed every call with no diagnostic. nanopi runs
+    /// hooks through `bash -c`, so the spawn succeeds and bash exits
+    /// 127 — neither 2 nor a JSON decision, so it fell into the plain
+    /// allow branch. The user believed a security hook was active when
+    /// it was doing nothing at all.
+    ///
+    /// Still allows (fail-open is the documented contract; a typo must
+    /// not wedge every tool call) — the fix is that it now says so.
+    #[tokio::test]
+    async fn a_hook_that_exits_nonzero_still_allows() {
+        for (command, label) in [
+            ("/nonexistent/path/to/hook.sh", "missing file → 127"),
+            ("exit 1", "script error → 1"),
+        ] {
+            let hook = HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: command.into(),
+                timeout: 4000,
+            };
+            let input = build_hook_input(
+                HookEvent::ToolExecutionStart,
+                Some("bash"),
+                None,
+                &json!({"command": "echo hi"}),
+                std::path::Path::new("/tmp"),
+                None,
+            );
+            let out = run_hook(&hook, &input, &HashMap::new())
+                .await
+                .unwrap_or_else(|e| panic!("{label}: should not be Err, got {e}"));
+            assert_eq!(
+                out,
+                HookOutcome::Allow,
+                "{label}: a broken hook must fail OPEN, not block every call"
+            );
+        }
+    }
+
+    /// exit 2 must still block — the warning path above must not have
+    /// swallowed the veto.
+    #[tokio::test]
+    async fn exit_two_still_blocks_after_the_nonzero_warning() {
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: "sh -c 'cat >/dev/null; echo nope >&2; exit 2'".into(),
+            timeout: 4000,
+        };
+        let input = build_hook_input(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            None,
+            &json!({"command": "echo hi"}),
+            std::path::Path::new("/tmp"),
+            None,
+        );
+        let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
+        assert_eq!(
+            out,
+            HookOutcome::Block {
+                reason: "nope".into()
+            }
+        );
     }
 
     #[test]
