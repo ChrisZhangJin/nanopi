@@ -1292,6 +1292,20 @@ impl Agent {
         // instead of at the start of the next turn.
         self.maybe_compact(tx).await;
 
+        // Anything still sitting in the steer channel arrived too late
+        // for the steer pump, which only runs at the top of an
+        // iteration. A turn that ends without tool calls — the common
+        // case — has no next iteration, so a message typed during the
+        // stream was left in the channel: never pushed into context,
+        // never persisted, never seen by the model. The TUI had already
+        // drawn its `[steer]` bar, so the user was told it landed.
+        //
+        // Demote them to follow-ups, same as the cancel and
+        // interrupted-marker paths already do, and the same contract
+        // the WIT docs state for `send_user_message`: steer the running
+        // turn, or queue as a follow-up if it arrives too late.
+        self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
+
         // v0.11.0: surface the first `FollowUp` message (if any)
         // onto the Agent so the caller can auto-trigger another
         // turn. Matches Pi's `getFollowUpMessages()` semantic.
@@ -4493,6 +4507,120 @@ mod tests {
         drop(tx);
         while rx.recv().await.is_some() {}
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A steer that arrives during a turn which ends without tool calls
+    /// must not vanish.
+    ///
+    /// The steer pump only runs at the top of an iteration, so a turn
+    /// finishing on `Stop` — the common single-shot case — has no next
+    /// iteration to drain it. The message stayed in the channel: never
+    /// pushed into context, never persisted, never seen by the model.
+    /// The TUI had already drawn `[steer] …`, so the user was told it
+    /// landed, and on resume the session showed one question and an
+    /// answer that had never been asked.
+    ///
+    /// Observed with `who are you` + a mid-stream `who mai`: the saved
+    /// session held only the first, and the reply addressed only the
+    /// first.
+    #[tokio::test]
+    async fn a_steer_that_misses_its_turn_becomes_a_follow_up() {
+        let dir = tmp();
+        let session_path = dir.join("late_steer.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        // Single-shot provider: text, then Stop. No tool calls, so
+        // `run_turn` never comes back around to the steer pump.
+        //
+        // The steer is sent from INSIDE `stream_turn`, which is the
+        // only way to land in the window that matters: the pump at the
+        // top of iteration 1 has already run, and there is no
+        // iteration 2. Enqueuing before `run_turn` instead exercises
+        // the pump, which always worked.
+        struct OneShot {
+            steer_tx: mpsc::Sender<SteerMessage>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for OneShot {
+            fn id(&self) -> &'static str {
+                "oneshot"
+            }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let _ = tx
+                    .send(AgentEvent::Start {
+                        message_id: "m".into(),
+                    })
+                    .await;
+                // The user types mid-stream. The send SUCCEEDS — the
+                // receiver is alive — which is what distinguishes this
+                // from the TUI's dropped-receiver fallback.
+                self.steer_tx
+                    .send(SteerMessage::Steering {
+                        text: "who am i".into(),
+                    })
+                    .await
+                    .expect("steer channel must still be open mid-stream");
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: "I'm a model.".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::Stop,
+                        usage: Usage::default(),
+                    })
+                    .await;
+                Ok(Usage::default())
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(OneShot { steer_tx }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "oneshot".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
+        };
+
+        let _ = agent
+            .run_turn("who are you", &tx, None, Some(steer_rx))
+            .await
+            .expect("turn");
+
+        assert_eq!(
+            agent.pending_follow_ups.pop_front().as_deref(),
+            Some("who am i"),
+            "a steer that missed its turn must survive as a follow-up, \
+             not be dropped after the TUI has already echoed it"
+        );
+
+        drop(tx);
+        while rx.recv().await.is_some() {}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
