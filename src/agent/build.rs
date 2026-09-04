@@ -117,17 +117,17 @@ fn load_extensions(
     }
     let summary = crate::wasm::PluginHost::new().load_all(extensions, cwd);
     for (path, err) in &summary.errors {
-        eprintln!("nanopi: extension {} failed to load: {err}", path.display());
+        crate::note!("nanopi: extension {} failed to load: {err}", path.display());
     }
     for tool in summary.tools {
         let name = tool.spec().name.clone();
         if let Err(collision) = registry.register_external(tool) {
-            eprintln!(
+            crate::note!(
                 "nanopi: extension tool {collision:?} collides with an \
                  existing tool — skipping it (rename it in the plugin)"
             );
         } else {
-            eprintln!("nanopi: registered extension tool {name:?}");
+            crate::note!("nanopi: registered extension tool {name:?}");
         }
     }
     // Commands are judged as a set, not one at a time: a name claimed
@@ -136,7 +136,7 @@ fn load_extensions(
     let resolved = crate::command::resolve_commands(summary.commands);
     print_command_diagnostics(&resolved.diagnostics);
     for cmd in &resolved.commands {
-        eprintln!(
+        crate::note!(
             "nanopi: registered extension command \"/{}\" from {:?}",
             cmd.spec.name, cmd.plugin_name
         );
@@ -155,7 +155,7 @@ fn load_extensions(
     _cwd: &std::path::Path,
 ) -> (Vec<crate::command::PluginCommand>, crate::subscriber::EventSubscribers) {
     if !extensions.is_empty() {
-        eprintln!(
+        crate::note!(
             "nanopi: {} [[extensions]] entries ignored — this build has no \
              WASM support (rebuild with `--features wasm`)",
             extensions.len()
@@ -169,7 +169,7 @@ fn load_extensions(
 /// same split as `print_skill_diagnostics`.
 pub fn print_command_diagnostics(diags: &[crate::command::CommandDiagnostic]) {
     for d in diags {
-        eprintln!("nanopi: {}", d.message);
+        crate::note!("nanopi: {}", d.message);
     }
 }
 
@@ -396,7 +396,7 @@ pub fn print_skill_diagnostics(diags: &[SkillDiagnostic]) {
             DiagnosticLevel::Warning => "warning",
             DiagnosticLevel::Collision => "collision",
         };
-        eprintln!("skill {}: {} ({})", label, d.message, d.path.display());
+        crate::note!("skill {}: {} ({})", label, d.message, d.path.display());
     }
 }
 

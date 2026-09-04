@@ -72,7 +72,7 @@ pub fn load() -> SettingsFile {
             return SettingsFile::default();
         }
         Err(e) => {
-            eprintln!(
+            crate::note!(
                 "nanopi: settings.toml unreadable ({}): {}; using defaults",
                 path.display(),
                 e
@@ -83,7 +83,7 @@ pub fn load() -> SettingsFile {
     match toml::from_str::<SettingsFile>(&text) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
+            crate::note!(
                 "nanopi: settings.toml parse error ({}): {}; using defaults",
                 path.display(),
                 e

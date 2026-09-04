@@ -563,7 +563,7 @@ impl PluginEngine {
                         2 => "warn",
                         _ => "error",
                     };
-                    eprintln!("[wasm:{tag}] {message}");
+                    crate::note!("[wasm:{tag}] {message}");
                     Ok(())
                 },
             )
@@ -1088,7 +1088,7 @@ impl ComponentBridge {
     fn reset(inner: &mut BridgeInner, rebuild: &PluginRebuild, budget_ticks: u64) {
         match rebuild.build(budget_ticks) {
             Ok(fresh) => *inner = fresh,
-            Err(e) => eprintln!("nanopi: could not recover plugin after trap: {e}"),
+            Err(e) => crate::note!("nanopi: could not recover plugin after trap: {e}"),
         }
     }
 }
@@ -1238,7 +1238,7 @@ impl WasmExecuteBridge for ComponentBridge {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
+                crate::note!(
                     "nanopi: dropped event delivery, plugin busy [event={event}]"
                 );
                 return;
@@ -1267,14 +1267,14 @@ impl WasmExecuteBridge for ComponentBridge {
                 // Return value is discarded by design (§3) — only
                 // `post_return` matters, to release the call frame.
                 if let Err(e) = handle_event.post_return(&mut inner.store) {
-                    eprintln!(
+                    crate::note!(
                         "nanopi: handle-event post_return failed, resetting plugin [event={event}]: {e}"
                     );
                     Self::reset(inner, &self.rebuild, self.budget_ticks);
                 }
             }
             Err(e) => {
-                eprintln!(
+                crate::note!(
                     "nanopi: handle-event trapped, resetting plugin [event={event}]: {e}"
                 );
                 Self::reset(inner, &self.rebuild, self.budget_ticks);

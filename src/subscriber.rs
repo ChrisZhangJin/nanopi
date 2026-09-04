@@ -99,7 +99,7 @@ impl EventSubscribers {
             })
             .await;
             if let Err(join_err) = result {
-                eprintln!(
+                crate::note!(
                     "nanopi: event handler panicked [plugin={plugin_name} event={name} error={join_err}]"
                 );
             }

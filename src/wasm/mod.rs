@@ -92,7 +92,7 @@ impl PluginHost {
             // directory entry would otherwise repeat the warning per
             // `.wasm` and bury the rest of startup.
             if cfg.allow_network && loader::allowlist_allows_any_host(&cfg.url_allowlist) {
-                eprintln!(
+                crate::note!(
                     "nanopi: {} has url_allowlist = [\"*\"] — this plugin may fetch \
                      ANY http/https host, including link-local metadata endpoints. \
                      Narrow it to `*.example.com` or `example.com` if you can.",
@@ -105,7 +105,7 @@ impl PluginHost {
             // startup warning even though both capabilities are
             // individually opt-in (`docs/v0.12-events.md` §5.1).
             if !cfg.events.is_empty() && cfg.allow_network {
-                eprintln!(
+                crate::note!(
                     "nanopi: {} has both `events` and `allow_network = true` — \
                      this plugin can observe lifecycle events AND reach the \
                      network, and could exfiltrate event payloads. Grant both \
@@ -115,7 +115,7 @@ impl PluginHost {
             }
             let (events_granted, refusal_reports) = crate::agent::hook::parse_event_grants(&cfg.events);
             for report in &refusal_reports {
-                eprintln!("nanopi: {}: {report}", cfg.path.display());
+                crate::note!("nanopi: {}: {report}", cfg.path.display());
             }
             let events_granted: Vec<String> =
                 events_granted.into_iter().map(|s| s.to_string()).collect();
@@ -159,7 +159,7 @@ impl PluginHost {
                             }
                         }
                         for unsatisfied in bridge.unsatisfied_event_requests() {
-                            eprintln!(
+                            crate::note!(
                                 "nanopi: {} requested event {unsatisfied:?} but the config's \
                                  `events` did not grant it — not delivered.",
                                 path.display()
@@ -176,7 +176,7 @@ impl PluginHost {
                                         .copied()
                                 })
                                 .collect();
-                            eprintln!(
+                            crate::note!(
                                 "nanopi: {} registered for events: {}",
                                 path.display(),
                                 events.join(", ")
@@ -237,7 +237,7 @@ impl PluginHost {
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        crate::note!(
                             "nanopi: skipping extension dir {}: {e}",
                             expanded.display()
                         );
@@ -247,13 +247,13 @@ impl PluginHost {
                 if expanded.extension().and_then(|e| e.to_str()) == Some("wasm") {
                     out.push(expanded);
                 } else {
-                    eprintln!(
+                    crate::note!(
                         "nanopi: skipping extension (not .wasm): {}",
                         expanded.display()
                     );
                 }
             } else {
-                eprintln!(
+                crate::note!(
                     "nanopi: skipping extension (not found): {}",
                     expanded.display()
                 );

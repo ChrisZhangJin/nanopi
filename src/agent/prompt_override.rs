@@ -130,7 +130,7 @@ fn resolve_prompt_input(input: &str) -> String {
         match std::fs::read_to_string(path) {
             Ok(content) => return content,
             Err(e) => {
-                eprintln!(
+                crate::note!(
                     "warning: '{input}' exists but could not be read as text ({e}); \
                      using it as literal prompt text instead"
                 );

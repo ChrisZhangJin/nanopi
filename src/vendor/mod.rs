@@ -84,7 +84,7 @@ pub fn pick_vendor(
             "minimax" => return Box::new(MinimaxVendor),
             "xiaomi" | "xiaomimimo" => return Box::new(XiaomiVendor),
             "fallback" => return Box::new(FallbackVendor),
-            _ => eprintln!("nanopi: unknown provider `{}` — falling through to sniff", p),
+            _ => crate::note!("nanopi: unknown provider `{}` — falling through to sniff", p),
         }
     }
     if let Some(url) = base_url {

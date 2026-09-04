@@ -478,7 +478,7 @@ pub async fn run_hook(
             let head: String = detail.chars().take(200).collect();
             format!(" stderr={head:?}")
         };
-        eprintln!(
+        crate::note!(
             "nanopi: {} hook exited {exit_code}{hint} with no decision \
              — allowing the call. command={:?}{detail}",
             input.event.env_var(),
@@ -590,7 +590,7 @@ pub async fn run_hooks(
                 // This was a `tracing::warn!`, but nothing ever
                 // initialized a tracing subscriber, so the message the
                 // comment promises went nowhere for its whole life.
-                eprintln!(
+                crate::note!(
                     "nanopi: hook errored; failing open (allow) \
                      [tool={tool_name} matcher={} error={e}]",
                     h.matcher
@@ -672,7 +672,7 @@ pub(crate) fn report_advisory(
 ) {
     match outcome {
         Ok(o) => report_advisory_outcome(event, o),
-        Err(e) => eprintln!(
+        Err(e) => crate::note!(
             "nanopi: {} hook errored [matcher={matcher} error={e}]",
             event.env_var()
         ),
@@ -684,7 +684,7 @@ pub(crate) fn report_advisory(
 /// for the whole chain.
 pub(crate) fn report_advisory_outcome(event: HookEvent, outcome: HookOutcome) {
     if let HookOutcome::Block { reason } = outcome {
-        eprintln!(
+        crate::note!(
             "nanopi: {} hook asked to block; ignored (advisory event) \
              [reason={reason}]",
             event.env_var()

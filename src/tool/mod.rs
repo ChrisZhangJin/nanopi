@@ -383,7 +383,7 @@ impl ToolRegistry {
         // Fallback: gateway-mangled names (see `canonical_name`).
         if let Some(canonical) = self.canonical_name(name) {
             if canonical != name {
-                eprintln!(
+                crate::note!(
                     "warning: tool name {name:?} normalized to {canonical:?} \
                      (upstream provider/gateway may be mangling names)"
                 );

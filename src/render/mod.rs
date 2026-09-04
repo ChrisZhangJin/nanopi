@@ -9,6 +9,7 @@ pub mod export_html;
 pub mod markdown;
 pub mod menu;
 pub mod panel;
+pub mod raw_tty;
 pub mod spinner;
 pub mod status_line;
 pub mod stdout;

@@ -512,7 +512,7 @@ impl OpenAiProvider {
                         }
                         let delay =
                             crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
                             attempt + 1,
                             retry.max_attempts,
@@ -545,7 +545,7 @@ impl OpenAiProvider {
                     }
                     let delay =
                         crate::provider::retry::compute_delay(attempt, &retry, hint, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -565,7 +565,7 @@ impl OpenAiProvider {
                     }
                     let delay =
                         crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -601,7 +601,7 @@ impl OpenAiProvider {
                     {
                         let delay =
                             crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: {}]",
                             attempt + 1,
                             retry.max_attempts,

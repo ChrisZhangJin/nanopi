@@ -393,7 +393,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                             return Err("send timeout: no response headers after 60s".into());
                         }
                         let delay = compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
                             attempt + 1,
                             retry.max_attempts,
@@ -423,7 +423,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                         ));
                     }
                     let delay = compute_delay(attempt, &retry, hint, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -442,7 +442,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                         return Err(msg);
                     }
                     let delay = compute_delay(attempt, &retry, None, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -474,7 +474,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                             && is_retryable_message(&msg)
                         {
                             let delay = compute_delay(attempt, &retry, None, rand01());
-                            eprintln!(
+                            crate::note!(
                                 "[retrying ({}/{}) after {:.1}s: {}]",
                                 attempt + 1,
                                 retry.max_attempts,
@@ -507,7 +507,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                                     && is_retryable_message(&msg)
                                 {
                                     let delay = compute_delay(attempt, &retry, None, rand01());
-                                    eprintln!(
+                                    crate::note!(
                                         "[retrying ({}/{}) after {:.1}s: {}]",
                                         attempt + 1,
                                         retry.max_attempts,
@@ -528,7 +528,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                     let msg = err.message.clone();
                     if !started && attempt < retry.max_attempts && is_retryable_message(&msg) {
                         let delay = compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: {}]",
                             attempt + 1,
                             retry.max_attempts,

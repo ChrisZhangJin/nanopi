@@ -623,6 +623,8 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
+    // From here until teardown, a bare `\n` on stderr staircases.
+    crate::render::raw_tty::set_raw_mode(true);
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
@@ -640,6 +642,7 @@ fn teardown_terminal(term: &mut Term) -> Result<()> {
     // lands on a clean line.
     let _ = term.clear();
     disable_raw_mode()?;
+    crate::render::raw_tty::set_raw_mode(false);
     crossterm::execute!(term.backend_mut(), DisableBracketedPaste)?;
     Ok(())
 }
