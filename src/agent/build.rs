@@ -115,32 +115,70 @@ fn load_extensions(
     if extensions.is_empty() {
         return (Vec::new(), Default::default());
     }
+    use crate::render::notice::Notice;
+    use crate::tool::ToolSource;
+
     let summary = crate::wasm::PluginHost::new().load_all(extensions, cwd);
+    // `load_all` collected its own notices; everything below appends to
+    // the same list so the user gets ONE block per startup rather than
+    // a warning block followed by loose lines.
+    let mut notices = summary.notices;
+
     for (path, err) in &summary.errors {
-        crate::note!("nanopi: extension {} failed to load: {err}", path.display());
+        notices.push(Notice::error(
+            path.display().to_string(),
+            format!("failed to load: {err}"),
+        ));
     }
+
+    // Group the per-tool lines by the plugin that supplied them:
+    // `registered extension tool "greet"` three times over says less
+    // than one `tools: events_seen, busy, greet` line, and buries any
+    // warning above it.
+    let mut registered: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for tool in summary.tools {
         let name = tool.spec().name.clone();
+        let subject = match tool.source() {
+            ToolSource::Plugin { path, .. } => path,
+            // Unreachable — these all came from `load_all` — but a
+            // built-in here should still be reported, not dropped.
+            ToolSource::Builtin => String::new(),
+        };
         if let Err(collision) = registry.register_external(tool) {
-            crate::note!(
-                "nanopi: extension tool {collision:?} collides with an \
-                 existing tool — skipping it (rename it in the plugin)"
-            );
+            notices.push(Notice::warn(
+                subject,
+                format!(
+                    "extension tool {collision:?} collides with an existing \
+                     tool — skipping it (rename it in the plugin)"
+                ),
+            ));
         } else {
-            crate::note!("nanopi: registered extension tool {name:?}");
+            registered.entry(subject).or_default().push(name);
         }
     }
+    for (subject, mut names) in registered {
+        names.sort();
+        notices.push(Notice::info(subject, format!("tools: {}", names.join(", "))));
+    }
+
     // Commands are judged as a set, not one at a time: a name claimed
     // by two plugins must register for neither, which is not decidable
     // while looking at one plugin.
     let resolved = crate::command::resolve_commands(summary.commands);
     print_command_diagnostics(&resolved.diagnostics);
+    let mut by_plugin: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for cmd in &resolved.commands {
-        crate::note!(
-            "nanopi: registered extension command \"/{}\" from {:?}",
-            cmd.spec.name, cmd.plugin_name
-        );
+        by_plugin
+            .entry(cmd.plugin_name.to_string())
+            .or_default()
+            .push(format!("/{}", cmd.spec.name));
     }
+    for (plugin, mut cmds) in by_plugin {
+        cmds.sort();
+        notices.push(Notice::info(plugin, format!("commands: {}", cmds.join(", "))));
+    }
+
+    crate::render::notice::emit("Extensions", &notices);
     let event_subscribers = crate::subscriber::EventSubscribers::from_subscribers(summary.subscribers);
     (resolved.commands, event_subscribers)
 }

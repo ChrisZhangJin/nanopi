@@ -39,6 +39,13 @@ pub struct PluginLoadSummary {
     /// Per-file failures — path plus the reason. Non-fatal: a broken
     /// plugin is reported and skipped, it does not stop startup.
     pub errors: Vec<(std::path::PathBuf, String)>,
+    /// Everything worth telling the user, COLLECTED rather than
+    /// printed as it happens. Loading interleaves warnings with
+    /// progress, so printing inline produced a flat wall in which a
+    /// network-exfiltration warning looked exactly like `registered
+    /// extension tool`. The caller renders these as one grouped block
+    /// (`render::notice`).
+    pub notices: Vec<crate::render::notice::Notice>,
 }
 
 /// Loads `.wasm` components declared in `[[extensions]]` and turns the
@@ -63,6 +70,7 @@ impl PluginHost {
         let mut commands: Vec<crate::command::PluginCommand> = Vec::new();
         let mut subscribers: Vec<crate::subscriber::Subscriber> = Vec::new();
         let mut errors = Vec::new();
+        let mut notices: Vec<crate::render::notice::Notice> = Vec::new();
         let mut loaded = 0usize;
 
         // One engine shared by every plugin — compiled code caches
@@ -83,6 +91,7 @@ impl PluginHost {
                     subscribers,
                     loaded: 0,
                     errors: vec![(anchor, e)],
+                    notices: Vec::new(),
                 };
             }
         };
@@ -92,12 +101,12 @@ impl PluginHost {
             // directory entry would otherwise repeat the warning per
             // `.wasm` and bury the rest of startup.
             if cfg.allow_network && loader::allowlist_allows_any_host(&cfg.url_allowlist) {
-                crate::note!(
-                    "nanopi: {} has url_allowlist = [\"*\"] — this plugin may fetch \
-                     ANY http/https host, including link-local metadata endpoints. \
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    "has url_allowlist = [\"*\"] — this plugin may fetch ANY \
+                     http/https host, including link-local metadata endpoints. \
                      Narrow it to `*.example.com` or `example.com` if you can.",
-                    cfg.path.display()
-                );
+                ));
             }
             // Same idea for `events` + `allow_network`: a plugin that
             // both observes lifecycle events and can reach the network
@@ -105,17 +114,20 @@ impl PluginHost {
             // startup warning even though both capabilities are
             // individually opt-in (`docs/v0.12-events.md` §5.1).
             if !cfg.events.is_empty() && cfg.allow_network {
-                crate::note!(
-                    "nanopi: {} has both `events` and `allow_network = true` — \
-                     this plugin can observe lifecycle events AND reach the \
-                     network, and could exfiltrate event payloads. Grant both \
-                     only if you trust the plugin.",
-                    cfg.path.display()
-                );
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    "has both `events` and `allow_network = true` — this plugin \
+                     can observe lifecycle events AND reach the network, and \
+                     could exfiltrate event payloads. Grant both only if you \
+                     trust the plugin.",
+                ));
             }
             let (events_granted, refusal_reports) = crate::agent::hook::parse_event_grants(&cfg.events);
             for report in &refusal_reports {
-                crate::note!("nanopi: {}: {report}", cfg.path.display());
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    report.to_string(),
+                ));
             }
             let events_granted: Vec<String> =
                 events_granted.into_iter().map(|s| s.to_string()).collect();
@@ -159,11 +171,13 @@ impl PluginHost {
                             }
                         }
                         for unsatisfied in bridge.unsatisfied_event_requests() {
-                            crate::note!(
-                                "nanopi: {} requested event {unsatisfied:?} but the config's \
-                                 `events` did not grant it — not delivered.",
-                                path.display()
-                            );
+                            notices.push(crate::render::notice::Notice::warn(
+                                path.display().to_string(),
+                                format!(
+                                    "requested event {unsatisfied:?} but the config's \
+                                     `events` did not grant it — not delivered."
+                                ),
+                            ));
                         }
                         let subscribed = bridge.event_subscriptions();
                         if !subscribed.is_empty() {
@@ -176,11 +190,10 @@ impl PluginHost {
                                         .copied()
                                 })
                                 .collect();
-                            crate::note!(
-                                "nanopi: {} registered for events: {}",
-                                path.display(),
-                                events.join(", ")
-                            );
+                            notices.push(crate::render::notice::Notice::info(
+                                path.display().to_string(),
+                                format!("registered for events: {}", events.join(", ")),
+                            ));
                             let handler: std::sync::Arc<dyn crate::subscriber::EventHandler> =
                                 std::sync::Arc::new(host::WasmEventHandler::new(bridge.clone()));
                             subscribers.push(crate::subscriber::Subscriber {
@@ -197,6 +210,7 @@ impl PluginHost {
         }
 
         PluginLoadSummary {
+            notices,
             tools,
             commands,
             subscribers,
