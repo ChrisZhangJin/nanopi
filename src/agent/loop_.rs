@@ -147,6 +147,115 @@ pub struct Agent {
     pub prompt_overrides: crate::agent::prompt_override::PromptOverrides,
 }
 
+/// Give every replayed tool call a result, synthesizing one where the
+/// session has none.
+///
+/// The session records a `tool_call` entry BEFORE running the tool
+/// (`execute_one_call`), which is the right order — for `bash` the
+/// record of what was about to run is worth more than the result, since
+/// the side effects may have happened either way. But it leaves a
+/// window: lose the process while a long command runs (Ctrl-C twice, a
+/// closed terminal, OOM, a laptop lid) and the file ends with a
+/// `tool_call` and no `tool_result`.
+///
+/// Replayed verbatim that becomes an assistant message carrying a
+/// `tool_use` block with nothing answering it, which both wire
+/// protocols reject. The session was then **permanently unresumable**:
+/// every `--continue` and `/resume` failed with a provider 400 that
+/// names none of this. And it happened at the likeliest possible
+/// moment, since interrupting a long command is exactly when people
+/// press Ctrl-C.
+///
+/// So synthesize a result that says the outcome is unknown, rather than
+/// inventing a plausible one or dropping the call. PI states the same
+/// rule as an invariant — "unsafe synthetic results explicitly state
+/// that captured output is incomplete and the external outcome is
+/// unknown" (`pi/packages/agent/docs/tool-durability.md`, invariant 9).
+/// Claiming the command failed would be a lie in the case that matters
+/// most: it may well have finished.
+fn repair_orphaned_tool_calls(context: &mut Context) {
+    use crate::agent::context::{AssistantBlock, ContextMessage};
+
+    // Every id that already has an answer, anywhere in the context.
+    // Answers sit in their own `Tool` messages, so a scan is simpler
+    // and more robust than pairing by position.
+    let answered: std::collections::HashSet<String> = context
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Collect insertions first: mutating while walking would
+    // invalidate the indices.
+    let mut insertions: Vec<(usize, Vec<ContextMessage>)> = Vec::new();
+    for (idx, msg) in context.messages.iter().enumerate() {
+        let ContextMessage::Assistant { content } = msg else {
+            continue;
+        };
+        let missing: Vec<String> = content
+            .iter()
+            .filter_map(|b| match b {
+                AssistantBlock::ToolCall { call } if !answered.contains(&call.id) => {
+                    Some(call.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let synthetic = missing
+            .into_iter()
+            .map(|id| ContextMessage::Tool {
+                tool_call_id: id,
+                content: ORPHANED_TOOL_CALL_RESULT.to_string(),
+                // `is_error` true: the call did not complete as far as
+                // this session can prove, and the model should not
+                // treat the text below as output. It is NOT a claim
+                // that the command itself failed — the text says so.
+                is_error: true,
+                images: Vec::new(),
+            })
+            .collect();
+        // Immediately after its assistant message: the Anthropic wire
+        // requires the results to follow the `tool_use` that asked for
+        // them, with nothing in between.
+        insertions.push((idx + 1, synthetic));
+    }
+
+    if insertions.is_empty() {
+        return;
+    }
+    let repaired: usize = insertions.iter().map(|(_, v)| v.len()).sum();
+    // Back to front so earlier indices stay valid.
+    for (at, msgs) in insertions.into_iter().rev() {
+        for (offset, m) in msgs.into_iter().enumerate() {
+            context.messages.insert(at + offset, m);
+        }
+    }
+    crate::note!(
+        "nanopi: this session had {repaired} tool call(s) with no recorded \
+         result — nanopi most likely exited while they were running. \
+         Synthesized unknown-outcome results so the session can be \
+         resumed; the model is told the outcome is unknown rather than \
+         being given a made-up one."
+    );
+}
+
+/// Stand-in result for a tool call the session never recorded an answer
+/// for. Addressed to the model, and deliberately does not claim the
+/// call failed — the whole point is that nobody knows.
+const ORPHANED_TOOL_CALL_RESULT: &str = "\
+nanopi exited while this tool call was running, so its result was never \
+recorded. The outcome is UNKNOWN: the command may have completed, \
+partially completed, or not run at all, and any side effects it has \
+already had are still in place. Do not assume it failed. If the answer \
+matters, verify the current state before acting — and prefer a \
+read-only check over re-running anything that writes.";
+
 impl Agent {
     /// Reconstruct an Agent from an existing session JSONL file.
     /// Replays message entries into the Context so a new turn can build
@@ -255,6 +364,7 @@ impl Agent {
             }
         }
         flush(&mut pending, &mut context);
+        repair_orphaned_tool_calls(&mut context);
         Ok(Self {
             context,
             provider: Box::new(OpenAiProvider::new("", "", "")),
@@ -3992,6 +4102,265 @@ mod tests {
     /// text+tool_call assistant turn round-trips through load_session as
     /// one Assistant message holding both blocks, followed by the Tool
     /// result and the next assistant text.
+    #[test]
+    /// The unresumable-session bug.
+    ///
+    /// A `tool_call` is persisted before the tool runs, so losing the
+    /// process during a long command leaves the file ending on a call
+    /// with no result. Replayed verbatim that is an assistant
+    /// `tool_use` block with nothing answering it — rejected by both
+    /// wire protocols, so every later `--continue` / `/resume` died on
+    /// a provider 400 that explained none of it.
+    #[test]
+    fn an_orphaned_tool_call_gets_an_unknown_outcome_result() {
+        use crate::agent::context::ContextMessage;
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("run the migration".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![crate::agent::context::AssistantBlock::ToolCall {
+                call: crate::agent::context::ToolCallBlock {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "./migrate.sh"}),
+                },
+            }],
+        });
+
+        repair_orphaned_tool_calls(&mut ctx);
+
+        assert_eq!(ctx.messages.len(), 3, "a result must have been inserted");
+        match &ctx.messages[2] {
+            ContextMessage::Tool {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_1");
+                assert!(*is_error, "the model must not read this as output");
+                // The load-bearing property: it says nobody knows,
+                // rather than inventing a result or claiming failure.
+                // `./migrate.sh` may well have completed.
+                assert!(content.contains("UNKNOWN"), "{content}");
+                assert!(
+                    content.contains("Do not assume it failed"),
+                    "a synthetic result must not imply the command failed: {content}"
+                );
+                assert!(
+                    content.contains("side effects"),
+                    "the model needs to know effects may already have landed: {content}"
+                );
+            }
+            other => panic!("expected a Tool message, got {other:?}"),
+        }
+    }
+
+    /// Placement matters as much as presence: the Anthropic wire wants
+    /// the results directly after the `tool_use` that asked for them.
+    /// A repair appended at the end would still be a 400.
+    #[test]
+    fn a_synthesized_result_lands_directly_after_its_call() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let call = |id: &str| AssistantBlock::ToolCall {
+            call: ToolCallBlock {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+        };
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("first".to_string());
+        // An interior orphan, with a complete turn after it.
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![call("orphan")],
+        });
+        ctx.push_user_text("second".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![call("answered")],
+        });
+        ctx.push_tool_result_with_images("answered", "ok", false, Vec::new());
+
+        repair_orphaned_tool_calls(&mut ctx);
+
+        let shape: Vec<&str> = ctx
+            .messages
+            .iter()
+            .map(|m| match m {
+                ContextMessage::User { .. } => "user",
+                ContextMessage::Assistant { .. } => "assistant",
+                ContextMessage::Tool { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["user", "assistant", "tool", "user", "assistant", "tool"],
+            "the synthetic result must sit between the assistant and the \
+             next user message, not at the end"
+        );
+        // And the already-answered call gained nothing.
+        let tool_ids: Vec<String> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_ids, vec!["orphan", "answered"]);
+    }
+
+    /// Several calls in one assistant message, only some answered:
+    /// each missing one gets its own result, in call order. A batch
+    /// where the process died partway through is the realistic shape,
+    /// since tools can run in parallel.
+    #[test]
+    fn a_partially_answered_batch_fills_only_the_gaps() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let call = |id: &str| AssistantBlock::ToolCall {
+            call: ToolCallBlock {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+        };
+        let mut ctx = Context::default();
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![call("a"), call("b"), call("c")],
+        });
+        ctx.push_tool_result_with_images("b", "done", false, Vec::new());
+
+        repair_orphaned_tool_calls(&mut ctx);
+
+        let tool_ids: Vec<String> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        // `a` and `c` synthesized in call order, then the real `b`.
+        assert_eq!(tool_ids, vec!["a", "c", "b"]);
+    }
+
+    /// A healthy session must come back byte-identical. This runs on
+    /// every resume, so a false positive would inject a fabricated
+    /// tool result into working conversations.
+    #[test]
+    fn a_complete_session_is_left_alone() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("hi".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![
+                AssistantBlock::Text {
+                    text: "checking".into(),
+                },
+                AssistantBlock::ToolCall {
+                    call: ToolCallBlock {
+                        id: "call_1".into(),
+                        name: "ls".into(),
+                        arguments: serde_json::json!({"path": "."}),
+                    },
+                },
+            ],
+        });
+        ctx.push_tool_result_with_images("call_1", "a\nb", false, Vec::new());
+        ctx.push_assistant_text("two files".to_string());
+
+        let before = serde_json::to_value(&ctx.messages).unwrap();
+        repair_orphaned_tool_calls(&mut ctx);
+        assert_eq!(
+            serde_json::to_value(&ctx.messages).unwrap(),
+            before,
+            "a healthy session must not be touched"
+        );
+    }
+
+    /// An assistant message with no tool calls at all — the ordinary
+    /// text turn — is the most common shape and must not be disturbed.
+    #[test]
+    fn a_text_only_session_is_left_alone() {
+        let mut ctx = Context::default();
+        ctx.push_user_text("hi".to_string());
+        ctx.push_assistant_text("hello".to_string());
+        let before = serde_json::to_value(&ctx.messages).unwrap();
+        repair_orphaned_tool_calls(&mut ctx);
+        assert_eq!(serde_json::to_value(&ctx.messages).unwrap(), before);
+    }
+
+    /// End to end through the real replay path, on the exact file a
+    /// killed process leaves: header, user message, `tool_call`, EOF.
+    #[test]
+    fn load_session_repairs_the_file_a_killed_process_leaves() {
+        use crate::agent::context::ContextMessage;
+        let dir = tmp();
+        let path = dir.join("killed.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":2,"id":"019fe000-0000-7000-8000-000000000000","timestamp":"2026-09-04T00:00:00Z","cwd":"/tmp","model":"m","base_url":""}"#, "\n",
+                r#"{"type":"message","id":"1","timestamp":"2026-09-04T00:00:01Z","role":"user","content":"run the slow thing"}"#, "\n",
+                r#"{"type":"tool_call","id":"call_1","timestamp":"2026-09-04T00:00:02Z","tool_name":"bash","arguments":{"command":"sleep 300"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let agent = Agent::load_session(&path, &dir).expect("load");
+
+        // Before the fix this was [user, assistant(tool_use)] — an
+        // unanswered tool_use, which both wire protocols reject, so the
+        // session could never be resumed again.
+        let shape: Vec<&str> = agent
+            .context
+            .messages
+            .iter()
+            .map(|m| match m {
+                ContextMessage::User { .. } => "user",
+                ContextMessage::Assistant { .. } => "assistant",
+                ContextMessage::Tool { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(shape, vec!["user", "assistant", "tool"]);
+
+        // Every tool_use id in the context has an answer — the property
+        // the providers actually enforce.
+        let calls: std::collections::HashSet<String> = agent
+            .context
+            .messages
+            .iter()
+            .flat_map(|m| match m {
+                ContextMessage::Assistant { content } => content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::agent::context::AssistantBlock::ToolCall { call } => {
+                            Some(call.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let answered: std::collections::HashSet<String> = agent
+            .context
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, answered, "every tool_use must have a tool_result");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn load_session_replays_tool_calls() {
         use crate::agent::context::{AssistantBlock, ContextMessage};
