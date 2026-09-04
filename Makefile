@@ -229,7 +229,14 @@ ifndef VERSION
 	@exit 1
 endif
 	@echo -n "$(VERSION)" > VERSION
-	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
+# Confined to the [package] section. Cargo.toml has a SECOND line
+# starting with `version = ` — wasmtime's, since it is declared as a
+# `[dependencies.wasmtime]` table rather than inline — and an
+# unaddressed sed rewrote that one too, pinning the dependency to
+# nanopi's own version number and breaking the build.
+	@sed -i '/^\[package\]/,/^\[dependencies/ s/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
+	@grep -q '^version = "$(VERSION)"' Cargo.toml || { echo "bump: Cargo.toml [package] version not updated"; exit 1; }
+	@grep -q '^version = "19"' Cargo.toml || { echo "bump: clobbered the wasmtime dependency version — check Cargo.toml"; exit 1; }
 	@echo "Updated VERSION and Cargo.toml to $(VERSION)."
 	@echo "Next: git commit -am 'chore: bump to v$(VERSION)' && git tag v$(VERSION) && git push && git push --tags"
 
