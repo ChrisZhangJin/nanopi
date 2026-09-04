@@ -727,13 +727,30 @@ impl Agent {
                 })
                 .await;
             if let Some(reason) = blocked {
-                let marker = format!("[Input hook blocked the prompt: {reason}]");
+                // NOT bracketed: both renderers wrap `AgentEvent::Error`
+                // in `[error: …]` themselves, so a self-bracketing
+                // message came out as
+                // `[error: [Input hook blocked the prompt: …]]`.
+                //
+                // And it says whose decision this was. A prompt refused
+                // by the user's own `[[hooks.input]]` entry is a policy
+                // outcome, not a malfunction — the bare
+                // `Input hook blocked the prompt` under a red `error:`
+                // reads like nanopi broke, which is the same confusion
+                // the tool-block message was reworded to avoid.
+                let notice = format!(
+                    "your `input` hook refused this prompt (policy, not a \
+                     failure) — {reason}"
+                );
                 let _ = tx
                     .send(AgentEvent::Error {
-                        error: marker.clone(),
+                        error: notice.clone(),
                     })
                     .await;
-                return Ok(marker);
+                // The returned text stands alone in `--output json` and
+                // in the session record, so it carries the same prose
+                // rather than a bracketed marker.
+                return Ok(notice);
             }
         }
 
@@ -2626,6 +2643,97 @@ mod tests {
                 "{event}: subscriber never saw it, only saw {seen:?}"
             );
         }
+    }
+
+    /// A refused prompt must not be double-bracketed, and must say
+    /// whose decision it was.
+    ///
+    /// Both renderers wrap `AgentEvent::Error` in `[error: …]`
+    /// themselves, so a message that bracketed itself produced
+    /// `[error: [Input hook blocked the prompt: …]]` on screen. And the
+    /// old wording under a red `error:` read like nanopi had
+    /// malfunctioned, when it was the user's own `[[hooks.input]]`
+    /// entry doing exactly what they configured.
+    #[tokio::test]
+    async fn a_refused_prompt_is_not_double_bracketed() {
+        let dir = tmp();
+        let session_path = dir.join("refused.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let script = dir.join("veto.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat > /dev/null\necho 'policy: no prompts today' >&2\nexit 2\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hooks = HooksConfig {
+            input: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: script.display().to_string(),
+                timeout: 3000,
+            }],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "unreachable".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let out = agent.run_turn("hi", &tx, None, None).await.unwrap();
+        drop(tx);
+
+        let mut errors = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::Error { error } = ev {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors.len(), 1, "expected exactly one Error event");
+        let err = &errors[0];
+
+        // The renderers add `[error: …]`. A leading `[` here means the
+        // user sees `[error: [ … ]]`.
+        assert!(
+            !err.starts_with('['),
+            "the message must not bracket itself — renderers already do: {err:?}"
+        );
+        // It names the mechanism and says this was policy, so a red
+        // line doesn't read as a malfunction.
+        assert!(err.contains("`input` hook"), "{err:?}");
+        assert!(err.contains("policy"), "{err:?}");
+        // The hook's own reason survives — without it the user cannot
+        // tell which of several hooks refused.
+        assert!(err.contains("policy: no prompts today"), "{err:?}");
+        // The returned text stands alone in `--output json`, so it
+        // carries the same prose rather than a bare marker.
+        assert_eq!(&out, err);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
