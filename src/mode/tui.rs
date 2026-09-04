@@ -540,18 +540,25 @@ pub async fn run_tui_mode(
         }
     }
 
-    // Closing lines: `✓ session saved` + resume hint so the user knows
-    // how to pick up where they left off.
+    // Closing line: the resume hint, and only that.
+    //
+    // A `✓ session <first 8 chars> saved` line used to sit above it.
+    // The abbreviation stops one character short of the first `-`, so
+    // `01a06af4-a1e9-…` printed as a bare `01a06af4` — which reads like
+    // a whole id rather than a prefix, next to the full one on the line
+    // below. And since v7 ids share their leading timestamp bits, two
+    // sessions from the same day differ only in those last digits, so
+    // the eye is being asked to do exactly the comparison it is worst
+    // at. The full id below already says everything the short one did.
+    //
     // `app.session_id`, NOT the `header` bound at startup: `/new`,
     // `/resume`, `/fork` and `/import` all switch the live session and
     // update `app.session_id`, but that binding is never reassigned. So
     // ending a run in a session you switched into printed the id of the
-    // one you STARTED in — and the `--session <id>` line under it sent
-    // you back to a conversation you had abandoned.
+    // one you STARTED in — and this line sent you back to a
+    // conversation you had abandoned.
     let sid = app.session_id.clone();
-    let sid_short = &sid[..8.min(sid.len())];
-    println!("\n\x1b[2m✓ session {sid_short} saved\x1b[0m");
-    println!("\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
+    println!("\n\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
 
     result
 }
