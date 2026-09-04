@@ -205,12 +205,7 @@ pub async fn run_print_mode(
     while let Some(ev) = rx.recv().await {
         if output == OutputFormat::Text {
             if let Some(mut s) = spinner.take() {
-                if matches!(
-                    ev,
-                    AgentEvent::TextDelta { .. }
-                        | AgentEvent::ToolCall { .. }
-                        | AgentEvent::Error { .. }
-                ) {
+                if stops_spinner(&ev) {
                     s.stop().await;
                 } else {
                     spinner = Some(s);
@@ -296,3 +291,83 @@ fn collect_messages(session_path: &std::path::Path) -> Result<Vec<Value>> {
 // Arc import used by future extensions (TUI mode).
 
 // time import retained for future usage.
+
+/// Does this event mean the spinner has to go?
+///
+/// A predicate rather than an inline `matches!` so the decision is
+/// testable. It cannot be tested through the process's output: the
+/// spinner writes to **stderr** and everything else here goes to
+/// stdout, so a piped run separates them and sees nothing wrong. The
+/// damage only appears on a TTY, where both land on one screen.
+///
+/// The rule: anything that streams output of its own stops the
+/// spinner, because the spinner redraws with `\r\x1b[K` and shreds
+/// whatever shares the terminal with it.
+///
+/// `ThinkingDelta` belongs here and was missing. Reported from a real
+/// minimax session as reasoning interleaved with `⠼ thinking (1.7s)`
+/// and broken across lines at arbitrary points. Latent since thinking
+/// existed — the Anthropic wire always hit it — and invisible on the
+/// OpenAI wire until inline `<think>` began arriving as ThinkingDelta
+/// rather than as ordinary text.
+fn stops_spinner(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::Error { .. }
+    )
+}
+
+#[cfg(test)]
+mod spinner_tests {
+    use super::*;
+    use crate::event::{FinishReason, Usage};
+
+    #[test]
+    fn anything_that_streams_output_stops_the_spinner() {
+        for ev in [
+            AgentEvent::TextDelta {
+                content_index: 0,
+                text: "hi".into(),
+            },
+            AgentEvent::ThinkingDelta {
+                content_index: 0,
+                text: "musing".into(),
+            },
+            AgentEvent::ToolCall {
+                content_index: 0,
+                call: crate::event::ToolCall {
+                    id: "c".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+            AgentEvent::Error {
+                error: "boom".into(),
+            },
+        ] {
+            assert!(stops_spinner(&ev), "should stop the spinner: {ev:?}");
+        }
+    }
+
+    /// Events that print nothing leave it running — otherwise the
+    /// spinner would vanish at `Start` and the user would stare at a
+    /// blank screen for the whole first token latency, which is the
+    /// reason it exists.
+    #[test]
+    fn silent_events_leave_the_spinner_running() {
+        for ev in [
+            AgentEvent::Start {
+                message_id: "m".into(),
+            },
+            AgentEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ] {
+            assert!(!stops_spinner(&ev), "should NOT stop the spinner: {ev:?}");
+        }
+    }
+}
