@@ -26,17 +26,51 @@ pub trait Vendor: Send + Sync + std::fmt::Debug {
     fn id(&self) -> &'static str;
     /// The vendor's native/primary wire protocol, independent of URL.
     fn transport(&self) -> ApiKind;
+    /// True when this vendor serves BOTH protocols off one host, split
+    /// by base_url path — `/anthropic` for Anthropic-native, anything
+    /// else (`/v1`, `/api/paas/v4`) for OpenAI-compat.
+    ///
+    /// For these the PATH decides the protocol outright; `transport()`
+    /// is only the default surface, not a constraint. Vendors that
+    /// speak one protocol at any path (api.openai.com,
+    /// api.anthropic.com, api.deepseek.com) leave this false.
+    fn dual_surface(&self) -> bool {
+        false
+    }
+
     /// The protocol to actually speak to `base_url`.
     ///
-    /// Several vendors (Xiaomi MiMo, z.ai, DeepSeek, dashscope) serve
-    /// both protocols off one host and split them by path: `/v1` for
-    /// OpenAI-compat, `/anthropic` for Anthropic-native. An
-    /// OpenAI-transport vendor pointed at the `/anthropic` surface must
-    /// switch, or every request lands on `/anthropic/chat/completions`
-    /// and the gateway answers 404. Anthropic-transport vendors are
-    /// unaffected — they're already on the right wire.
+    /// Dual-surface vendors are decided by the path, in BOTH
+    /// directions. Getting only one direction right was a bug: the
+    /// match below rerouted an OpenAI-transport vendor onto Anthropic
+    /// when the URL said `/anthropic`, but an Anthropic-transport
+    /// vendor stayed Anthropic no matter what the URL said. So MiniMax
+    /// — whose native surface is `/anthropic` — reported Anthropic even
+    /// for `https://api.minimaxi.com/v1`, and a correct, self-consistent
+    /// `base_url = ".../v1"` + `api_kind = "openai"` was flagged as
+    /// contradicting the vendor.
+    ///
+    /// Asymmetry was never justified. A host that splits protocols by
+    /// path splits them both ways.
     fn transport_for(&self, base_url: &str) -> ApiKind {
+        if self.dual_surface() {
+            if url_is_anthropic_surface(base_url) {
+                return ApiKind::Anthropic;
+            }
+            // Only a URL that actually HAS a path says anything. A bare
+            // host (`https://api.minimaxi.com`) discriminates nothing,
+            // so fall through to the vendor's default surface —
+            // treating it as OpenAI would send `provider = "minimax"`
+            // with no path straight into a 404.
+            if url_has_path(base_url) {
+                return ApiKind::Openai;
+            }
+            return self.transport();
+        }
         match self.transport() {
+            // Kept for the fallback vendor and any single-protocol
+            // vendor pointed at an unexpected `/anthropic` surface:
+            // better to switch than to POST `/anthropic/chat/completions`.
             ApiKind::Openai if url_is_anthropic_surface(base_url) => ApiKind::Anthropic,
             native => native,
         }
@@ -59,6 +93,22 @@ pub trait Vendor: Send + Sync + std::fmt::Debug {
 pub fn url_is_anthropic_surface(base_url: &str) -> bool {
     let u = base_url.trim_end_matches('/').to_ascii_lowercase();
     u.ends_with("/anthropic") || u.contains("/anthropic/")
+}
+
+/// True when `base_url` carries a path component beyond the host —
+/// `https://h/v1` yes, `https://h` and `https://h/` no.
+///
+/// For a dual-surface vendor the path is what names the protocol
+/// surface, so its absence is not "the OpenAI one", it is "unstated".
+pub fn url_has_path(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    match after_scheme.split_once('/') {
+        Some((_host, path)) => !path.trim_matches('/').is_empty(),
+        None => false,
+    }
 }
 
 pub fn openai_effort_string(level: ThinkingLevel) -> &'static str {
@@ -142,6 +192,82 @@ mod tests {
         assert!(!url_is_anthropic_surface("https://api.openai.com/v1"));
     }
 
+    /// The reported false positive: `base_url = "https://api.minimaxi.com/v1"`
+    /// with `api_kind = "openai"` is a correct, self-consistent config —
+    /// MiniMax serves an OpenAI-compatible API at `/v1` — and startup
+    /// warned that it contradicted the vendor. It warned because
+    /// `transport_for` returned the vendor's native Anthropic for ANY
+    /// URL, so the comparison in `main.rs` could never agree.
+    #[test]
+    fn a_dual_surface_vendor_agrees_with_a_matching_openai_url() {
+        let base = "https://api.minimaxi.com/v1";
+        let v = pick_vendor(None, Some(base), "minimax-M3");
+        assert_eq!(v.id(), "minimax", "sanity: the sniff still finds MiniMax");
+        assert_eq!(
+            v.transport_for(base),
+            ApiKind::Openai,
+            "an explicit /v1 URL is the OpenAI surface — this is what \
+             main.rs compares api_kind against, so disagreeing here is \
+             exactly the spurious warning"
+        );
+        // And the other pairing is equally valid, with no warning.
+        let anthropic_base = "https://api.minimaxi.com/anthropic";
+        assert_eq!(
+            pick_vendor(None, Some(anthropic_base), "minimax-M3").transport_for(anthropic_base),
+            ApiKind::Anthropic
+        );
+    }
+
+    /// A genuine contradiction must STILL warn — the whole point of the
+    /// check is that guessing wrong yields a bare 404 downstream.
+    #[test]
+    fn a_real_surface_mismatch_still_disagrees() {
+        // `/anthropic` path but the user insists on OpenAI.
+        let base = "https://api.minimaxi.com/anthropic";
+        assert_ne!(
+            pick_vendor(None, Some(base), "minimax-M3").transport_for(base),
+            ApiKind::Openai
+        );
+        // A `/v1` path with `api_kind = "anthropic"` would POST
+        // `/v1/messages` — also wrong, also worth a warning.
+        let base = "https://api.minimaxi.com/v1";
+        assert_ne!(
+            pick_vendor(None, Some(base), "minimax-M3").transport_for(base),
+            ApiKind::Anthropic
+        );
+    }
+
+    /// A bare host discriminates nothing, so it must fall back to the
+    /// vendor's default surface rather than being read as "not
+    /// /anthropic, therefore OpenAI" — which would 404 every
+    /// `provider = "minimax"` config that omits the path.
+    #[test]
+    fn a_bare_host_falls_back_to_the_vendors_default_surface() {
+        assert_eq!(
+            MinimaxVendor.transport_for("https://api.minimaxi.com"),
+            ApiKind::Anthropic
+        );
+        assert_eq!(
+            MinimaxVendor.transport_for("https://api.minimaxi.com/"),
+            ApiKind::Anthropic
+        );
+        // Xiaomi's default surface is the OpenAI one.
+        assert_eq!(
+            XiaomiVendor.transport_for("https://token-plan-cn.xiaomimimo.com"),
+            ApiKind::Openai
+        );
+    }
+
+    #[test]
+    fn url_has_path_distinguishes_bare_hosts() {
+        assert!(!url_has_path("https://h"));
+        assert!(!url_has_path("https://h/"));
+        assert!(!url_has_path("h"));
+        assert!(url_has_path("https://h/v1"));
+        assert!(url_has_path("https://h/anthropic"));
+        assert!(url_has_path("https://h/api/paas/v4"));
+    }
+
     #[test]
     fn transport_for_switches_openai_vendors_on_anthropic_surface() {
         let v = XiaomiVendor;
@@ -154,13 +280,23 @@ mod tests {
             v.transport_for("https://token-plan-cn.xiaomimimo.com/v1"),
             ApiKind::Openai
         );
-        // Anthropic-native vendors are unaffected either way.
+        // MiniMax is dual-surface too, so the path decides for it in
+        // BOTH directions. This assertion used to read `Anthropic` —
+        // it encoded the bug: an Anthropic-transport vendor ignored a
+        // `/v1` URL entirely.
         assert_eq!(
             MinimaxVendor.transport_for("https://api.minimax.chat/v1"),
+            ApiKind::Openai
+        );
+        // A single-protocol vendor is unaffected: api.anthropic.com
+        // speaks Anthropic at every path, so there is nothing for a
+        // path to discriminate.
+        assert_eq!(
+            AnthropicVendor.transport_for("https://api.anthropic.com"),
             ApiKind::Anthropic
         );
         assert_eq!(
-            AnthropicVendor.transport_for("https://api.anthropic.com"),
+            AnthropicVendor.transport_for("https://api.anthropic.com/v1"),
             ApiKind::Anthropic
         );
     }

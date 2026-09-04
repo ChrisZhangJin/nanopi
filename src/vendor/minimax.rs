@@ -11,6 +11,11 @@ pub struct MinimaxVendor;
 impl Vendor for MinimaxVendor {
     fn id(&self) -> &'static str { "minimax" }
     fn transport(&self) -> ApiKind { ApiKind::Anthropic }
+    /// Both surfaces on both hosts: `/anthropic/v1/messages` and
+    /// `/v1/chat/completions`. `transport()` above names only the
+    /// DEFAULT (what `default_base_url` points at) — a `base_url`
+    /// ending in `/v1` is the OpenAI surface and is equally valid.
+    fn dual_surface(&self) -> bool { true }
     /// MiniMax answers on two hosts — the older `api.minimax.chat` and
     /// the current `api.minimaxi.com` (the one behind the
     /// `platform.minimaxi.com` console). Both still serve

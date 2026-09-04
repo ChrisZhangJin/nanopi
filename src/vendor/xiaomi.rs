@@ -14,6 +14,9 @@ pub struct XiaomiVendor;
 impl Vendor for XiaomiVendor {
     fn id(&self) -> &'static str { "xiaomi" }
     fn transport(&self) -> ApiKind { ApiKind::Openai }
+    /// `…/v1` and `…/anthropic` on the same hosts — see the module
+    /// docs above.
+    fn dual_surface(&self) -> bool { true }
     fn supports_thinking(&self, model: &str) -> bool {
         let m = model.to_ascii_lowercase();
         m.contains("mimo") || m.contains("thinking")
