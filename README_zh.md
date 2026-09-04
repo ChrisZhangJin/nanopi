@@ -366,7 +366,7 @@ linker = "musl-gcc"
 - **JSONL 而非 JSON** —— append-only 文件在写入过程中崩溃也能存活
 - **Provider 抽象** 在 v0.6 落地：原生 Anthropic + 任意 OpenAI 兼容端点
 
-设计与实现笔记见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 与 [`docs/PLAN.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/PLAN.md)。
+设计与实现笔记见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 与 [`docs/PLAN.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/PLAN.md)；[`docs/claims-and-races.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/claims-and-races.md) 规定 nanopi 可以就自己的行为声称什么，以及支撑这些规则的竞态表。
 
 ## 致谢
 

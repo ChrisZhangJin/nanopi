@@ -372,7 +372,7 @@ linker = "musl-gcc"
 - **JSONL over JSON** — append-only files survive crashes mid-write.
 - **Provider abstraction** landed in v0.6; native Anthropic + any OpenAI-compatible endpoint.
 
-See [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) and [`docs/PLAN.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/PLAN.md) for design + implementation notes.
+See [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) and [`docs/PLAN.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/PLAN.md) for design + implementation notes, and [`docs/claims-and-races.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/claims-and-races.md) for what nanopi is allowed to claim about its own actions — plus the race table behind those rules.
 
 ## Credits
 
