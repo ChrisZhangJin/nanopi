@@ -369,8 +369,39 @@ impl Agent {
     /// events so the UI can draw a scrollback marker. The manual
     /// `/compact` path passes None and drives its own feedback via
     /// the palette; the auto-trigger passes Some(&turn_tx).
-    pub async fn compact_now(&mut self, tx: Option<&mpsc::Sender<AgentEvent>>, reason: &str) {
+    /// Returns true if a pass actually ran. False means
+    /// `find_compact_boundary` found nothing to do — the whole context
+    /// already fits inside the verbatim tail budget — and the context is
+    /// byte-for-byte unchanged.
+    ///
+    /// The caller needs this to describe what happened: measuring
+    /// `estimate_chars()` either side can't tell "compacted, and the
+    /// summary happened to be the same length" from "never ran", and
+    /// `/compact` on a short session reported the first while doing the
+    /// second.
+    pub async fn compact_now(
+        &mut self,
+        tx: Option<&mpsc::Sender<AgentEvent>>,
+        reason: &str,
+    ) -> bool {
         use crate::agent::compact::compact;
+
+        // Decide whether there is anything to do BEFORE announcing
+        // anything. `compact()` makes this same call internally and
+        // returns None when it comes back empty, but by then the
+        // `session_before_compact` hook has already fired — leaving a
+        // `before` with no matching `after` in every hook log, and no
+        // way for a hook author to tell that pair apart from a crash
+        // mid-compaction. The duplicated boundary scan is a walk over
+        // the message list; the honesty is worth it.
+        if crate::agent::compact::find_compact_boundary(
+            &self.context.messages,
+            crate::agent::compact::KEEP_RECENT_TOKENS,
+        )
+        .is_none()
+        {
+            return false;
+        }
 
         // ── SessionBeforeCompact hook (v0.11.0) ──────────────────
         // Advisory only — fires before compaction runs. `subject`
@@ -413,8 +444,10 @@ impl Agent {
                 })
                 .await;
         }
+        // The boundary was there a moment ago and nothing has touched
+        // the context since, so this is not expected to be None.
         let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
-            return;
+            return false;
         };
 
         if let Some(tx) = tx {
@@ -466,6 +499,7 @@ impl Agent {
                 replaced_count: result.replaced_count,
             },
         );
+        true
     }
 
     /// Threshold-gated version of `compact_now`. Called at the top of
@@ -479,8 +513,10 @@ impl Agent {
         if !should_auto_compact(est_chars, window) {
             return false;
         }
-        self.compact_now(Some(tx), "threshold").await;
-        true
+        // Over threshold but no boundary (a single message larger than
+        // the tail budget) means no pass ran — say so rather than
+        // reporting one.
+        self.compact_now(Some(tx), "threshold").await
     }
 
     /// Run a single user turn to completion. Streams events to `tx` and
@@ -3608,6 +3644,88 @@ mod tests {
         assert_eq!(
             payload["session_id"], session_id,
             "session_id must be the real session id, not the reason string"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A context small enough to fit entirely in the verbatim tail has
+    /// no head to summarize, so no pass runs — and `compact_now` must
+    /// say so. `/compact` on a short session printed
+    /// `[compacted: 2158 → 2158 chars]`: the no-op was correct, the
+    /// claim was not.
+    #[tokio::test]
+    async fn compact_now_reports_false_when_there_is_nothing_to_compact() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        agent.context.push_user_text("hi".to_string());
+        agent.context.push_assistant_text("hello".to_string());
+        let before = agent.context.estimate_chars();
+
+        let ran = agent.compact_now(None, "manual").await;
+
+        assert!(!ran, "nothing to compact must not report a pass");
+        assert_eq!(
+            agent.context.estimate_chars(),
+            before,
+            "a no-op pass must leave the context untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the inverse, so the flag isn't just wired to `false`.
+    #[tokio::test]
+    async fn compact_now_reports_true_when_a_pass_actually_runs() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+        let before = agent.context.estimate_chars();
+
+        let ran = agent.compact_now(None, "manual").await;
+
+        assert!(ran, "a real pass must report itself");
+        assert!(
+            agent.context.estimate_chars() < before,
+            "a real pass must shrink the context"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hook pair must be balanced. A `session_before_compact` with
+    /// no matching `session_compact` is indistinguishable, from a hook
+    /// author's side, from nanopi crashing mid-compaction — and that is
+    /// exactly what a no-op `/compact` used to write into the log.
+    #[tokio::test]
+    async fn a_no_op_compaction_fires_neither_hook() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let out = dir.join("hooks.jsonl");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat >> {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        agent.hooks.session_before_compact = vec![hook_cfg.clone()];
+        agent.hooks.session_compact = vec![hook_cfg];
+
+        agent.context.push_user_text("hi".to_string());
+        agent.context.push_assistant_text("hello".to_string());
+        let ran = agent.compact_now(None, "manual").await;
+
+        assert!(!ran);
+        assert!(
+            !out.exists(),
+            "a compaction that never ran must not announce one: {:?}",
+            std::fs::read_to_string(&out).unwrap_or_default()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

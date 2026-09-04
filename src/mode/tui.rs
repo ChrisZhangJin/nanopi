@@ -2939,12 +2939,28 @@ async fn handle_action(
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let before = a.context.estimate_chars();
-                a.compact_now(None, "manual").await;
+                let ran = a.compact_now(None, "manual").await;
                 let after = a.context.estimate_chars();
+                // `before → after` alone can't distinguish "compacted,
+                // same size" from "never ran", and on a short session
+                // it printed the former while doing the latter:
+                // `[compacted: 2158 → 2158 chars]`. The whole context
+                // already fit inside the verbatim tail budget, so there
+                // was no head to summarize — which is the right call,
+                // just not what the line said.
+                let msg = if ran {
+                    format!("[compacted: {before} → {after} chars]")
+                } else {
+                    format!(
+                        "[nothing to compact: {before} chars all fit in the \
+                         {} k-token tail kept verbatim]",
+                        crate::agent::compact::KEEP_RECENT_TOKENS / 1000
+                    )
+                };
                 insert_line(
                     term,
                     Line::from(vec![Span::styled(
-                        format!("[compacted: {before} → {after} chars]"),
+                        msg,
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
