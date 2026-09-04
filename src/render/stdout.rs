@@ -119,6 +119,17 @@ pub struct StdoutRenderer {
     /// separating them, which is nothing at all once the output is
     /// piped or the terminal drops SGR.
     after_thinking: bool,
+    /// True while the sticky assistant color opened by `Start` is still
+    /// in effect.
+    ///
+    /// Every other arm here ends with `\x1b[0m`, which resets that color
+    /// along with its own. `Start` opening the color exactly once and
+    /// letting it ride therefore only held for a turn with nothing in it
+    /// but text — the moment any reasoning, tool call, or compaction
+    /// marker went out, the rest of the reply fell back to the
+    /// terminal's default foreground. Tracking it explicitly means each
+    /// arm can reset freely and `TextDelta` re-arms when it has to.
+    color_armed: bool,
 }
 
 impl StdoutRenderer {
@@ -126,6 +137,7 @@ impl StdoutRenderer {
         Self {
             buffer: String::new(),
             after_thinking: false,
+            color_armed: false,
         }
     }
 
@@ -146,10 +158,20 @@ impl StdoutRenderer {
     /// entry point so `mode::print` is unaffected.
     fn render_to<W: Write>(&mut self, out: &mut W, event: &AgentEvent) -> io::Result<()> {
         let out = &mut *out;
+        // Every arm below except these two ends with `\x1b[0m`, so the
+        // sticky assistant color is gone by the time it returns. Say so
+        // once here rather than trusting nine arms to each remember.
+        if !matches!(
+            event,
+            AgentEvent::Start { .. } | AgentEvent::TextDelta { .. }
+        ) {
+            self.color_armed = false;
+        }
         match event {
             AgentEvent::Start { .. } => {
                 // Begin green text.
                 write!(out, "\x1b[1;32m")?;
+                self.color_armed = true;
             }
             AgentEvent::TextDelta { text, .. } => {
                 // Break the line the reasoning left open. Only on the
@@ -159,13 +181,24 @@ impl StdoutRenderer {
                 if std::mem::take(&mut self.after_thinking) {
                     writeln!(out)?;
                 }
+                if !self.color_armed {
+                    write!(out, "\x1b[1;32m")?;
+                    self.color_armed = true;
+                }
                 self.buffer.push_str(text);
                 write!(out, "{}", text)?;
                 out.flush()?;
             }
             AgentEvent::ThinkingDelta { text, .. } => {
-                // Subtle gray, dim.
-                write!(out, "\x1b[2m{}\x1b[0m", text)?;
+                // Subtle gray, dim. Reset FIRST: `Start` leaves a
+                // sticky `1;32` open, and `2m` merely adds to it, so
+                // the first reasoning delta of a turn came out bold
+                // green while every later one — arriving after this
+                // arm's own trailing reset had cleared the green —
+                // came out dim. Same event, two colors, split at an
+                // arbitrary SSE chunk boundary. Opening with a reset
+                // makes each delta self-contained.
+                write!(out, "\x1b[0m\x1b[2m{}\x1b[0m", text)?;
                 self.after_thinking = true;
                 out.flush()?;
             }
@@ -526,6 +559,106 @@ mod tests {
         ]);
         assert!(out.ends_with("Done."), "reply lost or misplaced: {out:?}");
         assert!(!out.contains("\n\n"), "blank line opened up: {out:?}");
+    }
+
+    /// Render a sequence and return the RAW bytes, escapes intact.
+    ///
+    /// `rendered` strips SGR, which is right for the layout assertions
+    /// but is exactly why the two-colors-for-one-event bug below shipped:
+    /// with the escapes gone, correct and incorrect coloring are the
+    /// same string.
+    fn rendered_raw(events: &[AgentEvent]) -> String {
+        let mut r = StdoutRenderer::new();
+        let mut out: Vec<u8> = Vec::new();
+        for ev in events {
+            r.render_to(&mut out, ev).expect("render_to");
+        }
+        String::from_utf8(out).expect("utf8")
+    }
+
+    fn start() -> AgentEvent {
+        AgentEvent::Start {
+            message_id: "m".into(),
+        }
+    }
+
+    /// The reported defect: only the first few words of the reasoning
+    /// were green, the rest plain. `Start` leaves a sticky `1;32` open;
+    /// the old thinking arm wrote `\x1b[2m…\x1b[0m`, so delta #1 painted
+    /// bold-green + dim while its own trailing reset cleared the green
+    /// for delta #2 onward. One logical span, two colors, split wherever
+    /// the SSE chunk boundary happened to fall.
+    #[test]
+    fn every_thinking_delta_renders_identically() {
+        let raw = rendered_raw(&[start(), thinking("The user just"), thinking(" said hi.")]);
+        // Each delta must be introduced by the same escape run, and that
+        // run must open with a reset — otherwise it inherits whatever
+        // the previous event left on.
+        const LEAD: &str = "\x1b[0m\x1b[2m";
+        for delta in ["The user just", " said hi."] {
+            let at = raw.find(delta).unwrap_or_else(|| panic!("missing {delta:?}"));
+            assert!(
+                raw[..at].ends_with(LEAD),
+                "reasoning delta {delta:?} inherited foreign SGR state: {raw:?}"
+            );
+        }
+    }
+
+    /// The reply after reasoning must get the assistant color back —
+    /// the thinking arm's own `\x1b[0m` took it down with it.
+    #[test]
+    fn the_reply_after_thinking_is_green_again() {
+        let raw = rendered_raw(&[start(), thinking("musing"), text("Hello")]);
+        let at = raw.find("Hello").expect("reply");
+        assert!(
+            raw[..at].ends_with("\x1b[1;32m"),
+            "reply lost the assistant color: {raw:?}"
+        );
+    }
+
+    /// Same fault, second site: a tool marker also ends with `\x1b[0m`,
+    /// so the reply that follows a tool result fell back to the default
+    /// foreground too.
+    #[test]
+    fn the_reply_after_a_tool_result_is_green_again() {
+        let raw = rendered_raw(&[
+            start(),
+            AgentEvent::ToolResult {
+                call_id: "c".into(),
+                tool_name: "bash".into(),
+                content: "ok".into(),
+                is_error: false,
+                elapsed_ms: 1,
+            },
+            text("Done."),
+        ]);
+        let at = raw.find("Done.").expect("reply");
+        assert!(
+            raw[..at].ends_with("\x1b[1;32m"),
+            "reply after a tool result lost the assistant color: {raw:?}"
+        );
+    }
+
+    /// Re-arming is once per interruption, not once per delta — an
+    /// escape sequence between every token would bloat piped output and
+    /// defeat terminals that batch SGR.
+    #[test]
+    fn the_color_is_re_armed_once_not_per_delta() {
+        let raw = rendered_raw(&[start(), thinking("m"), text("a"), text("b"), text("c")]);
+        assert_eq!(
+            raw.matches("\x1b[1;32m").count(),
+            2,
+            "expected one arm from Start and exactly one re-arm: {raw:?}"
+        );
+    }
+
+    /// A turn with no reasoning and no tools must be byte-identical to
+    /// what it was before any of this — the common `-p` case pays
+    /// nothing.
+    #[test]
+    fn a_plain_turn_gains_no_extra_escapes() {
+        let raw = rendered_raw(&[start(), text("hi")]);
+        assert_eq!(raw, "\x1b[1;32mhi");
     }
 
     #[test]
