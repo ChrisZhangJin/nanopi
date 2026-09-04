@@ -542,7 +542,13 @@ pub async fn run_tui_mode(
 
     // Closing lines: `✓ session saved` + resume hint so the user knows
     // how to pick up where they left off.
-    let sid = header.id.to_string();
+    // `app.session_id`, NOT the `header` bound at startup: `/new`,
+    // `/resume`, `/fork` and `/import` all switch the live session and
+    // update `app.session_id`, but that binding is never reassigned. So
+    // ending a run in a session you switched into printed the id of the
+    // one you STARTED in — and the `--session <id>` line under it sent
+    // you back to a conversation you had abandoned.
+    let sid = app.session_id.clone();
     let sid_short = &sid[..8.min(sid.len())];
     println!("\n\x1b[2m✓ session {sid_short} saved\x1b[0m");
     println!("\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
