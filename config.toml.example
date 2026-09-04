@@ -244,6 +244,11 @@ base_url = "https://api.openai.com/v1"
 # read `session_id` to distinguish a compaction's cause must now read
 # `arguments.reason` instead.
 
+# Working versions of every script referenced below live in
+# `examples/hooks/` — copy them to ~/.nanopi/hooks/ and see that
+# directory's README.md for the payload shape and the three decision
+# forms (refuse / rewrite / allow).
+
 # Ex 1: veto dangerous rm invocations before bash runs them.
 # [[hooks.tool_execution_start]]
 # matcher = "^bash$"
@@ -268,9 +273,9 @@ base_url = "https://api.openai.com/v1"
 
 # Ex 5: run cleanup on session exit (also fires on /new, /resume,
 # /fork, /import — check arguments.reason if you only want the final
-# quit).
+# quit). `examples/hooks/session-log.sh` shows that check.
 # [[hooks.session_shutdown]]
-# command = "~/.nanopi/hooks/cleanup.sh"
+# command = "~/.nanopi/hooks/session-log.sh"
 
 # ── v0.11.0 lifecycle hooks ─────────────────────────────────────────
 # These map to PI's before_agent_start / turn_start / turn_end /
