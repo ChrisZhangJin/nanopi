@@ -3,13 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.11.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-09-02T00:00:00.000Z"
-last_activity: "2026-09-02 - v0.12 events A+B: hook events renamed to PI names, honest session payloads, and WASM plugins observing all eleven lifecycle events."
+last_updated: "2026-09-04T03:26:25.818Z"
+last_activity: "2026-09-04 — manual acceptance of v0.12 found eight defects in how nanopi describes its own actions; all eight fixed with regression tests."
 ---
 
 # Project State
 
-Last activity: 2026-09-02 — Stages A and B of the v0.12 event work are
+Last activity: 2026-09-04 — manual acceptance of v0.12. Eight defects
+found by hand and fixed, all in the same family: nanopi describing its
+own actions more confidently than it performed them.
 both in: hook events renamed to PI's vocabulary with honest session payloads
 and retired keys refused (`7a15138`…`9caa4c5`), and WASM plugins can now
 observe all eleven lifecycle events under a config-granted,
@@ -38,14 +40,17 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
 
 - Core agent loop (`src/agent`), providers (`src/provider`), vendor
   dispatch (`src/vendor`), tool suite (`src/tool`).
+
 - TOML config loader (`src/config.rs`) with global + project layering;
   `src/paths.rs` owns every `~/.nanopi` / `NANOPI_HOME` path **and the
   single home-expansion point** (`expand_home`).
+
 - Trust prompt (`src/trust.rs`), settings/keybindings pickers (v0.9.3).
 - Static musl release pipeline (Makefile, dist/). VERSION is
   centralized: `VERSION` file → `include_str!` in `src/main.rs:29`,
   `make bump VERSION=x.y.z`, and a tag-vs-VERSION gate in
   `release.yml`. `.planning/PLAN-VERSION.md` is **implemented**.
+
 - **First-run wizard** (`src/wizard.rs`): provider pick-list (OpenAI,
   DeepSeek, Anthropic direct, Gemini gateway, Ollama, Custom),
   probe-before-write validation, key file at mode 0600. Exposed as
@@ -53,14 +58,17 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
   credentials. It writes an **absolute** `api_key_file` — the old
   tilde-form literal was the Windows first-run bug, fixed in
   `e9425b8`.
+
 - **Hook lifecycle** — all ten events implemented
   (`src/agent/hook.rs:38`): `PreToolUse`, `PostToolUse`,
   `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `BeforeAgentStart`
   (the only one that can Block or Transform), `TurnStart`, `TurnEnd`,
   `MessageEnd`, `SessionBeforeCompact`, `SessionCompact`.
   `post_tool_use` can transform the result, not just observe it.
+
 - **Steer / follow-up injection** — mid-stream typing steers the
   running turn; queued follow-ups auto-start the next one.
+
 - **Plugin slash commands** (2026-09-02) — a component may export
   `list-commands` / `execute-command` from the second WIT world
   `extension-commands`, and its commands appear in the `/` palette
@@ -71,8 +79,10 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
   verbatim first), `{"error"}` is shown only to the user. Collisions
   are refused, never renamed. `src/command.rs` is deliberately
   non-gated so `mode/tui.rs` keeps zero `cfg(feature = "wasm")`.
+
 - **`tool_exec_mode`** — parallel vs sequential tool execution
   (`src/config.rs:114`). Pi's per-tool override is still deferred.
+
 - **WASM plugin system** behind `--features wasm` (`src/wasm/`).
   Components declared in `[[extensions]]` are compiled, instantiated,
   and their exported tools registered alongside the built-ins.
@@ -83,6 +93,7 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
   `error: ` strings rather than trapping. The `Store`/`Config` stay
   synchronous — network is bridged by a worker thread + `mpsc`, so
   `ComponentBridge` is untouched and no dependency was added.
+
 - **Hardening pass** — ~20 `fix(...)` commits after the feature work:
   plugin epoch deadlines, trap isolation, `url_allowlist` backslash
   bypass, cwd-guard escapes in `write`/`edit`, cancel-safety of
@@ -94,6 +105,7 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
 - **v0.11.0 release decision** — merge to `main` + bump + tag, or keep
   developing. The release procedure (and its traps) is documented per
   ROADMAP M3.
+
 - Deferred plugin capabilities, none blocking: per-tool `executionMode`
   override, provider registration from plugins, richer session
   metadata. Plugin **hot reload** is the notable one — `/reload`
@@ -145,3 +157,4 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
 | 260902-m0z | Stage A of the v0.12 event work: the four Claude-Code-named hook events take PI's names (`tool_execution_start` / `tool_execution_end` / `input` / `session_shutdown`), retired keys are a hard config error naming the replacement, `session_start`/`session_shutdown` carry PI's `reason` and fire on `/new` `/resume` `/fork` `/import`, and the session payload stops lying (`session_id` + `NANOPI_SESSION_ID` are the real id; the reason moved to `arguments.reason`) | 2026-09-02 | `7a15138`…`9caa4c5` | [260902-m0z-rename-hook-events-pi-names](./quick/260902-m0z-rename-hook-events-pi-names/) |
 | 260902-nms | Stage B of the v0.12 event work: WASM plugins observe lifecycle events. Third WIT world `extension-events` (`list-events` / `handle-event`), delivery at all eleven emit sites, config-granted subscriptions (both the plugin's request and the `events` grant must agree), observe-only with `try_lock`-and-drop so a busy plugin can never extend a turn, a 2s event epoch budget, `/tools` shows subscriptions, and a committed fixture + example plugin | 2026-09-02 | `5d2e90f`…`009f236` | [260902-nms-wasm-event-subscribers](./quick/260902-nms-wasm-event-subscribers/) |
 | 260903-l1s | Inline `<think>…</think>` blocks on the OpenAI wire render as thinking instead of reply text. Split in the provider adapter, so the same fix keeps reasoning out of the context, the session transcript and the `--output json` envelope — and makes the OpenAI wire produce the same transcript as the Anthropic one for the same model. Gated on POSITION, not vendor: only a leading `<think>` block counts as reasoning, so a mid-answer mention or a code fence stays literal and the fix reaches every OpenAI-wire vendor including ollama/vLLM. `inline_think_tags` remains the escape hatch both ways | 2026-09-03 | `3cc93ee`…`78958cd` | [260903-l1s-inline-think-tags](./quick/260903-l1s-inline-think-tags/) |
+| — | Manual acceptance of v0.12 surfaced eight defects, fixed with regression tests: reasoning rendered in two colors and the reply losing its color after any interruption (`d48f1aa`); the exit hint naming the startup session instead of the one you ended in (`af9f18b`); a no-op `/compact` claiming it compacted and leaving an orphaned `session_before_compact` hook with no matching `session_compact` (`87a81b4`); a mid-stream steer silently dropped when the turn ended without tool calls, so the saved session attributed a reply to a question never asked (`b90b27f`); `make bump` rewriting the wasmtime dependency version (`1777fb8`); stderr notices staircasing in raw mode across 35 call sites (`53bd497`); a spurious `api_kind` warning for a correct dual-surface MiniMax config, unsatisfiable by construction (`f1b27f5`); and a refused prompt shown as `[error: [ … ]]` framed as a malfunction rather than the user's own policy (`c0ce35c`). Plus PI-style grouped startup notices (`4dc8f2a`) and the dropped abbreviated session id (`5f2574e`) | 2026-09-04 | `d48f1aa`…`c0ce35c` | — |
