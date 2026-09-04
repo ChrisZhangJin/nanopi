@@ -181,7 +181,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// terminal). Capped: a 400-column window should not produce 400-column
 /// paragraphs, which are harder to read than the wrap.
 fn text_width() -> usize {
-    let cols = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let cols = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
     cols.clamp(40, 100)
 }
 
