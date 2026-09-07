@@ -385,8 +385,21 @@ Real-time visibility, no transcript corruption.
 `fetch_url` (`loader.rs:332`) already does async I/O from inside a
 synchronous `func_wrap` closure: it spawns a thread with its own
 current-thread runtime, `block_on`s there, and returns the result over
-an `std::sync::mpsc` channel. `host-call-tool` uses the same shape,
-plus an `Arc<ToolRegistry>` carried in `PluginState`.
+an `std::sync::mpsc` channel. `host-call-tool` uses the same shape.
+
+**Correction.** An earlier version of this paragraph added "plus an
+`Arc<ToolRegistry>` carried in `PluginState`". That is not
+implementable, and planning stage 3 is what found it: the registry is
+still being assembled while `load_all` runs, `EventSubscribers` does
+not exist until `build.rs:182`, and the `mpsc::Sender<AgentEvent>` is
+created per turn and has no existence at plugin-load time. None of the
+three can be captured into `PluginState`, which is built once at load.
+
+The seam is instead a process-wide installed dispatch, the same shape
+`notify::install_sink` and `plugin_context` already use: installed when
+the Agent is built, and refreshed once per `run_turn` alongside stage
+2's `context.system` refresh so the live `session_id` survives `/new`
+and `/resume`.
 
 ## 3. Grants, in one place
 
