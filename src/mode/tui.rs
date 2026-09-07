@@ -5055,6 +5055,55 @@ mod tests {
         assert_eq!(pick_follow_up(None, &mut slot), None, "and then nothing");
     }
 
+    /// **A structural test, and a test of last resort.** The reversion
+    /// it exists for — deleting the per-turn `plugin_send::install` from
+    /// `KeyAction::StartTurn` and relying on the one at startup — came
+    /// back GREEN against every behavioural test in this crate, because
+    /// the call site sits inside `handle_action`, which needs a live
+    /// `Term`, an agent slot and a spawned turn task to reach.
+    ///
+    /// The consequence of that deletion is not small: the steer sender
+    /// is created FRESH for every turn, so a sink kept from the first
+    /// turn holds one whose receiver died with it, and every plugin
+    /// message from the second turn onward would silently queue as a
+    /// follow-up instead of steering the running turn.
+    /// `plugin_send::installing_a_fresh_sink_replaces_the_previous_turns_sender`
+    /// pins `install`'s REPLACE semantics; nothing pinned that anyone
+    /// calls it.
+    ///
+    /// So this reads the source. It is brittle by construction — a
+    /// rename breaks it — and that is the accepted cost: a brittle test
+    /// that fails loudly on the right change beats a silent capability
+    /// that degrades after the first turn. If you are here because a
+    /// rename broke it, update the needle; if you are here because you
+    /// moved the call, move the needle with it and make sure the new
+    /// home still runs once per turn.
+    #[test]
+    fn the_send_sink_is_republished_on_every_turn_not_once_at_startup() {
+        let src = include_str!("tui.rs");
+        let arm = src
+            .split_once("KeyAction::StartTurn(msg) => {")
+            .expect("the turn-start arm must exist")
+            .1
+            .split_once("KeyAction::SteerTurn(")
+            .expect("…and end where the next arm begins")
+            .0;
+        assert!(
+            arm.contains("plugin_send::install"),
+            "KeyAction::StartTurn must REPUBLISH the send sink with this \
+             turn's steer sender. Installing only at startup leaves a \
+             sender whose receiver died with the first turn, and every \
+             later plugin message queues instead of steering — silently, \
+             and only from the second turn on."
+        );
+        assert!(
+            arm.contains("plugin_send::reset_turn"),
+            "…and it must promote the staged turn origin at the SAME \
+             boundary as `notify::reset_turn`. A second boundary drifts, \
+             and the drift is a hole in §2.4's rule 2."
+        );
+    }
+
     /// The drain is also the only place that learns WHOSE turn is about
     /// to start, which is what makes §2.4's rule 2 true for a turn a
     /// plugin STARTED as opposed to one it steered. `StartTurn`'s
