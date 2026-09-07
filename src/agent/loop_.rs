@@ -4278,7 +4278,7 @@ mod tests {
     // ─────── v0.6: --continue / active_session ───────
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_lock()
     }
 
     /// No active session registered for this cwd → returns None.

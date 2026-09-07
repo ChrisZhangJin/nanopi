@@ -1968,7 +1968,7 @@ mod tests {
     /// own test guard, and the same lock so they exclude against each
     /// other too.
     fn context_guard() -> std::sync::MutexGuard<'static, ()> {
-        let g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::test_lock();
         crate::plugin_context::clear_all();
         // Without an installed sink `notify` writes straight to
         // stderr and `drain` returns nothing — these tests assert on
@@ -2071,7 +2071,7 @@ mod tests {
     /// and a refused one discloses nothing — it did not happen.
     #[test]
     fn a_call_that_ran_is_disclosed_and_a_refused_one_is_not() {
-        let _l = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _l = crate::test_lock();
         let dir = std::env::temp_dir().join(format!("nanopi-gate-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f.txt"), "hi\n").unwrap();

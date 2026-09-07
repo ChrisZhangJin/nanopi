@@ -536,7 +536,7 @@ mod tests {
     /// clean and the test doesn't pick up the developer's real ~/.nanopi.
     #[test]
     fn compose_injects_cwd_context_file() {
-        let _g = crate::TEST_LOCK.lock().unwrap();
+        let _g = crate::test_lock();
         let prev = std::env::var_os("NANOPI_HOME");
         let home = tmpdir("home");
         std::env::set_var("NANOPI_HOME", &home);
@@ -585,7 +585,7 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::TEST_LOCK.lock().unwrap();
+        let _g = crate::test_lock();
         let prev = std::env::var_os("NANOPI_HOME");
         let home = tmpdir("home");
         std::env::set_var("NANOPI_HOME", &home);
@@ -646,7 +646,7 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::TEST_LOCK.lock().unwrap();
+        let _g = crate::test_lock();
         let prev = std::env::var_os("NANOPI_HOME");
         let home = tmpdir("home");
         std::env::set_var("NANOPI_HOME", &home);
@@ -719,7 +719,7 @@ mod tests {
     /// restoring the previous value afterward. Mirrors the pattern used
     /// throughout this module's existing tests.
     fn with_empty_global_home<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _g = crate::TEST_LOCK.lock().unwrap();
+        let _g = crate::test_lock();
         let prev = std::env::var_os("NANOPI_HOME");
         let home = tmpdir("home");
         std::env::set_var("NANOPI_HOME", &home);
@@ -953,7 +953,7 @@ mod tests {
     /// newline would pass a `contains` and still change every request.
     #[test]
     fn with_no_contribution_the_prompt_is_byte_identical_to_the_base() {
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let cwd = tmpdir("nocontrib");
         let base = "BASE PROMPT";
@@ -973,7 +973,7 @@ mod tests {
     /// build-time-only injection cannot pass this.
     #[test]
     fn a_contribution_set_after_the_agent_is_built_reaches_the_prompt() {
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let cwd = tmpdir("aftrbuild");
         let mut a = prompt_agent(&cwd, "BASE PROMPT");
@@ -998,7 +998,7 @@ mod tests {
     /// carry ten copies of it (invariant 10).
     #[test]
     fn ten_refreshes_leave_exactly_one_block() {
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let cwd = tmpdir("tenrefresh");
         let mut a = prompt_agent(&cwd, "BASE PROMPT");
@@ -1022,7 +1022,7 @@ mod tests {
     /// that can see the difference.
     #[test]
     fn clearing_a_contribution_returns_the_prompt_to_the_base() {
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let cwd = tmpdir("clearing");
         let base = "BASE PROMPT";
@@ -1052,7 +1052,7 @@ mod tests {
     /// once both branches have converged.
     #[test]
     fn a_custom_system_prompt_keeps_its_tail_with_a_contribution_active() {
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let prev = std::env::var_os("NANOPI_HOME");
         let home = tmpdir("home");
@@ -1110,7 +1110,7 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let prev = std::env::var_os("NANOPI_HOME");
         let home = tmpdir("home");
@@ -1167,7 +1167,7 @@ mod tests {
     /// reload `[[extensions]]`.
     #[test]
     fn reloading_the_base_leaves_an_active_contribution_standing() {
-        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_lock();
         crate::plugin_context::clear_all();
         let cwd = tmpdir("reloadbase");
         let mut a = prompt_agent(&cwd, "OLD BASE");

@@ -1001,7 +1001,7 @@ mod tests {
         use crate::tool::ToolRegistry;
         use crate::util::{time, uuid};
 
-        let _g = crate::TEST_LOCK.lock().unwrap();
+        let _g = crate::test_lock();
         let prev_home = std::env::var_os("NANOPI_HOME");
         let home = std::env::temp_dir().join(format!("nanopi-resume-tools-{}", uuid::v7()));
         std::fs::create_dir_all(&home).unwrap();

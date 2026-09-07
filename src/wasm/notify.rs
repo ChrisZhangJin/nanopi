@@ -279,7 +279,7 @@ mod tests {
     /// Reuses the crate's existing test lock rather than adding a
     /// second one that would not exclude against it.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        let g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::test_lock();
         let mut sink = lock();
         sink.queue.clear();
         sink.accepted = 0;

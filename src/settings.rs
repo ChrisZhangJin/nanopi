@@ -226,7 +226,7 @@ mod tests {
     // Tests in this module mutate $NANOPI_HOME; acquire the process-wide
     // test lock (defined in lib.rs) so session tests don't race.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_lock()
     }
 
     fn tmp() -> PathBuf {

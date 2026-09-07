@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn nanopi_home_honors_env() {
-        let _g = crate::TEST_LOCK.lock().unwrap();
+        let _g = crate::test_lock();
         let prev = std::env::var_os("NANOPI_HOME");
         std::env::set_var("NANOPI_HOME", "/tmp/nanopi-test-home");
 

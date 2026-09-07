@@ -195,7 +195,7 @@ mod tests {
     /// second one that would not exclude against it — exactly as
     /// `notify.rs`'s test module does.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        let g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::test_lock();
         clear_all();
         g
     }

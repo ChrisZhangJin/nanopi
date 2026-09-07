@@ -189,7 +189,7 @@ mod tests {
     use super::*;
 
     fn _lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_lock()
     }
 
     #[test]
