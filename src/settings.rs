@@ -225,10 +225,6 @@ mod tests {
 
     // Tests in this module mutate $NANOPI_HOME; acquire the process-wide
     // test lock (defined in lib.rs) so session tests don't race.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_lock()
-    }
-
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("nanopi-settings-{}", crate::util::uuid::v7()));
@@ -238,21 +234,14 @@ mod tests {
 
     #[test]
     fn missing_files_returns_empty() {
-        let _guard = lock();
         // Point NANOPI_HOME at a path that doesn't exist (so global
         // settings.toml is missing) and cwd at another missing path
         // (so local settings.toml is missing too).
-        let tmp_home = tmp();
+        let _h = crate::TempNanopiHome::new();
+        let tmp_home = _h.path().to_path_buf();
         let tmp_cwd = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &tmp_home);
 
         let h = load_settings(&tmp_cwd).unwrap();
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&tmp_home);
         let _ = std::fs::remove_dir_all(&tmp_cwd);
 
@@ -262,10 +251,8 @@ mod tests {
 
     #[test]
     fn loads_tool_execution_start() {
-        let _guard = lock();
-        let dir = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
         std::fs::write(
             dir.join("settings.toml"),
             r#"
@@ -289,11 +276,6 @@ timeout = 2000
         assert_eq!(h.tool_execution_start[0].matcher, "bash");
         assert_eq!(h.tool_execution_end.len(), 1);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -302,10 +284,8 @@ timeout = 2000
     /// its replacement — same as config.toml.
     #[test]
     fn retired_hook_key_in_settings_toml_is_a_hard_error() {
-        let _guard = lock();
-        let dir = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
         std::fs::write(
             dir.join("settings.toml"),
             r#"
@@ -327,11 +307,6 @@ command = "echo hi"
             "error should name the replacement: {err}"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -345,10 +320,8 @@ command = "echo hi"
     /// silently.
     #[test]
     fn an_input_hook_with_a_real_matcher_fails_to_load() {
-        let _guard = lock();
-        let dir = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
         std::fs::write(
             dir.join("settings.toml"),
             r#"
@@ -381,11 +354,6 @@ command = "cat >> /tmp/input.log"
         let h = load_settings(&PathBuf::from("/tmp")).expect("`*` must still load");
         assert_eq!(h.input.len(), 1);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -393,10 +361,8 @@ command = "cat >> /tmp/input.log"
     /// it just isn't rewritten by the retired-key table.
     #[test]
     fn misspelled_hook_key_in_settings_toml_is_still_an_error() {
-        let _guard = lock();
-        let dir = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
         std::fs::write(
             dir.join("settings.toml"),
             r#"
@@ -410,20 +376,13 @@ command = "echo hi"
         let r = load_settings(&PathBuf::from("/tmp"));
         assert!(matches!(r, Err(SettingsError::Toml { .. })));
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn config_toml_hooks_and_legacy_settings_toml_hooks_both_load() {
-        let _guard = lock();
-        let dir = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
 
         // Legacy settings.toml — one tool_execution_start hook.
         std::fs::write(
@@ -457,11 +416,6 @@ command = "/bin/true"
 
         let h = load_settings(&PathBuf::from("/tmp")).unwrap();
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
 
         // Both hooks present, config.toml first, settings.toml appended.
@@ -478,11 +432,9 @@ command = "/bin/true"
     /// `load_settings` are the project-level ones this test wrote.
     #[test]
     fn project_settings_toml_loads_compaction_hooks() {
-        let _guard = lock();
-        let home = tmp();
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
 
         std::fs::create_dir_all(cwd.join(".nanopi")).unwrap();
         std::fs::write(
@@ -505,11 +457,6 @@ timeout = 1000
 
         let h = load_settings(&cwd).unwrap();
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
 
@@ -521,10 +468,8 @@ timeout = 1000
 
     #[test]
     fn invalid_matcher_is_error() {
-        let _guard = lock();
-        let dir = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
         std::fs::write(
             dir.join("settings.toml"),
             r#"
@@ -537,11 +482,6 @@ command = "/bin/true"
         .unwrap();
 
         let r = load_settings(&dir);
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(r, Err(SettingsError::Matcher(_))), "got {r:?}");
     }

@@ -864,10 +864,6 @@ pub fn active_session(cwd: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_lock()
-    }
-
     fn tmp() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("nanopi-session-{}", uuid::v7()));
@@ -890,10 +886,8 @@ mod tests {
         // the read below failed with NotASession maybe one run in twenty.
         // It was also writing into the developer's real
         // ~/.nanopi/sessions whenever it won that race.
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let (path, header) = new_session(&cwd, "test-model", "https://api.example/v1").unwrap();
@@ -963,11 +957,6 @@ mod tests {
         matches!(entries[4], SessionEntry::ModelChange { .. });
 
         // Cleanup
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -989,11 +978,9 @@ mod tests {
 
     #[test]
     fn active_session_roundtrip() {
-        let _guard = lock();
+        let _h = crate::TempNanopiHome::new();
         // Use NANOPI_HOME to isolate from real ~/.nanopi.
-        let tmp_home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &tmp_home);
+        let tmp_home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let (path, _) = new_session(&cwd, "m", "https://api.example/v1").unwrap();
@@ -1002,22 +989,13 @@ mod tests {
         let got = active_session(&cwd);
         assert_eq!(got, Some(path));
 
-        // Cleanup
-        if let Some(h) = prev {
-            std::env::set_var("NANOPI_HOME", h);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
-        let _ = std::fs::remove_dir_all(&tmp_home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
     fn active_session_replaces_existing() {
-        let _guard = lock();
-        let tmp_home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &tmp_home);
+        let _h = crate::TempNanopiHome::new();
+        let tmp_home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let (p1, _) = new_session(&cwd, "m", "https://api.example/v1").unwrap();
@@ -1036,12 +1014,6 @@ mod tests {
             .count();
         assert_eq!(count, 1);
 
-        if let Some(h) = prev {
-            std::env::set_var("NANOPI_HOME", h);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
-        let _ = std::fs::remove_dir_all(&tmp_home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -1059,18 +1031,11 @@ mod tests {
     /// No --continue / --session → New.
     #[test]
     fn resolve_session_default_is_new() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let choice = resolve_session(&cwd, false, None, None, None).expect("resolve");
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         matches!(choice, SessionChoice::New);
     }
@@ -1078,18 +1043,11 @@ mod tests {
     /// --continue with no prior session falls back to New (not error).
     #[test]
     fn resolve_session_continue_without_history_falls_back_to_new() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let choice = resolve_session(&cwd, true, None, None, None).expect("resolve");
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         matches!(choice, SessionChoice::New);
     }
@@ -1097,21 +1055,14 @@ mod tests {
     /// --continue with a recorded active session returns Resume that path.
     #[test]
     fn resolve_session_continue_returns_active_path() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (path, _h) = new_session(&cwd, "m", "http://x").unwrap();
         set_active_session(&cwd, &path).unwrap();
 
         let choice = resolve_session(&cwd, true, None, None, None).expect("resolve");
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         match choice {
             SessionChoice::Resume(p) => assert_eq!(p, path),
@@ -1122,20 +1073,13 @@ mod tests {
     /// --session <id> resolves to that session file.
     #[test]
     fn resolve_session_by_id_returns_path() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (path, header) = new_session(&cwd, "m", "http://x").unwrap();
 
         let choice = resolve_session(&cwd, false, Some(&header.id), None, None).expect("resolve");
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         match choice {
             SessionChoice::Resume(p) => assert_eq!(p, path),
@@ -1146,10 +1090,8 @@ mod tests {
     /// fork_session copies body entries and sets parent_id on the new header.
     #[test]
     fn fork_session_copies_history() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         // Build a source session with two messages.
@@ -1185,11 +1127,6 @@ mod tests {
         matches!(&entries[0], SessionEntry::Message { .. });
         matches!(&entries[1], SessionEntry::Message { .. });
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1199,10 +1136,8 @@ mod tests {
     /// TUI can pre-fill the editor. parent_id links back to source.
     #[test]
     fn fork_session_at_truncates_prefix_and_returns_selected_text() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
@@ -1255,11 +1190,6 @@ mod tests {
         assert_eq!(entries.len(), 5);
         assert_eq!(prefill, None);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1328,10 +1258,8 @@ mod tests {
     /// has parent_id pointing at the source.
     #[test]
     fn resolve_session_fork_creates_child() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (_src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
@@ -1340,11 +1268,6 @@ mod tests {
         let new_path = match choice {
             SessionChoice::Resume(p) => p,
             other => {
-                if let Some(p) = prev {
-                    std::env::set_var("NANOPI_HOME", p);
-                } else {
-                    std::env::remove_var("NANOPI_HOME");
-                }
                 panic!("expected Resume, got {other:?}");
             }
         };
@@ -1352,11 +1275,6 @@ mod tests {
         assert_eq!(new_hdr.parent_id, Some(src_hdr.id.clone()));
         assert_ne!(new_hdr.id, src_hdr.id);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1364,18 +1282,11 @@ mod tests {
     /// --fork with a missing source id returns error.
     #[test]
     fn resolve_session_fork_missing_source_errors() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let r = resolve_session(&cwd, false, None, Some("does-not-exist"), None);
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
         assert!(r.is_err());
@@ -1399,10 +1310,8 @@ mod tests {
 
     #[test]
     fn set_session_name_roundtrips() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
         let (path, _hdr) = new_session(&cwd, "m", "http://x").unwrap();
         append_entry(
@@ -1432,11 +1341,6 @@ mod tests {
         let (h, _e) = read_session(&path).unwrap();
         assert_eq!(h.name, None);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1474,18 +1378,11 @@ mod tests {
     /// --session <id> with a missing id returns error (not New).
     #[test]
     fn resolve_session_by_id_missing_returns_error() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let r = resolve_session(&cwd, false, Some("does-not-exist"), None, None);
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         assert!(r.is_err(), "expected error for missing id, got {r:?}");
     }
@@ -1534,10 +1431,8 @@ mod tests {
     /// it lands at `<id>.jsonl` so a later run finds it by exact name.
     #[test]
     fn session_id_creates_then_resumes_same_session() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let first = resolve_session(&cwd, false, None, None, Some("ci-pr-1234"));
@@ -1559,11 +1454,6 @@ mod tests {
             other => panic!("expected Resume, got {other:?}"),
         }
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1573,10 +1463,8 @@ mod tests {
     /// conflict. Refuse it rather than hand project B project A's history.
     #[test]
     fn session_id_held_by_another_cwd_is_refused() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd_a = home_tmp();
         let cwd_b = home_tmp();
 
@@ -1587,11 +1475,6 @@ mod tests {
             "expected IdInUseElsewhere, got {r:?}"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd_a);
         let _ = std::fs::remove_dir_all(&cwd_b);
         let _ = std::fs::remove_dir_all(&home);
@@ -1601,10 +1484,8 @@ mod tests {
     /// and an existing id is fatal rather than resumed (PI main.ts:322).
     #[test]
     fn fork_with_session_id_names_the_destination() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (_src_path, src_hdr) = new_session(&cwd, "m", "http://x").unwrap();
@@ -1626,11 +1507,6 @@ mod tests {
             "expected IdAlreadyExists, got {again:?}"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1638,10 +1514,8 @@ mod tests {
     /// A malformed id is rejected before it can reach the filesystem.
     #[test]
     fn resolve_session_rejects_invalid_session_id() {
-        let _guard = lock();
-        let home = home_tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let r = resolve_session(&cwd, false, None, None, Some("../escape"));
@@ -1650,11 +1524,6 @@ mod tests {
             "expected InvalidId, got {r:?}"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&cwd);
         let _ = std::fs::remove_dir_all(&home);
     }

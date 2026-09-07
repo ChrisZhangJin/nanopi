@@ -143,8 +143,7 @@ mod tests {
 
     #[test]
     fn nanopi_home_honors_env() {
-        let _g = crate::test_lock();
-        let prev = std::env::var_os("NANOPI_HOME");
+        let _h = crate::TempNanopiHome::new();
         std::env::set_var("NANOPI_HOME", "/tmp/nanopi-test-home");
 
         assert_eq!(nanopi_home(), Some(PathBuf::from("/tmp/nanopi-test-home")));
@@ -157,11 +156,6 @@ mod tests {
             Some(PathBuf::from("/tmp/nanopi-test-home/skills"))
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
     }
 
     #[test]
