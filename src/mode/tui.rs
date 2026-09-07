@@ -256,6 +256,34 @@ fn skill_menu_items(skills: &[crate::resources::Skill]) -> Vec<MenuItem<SlashCmd
         .collect()
 }
 
+/// Every row the palette can offer right now: built-ins, then skills,
+/// then plugin commands.
+///
+/// The ONE place the command vocabulary is assembled. `sync_palette`
+/// builds the menu from it and `submit_or_chat` asks it what exists —
+/// so "unknown" means unknown to the palette after plugins have
+/// registered, not unknown to a second hand-maintained list. A second
+/// list is exactly the bug that once routed fourteen commands to the
+/// model when the line had a leading space.
+fn palette_items(app: &App) -> Vec<MenuItem<SlashCmd>> {
+    // Built-ins first, then skills, then plugin commands: a built-in
+    // always sorts above a plugin row, so even if the reserved-name
+    // guard ever failed the built-in stays reachable.
+    let mut items = slash_items();
+    items.extend(skill_menu_items(&app.skills_cache));
+    items.extend(command_menu_items(&app.commands_cache));
+    items
+}
+
+/// The same vocabulary as bare names (no leading `/`), for the
+/// unknown-command check.
+fn known_command_names(app: &App) -> Vec<String> {
+    palette_items(app)
+        .into_iter()
+        .map(|i| i.label.trim_start_matches('/').to_string())
+        .collect()
+}
+
 /// Truncate a description so a long one doesn't blow out the palette
 /// row. Matches PI's autocomplete label rules
 /// (interactive-mode.ts prefixAutocompleteDescription).
@@ -1143,6 +1171,14 @@ enum KeyAction {
     /// `/reload`: re-read config.toml / settings.toml / skills without
     /// exiting the session. New skills become visible on the next turn.
     Reload,
+    /// T4.6: the submission read as a command and the palette has no
+    /// such name. Scrollback only — it never reaches the model and
+    /// never enters the session transcript, the same rule
+    /// [`crate::command::CommandAction::Error`] follows.
+    UnknownCommand {
+        word: String,
+        suggestion: Option<String>,
+    },
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -1467,18 +1503,165 @@ async fn try_steer(
 /// exit, compact, or a chat turn. Extracted so the Submit path in
 /// interpret_key stays readable now that capture modes have their
 /// own branches.
-/// Only ever sees text the palette declined, so it no longer needs to
-/// recognise command names. It used to carry its own list of three
-/// (`/quit`, `/exit`, `/compact`) — a third source of truth beside
+/// The scrollback block an unknown command produces.
+///
+/// Split from the handler so its wording is testable — `insert_line`
+/// needs a live `Term`. Three lines at most, and the last one is not
+/// optional: refusing input without saying how to send it anyway would
+/// trade a wasted turn for a stuck user.
+fn unknown_command_lines(word: &str, suggestion: Option<&str>) -> Vec<Line<'static>> {
+    let red = Style::default().fg(Color::Red);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Unknown command: /{word}"),
+        red,
+    )])];
+    if let Some(s) = suggestion {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  Did you mean /{s}?"),
+            dim,
+        )]));
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!("  Type / to list commands, or //{word} to send it to the model as text."),
+        dim,
+    )]));
+    lines
+}
+
+/// What a submission starting with `/` actually is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashVerdict {
+    /// Send it. A leading `//` escape has had one slash removed, so
+    /// what the model sees is what the user meant to write.
+    Prose(String),
+    /// It reads as a command invocation and nothing in the palette
+    /// owns the name.
+    Unknown {
+        word: String,
+        suggestion: Option<String>,
+    },
+}
+
+/// Does `word` read as a command NAME, as opposed to the head of a
+/// path or a sentence?
+///
+/// This is the whole reason an unknown-command error is safe to add.
+/// PI never errors — an unmatched `/word` just goes to the model — and
+/// the case that justifies its silence is real: "/etc/nginx/nginx.conf
+/// is misconfigured" is a question, not a typo. So the refusal is
+/// narrowed to names a command could actually have, which is the same
+/// alphabet `command::name_problem` admits: no whitespace, no
+/// `/`, and here also no `.`, because every filesystem path a user
+/// pastes has one or the other.
+fn looks_like_command_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':'))
+}
+
+/// Edit distance, capped by the caller's threshold rather than by
+/// cleverness — the inputs are two command names, so the full matrix
+/// is a few hundred bytes.
+///
+/// In-tree on purpose: a typo hint is not worth a dependency, and the
+/// obvious twenty lines are easier to audit than a fuzzy matcher whose
+/// scoring nobody can predict.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The closest known command to `word`, if one is close enough to be
+/// worth naming.
+///
+/// Two edits, and never more than half the word — otherwise `/ab`
+/// "suggests" `/cd`, which is noise dressed as help. Case-insensitive,
+/// because `/Compact` is a typo the user would like fixed rather than
+/// a different command.
+fn closest_command(word: &str, known: &[&str]) -> Option<String> {
+    let lower = word.to_lowercase();
+    let budget = 2.min(lower.chars().count().div_ceil(2));
+    known
+        .iter()
+        .map(|k| (edit_distance(&lower, &k.to_lowercase()), *k))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k.to_string())
+}
+
+/// Classify one submission the palette declined.
+///
+/// `known` is the palette's vocabulary, bare names. Pure, so the whole
+/// T4.6 decision is testable without a `Term`.
+fn classify_submission(text: &str, known: &[&str]) -> SlashVerdict {
+    let t = text.trim();
+    // A multi-line paste is prose whatever it starts with: the palette
+    // only ever looked at the first line, and refusing a wall of text
+    // over its first token would be a worse bug than the one being
+    // fixed.
+    if !t.starts_with('/') || t.contains('\n') {
+        return SlashVerdict::Prose(t.to_string());
+    }
+    // `//foo` is the escape hatch the error message advertises: one
+    // slash is eaten and the rest goes to the model verbatim. Needed
+    // because a leading space no longer works — `slash_line` trims it.
+    if let Some(rest) = t.strip_prefix("//") {
+        return SlashVerdict::Prose(format!("/{rest}"));
+    }
+    let word = t[1..].split_whitespace().next().unwrap_or("");
+    // Known, yet the palette declined it — only reachable if the two
+    // ever disagree. Send it rather than refuse: the old behaviour is
+    // the safer answer when the vocabulary is self-contradictory.
+    if known.contains(&word) || !looks_like_command_word(word) {
+        return SlashVerdict::Prose(t.to_string());
+    }
+    SlashVerdict::Unknown {
+        word: word.to_string(),
+        suggestion: closest_command(word, known),
+    }
+}
+
+/// Only ever sees text the palette declined, so it still does not
+/// RESOLVE command names — it used to carry its own list of three
+/// (`/quit`, `/exit`, `/compact`), a third source of truth beside
 /// `slash_items()` and `dispatch_slash`, and the reason a leading space
-/// routed the other fourteen commands to the model. The palette is now
-/// the only thing that resolves a command; anything reaching here is
-/// prose, including prose that happens to start with `/`.
+/// routed the other fourteen commands to the model. The palette is
+/// still the only thing that resolves a command.
+///
+/// What it does do (T4.6) is REFUSE: text that reads as a command
+/// invocation and matches nothing in [`known_command_names`] is an
+/// error shown to the user, not a billed turn spent having the model
+/// explain that it has never heard of `/greet`. The vocabulary it
+/// checks against is the palette's own, built by [`palette_items`] —
+/// no second list, and plugin commands count because they are in it.
 fn submit_or_chat(app: &App, text: String) -> KeyAction {
     let t = text.trim();
     if t.is_empty() {
         return KeyAction::Nothing;
     }
+    let known = known_command_names(app);
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    let t = match classify_submission(t, &known) {
+        // Never reaches the agent, so it cannot enter the transcript.
+        SlashVerdict::Unknown { word, suggestion } => {
+            return KeyAction::UnknownCommand { word, suggestion };
+        }
+        SlashVerdict::Prose(s) => s,
+    };
+    let t = t.as_str();
     if app.status == Status::Streaming {
         // v0.11.0: mid-stream Enter steers the running turn instead of
         // silently doing nothing.
@@ -1509,14 +1692,7 @@ fn sync_palette(app: &mut App) {
     let first_line = slash_line(&full);
     if first_line.starts_with('/') {
         if app.palette.is_none() {
-            // Built-ins first, then skills, then plugin commands: a
-            // built-in always sorts above a plugin row, so even if the
-            // reserved-name guard ever failed the built-in stays
-            // reachable.
-            let mut items = slash_items();
-            items.extend(skill_menu_items(&app.skills_cache));
-            items.extend(command_menu_items(&app.commands_cache));
-            app.palette = Some(MenuState::new(items));
+            app.palette = Some(MenuState::new(palette_items(app)));
         }
         if let Some(m) = app.palette.as_mut() {
             // Filter only on the command WORD (chars up to the first
@@ -3184,6 +3360,11 @@ async fn handle_action(
                 let outcome = handler.run(&task_name, &args);
                 (task_name, outcome)
             }));
+        }
+        KeyAction::UnknownCommand { word, suggestion } => {
+            for line in unknown_command_lines(&word, suggestion.as_deref()) {
+                insert_line(term, line)?;
+            }
         }
         KeyAction::PluginCommandFinished { name, outcome } => {
             app.status_note = None;
@@ -5766,6 +5947,235 @@ mod tests {
         }
     }
 
+    // ── T4.6: unknown slash commands ────────────────────────────────
+
+    /// The defect T4.6 recorded: `/greet Chris` (a TOOL, not a command)
+    /// was handed to the model, burning a turn to have it explain that
+    /// it does not know what `/greet` means. It must be refused, and
+    /// the refusal must come out of the palette's own vocabulary.
+    #[test]
+    fn an_unknown_command_is_refused_not_sent() {
+        for text in ["/greet Chris", "/greet", "/nosuchcommand", "  /greet x"] {
+            let mut app = mkapp();
+            seed_input(&mut app, text);
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            match got {
+                KeyAction::UnknownCommand { word, .. } => {
+                    assert!(
+                        text.contains(&word),
+                        "the refusal must name what the user typed: {word:?} vs {text:?}"
+                    );
+                }
+                other => panic!("expected {text:?} to be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// The refusal is the whole point only if it never becomes a turn:
+    /// no `StartTurn`, no `SteerTurn`, so nothing reaches the agent and
+    /// nothing is written to the transcript as if the user had said it.
+    #[test]
+    fn a_refusal_never_becomes_a_turn_even_mid_stream() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "/greet Chris");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(got, KeyAction::UnknownCommand { .. }),
+            "mid-stream a typo must not be steered into the running turn, got {got:?}"
+        );
+    }
+
+    /// A plugin command is in the palette, so it must not read as
+    /// unknown — "unknown" has to mean unknown AFTER registration, not
+    /// unknown to a hardcoded list.
+    #[test]
+    fn a_plugin_command_is_not_unknown() {
+        struct H;
+        impl crate::command::CommandHandler for H {
+            fn run(
+                &self,
+                _n: &str,
+                _a: &str,
+            ) -> Result<crate::command::CommandAction, String> {
+                Ok(crate::command::CommandAction::Print("ok".into()))
+            }
+        }
+        let mut app = mkapp();
+        app.commands_cache = vec![crate::command::PluginCommand {
+            spec: crate::command::CommandSpec {
+                name: "todo".into(),
+                description: "d".into(),
+            },
+            plugin_name: std::sync::Arc::from("p"),
+            handler: std::sync::Arc::new(H),
+        }];
+        let known = known_command_names(&app);
+        assert!(
+            known.iter().any(|n| n == "todo"),
+            "the plugin command must be in the vocabulary: {known:?}"
+        );
+        // …and it resolves through the palette as before.
+        seed_input(&mut app, "/todo buy milk");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(&got, KeyAction::RunPluginCommand { name, args }
+                if name == "todo" && args == "buy milk"),
+            "got {got:?}"
+        );
+    }
+
+    /// Skills are palette rows too, so `/skill:<name>` for a loaded
+    /// skill is known and a bare `/skill:typo` is not.
+    #[test]
+    fn a_loaded_skill_is_in_the_vocabulary() {
+        let mut app = mkapp();
+        app.skills_cache = vec![crate::resources::Skill {
+            name: "review".into(),
+            description: "d".into(),
+            file_path: std::path::PathBuf::from("/tmp/SKILL.md"),
+            base_dir: std::path::PathBuf::from("/tmp"),
+            source: crate::resources::SkillSource::Project,
+            disable_model_invocation: false,
+        }];
+        assert!(known_command_names(&app).iter().any(|n| n == "skill:review"));
+    }
+
+    /// The single-source-of-truth rule, asserted directly: everything
+    /// the palette offers is a name `submit_or_chat` considers known.
+    /// If these ever came from two lists this is what would catch it.
+    #[test]
+    fn the_vocabulary_is_exactly_the_palette() {
+        // Seeded with a skill and a plugin command, because with only
+        // built-ins the vocabulary matches a hardcoded list by accident
+        // and the test comes back green when the two are separated.
+        struct H;
+        impl crate::command::CommandHandler for H {
+            fn run(
+                &self,
+                _n: &str,
+                _a: &str,
+            ) -> Result<crate::command::CommandAction, String> {
+                Ok(crate::command::CommandAction::Print("ok".into()))
+            }
+        }
+        let mut app = mkapp();
+        app.skills_cache = vec![crate::resources::Skill {
+            name: "review".into(),
+            description: "d".into(),
+            file_path: std::path::PathBuf::from("/tmp/SKILL.md"),
+            base_dir: std::path::PathBuf::from("/tmp"),
+            source: crate::resources::SkillSource::Project,
+            disable_model_invocation: false,
+        }];
+        app.commands_cache = vec![crate::command::PluginCommand {
+            spec: crate::command::CommandSpec {
+                name: "todo".into(),
+                description: "d".into(),
+            },
+            plugin_name: std::sync::Arc::from("p"),
+            handler: std::sync::Arc::new(H),
+        }];
+        let app = app;
+        let labels: Vec<String> = palette_items(&app)
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        let known = known_command_names(&app);
+        assert_eq!(labels.len(), known.len());
+        for (label, name) in labels.iter().zip(&known) {
+            assert_eq!(label, &format!("/{name}"));
+            assert_eq!(
+                classify_submission(
+                    label,
+                    &known.iter().map(String::as_str).collect::<Vec<_>>()
+                ),
+                SlashVerdict::Prose(label.clone()),
+                "{label} must not read as unknown"
+            );
+        }
+    }
+
+    /// A typo of a real command is worth more than a bare refusal.
+    #[test]
+    fn a_near_miss_suggests_the_real_command() {
+        let known = crate::command::RESERVED_COMMAND_NAMES;
+        for (typed, want) in [
+            ("compct", "compact"),
+            ("sesion", "session"),
+            ("Model", "model"),
+            ("quti", "quit"),
+        ] {
+            match classify_submission(&format!("/{typed}"), &known) {
+                SlashVerdict::Unknown { suggestion, .. } => assert_eq!(
+                    suggestion.as_deref(),
+                    Some(want),
+                    "/{typed} should have suggested /{want}"
+                ),
+                other => panic!("expected /{typed} unknown, got {other:?}"),
+            }
+        }
+    }
+
+    /// …and something that resembles nothing gets no invented hint.
+    /// A bad suggestion is worse than none: it sends the user to a
+    /// command they did not want.
+    #[test]
+    fn a_distant_word_gets_no_suggestion() {
+        let known = crate::command::RESERVED_COMMAND_NAMES;
+        for typed in ["greet", "xyzzyfrobnicate", "ab"] {
+            match classify_submission(&format!("/{typed}"), &known) {
+                SlashVerdict::Unknown { suggestion, .. } => assert_eq!(
+                    suggestion, None,
+                    "/{typed} should not have suggested {suggestion:?}"
+                ),
+                other => panic!("expected /{typed} unknown, got {other:?}"),
+            }
+        }
+    }
+
+    /// The escape hatch the error message advertises has to work, or
+    /// the refusal leaves the user unable to say the thing at all.
+    #[test]
+    fn a_doubled_slash_sends_one_slash_to_the_model() {
+        let mut app = mkapp();
+        seed_input(&mut app, "//greet is not a command, right?");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match got {
+            KeyAction::StartTurn(sent) => {
+                assert_eq!(sent, "/greet is not a command, right?")
+            }
+            other => panic!("expected the escaped line to be sent, got {other:?}"),
+        }
+    }
+
+    /// A multi-line paste is prose whatever its first token looks like.
+    #[test]
+    fn a_multiline_submission_is_never_refused() {
+        let known = ["compact"];
+        assert!(matches!(
+            classify_submission("/greet\nand more", &known),
+            SlashVerdict::Prose(_)
+        ));
+    }
+
+    /// The refusal has to tell the user both how to find the real
+    /// command and how to send the line anyway.
+    #[test]
+    fn the_refusal_says_how_to_recover() {
+        let lines = unknown_command_lines("greet", Some("export"));
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(text[0], "Unknown command: /greet");
+        assert_eq!(text[1], "  Did you mean /export?");
+        assert!(text[2].contains("Type /"), "{}", text[2]);
+        assert!(text[2].contains("//greet"), "{}", text[2]);
+        // No suggestion → no empty second row.
+        assert_eq!(unknown_command_lines("greet", None).len(), 2);
+    }
+
     /// The argument splitter has to trim the same way the palette does,
     /// or `" /name x"` splits at the leading space and yields the whole
     /// line as the argument.
@@ -5783,15 +6193,18 @@ mod tests {
     /// Trimming for the palette closed the accidental escape hatch that
     /// a leading space used to provide, so an unmatched `/…` line must
     /// fall through to the model instead of leaving the user stuck on
-    /// "(no matches)" with text they cannot submit. Matches PI, which
-    /// has no "unknown command" error — `/typo` silently becomes a
-    /// prompt.
+    /// "(no matches)" with text they cannot submit.
+    ///
+    /// Narrowed by T4.6: a line that reads as a COMMAND is now refused
+    /// (see `an_unknown_command_is_refused_not_sent`), but a path or a
+    /// sentence still goes through, which is the case that justified
+    /// PI's blanket silence in the first place.
     #[test]
     fn an_unmatched_slash_line_is_sent_as_chat() {
         for text in [
             "/etc/nginx/nginx.conf is misconfigured",
             " /usr/bin/env is missing",
-            "/nosuchcommand",
+            "/3.5 is the version",
         ] {
             let mut app = mkapp();
             seed_input(&mut app, text);
