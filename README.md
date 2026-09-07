@@ -291,6 +291,8 @@ And may import these host functions:
 | `host-log` | `(level: u8, message: string)` | always | Write to nanopi's stderr. `0`=trace `1`=info `2`=warn `3`=error. |
 | `host-fs-read` | `(path: string) -> string` | `allow_fs` | Read a UTF-8 file inside the working directory. Returns contents, or a string starting with `error: `. |
 | `host-http-get` | `(url: string) -> string` | `allow_network` + `url_allowlist` | Fetch an `http`/`https` URL. Returns the response body, or a string starting with `error: `. |
+| `host-store-get` | `(key: string) -> string` | `allow_store` | Read this plugin's stored value for `key`. Absent reads as `""`. |
+| `host-store-set` | `(key: string, value: string) -> string` | `allow_store` | Replace this plugin's value at `key`. Returns `""` once the bytes are on the filesystem, or a string starting with `error: `. |
 
 Payloads cross the boundary as JSON strings rather than WIT records — one primitive type keeps the ABI small enough that neither side needs a codegen step.
 
@@ -301,6 +303,8 @@ Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki
 **Sandboxing.** Components run inside wasmtime with no ambient authority — a plugin reaches the outside world only through host functions you opt into.
 
 `host-fs-read` is gated on `allow_fs = true`, and even then the path must resolve *inside* the working directory. Paths are canonicalized before that check, so `../` traversal and symlinks pointing outward are both refused. (The built-in `read` tool deliberately has no such guard, on the reasoning that the model can shell out anyway — but a plugin has no shell, so here the boundary is real rather than theater.)
+
+`host-store-get` / `host-store-set` are gated on `allow_store = true` and are **keys, not paths** — the plugin supplies a map key and the host alone decides which file it lands in (`~/.nanopi/extensions/<stem>/store.json`, one JSON object per plugin). So none of the confinement machinery above applies or is needed: there is no path for a plugin to point outward. Bounds are 1 MiB total, 1000 keys, and keys up to 128 chars; every refusal comes back in-band and stores nothing, so a plugin is never told it failed while the value went in anyway. A `""` return from `host-store-set` means the bytes reached the filesystem — the host commits with a temp file and a rename, so a crash leaves the whole old file or the whole new one, never a torn one. Two plugins whose `.wasm` files share a file stem where either has `allow_store` fail to load rather than silently sharing one store.
 
 `host-http-get` is gated twice: on `allow_network = true`, and then on the URL's host matching `url_allowlist`. An **empty allowlist denies everything**, so switching the capability on does not by itself reach anything. Matching is on the parsed host, not a substring — `https://evil.com/?x=api.github.com` and `https://api.github.com@evil.com/` are both refused against an allowlist of `api.github.com`.
 

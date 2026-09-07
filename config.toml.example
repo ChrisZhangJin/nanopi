@@ -114,6 +114,28 @@ base_url = "https://api.openai.com/v1"
 #                   Even when true, reads are confined to the working
 #                   directory: paths are canonicalized first, so `../`
 #                   and outward-pointing symlinks are refused.
+#   allow_store     Let the plugin call host-store-get / host-store-set
+#                   (v0.12.0). Default false. Gives the plugin its own
+#                   keyed store that SURVIVES A RESTART, at
+#                   ~/.nanopi/extensions/<stem>/store.json — one JSON
+#                   object per plugin, where <stem> is the .wasm file
+#                   name without its extension.
+#                   KEYS, NOT PATHS: the plugin supplies a map key and
+#                   the host decides which file that lands in, so this
+#                   grants no filesystem reach — nothing here needs the
+#                   confinement rules allow_fs has.
+#                   Bounds, all reported in-band and all refusing
+#                   WITHOUT storing anything: 1 MiB total, 1000 keys,
+#                   keys up to 128 chars. A key that was already there
+#                   can always be replaced, even at the key cap.
+#                   Two plugins whose .wasm files share a file stem
+#                   where either sets allow_store is a LOAD ERROR for
+#                   BOTH — they would share one store.json, and one
+#                   silently overwriting the other's memory is worse
+#                   than refusing to start either. Rename one file.
+#                   Combining allow_store with allow_network = true is
+#                   warned about at startup: a durable profile built up
+#                   across restarts, plus a way off the machine.
 #   allow_network   Let the plugin call host-http-get. Default false.
 #                   Only http/https; requests time out after 10s, and
 #                   redirects are not followed, so a 3xx cannot walk a
@@ -176,6 +198,13 @@ base_url = "https://api.openai.com/v1"
 # [[extensions]]
 # path = "~/.nanopi/extensions/"
 # max_files = 16
+
+# A memory plugin: watches what you type and remembers it across
+# restarts. No network, so what it accumulates stays on this machine.
+# [[extensions]]
+# path = "~/.nanopi/extensions/memory.wasm"
+# allow_store = true
+# events = ["input", "message_end"]
 
 # A plugin that only watches lifecycle events (e.g. an audit logger) —
 # no tools, no commands, just `events`.

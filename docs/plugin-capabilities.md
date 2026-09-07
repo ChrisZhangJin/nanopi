@@ -343,9 +343,26 @@ plus an `Arc<ToolRegistry>` carried in `PluginState`.
 | — | `host-log`, `host-notify` | always |
 
 Every grant is two-sided in the same sense as `events`: the plugin can
-only use what the config named. `/tools` must show all of them, because
-it is the one place a user can see what an installed plugin is allowed
-to do.
+only use what the config named.
+
+`/tools` **should** show all of them, because it is the one place a user
+can see what an installed plugin is allowed to do — but it does not yet,
+and this document is not going to claim otherwise. Today `/tools` shows
+`Watching events (N plugins)` and nothing about grants: subscriptions
+are per-plugin data the Agent already holds
+(`event_subscribers.subscriptions()`), whereas grants are consumed
+inside `load_all` and never retained, so surfacing them needs a new
+`load_all → Agent → App cache → render` pipe. That pipe is built once,
+for all six grants, in the stage that first needs more than one of them
+— building it for `allow_store` alone would mean building it twice.
+
+Until then the grant is made visible at **startup** instead: a plugin
+loaded with `allow_store` gets an `[Extensions]` notice naming its store
+file. That is weaker than `/tools` — it scrolls away, and it is not
+somewhere you can go and *ask* — so it is a stand-in, not the answer.
+Stating the gap here rather than the aspiration is the same rule
+`docs/claims-and-races.md` §1 applies to everything else nanopi says
+about itself.
 
 Two combinations deserve the escalated warning `[Extensions]` already
 gives `events` + `allow_network`:

@@ -168,6 +168,24 @@ pub struct ExtensionConfig {
     /// Enable the `host-fs-read` host function (read-only).
     /// Default: `false`.
     pub allow_fs: bool,
+
+    /// v0.12: enable `host-store-get` / `host-store-set` — this
+    /// plugin's own keyed store at
+    /// `~/.nanopi/extensions/<stem>/store.json`. Default: `false`.
+    ///
+    /// Gated rather than free because state that survives a restart is
+    /// a different capability from state in the instance's memory:
+    /// combined with `allow_network = true` it is a durable profile of
+    /// the user that can leave the machine, which is why that
+    /// combination warns at plugin load
+    /// (`docs/plugin-capabilities.md` §3).
+    ///
+    /// The plugin supplies KEYS, never paths — the host owns the
+    /// mapping to a file — so this grants no filesystem reach that
+    /// `allow_fs` would otherwise cover. Identity is the `.wasm` file
+    /// stem, so two plugins with the same stem where either sets this
+    /// are a load error rather than a silent shared store.
+    pub allow_store: bool,
     /// Hosts `host-http-get` may reach. Empty denies every URL, so
     /// `allow_network = true` alone reaches nothing. Compared against
     /// the URL's parsed host, never a substring.
@@ -210,6 +228,7 @@ impl Default for ExtensionConfig {
             max_files: 64,
             allow_network: false,
             allow_fs: false,
+            allow_store: false,
             url_allowlist: Vec::new(),
             events: Vec::new(),
         }
@@ -411,6 +430,46 @@ mod tests {
 
     fn uuid_v7() -> String {
         crate::util::uuid::v7().to_string()
+    }
+
+    #[test]
+    fn allow_store_defaults_off_and_parses() {
+        let cfg: Config = toml::from_str(
+            "[[extensions]]\npath = \"a.wasm\"\n\n\
+             [[extensions]]\npath = \"b.wasm\"\nallow_store = true\n",
+        )
+        .expect("valid config");
+        assert!(
+            !cfg.extensions[0].allow_store,
+            "a durable store must be opt-in, like every other grant"
+        );
+        assert!(cfg.extensions[1].allow_store);
+    }
+
+    /// Pins the CURRENT behavior, which is not what one might assume:
+    /// `ExtensionConfig` does NOT carry `#[serde(deny_unknown_fields)]`
+    /// — only `HooksSection` does (`agent/hook.rs`, the retired-key
+    /// rule) — so a typo'd grant inside `[[extensions]]` is silently
+    /// ignored rather than refused.
+    ///
+    /// That is a real gap: `allow_stroe = true` reads as a plugin the
+    /// user believes they granted a store and did not, and nothing says
+    /// otherwise. It is NOT fixed here, because turning it on would
+    /// start rejecting configs that load today, which is a decision
+    /// about every `[[extensions]]` key rather than about `allow_store`
+    /// (see the SUMMARY). This test exists so the gap is written down
+    /// and so flipping it later is a deliberate, visible change instead
+    /// of an accident.
+    #[test]
+    fn a_typod_extension_grant_is_currently_ignored_not_refused() {
+        let cfg: Config = toml::from_str(
+            "[[extensions]]\npath = \"a.wasm\"\nallow_stroe = true\n",
+        )
+        .expect("today this parses — see the doc comment, this is the gap");
+        assert!(
+            !cfg.extensions[0].allow_store,
+            "the typo grants nothing, which is the safe half of the gap"
+        );
     }
 
     /// Test guard: point NANOPI_HOME at an empty temp dir so tests

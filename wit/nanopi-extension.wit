@@ -78,6 +78,76 @@ world extension {
     /// allowlist never approved.
     import host-http-get: func(url: string) -> string;
 
+    /// ─── Imports are additive; they need NO new world. ───
+    ///
+    /// The LINEAR LADDER note at the top of this file is about EXPORTS
+    /// only. `wasm-tools component new` fails on a *missing export*, so
+    /// adding an export to `extension` breaks every existing plugin
+    /// source. An import is the other direction: a guest compiled
+    /// against the older WIT simply never references these functions,
+    /// and a component that references no import needs nothing linked
+    /// for it. The host links them unconditionally and the old binaries
+    /// keep loading — the three committed fixtures predate these three
+    /// imports and prove it on every test run.
+    ///
+    /// So new capabilities go here, on `world extension`, and are
+    /// inherited by `extension-commands` / `extension-events` through
+    /// `include`. Do NOT add a fourth world for them.
+    ///
+    /// ─────────────────────────────────────────────────────────────
+
+    /// Read this plugin's stored value for `key`. Absent → `""`.
+    ///
+    /// Gated on `allow_store = true` in the plugin's `[[extensions]]`
+    /// entry — without it every call returns an `error: ` string, and
+    /// no store file is ever created. State that survives a restart is
+    /// a different capability from state in the instance's memory:
+    /// combined with `allow_network` it is a durable profile of the
+    /// user, which is why it is gated rather than free.
+    ///
+    /// KEYS, NOT PATHS. The plugin never names a filesystem location,
+    /// so the whole class of problems `host-fs-read` defends against —
+    /// `../`, symlinks pointing outward, non-regular files — does not
+    /// exist here. The host owns the mapping: one JSON object per
+    /// plugin at `~/.nanopi/extensions/<stem>/store.json`, where
+    /// `<stem>` is the `.wasm` file stem. Two plugins with the same
+    /// stem where either has `allow_store` is a LOAD ERROR, not a
+    /// silent share — the same policy as a command-name collision.
+    ///
+    /// Absent reads as `""` unambiguously, because `""` is not valid
+    /// JSON and a plugin should store JSON. The residual ambiguity — a
+    /// plugin storing a literal string that begins `error: ` — is
+    /// inherited from this ABI's in-band error convention and is
+    /// documented rather than papered over.
+    ///
+    /// A store value SURVIVES A GUEST TRAP. The store is host-side
+    /// precisely because a trap resets the instance and takes guest
+    /// memory with it.
+    import host-store-get: func(key: string) -> string;
+
+    /// Replace this plugin's value at `key`. Returns `""` on success,
+    /// or an `error: ` string.
+    ///
+    /// A return of `""` means THE BYTES REACHED THE FILESYSTEM, not a
+    /// buffer: the host commits by writing a temp file and renaming it
+    /// over `store.json` in the same directory, and returns only after
+    /// that rename. A same-directory rename is atomic, so a crash
+    /// mid-`set` leaves either the whole old file or the whole new one,
+    /// never a torn one. There is no `fsync` — this survives a process
+    /// crash, not a power cut.
+    ///
+    /// Bounds, checked BEFORE anything is written. A refusal stores
+    /// NOTHING, so a plugin is never told it failed while the value
+    /// went in anyway:
+    ///
+    ///   total serialized store   1 MiB   `error: store quota exceeded (1 MiB)`
+    ///   number of keys           1000    refused, naming the cap
+    ///   key length               128     refused, naming the cap (inclusive: 128 is fine)
+    ///
+    /// Replacing a key that already exists does not count against the
+    /// key cap, so a plugin at the cap can still update what it holds.
+    import host-store-set: func(key: string, value: string) -> string;
+
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [
