@@ -314,6 +314,41 @@ fn subscriptions_section(subs: &[(String, Vec<String>)]) -> Vec<Line<'static>> {
     lines
 }
 
+/// `/tools`'s "what can each plugin do to me" section. The callable
+/// tool list answers "what can the model call" and
+/// [`subscriptions_section`] answers "what is watching me"; neither
+/// answers "what was this plugin granted" — and `allow_tools` makes
+/// that the difference between a plugin that formats text and one that
+/// can run `bash`.
+///
+/// Empty slice → empty `Vec`, so the section is omitted rather than
+/// growing a permanently-empty heading in every non-`wasm` build. Same
+/// rule as [`subscriptions_section`]. Note this is NOT the same as a
+/// plugin with no grants: that plugin still gets a row, reading `no
+/// grants`, because "installed, powerless" and "not installed" must
+/// not look identical.
+fn grants_section(grants: &[crate::plugin_grants::PluginGrants]) -> Vec<Line<'static>> {
+    if grants.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Plugin grants ({} plugins)", grants.len()),
+        Style::default()
+            .fg(Color::Indexed(108))
+            .add_modifier(Modifier::BOLD),
+    )])];
+    for g in grants {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<20}", g.plugin_name),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(g.summary(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
+}
+
 const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
 
 /// Max input content lines shown at once when no overlay menu is open.
@@ -817,6 +852,11 @@ struct App {
     /// field carries no WASM feature gate into `tui.rs`. Always empty in
     /// a build without `--features wasm`.
     subscriptions_cache: Vec<(String, Vec<String>)>,
+    /// Pre-rendered grant rows for `/tools`, refreshed in
+    /// `refresh_status` beside `subscriptions_cache`. Non-gated
+    /// (`src/plugin_grants.rs`); always empty without `--features
+    /// wasm`, which is why the section is omitted rather than empty.
+    plugin_grants_cache: Vec<crate::plugin_grants::PluginGrants>,
     /// In-flight plugin command, run on the blocking pool.
     ///
     /// Not awaited inline: `handle_action` runs inside the `select!`
@@ -888,6 +928,7 @@ impl App {
             skills_cache: Vec::new(),
             commands_cache: Vec::new(),
             subscriptions_cache: Vec::new(),
+            plugin_grants_cache: Vec::new(),
             command_task: None,
         }
     }
@@ -2779,6 +2820,16 @@ async fn handle_action(
             // is the other half of a plugin's blast radius and just as
             // worth an operator's attention. Nothing printed when no
             // plugin subscribed to any event.
+            // And this one answers "what was it allowed to do" —
+            // `allow_tools` in particular, which is what separates a
+            // plugin that formats text from one that can run `bash`.
+            for line in grants_section(&app.plugin_grants_cache) {
+                insert_line(term, line)?;
+            }
+            if !app.plugin_grants_cache.is_empty() {
+                insert_line(term, Line::from(""))?;
+            }
+
             for line in subscriptions_section(&app.subscriptions_cache) {
                 insert_line(term, line)?;
             }
@@ -3384,6 +3435,7 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.skills_cache = a.skills.clone();
         app.commands_cache = a.plugin_commands.clone();
         app.subscriptions_cache = a.event_subscribers.subscriptions();
+        app.plugin_grants_cache = a.plugin_grants.clone();
     }
 }
 
@@ -4896,6 +4948,42 @@ mod tests {
     }
 
     #[test]
+    fn grants_section_is_empty_when_no_plugin_loaded() {
+        // The non-`wasm` build takes this path on every `/tools`, so a
+        // heading here would be a permanent lie in the default binary.
+        assert!(grants_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn grants_section_gives_a_powerless_plugin_a_row_saying_so() {
+        let grants = vec![
+            crate::plugin_grants::PluginGrants {
+                plugin_name: "indexer".into(),
+                path: "/tmp/indexer.wasm".into(),
+                grants: vec!["allow_tools(find, read)".into()],
+            },
+            crate::plugin_grants::PluginGrants {
+                plugin_name: "formatter".into(),
+                path: "/tmp/formatter.wasm".into(),
+                grants: Vec::new(),
+            },
+        ];
+        let texts = line_texts(&grants_section(&grants));
+        assert_eq!(texts.len(), 3, "header + one row per plugin: {texts:?}");
+        assert!(texts[0].contains("Plugin grants"), "{texts:?}");
+        assert!(texts[0].contains('2'), "header counts the plugins: {texts:?}");
+        assert!(texts[1].contains("indexer"), "{texts:?}");
+        assert!(texts[1].contains("allow_tools(find, read)"), "{texts:?}");
+        assert!(texts[2].contains("formatter"), "{texts:?}");
+        assert!(
+            texts[2].contains("no grants"),
+            "an ungranted plugin must still get a row, and it must SAY \
+             it holds nothing — otherwise `installed, powerless` and \
+             `not installed` read the same: {texts:?}"
+        );
+    }
+
+    #[test]
     fn wrap_chars_one_column_per_char() {
         // CJK counts as ONE column here (unlike unicode-width), so a run
         // of 5 chars fits in width 5 on a single row — no double-width gap.
@@ -4997,6 +5085,7 @@ mod tests {
             context: crate::agent::context::Context::default(),
             provider: Box::new(DeadProvider),
             registry: ToolRegistry::standard(),
+            plugin_grants: Vec::new(),
             session_path,
             session_id: session_id.to_string(),
             cwd: dir.to_path_buf(),

@@ -111,9 +111,13 @@ fn load_extensions(
     registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
     cwd: &std::path::Path,
-) -> (Vec<crate::command::PluginCommand>, crate::subscriber::EventSubscribers) {
+) -> (
+    Vec<crate::command::PluginCommand>,
+    crate::subscriber::EventSubscribers,
+    Vec<crate::plugin_grants::PluginGrants>,
+) {
     if extensions.is_empty() {
-        return (Vec::new(), Default::default());
+        return (Vec::new(), Default::default(), Vec::new());
     }
     use crate::render::notice::Notice;
     use crate::tool::ToolSource;
@@ -123,6 +127,8 @@ fn load_extensions(
     // the same list so the user gets ONE block per startup rather than
     // a warning block followed by loose lines.
     let mut notices = summary.notices;
+    // Moved out before `summary.tools` is consumed below.
+    let grants = summary.grants;
 
     for (path, err) in &summary.errors {
         notices.push(Notice::error(
@@ -180,7 +186,7 @@ fn load_extensions(
 
     crate::render::notice::emit("Extensions", &notices);
     let event_subscribers = crate::subscriber::EventSubscribers::from_subscribers(summary.subscribers);
-    (resolved.commands, event_subscribers)
+    (resolved.commands, event_subscribers, grants)
 }
 
 /// No-op stand-in for builds without the `wasm` feature. Warns once if
@@ -191,7 +197,11 @@ fn load_extensions(
     _registry: &mut ToolRegistry,
     extensions: &[crate::config::ExtensionConfig],
     _cwd: &std::path::Path,
-) -> (Vec<crate::command::PluginCommand>, crate::subscriber::EventSubscribers) {
+) -> (
+    Vec<crate::command::PluginCommand>,
+    crate::subscriber::EventSubscribers,
+    Vec<crate::plugin_grants::PluginGrants>,
+) {
     if !extensions.is_empty() {
         crate::note!(
             "nanopi: {} [[extensions]] entries ignored — this build has no \
@@ -199,7 +209,7 @@ fn load_extensions(
             extensions.len()
         );
     }
-    (Vec::new(), Default::default())
+    (Vec::new(), Default::default(), Vec::new())
 }
 
 /// Print command-registry diagnostics to stderr. Kept out of
@@ -241,7 +251,8 @@ impl Agent {
         // from both the system prompt's tool list and the `tools` array
         // sent to the model, i.e. registered but uncallable.
         let mut registry = registry;
-        let (plugin_commands, event_subscribers) = load_extensions(&mut registry, &extensions, &cwd);
+        let (plugin_commands, event_subscribers, plugin_grants) =
+            load_extensions(&mut registry, &extensions, &cwd);
 
         let tool_names = registry.names();
         let LoadSkillsResult {
@@ -288,6 +299,7 @@ impl Agent {
             pending_follow_ups: initial_follow_up.into_iter().collect(),
             tool_exec_mode,
             plugin_commands,
+            plugin_grants,
             event_subscribers,
         };
         // Published here as well as per turn, so a plugin that calls
@@ -340,9 +352,14 @@ impl Agent {
         // plugin tools are registered but uncallable. Resumed sessions
         // used to skip plugin loading entirely, so `--continue` and
         // every TUI resume path silently lost every plugin tool.
-        let (plugin_commands, event_subscribers) =
+        let (plugin_commands, event_subscribers, plugin_grants) =
             load_extensions(&mut self.registry, extensions, &self.cwd);
         self.plugin_commands = plugin_commands;
+        // Set in BOTH build paths, the recurring stage-1/stage-2
+        // failure: a resumed session that showed no grant rows would
+        // read as "this plugin holds nothing", which is the exact
+        // opposite of the truth.
+        self.plugin_grants = plugin_grants;
         self.event_subscribers = event_subscribers;
 
         // load_session rebuilds Context from JSONL messages only — it
@@ -922,6 +939,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: Default::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: PromptOverrides::default(),
             system_base: None,

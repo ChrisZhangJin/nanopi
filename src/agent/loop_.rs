@@ -126,6 +126,11 @@ pub struct Agent {
     /// any `cfg(feature = "wasm")`. Empty in a build without the
     /// feature, and in print mode, which has no command palette.
     pub plugin_commands: Vec<crate::command::PluginCommand>,
+    /// What each loaded plugin was granted, pre-rendered at load for
+    /// `/tools`. Non-gated for the same reason as `plugin_commands`:
+    /// the TUI reads it and must compile without the `wasm` feature,
+    /// where it simply stays empty.
+    pub plugin_grants: Vec<crate::plugin_grants::PluginGrants>,
     /// Lifecycle-event subscribers registered by WASM plugins — the
     /// granted ∩ requested intersection computed at load time. Held
     /// here for the same non-gated reason as `plugin_commands`: keeps
@@ -414,6 +419,7 @@ impl Agent {
             // plugins — `load_session` only replays JSONL and knows
             // nothing about config.
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             // `None`, and `hydrate_resumed` composes it. The session
@@ -2346,6 +2352,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -2443,6 +2450,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -2535,6 +2543,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -2676,6 +2685,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -2768,6 +2778,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3010,6 +3021,7 @@ mod tests {
                 pending_follow_ups: Default::default(),
                 tool_exec_mode: crate::config::ToolExecMode::default(),
                 plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
                 event_subscribers: subs,
                 prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
                 system_base: None,
@@ -3086,6 +3098,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3162,6 +3175,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3258,6 +3272,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3325,6 +3340,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::Sequential,
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3457,6 +3473,7 @@ mod tests {
                 pending_follow_ups: Default::default(),
                 tool_exec_mode: mode,
                 plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
                 event_subscribers: Default::default(),
                 prompt_overrides:
                     crate::agent::prompt_override::PromptOverrides::default(),
@@ -3559,6 +3576,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3623,6 +3641,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3704,6 +3723,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3807,6 +3827,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -3955,6 +3976,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -4045,6 +4067,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -4113,6 +4136,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -4916,6 +4940,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -4985,6 +5010,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -5107,6 +5133,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
@@ -5254,6 +5281,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
         };
 
@@ -5374,6 +5402,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
         };
 
@@ -5431,6 +5460,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
         };
 
@@ -5485,6 +5515,7 @@ mod tests {
             pending_follow_ups: Default::default(),
             tool_exec_mode: mode,
             plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,

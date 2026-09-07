@@ -19,6 +19,11 @@ pub mod plugin_context;
 /// Without the feature nothing ever installs a dispatch and nothing
 /// ever calls one.
 pub mod plugin_tools;
+/// Unconditionally compiled, same seam as `plugin_context` and
+/// `subscriber`: `mode::tui` reads this to render `/tools`'s grant
+/// rows, so the TUI needs no `#[cfg(feature = "wasm")]`. Without the
+/// feature the vec is always empty and the section is omitted.
+pub mod plugin_grants;
 pub mod resources;
 pub mod session;
 pub mod settings;

@@ -198,6 +198,10 @@ hid `b90b27f`: two of the three exits called
 | a WASM plugin traps | reported as a failed call; the plugin stays callable afterwards | ✅ |
 | user cancels mid-tool | the turn aborts; a directive-only marker enters context, and does NOT embed partial text | ✅ |
 | — and that marker is persisted | `append_entry` beside the context push | ⬜ |
+| a plugin's tool call fires an event back into the calling plugin | the delivery is dropped by `try_lock` and counted; the call proceeds | ✅ `a_busy_plugin_drops_the_event_and_counts_it` |
+| a plugin's tool call | no `SessionEntry`, no `AgentEvent` — the transcript is the conversation with the model | ✅ `a_plugin_initiated_call_leaves_the_session_file_byte_unchanged`, `a_plugin_origin_call_emits_no_agent_event` |
+| a plugin's tool call outruns its 30s deadline | reported as a failed call; the `tool_execution_start`/`end` pair stays balanced | ✅ `a_timed_out_call_still_fires_tool_execution_end` |
+| — and a process that call spawned | may outlive the deadline: the plugin is unblocked, the child is not killed | ⬜ known limit, not pinned |
 
 The cancel row's rationale is worth keeping: embedding the half-written
 response made the next turn's model continue it instead of answering

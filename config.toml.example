@@ -191,6 +191,35 @@ base_url = "https://api.openai.com/v1"
 #                   A star anywhere else ("api.*.com") is refused
 #                   rather than widened. Effective only when
 #                   allow_network = true.
+#   allow_tools     Built-in tools this plugin may CALL, by name
+#                   (v0.12.0), via host-call-tool. Absent or empty
+#                   DENIES EVERY TOOL, like url_allowlist and events.
+#                   Per tool, not per plugin, because the tools are not
+#                   equivalent: allow_tools = ["bash"] is arbitrary
+#                   command execution, and it walks straight past
+#                   allow_fs's cwd confinement and url_allowlist's
+#                   per-host approval. nanopi prints the escalated
+#                   [Extensions] warning when it sees bash here.
+#                   Built-ins ONLY — bash, edit, find, grep, ls, read,
+#                   write. A plugin may not call another plugin's tool
+#                   (that would deadlock: the tool path takes a
+#                   blocking lock, unlike event delivery). A name that
+#                   is not a built-in is a LOAD ERROR naming the valid
+#                   ones, not a silent no-op.
+#                   A call that RAN comes back as
+#                     {"content": "...", "is_error": false}
+#                   and anything that did NOT run comes back as a bare
+#                   `error: ...` string. Nothing traps.
+#                   Bounded at 30s per call, and each call that ran is
+#                   announced in your scrollback naming the plugin and
+#                   the tool — a plugin acts with nothing on screen, and
+#                   its calls are deliberately NOT in the session
+#                   transcript, so `--continue` will not show them.
+#                   Your [[hooks.*]] still run: a plugin does not
+#                   outrank your own policy, and a block comes back as
+#                   `error: blocked by hook: <reason>`.
+#                   `/tools` lists what every loaded plugin holds, under
+#                   "Plugin grants".
 #   events          Lifecycle events this plugin may OBSERVE (v0.12.0).
 #                   Absent or empty grants NOTHING — a plugin exporting
 #                   `list-events` still receives no deliveries until its
@@ -238,6 +267,21 @@ base_url = "https://api.openai.com/v1"
 # allow_store = true
 # allow_context = true
 # events = ["input", "message_end"]
+
+# A codebase indexer: walks the tree and reads files through nanopi's
+# own tools, so it needs no filesystem grant of its own. It cannot
+# write, and it cannot exec.
+# [[extensions]]
+# path = "~/.nanopi/extensions/indexer.wasm"
+# allow_tools = ["find", "read"]
+# allow_store = true
+
+# A remote executor needs a shell. nanopi warns at startup when it sees
+# bash here, and the warning is correct: this grant makes every other
+# grant on this plugin decorative.
+# [[extensions]]
+# path = "~/.nanopi/extensions/remote-exec.wasm"
+# allow_tools = ["bash"]
 
 # A plugin that only watches lifecycle events (e.g. an audit logger) —
 # no tools, no commands, just `events`.

@@ -34,6 +34,11 @@ pub struct PluginLoadSummary {
     /// Empty for a plugin whose `list-events` ∩ config `events` is empty
     /// (including plugins that export no `list-events` at all).
     pub subscribers: Vec<crate::subscriber::Subscriber>,
+    /// What each successfully-loaded plugin was granted, rendered at
+    /// load for `/tools`'s grant section. One row per loaded plugin,
+    /// including plugins granted nothing — see
+    /// `crate::plugin_grants::PluginGrants`.
+    pub grants: Vec<crate::plugin_grants::PluginGrants>,
     /// How many `.wasm` files instantiated cleanly.
     pub loaded: usize,
     /// Per-file failures — path plus the reason. Non-fatal: a broken
@@ -46,6 +51,48 @@ pub struct PluginLoadSummary {
     /// extension tool`. The caller renders these as one grouped block
     /// (`render::notice`).
     pub notices: Vec<crate::render::notice::Notice>,
+}
+
+/// Render one plugin's config into the short grant tokens `/tools`
+/// shows. Built HERE, at load, rather than in the TUI: the TUI can
+/// only see the config on disk, which is not necessarily the config
+/// the running plugin was loaded under, and `ExtensionConfig` is
+/// behind the feature flag anyway.
+///
+/// A grant that is off contributes nothing — the row lists what a
+/// plugin HAS, and an operator scanning for `bash` should not have to
+/// read past four `no`s per plugin to find it. Order is fixed
+/// (filesystem, network, store, context, tools, events) so two rows
+/// are comparable at a glance.
+fn grant_tokens(cfg: &ExtensionConfig) -> Vec<String> {
+    let mut t = Vec::new();
+    if cfg.allow_fs {
+        t.push("allow_fs".to_string());
+    }
+    if cfg.allow_network {
+        // The allowlist is what actually bounds the reach, so it goes
+        // in the token: `allow_network` alone reaches nothing, and
+        // `allow_network(*)` reaches everything. Those must not look
+        // the same in a row an operator is scanning for risk.
+        t.push(if cfg.url_allowlist.is_empty() {
+            "allow_network(no allowlist, reaches nothing)".to_string()
+        } else {
+            format!("allow_network({})", cfg.url_allowlist.join(", "))
+        });
+    }
+    if cfg.allow_store {
+        t.push("allow_store".to_string());
+    }
+    if cfg.allow_context {
+        t.push("allow_context".to_string());
+    }
+    if !cfg.allow_tools.is_empty() {
+        t.push(format!("allow_tools({})", cfg.allow_tools.join(", ")));
+    }
+    if !cfg.events.is_empty() {
+        t.push(format!("events({})", cfg.events.join(", ")));
+    }
+    t
 }
 
 /// Loads `.wasm` components declared in `[[extensions]]` and turns the
@@ -71,6 +118,7 @@ impl PluginHost {
         let mut subscribers: Vec<crate::subscriber::Subscriber> = Vec::new();
         let mut errors = Vec::new();
         let mut notices: Vec<crate::render::notice::Notice> = Vec::new();
+        let mut grants: Vec<crate::plugin_grants::PluginGrants> = Vec::new();
         let mut loaded = 0usize;
 
         // One engine shared by every plugin — compiled code caches
@@ -89,6 +137,7 @@ impl PluginHost {
                     tools,
                     commands,
                     subscribers,
+                    grants: Vec::new(),
                     loaded: 0,
                     errors: vec![(anchor, e)],
                     notices: Vec::new(),
@@ -267,12 +316,18 @@ impl PluginHost {
                     Ok((bridge, specs)) => {
                         let plugin_path: std::sync::Arc<str> =
                             path.display().to_string().into();
-                        // The grant has to be visible SOMEWHERE at
-                        // startup. `/tools` is the natural home for it
-                        // (`plugin-capabilities.md` §3) but carries no
-                        // per-plugin grant data yet, so until that pipe
-                        // exists this notice is what keeps the grant
-                        // from being silent.
+                        grants.push(crate::plugin_grants::PluginGrants {
+                            plugin_name: plugin_name.to_string(),
+                            path: path.display().to_string(),
+                            grants: grant_tokens(cfg),
+                        });
+                        // `/tools` now carries the full grant row
+                        // (`plugin-capabilities.md` §3), so this notice
+                        // is no longer the only place a grant is
+                        // visible. It stays because it names the store
+                        // FILE, which a one-line `/tools` row does not,
+                        // and because it lands at startup rather than
+                        // waiting for the user to think to ask.
                         if cfg.allow_store {
                             notices.push(crate::render::notice::Notice::info(
                                 path.display().to_string(),
@@ -353,6 +408,7 @@ impl PluginHost {
             tools,
             commands,
             subscribers,
+            grants,
             loaded,
             errors,
         }
@@ -505,6 +561,58 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn a_plugin_granted_nothing_produces_no_tokens() {
+        let cfg = ExtensionConfig::default();
+        assert!(
+            grant_tokens(&cfg).is_empty(),
+            "an ungranted plugin contributes no tokens — the ROW still \
+             renders, reading `no grants`, but that is the display \
+             layer's job, not this function's: {:?}",
+            grant_tokens(&cfg)
+        );
+    }
+
+    #[test]
+    fn every_grant_renders_once_in_a_fixed_order() {
+        let cfg = ExtensionConfig {
+            allow_fs: true,
+            allow_network: true,
+            url_allowlist: vec!["github.com".to_string()],
+            allow_store: true,
+            allow_context: true,
+            allow_tools: vec!["find".to_string(), "read".to_string()],
+            events: vec!["turn_start".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            grant_tokens(&cfg),
+            vec![
+                "allow_fs".to_string(),
+                "allow_network(github.com)".to_string(),
+                "allow_store".to_string(),
+                "allow_context".to_string(),
+                "allow_tools(find, read)".to_string(),
+                "events(turn_start)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_network_without_an_allowlist_says_it_reaches_nothing() {
+        // `allow_network = true` with an empty allowlist reaches no
+        // host at all. A bare `allow_network` token would read as the
+        // opposite to anyone scanning the row for exfiltration risk.
+        let cfg = ExtensionConfig {
+            allow_network: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            grant_tokens(&cfg),
+            vec!["allow_network(no allowlist, reaches nothing)".to_string()]
+        );
     }
 
     #[test]

@@ -268,6 +268,25 @@ Empty (the default) denies everything, matching `url_allowlist` and
 can express "may read, may not write" and "may search, may not
 execute", which `allow_fs = true` cannot.
 
+**What comes back, exactly.** One string, always; nothing traps. A call
+that RAN returns the JSON frame, including a call that ran and failed:
+
+| Outcome | Returned string |
+|---|---|
+| ran, succeeded | `{"content":"…","is_error":false}` |
+| ran, tool errored | `{"content":"tool error: …","is_error":true}` |
+| outran the 30s deadline | `{"content":"tool call exceeded the 30s plugin deadline","is_error":true}` |
+| not in `allow_tools` | `error: tool "bash" is not in this plugin's allow_tools (…)` |
+| not a built-in tool | `error: tool "greet" is supplied by extension "other" — …` |
+| no such tool | `error: unknown tool "nope"` |
+| args not JSON | `error: args-json is not valid JSON: …` |
+| blocked by a hook | `error: blocked by hook: <reason>` |
+| tool calls not available yet | `error: tool calls are not available right now` |
+
+The split is the useful part: a bare `error: ` prefix means the call
+never happened, and a JSON frame means it did — which is also exactly
+the line the host disclosure draws.
+
 `host-fs-read` stays rather than being folded into this. Its
 confinement — inside cwd, regular files only — is narrower than
 granting `allow_tools = ["read"]`, and it is the simpler thing for the
@@ -351,9 +370,20 @@ paths for one situation is exactly what hid the missing
 compaction hooks (`87a81b4`).
 
 So: one `run_one_tool`, plus an origin the caller supplies. Origin
-decides two things and nothing else — whether a `SessionEntry` is
-written, and whether an `AgentEvent` tool card is emitted. Hooks fire
-either way. That makes the difference a single explicit switch with a
+decides **three** things and nothing else — whether a `SessionEntry` is
+written, whether an `AgentEvent` tool card is emitted, and the execution
+deadline. Hooks fire either way.
+
+Three, not the two an earlier version of this paragraph listed: §"It
+needs its own timeout" below demands a host-side bound, and the origin
+is where that bound belongs, because it is precisely the model/plugin
+distinction that decides whether the call is user-awaited. Stage 3 set
+it at 30s, around the `tool.execute` await ONLY — wrapping the whole
+function would drop the future after `tool_execution_start` had already
+fired, manufacturing a second instance of the unbalanced-hook-pair
+defect `87a81b4`. A process the timed-out tool spawned (a `bash` child)
+may outlive the deadline: the plugin is unblocked, the child is not
+killed. That is a known limit, not a claim. That makes the difference a single explicit switch with a
 test per branch, instead of a divergence waiting to happen.
 
 #### It needs its own timeout
@@ -416,24 +446,25 @@ and `/resume`.
 Every grant is two-sided in the same sense as `events`: the plugin can
 only use what the config named.
 
-`/tools` **should** show all of them, because it is the one place a user
-can see what an installed plugin is allowed to do — but it does not yet,
-and this document is not going to claim otherwise. Today `/tools` shows
-`Watching events (N plugins)` and nothing about grants: subscriptions
-are per-plugin data the Agent already holds
-(`event_subscribers.subscriptions()`), whereas grants are consumed
-inside `load_all` and never retained, so surfacing them needs a new
-`load_all → Agent → App cache → render` pipe. That pipe is built once,
-for all six grants, in the stage that first needs more than one of them
-— building it for `allow_store` alone would mean building it twice.
+`/tools` shows them. It is the one place a user can go and *ask* what an
+installed plugin is allowed to do, so stage 3 built the pipe the earlier
+version of this section said was still missing: `load_all` renders one
+short token list per successfully-loaded plugin →
+`PluginLoadSummary.grants` → `Agent.plugin_grants` → the TUI's
+`plugin_grants_cache` → a `Plugin grants (N plugins)` section rendered
+under the callable-tool list, beside `Watching events (N plugins)`.
 
-Until then the grant is made visible at **startup** instead: a plugin
-loaded with `allow_store` gets an `[Extensions]` notice naming its store
-file. That is weaker than `/tools` — it scrolls away, and it is not
-somewhere you can go and *ask* — so it is a stand-in, not the answer.
-Stating the gap here rather than the aspiration is the same rule
-`docs/claims-and-races.md` §1 applies to everything else nanopi says
-about itself.
+Two details are deliberate. A plugin granted **nothing** still gets a
+row, reading `no grants` — "installed, powerless" and "not installed"
+must not look identical, and "this plugin can do nothing" is the answer
+a user came to `/tools` to get. And only *successfully-loaded* plugins
+get a row: a row for a plugin that failed to load would claim a grant
+nothing holds.
+
+The startup `[Extensions]` notices stay. They are not a stand-in any
+more, they are complementary: the `allow_store` notice names the store
+**file**, which a one-line grant row does not carry, and a startup line
+lands without the user having to think to ask.
 
 Two combinations deserve the escalated warning `[Extensions]` already
 gives `events` + `allow_network`:

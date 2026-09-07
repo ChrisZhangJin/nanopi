@@ -290,6 +290,7 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 | `host-store-set` | `(key: string, value: string) -> string` | `allow_store` | 替换该插件在 `key` 下的值。字节落到文件系统后返回 `""`，否则返回以 `error: ` 开头的字符串。 |
 | `host-notify` | `(text: string) -> string` | 始终可用 | 往用户的 scrollback 里写一行，前缀由宿主用该插件的名字加上。按轮次限流。 |
 | `host-set-context` | `(text: string) -> string` | `allow_context` | 声明一段要进入模型上下文的文字，并标注来自该插件。每次调用**替换**该插件上一次的贡献；传 `""` 表示清除。返回 `""`，否则返回以 `error: ` 开头的字符串。 |
+| `host-call-tool` | `(name: string, args-json: string) -> string` | `allow_tools`，逐个工具点名 | 调用 nanopi 的内置工具。真的跑起来的调用返回 `{"content": "...", "is_error": false}`；没跑起来的返回以 `error: ` 开头的裸字符串。 |
 
 数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
 
@@ -306,6 +307,8 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 `host-store-get` / `host-store-set` 由 `allow_store = true` 门控，而且它们收的是**键，不是路径** —— 插件给出一个 map 的键，落到哪个文件完全由宿主决定（`~/.nanopi/extensions/<stem>/store.json`，每个插件一个 JSON 对象）。所以上面那套路径约束在这里既不适用也不需要：插件手上根本没有一条能指向外部的路径。上限是总共 1 MiB、1000 个键、键最长 128 字符；每一次拒绝都在带内返回，并且什么都不写入 —— 不会出现「告诉插件失败了，值却还是进去了」。`host-store-set` 返回 `""` 意味着字节已经到了文件系统：宿主用临时文件加 rename 提交，所以崩溃之后留下的要么是完整的旧文件、要么是完整的新文件，不会是撕裂的半个。两个插件的 `.wasm` 文件名主干相同、且其中任一开了 `allow_store` 时，两个都会加载失败，而不是悄悄共用一个 store。
 
 `host-set-context` 由 `allow_context = true` 门控。它是唯一一个改变**智能体所相信的东西**、而不是插件所知道的东西的 import：插件声明的文字会在每一轮开始时被折进 system prompt。归属头部 —— `[context contributed by extension "memory"]` —— 由宿主写入，因为没有它，模型就分不清插件注入的指令和你自己的指令。每次调用是**替换**而不是追加，所以它是幂等状态，十轮也不会攒出十份；传 `""` 清除。上限是每个插件 4 KiB，按字节算，而且刻意定得小：这段文字在这个会话余下的时间里会进入**每一个**请求。超限的调用在带内被拒，并且**之前那份贡献依然有效** —— 被告知「不行」不会顺带把你已有的东西弄丢。每一次变更都会在你的 scrollback 里公示并点明是哪个插件 —— 否则这份贡献是不可见的，因为你从来看不到 system prompt —— 而且这条公示与插件自己的 `host-notify` 额度**分开记账**，所以插件没法先用噪声把额度耗光、再把它埋掉。与 `allow_network = true` 组合是 nanopi 目前最锋利的一对权限，启动时会告警：那意味着一个远端来源可以塑造智能体的行为。
+
+`host-call-tool` 是**逐个工具**门控的：`allow_tools` 里必须点到这个工具的名字。默认为空，空即拒绝一切，和 `url_allowlist` 同一条规则。之所以按工具而不是按插件，是因为这些工具并不等价：`allow_tools = ["find", "read"]` 让一个索引插件能遍历、能读，但不能写也不能执行；而 `allow_tools = ["bash"]` 就是任意命令执行，它会直接绕过 `allow_fs` 的工作目录约束和 `url_allowlist` 的逐 host 审批 —— 启动时 nanopi 看到 `bash` 会打一条升级过的告警，因为这个权限一给，同一个插件上其他所有权限都成了装饰。只能调内置工具：插件不能调另一个插件的工具，而不属于内置的名字是**加载错误**并列出合法的名字，不是悄悄的空操作。返回形状是这份契约里诚实的那一半：JSON 帧意味着调用真的跑了（包括跑了但失败的），裸的 `error: ` 意味着它根本没发生。没有任何情况会 trap。每次调用上限 30 秒 —— epoch 预算约束的是 guest 代码，抢占不了一个已经在执行的宿主函数 —— 而超时后被丢下的 `bash` 子进程可能比这个期限活得更久，这是一个已知限制，不是一句承诺。你的 `[[hooks.*]]` 照样会跑，所以插件的位阶并不高于你自己的策略；被拦下时返回 `error: blocked by hook: <reason>`。每一次真的跑起来的调用都会在你的 scrollback 里公示，点明是哪个插件调了哪个工具，而且走宿主自己的额度，所以 `host-notify` 的洪水埋不掉它 —— 这是必需的，因为插件的调用**刻意不进**会话记录（模型从未发出过的 `tool_call` 条目，正是当年让会话无法恢复的那个形状），这也意味着 `--continue` 不会显示插件做过什么。`/tools` 会在「Plugin grants」小节里列出每个已加载插件手上有什么；一个什么权限都没拿到的插件也照样有一行，写着 `no grants`。
 
 `host-http-get` 有两道门：先是 `allow_network = true`，然后 URL 的 host 必须匹配 `url_allowlist`。**空 allowlist 拒绝一切**，所以只把开关打开本身还是什么都访问不到。匹配比对的是解析出的 host 而不是子串 —— allowlist 为 `api.github.com` 时，`https://evil.com/?x=api.github.com` 和 `https://api.github.com@evil.com/` 都会被拒。
 
