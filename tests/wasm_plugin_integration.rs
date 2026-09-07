@@ -74,6 +74,25 @@ fn fixture() -> PathBuf {
         .join("tests/fixtures/example-plugin.component.wasm")
 }
 
+/// A plugin name no other load in this test binary will use.
+///
+/// Plugin identity became load-bearing at RUNTIME with hot reload:
+/// `wasm::generation` keys the live-instance table by plugin NAME, so
+/// two bridges loaded under one name make the earlier one stale and its
+/// calls refuse in-band. These tests run in parallel in one process, so
+/// the shared literal `"fixture"` this file used to pass was a race
+/// waiting for the feature that needed the table. Reality carries the
+/// same constraint from the other side: two `.wasm` files with the same
+/// stem are already a hard load error.
+fn unique_name() -> std::sync::Arc<str> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "fixture-{}",
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+    .into()
+}
+
 fn events_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/events-plugin.component.wasm")
@@ -85,7 +104,7 @@ fn events_fixture() -> PathBuf {
 fn loads_real_component_and_executes_its_tools() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, specs) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("example component must load");
 
     // list-tools reached the host intact.
@@ -125,7 +144,7 @@ fn loads_real_component_and_executes_its_tools() {
 fn events_fixture_loads_through_the_current_loader() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, specs) = engine
-        .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("events component must load");
 
     let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
@@ -157,7 +176,7 @@ fn an_event_in_both_lists_is_delivered() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             vec!["turn_start".to_string()],
         )
         .expect("events component must load");
@@ -196,7 +215,7 @@ fn an_event_the_config_did_not_grant_is_not_delivered() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             // Grants only `input` — the plugin also requests
             // `tool_execution_start` and `turn_start`, so those two
             // must show up as unsatisfied and never be delivered.
@@ -241,7 +260,7 @@ fn a_plugin_exporting_neither_event_function_still_loads_and_receives_nothing() 
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             vec!["turn_start".to_string()],
         )
         .expect("example component must load");
@@ -277,7 +296,7 @@ fn a_trap_in_handle_event_leaves_tools_callable() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             vec!["input".to_string()],
         )
         .expect("events component must load");
@@ -313,7 +332,7 @@ fn handle_event_return_value_is_ignored() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             vec!["input".to_string()],
         )
         .expect("events component must load");
@@ -350,7 +369,7 @@ fn a_busy_plugin_drops_the_event_and_counts_it() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             vec!["turn_start".to_string()],
         )
         .expect("events component must load");
@@ -392,7 +411,7 @@ fn a_busy_plugin_drops_the_event_and_counts_it() {
 #[test]
 fn repeated_calls_stay_correct() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new()).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()).expect("load");
 
     for _ in 0..20 {
         let out = bridge
@@ -407,7 +426,7 @@ fn repeated_calls_stay_correct() {
 #[test]
 fn unknown_tool_name_is_rejected() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new()).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()).expect("load");
 
     let err = bridge
         .execute_tool("definitely_not_a_tool", "{}")
@@ -420,7 +439,7 @@ fn unknown_tool_name_is_rejected() {
 #[test]
 fn plugin_reports_bad_arguments_as_tool_error() {
     let engine = PluginEngine::new().expect("engine init");
-    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new()).expect("load");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()).expect("load");
 
     // `text` missing entirely.
     let out = bridge.execute_tool("rot13", r#"{}"#).expect("no trap");
@@ -444,7 +463,7 @@ fn core_module_is_rejected_with_a_useful_message() {
     // Smallest valid core module: magic + version.
     std::fs::write(&p, [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]).unwrap();
 
-    match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new()) {
+    match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()) {
         Ok(_) => panic!("a core module is not a component and must be refused"),
         Err(e) => assert!(e.contains("compile") || e.contains("list-tools"), "{e}"),
     }
@@ -469,7 +488,7 @@ fn fs_read_denied_without_allow_fs() {
 
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), dir.clone(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     let out = bridge
@@ -489,7 +508,7 @@ fn fs_read_allowed_inside_cwd() {
 
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     let out = bridge
@@ -510,7 +529,7 @@ fn fs_read_refuses_traversal_out_of_cwd() {
     let dir = scratch_dir("traversal");
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     for probe in [
@@ -542,7 +561,7 @@ fn fs_read_refuses_symlink_escape() {
 
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     let out = bridge
@@ -628,7 +647,7 @@ fn http_get_denied_without_allow_network() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             Vec::new(),
         )
         .expect("load");
@@ -664,7 +683,7 @@ fn http_get_denied_when_host_not_in_allowlist() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             Vec::new(),
         )
         .expect("load");
@@ -690,7 +709,7 @@ fn http_get_empty_allowlist_denies_everything() {
     let port = spawn_test_server("SERVED-BODY-EMPTY-CASE");
     let engine = PluginEngine::new().expect("engine");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, true, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, true, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     let out = bridge
@@ -730,7 +749,7 @@ fn http_get_allowed_host_reaches_server() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             Vec::new(),
         )
         .expect("load");
@@ -770,7 +789,7 @@ fn http_get_wildcard_allowlist_reaches_an_unnamed_host() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             Vec::new(),
         )
         .expect("load");
@@ -804,7 +823,7 @@ fn wildcard_allowlist_still_refuses_non_http_schemes() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             Vec::new(),
         )
         .expect("load");
@@ -883,7 +902,7 @@ fn http_get_does_not_follow_redirect_off_the_allowlist() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             Vec::new(),
         )
         .expect("load");
@@ -918,7 +937,7 @@ fn http_get_does_not_follow_redirect_off_the_allowlist() {
 fn loads_and_executes_slash_commands() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, _specs) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("example component must load");
 
     let mut cmds: Vec<String> = bridge.command_specs().into_iter().map(|c| c.name).collect();
@@ -959,7 +978,7 @@ fn loads_and_executes_slash_commands() {
 fn command_args_reach_the_guest_verbatim() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     match bridge
@@ -978,7 +997,7 @@ fn command_args_reach_the_guest_verbatim() {
 fn an_unknown_command_is_refused_without_entering_the_guest() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     let err = bridge.execute_command("nope", "").unwrap_err();
@@ -1001,7 +1020,7 @@ fn a_component_without_list_commands_still_loads() {
         .join("tests/fixtures/runaway-plugin.component.wasm");
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, specs) = engine
-        .load(&path, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&path, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("a command-less component must still load");
 
     assert!(!specs.is_empty(), "its tools still register");
@@ -1021,7 +1040,7 @@ fn a_component_without_list_commands_still_loads() {
 fn a_trap_on_either_side_leaves_the_other_callable() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     // Baseline.
@@ -1059,7 +1078,7 @@ fn a_trap_on_either_side_leaves_the_other_callable() {
 fn the_command_path_rearms_the_epoch_deadline() {
     let engine = PluginEngine::new().expect("engine init");
     let (bridge, _) = engine
-        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
         .expect("load");
 
     bridge
@@ -1098,7 +1117,7 @@ fn a_runaway_event_handler_is_bounded_by_the_event_budget() {
             Vec::new(),
             false,
             std::env::temp_dir(),
-            "fixture".into(),
+            unique_name(),
             vec!["input".to_string()],
         )
         .expect("events component must load");

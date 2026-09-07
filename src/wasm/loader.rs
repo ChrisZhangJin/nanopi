@@ -1930,6 +1930,15 @@ impl WasmExecuteBridge for ComponentBridge {
 mod tests {
     use super::*;
 
+    /// A plugin name no other load in this process will use — see the
+    /// same helper in `tests/wasm_plugin_integration.rs`. The
+    /// live-instance table in `crate::wasm::generation` is keyed by
+    /// plugin name, and these tests load real components in parallel.
+    fn unique_plugin_name() -> Arc<str> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!("fixture-{}", N.fetch_add(1, Ordering::Relaxed)).into()
+    }
+
     fn store_fixture(stem: &str) -> (PathBuf, crate::wasm::store::PluginStore) {
         let mut root = std::env::temp_dir();
         root.push(format!(
@@ -2848,7 +2857,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, specs) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_plugin_name(), Vec::new())
             .expect("runaway fixture must still LOAD — only execute-tool spins");
         assert_eq!(specs.len(), 1, "fixture advertises one tool");
 
@@ -2884,7 +2893,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_plugin_name(), Vec::new())
             .expect("example fixture loads");
 
         for i in 0..3 {
@@ -3197,7 +3206,7 @@ mod tests {
             .join("tests/fixtures/example-plugin.component.wasm");
         let engine = PluginEngine::new().expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_plugin_name(), Vec::new())
             .expect("example fixture loads");
 
         let good = r#"{"text":"abc"}"#;
@@ -3230,7 +3239,7 @@ mod tests {
         std::fs::write(&p, b"definitely not a wasm component").unwrap();
         // `unwrap_err()` needs the Ok half to be Debug, and
         // `Arc<dyn WasmExecuteBridge>` isn't — match instead.
-        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), "fixture".into(), Vec::new()) {
+        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_plugin_name(), Vec::new()) {
             Ok(_) => panic!("garbage bytes must not compile as a component"),
             Err(e) => assert!(e.contains("compile"), "got {e}"),
         }
