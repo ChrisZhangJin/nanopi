@@ -322,6 +322,64 @@ replacing that lock with a queue must restore the re-entrancy guard
 explicitly, because the queue would make the inner delivery *wait* for
 a call that cannot finish until the delivery returns.
 
+#### Built-in tools only
+
+`host-call-tool` reaches built-in tools. It must NOT be able to invoke
+another plugin's tool, and the reason is a deadlock, not tidiness.
+
+`ComponentBridge::execute_tool` takes a **blocking** lock
+(`loader.rs:1396`) — unlike `handle_event`, which uses `try_lock`. So
+with two plugins each granted the other's tool: A's guest call holds
+A's lock and invokes B's tool; B's guest call then invokes A's tool;
+A's `execute_tool` blocks on a lock A's own in-flight call is holding.
+Neither returns.
+
+`try_lock` protects event delivery from re-entrancy (see below) but
+nothing protects the tool path, because the tool path is *supposed* to
+wait — the caller wants the result. Restricting the grant to built-ins
+removes the cycle by construction rather than by cycle detection, and
+every example in this section (`bash`, `find`, `read`) is a built-in
+anyway. `ToolSource::Builtin` makes the check one match arm.
+
+#### One code path, an origin flag
+
+Plugin-initiated calls must fire the same hooks (above) and must NOT
+reach the session (below). The temptation is a second, narrower
+execution path; the codebase's own history argues against it, since two
+paths for one situation is exactly what hid the missing
+`drain_steer_to_follow_ups` call (`b90b27f`) and the unbalanced
+compaction hooks (`87a81b4`).
+
+So: one `run_one_tool`, plus an origin the caller supplies. Origin
+decides two things and nothing else — whether a `SessionEntry` is
+written, and whether an `AgentEvent` tool card is emitted. Hooks fire
+either way. That makes the difference a single explicit switch with a
+test per branch, instead of a divergence waiting to happen.
+
+#### It needs its own timeout
+
+The epoch budget bounds GUEST code and cannot preempt a host function
+already executing — the same limitation that let `host-fs-read` on a
+FIFO hang unboundedly before the regular-file check, and the reason
+`host-http-get` carries its own 10s timeout.
+
+`host-call-tool("bash", {"command": "sleep 9999"})` is therefore
+outside the epoch's reach. It needs a host-side deadline of its own.
+Note the asymmetry when choosing one: a model-initiated `cargo build`
+is user-visible and user-awaited, while a plugin's call happens with no
+prompt on screen, so the tolerance for a long one is lower, not higher.
+
+#### The user should see it happen
+
+A plugin running `bash` with nothing on screen is the thing this
+document's §"A plugin's tool call is NOT a session entry" trades away.
+Stage 2 shipped the mechanism to give it back: the HOST emits a
+disclosure line per plugin-initiated call, on its own budget — not the
+plugin's, for the reason stage 2 established (a disclosure an adversary
+can suppress by flooding is not a disclosure).
+
+Real-time visibility, no transcript corruption.
+
 #### Implementation path is not new
 
 `fetch_url` (`loader.rs:332`) already does async I/O from inside a
