@@ -721,6 +721,9 @@ fn teardown_terminal(term: &mut Term) -> Result<()> {
     let _ = term.clear();
     disable_raw_mode()?;
     crate::render::raw_tty::set_raw_mode(false);
+    // Notices queued after the loop's last tick have no drainer left
+    // (T4.7). Raw mode is already off, so these go out as plain `\n`.
+    crate::render::raw_tty::flush_pending_to_stderr();
     crossterm::execute!(term.backend_mut(), DisableBracketedPaste)?;
     Ok(())
 }
@@ -1863,16 +1866,32 @@ async fn run_app(
                         app.command_task = Some(task);
                     }
                 }
+                // `note!` lines — plugin `host-log`, provider retry
+                // notices, hook diagnostics, `/new`'s config warnings.
+                // While the TUI is up `note!` queues instead of writing
+                // to stderr, because stderr lands in the region ratatui
+                // manages and the next redraw wipes it (T4.7). This is
+                // the drain that puts them in scrollback for good.
+                //
+                // Dim: these are diagnostics, and they must not read as
+                // the model's words or as a plugin addressing the user
+                // (`host-notify`, cyan, below).
+                for line in crate::render::raw_tty::drain() {
+                    insert_line(term, Line::from(vec![Span::styled(
+                        line,
+                        Style::default().fg(Color::DarkGray),
+                    )]))?;
+                }
                 // Plugin `host-notify` lines. Drained here rather than
                 // pushed from the host function because that function
                 // is a synchronous wasmtime closure with no `Term` and
                 // no channel to this loop (see `wasm::notify`).
                 //
-                // `insert_line` — NOT `note!`. `note!` writes raw
-                // stderr into ratatui's managed region and is wiped by
-                // the next redraw (T4.7); a plugin addressing the user
-                // has to survive that, which is the whole distinction
-                // between `host-notify` and `host-log`.
+                // `insert_line` — NOT `note!`. Both now reach
+                // scrollback (T4.7), but they arrive differently
+                // styled and `host-notify` carries the plugin's
+                // attribution, which is the distinction between a
+                // plugin addressing the user and one logging.
                 #[cfg(feature = "wasm")]
                 for line in crate::wasm::notify::drain() {
                     // Cyan, distinct from assistant text (green) and

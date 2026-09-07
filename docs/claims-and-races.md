@@ -262,7 +262,10 @@ refused requests are the ones such a plugin cares about most.
 | stderr written while the TUI owns the screen | `\r\n`, via `crate::note!` — a bare `\n` staircases in raw mode | ✅ `53bd497` |
 | stderr written before `setup_terminal()` | bare `\n` is correct; `note!` handles both via the raw-mode flag | ✅ |
 | a thinking delta lands after `Start`'s sticky color | each delta self-contained; `TextDelta` re-arms the color once per interruption | ✅ `d48f1aa` |
-| a `note!` line lands in ratatui's managed region | it is wiped on the next redraw — known, unfixed, T4.7 | ⬜ |
+| a `note!` line lands in ratatui's managed region | it does not: while the TUI owns the screen `note!` queues instead of writing to stderr, and the loop drains it into scrollback via `insert_before` | ✅ |
+| a `note!` is written with no drainer running (before the first tick, after the loop exits) | it is flushed to stderr at teardown, not dropped | ✅ |
+| a plugin `note!`s in a loop while the TUI is not ticking | the queue is capped at `MAX_PENDING`; the OLDEST are dropped, so the newest line survives | ✅ |
+| a `note!` is written to BOTH stderr and the queue | it cannot be: `note` matches one `Destination`. Not observable from a test — libtest does not capture an in-process stderr write, so the enum is the guard, not an assertion | ⬜ |
 
 ## 4. Review checklist
 
