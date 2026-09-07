@@ -148,6 +148,39 @@ world extension {
     /// key cap, so a plugin at the cap can still update what it holds.
     import host-store-set: func(key: string, value: string) -> string;
 
+    /// Put one line in the user's scrollback. Returns `""` when the
+    /// line was delivered whole, or an `error: ` string.
+    ///
+    /// UNGATED, because it is output rather than access: it reaches
+    /// nothing, reads nothing, and leaves nothing behind. What it can
+    /// do is flood the user's attention, so it is bounded by a RATE
+    /// LIMIT instead of a grant — N lines per plugin per turn, after
+    /// which further lines are dropped and one `… M more suppressed`
+    /// line reports how many. The truncation announces itself; the
+    /// suppressed calls also return an `error: ` string, so a plugin is
+    /// never told it spoke when it did not.
+    ///
+    /// THE HOST APPLIES THE PREFIX. Attribution is built from this
+    /// plugin's `.wasm` file stem and the payload is never parsed for
+    /// it, so a plugin cannot impersonate another: text of
+    /// `[other] rm -rf /` from a plugin named `memory` renders as
+    /// `[memory] [other] rm -rf /`. Newlines in the payload are
+    /// flattened to spaces for the same reason — the prefix covers the
+    /// first line only, so a second line could otherwise pose as
+    /// another plugin's notice. One call is one line.
+    ///
+    /// Payload capped at 64 KiB, the same `MAX_ACTION_PAYLOAD` the
+    /// command actions use. Over that the line is delivered truncated
+    /// and the return value says so, rather than `""`.
+    ///
+    /// DIFFERENT FROM `host-log`, and the difference matters. `host-log`
+    /// writes raw stderr, which lands inside ratatui's managed region
+    /// and is wiped by the next redraw (the known defect in
+    /// `docs/v0.12-manual-test-plan.md` T4.7) — fine for debugging,
+    /// useless for telling the user something. `host-notify` goes
+    /// through `insert_before`, so it scrolls into history and stays.
+    import host-notify: func(text: string) -> string;
+
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [

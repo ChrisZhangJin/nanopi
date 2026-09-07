@@ -293,6 +293,7 @@ And may import these host functions:
 | `host-http-get` | `(url: string) -> string` | `allow_network` + `url_allowlist` | Fetch an `http`/`https` URL. Returns the response body, or a string starting with `error: `. |
 | `host-store-get` | `(key: string) -> string` | `allow_store` | Read this plugin's stored value for `key`. Absent reads as `""`. |
 | `host-store-set` | `(key: string, value: string) -> string` | `allow_store` | Replace this plugin's value at `key`. Returns `""` once the bytes are on the filesystem, or a string starting with `error: `. |
+| `host-notify` | `(text: string) -> string` | always | Put one line in the user's scrollback, prefixed by the host with this plugin's name. Rate-limited per turn. |
 
 Payloads cross the boundary as JSON strings rather than WIT records — one primitive type keeps the ABI small enough that neither side needs a codegen step.
 
@@ -303,6 +304,8 @@ Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki
 **Sandboxing.** Components run inside wasmtime with no ambient authority — a plugin reaches the outside world only through host functions you opt into.
 
 `host-fs-read` is gated on `allow_fs = true`, and even then the path must resolve *inside* the working directory. Paths are canonicalized before that check, so `../` traversal and symlinks pointing outward are both refused. (The built-in `read` tool deliberately has no such guard, on the reasoning that the model can shell out anyway — but a plugin has no shell, so here the boundary is real rather than theater.)
+
+`host-notify` is ungated because it is output, not access — it reaches nothing and leaves nothing behind. What it can do is flood your attention, so it is bounded by a rate limit rather than a grant: past the per-turn allowance further lines are dropped and one `… N more suppressed` line says how many, and the suppressed calls come back as `error: ` strings so a plugin is never told it spoke when it did not. The prefix is applied by the host from the `.wasm` file stem and the payload is never parsed for it, so one plugin cannot impersonate another. It differs from `host-log` in where the text ends up: `host-log` writes raw stderr, which lands inside the TUI's managed region and is wiped by the next redraw, whereas `host-notify` scrolls into history and stays.
 
 `host-store-get` / `host-store-set` are gated on `allow_store = true` and are **keys, not paths** — the plugin supplies a map key and the host alone decides which file it lands in (`~/.nanopi/extensions/<stem>/store.json`, one JSON object per plugin). So none of the confinement machinery above applies or is needed: there is no path for a plugin to point outward. Bounds are 1 MiB total, 1000 keys, and keys up to 128 chars; every refusal comes back in-band and stores nothing, so a plugin is never told it failed while the value went in anyway. A `""` return from `host-store-set` means the bytes reached the filesystem — the host commits with a temp file and a rename, so a crash leaves the whole old file or the whole new one, never a torn one. Two plugins whose `.wasm` files share a file stem where either has `allow_store` fail to load rather than silently sharing one store.
 

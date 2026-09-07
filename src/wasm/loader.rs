@@ -69,6 +69,11 @@ pub struct PluginState {
     /// not the absence of the handle, so there is exactly one place to
     /// get the gate wrong.
     store: Arc<crate::wasm::store::PluginStore>,
+    /// The `.wasm` file stem, computed once by `load_all`. Both the
+    /// store's directory name and the `host-notify` attribution come
+    /// from it — never from anything the guest supplied, which is what
+    /// makes impersonation unavailable rather than merely discouraged.
+    plugin_name: Arc<str>,
 }
 
 /// `host-store-get`, minus wasmtime. This free function is the test
@@ -730,6 +735,33 @@ impl PluginEngine {
                 },
             )
             .map_err(|e| format!("link host-store-set failed: {e}"))?;
+
+        // Host import: `host-notify(text: string) -> string`.
+        //
+        // No gate — output, not access (invariant 4 exempts this and
+        // `host-log`). The bound is the rate limit inside
+        // `notify::notify`, and the attribution comes from
+        // `state.plugin_name`, never from `text`.
+        linker
+            .root()
+            .func_wrap(
+                "host-notify",
+                |store: wasmtime::StoreContextMut<'_, PluginState>,
+                 (text,): (String,)| {
+                    let state = store.data();
+                    // A suppressed or truncated line reports as an
+                    // error. Returning `""` there would tell the plugin
+                    // it addressed the user when it did not, which is
+                    // invariant 9 exactly.
+                    Ok((
+                        match crate::wasm::notify::notify(&state.plugin_name, &text) {
+                            Ok(()) => String::new(),
+                            Err(e) => format!("error: {e}"),
+                        },
+                    ))
+                },
+            )
+            .map_err(|e| format!("link host-notify failed: {e}"))?;
         Ok(linker)
     }
 
@@ -776,6 +808,7 @@ impl PluginEngine {
                 allow_network,
                 allow_store,
                 store: plugin_store.clone(),
+                plugin_name: plugin_name.clone(),
             },
         );
         // Armed before `instantiate`, not after. A component built as a
@@ -966,6 +999,7 @@ impl PluginEngine {
                 // The SAME `Arc`, not a fresh `PluginStore`. This is
                 // what makes a committed value outlive a trap.
                 store: plugin_store,
+                plugin_name,
             },
             // The Store is not Sync, and a component instance is
             // single-threaded by construction. nanopi runs tool calls
@@ -1048,7 +1082,11 @@ const MAX_COMMANDS_PER_PLUGIN: usize = 64;
 const MAX_COMMAND_DESCRIPTION: usize = 1024;
 /// Cap on a single action payload. A plugin returning 10 MB of `print`
 /// would otherwise be rendered into scrollback a line at a time.
-const MAX_ACTION_PAYLOAD: usize = 64 * 1024;
+///
+/// `pub` because `host-notify` writes to the same scrollback and so has
+/// the same ceiling — shared rather than a second `64 * 1024` that can
+/// drift from this one.
+pub const MAX_ACTION_PAYLOAD: usize = 64 * 1024;
 
 fn parse_command_specs(json: &str) -> Result<Vec<crate::command::CommandSpec>, String> {
     let wire: Vec<WireCommandSpec> = serde_json::from_str(json)
@@ -1155,6 +1193,7 @@ struct PluginRebuild {
     /// Shared with the live `PluginState`, deliberately. Host-side
     /// plugin state must survive a trap; guest memory must not.
     store: Arc<crate::wasm::store::PluginStore>,
+    plugin_name: Arc<str>,
 }
 
 impl PluginRebuild {
@@ -1183,6 +1222,7 @@ impl PluginRebuild {
                 // `reset` replaces the whole `PluginState`.
                 allow_store: self.allow_store,
                 store: self.store.clone(),
+                plugin_name: self.plugin_name.clone(),
             },
         );
         store.set_epoch_deadline(budget_ticks);
@@ -1534,6 +1574,7 @@ mod tests {
             allow_network: false,
             allow_store: true,
             store: store.clone(),
+            plugin_name: "memory".into(),
         };
         let inner = rebuild
             .build(engine.budget_ticks)
@@ -1548,6 +1589,11 @@ mod tests {
             "yes",
             "the SAME store must come through the rebuild — a fresh one here \
              would lose every committed value on the first trap"
+        );
+        assert_eq!(
+            &*state.plugin_name, "memory",
+            "and the notify attribution must survive too — dropping it here \
+             would silently re-attribute every line after the first trap"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -288,6 +288,7 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 | `host-http-get` | `(url: string) -> string` | `allow_network` + `url_allowlist` | 抓取 `http`/`https` URL。返回响应体，或以 `error: ` 开头的字符串。 |
 | `host-store-get` | `(key: string) -> string` | `allow_store` | 读该插件在 `key` 下存的值。键不存在时读到 `""`。 |
 | `host-store-set` | `(key: string, value: string) -> string` | `allow_store` | 替换该插件在 `key` 下的值。字节落到文件系统后返回 `""`，否则返回以 `error: ` 开头的字符串。 |
+| `host-notify` | `(text: string) -> string` | 始终可用 | 往用户的 scrollback 里写一行，前缀由宿主用该插件的名字加上。按轮次限流。 |
 
 数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
 
@@ -298,6 +299,8 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 **沙箱。** 组件跑在 wasmtime 里，没有环境权限 —— 插件只能通过你显式开启的宿主函数接触外部。
 
 `host-fs-read` 由 `allow_fs = true` 门控，且路径必须解析到工作目录**内部**。检查前会先 canonicalize，所以 `../` 穿越和指向外部的符号链接都会被拒。（内置 `read` 工具刻意没有这道检查，理由是模型反正能 shell out —— 但插件没有 shell，所以这里的边界是真约束而非安全剧场。）
+
+`host-notify` 不设门控，因为它是输出而不是访问 —— 它碰不到任何东西，也不留下任何东西。它唯一能造成的问题是淹没你的注意力，所以约束它的是限流而不是权限门：超出每轮的额度后，多出来的行会被丢弃，并由一行 `… N more suppressed` 说明丢了多少；被丢弃的那几次调用返回的是 `error: ` 字符串，所以插件不会以为自己说了话其实没说。前缀由宿主根据 `.wasm` 文件名主干加上，payload 永远不会被拿去解析前缀，所以一个插件无法冒充另一个。它和 `host-log` 的区别在于文字最终落在哪里：`host-log` 写的是裸 stderr，会落进 TUI 管理的区域并被下一次重绘擦掉，而 `host-notify` 会滚进历史里留下来。
 
 `host-store-get` / `host-store-set` 由 `allow_store = true` 门控，而且它们收的是**键，不是路径** —— 插件给出一个 map 的键，落到哪个文件完全由宿主决定（`~/.nanopi/extensions/<stem>/store.json`，每个插件一个 JSON 对象）。所以上面那套路径约束在这里既不适用也不需要：插件手上根本没有一条能指向外部的路径。上限是总共 1 MiB、1000 个键、键最长 128 字符；每一次拒绝都在带内返回，并且什么都不写入 —— 不会出现「告诉插件失败了，值却还是进去了」。`host-store-set` 返回 `""` 意味着字节已经到了文件系统：宿主用临时文件加 rename 提交，所以崩溃之后留下的要么是完整的旧文件、要么是完整的新文件，不会是撕裂的半个。两个插件的 `.wasm` 文件名主干相同、且其中任一开了 `allow_store` 时，两个都会加载失败，而不是悄悄共用一个 store。
 
