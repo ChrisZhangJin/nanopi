@@ -283,6 +283,46 @@ world extension {
     /// The user is told about it by a one-line host disclosure instead.
     import host-call-tool: func(name: string, args-json: string) -> string;
 
+    /// Start or steer a turn with `text`, as if the user had typed it
+    /// (`docs/plugin-capabilities.md` §2.4).
+    ///
+    /// Returns `""` on success, or `error: <reason>` — never traps.
+    ///
+    /// GATED on `allow_send_message = true` in this plugin's
+    /// `[[extensions]]` entry. This is the only capability that SPENDS
+    /// THE USER'S MONEY: it causes a billed turn against the provider.
+    /// Treat every call as one the user will be charged for.
+    ///
+    /// The text is always echoed to the user verbatim, attributed to
+    /// this plugin, and disclosed on the host's own budget. There is no
+    /// quiet path — a plugin can never believe it sent something the
+    /// user did not see.
+    ///
+    /// ROUTING. If a turn is running the text STEERS it, arriving as a
+    /// fresh user message at the next iteration boundary — the same
+    /// path a mid-stream typed line takes. If no turn is running, or
+    /// the one that was running has just ended, the text starts the
+    /// next turn instead. It is never dropped, and it never outranks a
+    /// line the human has already queued.
+    ///
+    /// GUARDED, three ways, all refusals in band:
+    ///
+    ///   * `error: a message from this plugin is already pending` — one
+    ///     unconsumed message per plugin. It clears when the text
+    ///     actually reaches a turn, not when this call returns.
+    ///   * `error: this plugin cannot send during a turn its own
+    ///     message started` — no replying to yourself. Per plugin, not
+    ///     global: another plugin may still speak during that turn.
+    ///   * `error: this plugin has started too many turns in this
+    ///     session (20)` — a per-session cap, because the first two
+    ///     rules do not bound a `turn_end` subscriber that sends once
+    ///     per turn forever.
+    ///
+    /// UNAVAILABLE in headless (`nanopi -p`), where there is no turn
+    /// loop to reach: `error: sending a message is not available right
+    /// now`. Refused, never silently discarded.
+    import host-send-user-message: func(text: string) -> string;
+
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [

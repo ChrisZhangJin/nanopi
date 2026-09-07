@@ -89,6 +89,14 @@ fn grant_tokens(cfg: &ExtensionConfig) -> Vec<String> {
     if !cfg.allow_tools.is_empty() {
         t.push(format!("allow_tools({})", cfg.allow_tools.join(", ")));
     }
+    // The one grant that spends money, so it is spelled out rather than
+    // left as a bare flag among six others an operator is scanning
+    // past. `/tools` is where a user checks what they have installed;
+    // "this plugin can bill you" should not read the same as "this
+    // plugin can read a file".
+    if cfg.allow_send_message {
+        t.push("allow_send_message(can start billed turns)".to_string());
+    }
     if !cfg.events.is_empty() {
         t.push(format!("events({})", cfg.events.join(", ")));
     }
@@ -239,6 +247,26 @@ impl PluginHost {
                     "has `bash` in allow_tools — this plugin can execute                      arbitrary commands, which walks past allow_fs's cwd                      confinement and url_allowlist's per-host approval and                      makes every other grant on it decorative. Grant it only                      if you trust the plugin completely.",
                 ));
             }
+            // Warned ALONE, like `bash` and unlike the `allow_network`
+            // pairs, and for the same kind of reason: it does not need
+            // a partner to be dangerous. Every other grant lets a
+            // plugin learn something, change what the agent believes,
+            // or run a tool the user could have run themselves. This
+            // one causes BILLED TURNS. The `allow_context`-alone
+            // precedent does not apply — that grant is only sharp in
+            // combination, so warning on it alone would be the noise
+            // users learn to skip; this one is sharp by itself.
+            if cfg.allow_send_message {
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    "has allow_send_message = true — this plugin can start \
+                     turns on its own, which SPENDS MONEY against your \
+                     provider. Turns it causes are always echoed to you and \
+                     capped per session, but the cap is a backstop, not a \
+                     budget. Grant it only to plugins you want driving the \
+                     agent.",
+                ));
+            }
             // A name in `allow_tools` that is not a built-in is a LOAD
             // ERROR for this entry, not a silent no-op — the same rule
             // a retired hook key follows. Checked against
@@ -309,6 +337,7 @@ impl PluginHost {
                     cfg.allow_store,
                     cfg.allow_context,
                     cfg.allow_tools.clone(),
+                    cfg.allow_send_message,
                     store::PluginStore::default_root(),
                     plugin_name.clone(),
                     events_granted.clone(),
@@ -642,6 +671,7 @@ mod tests {
             allow_store: false,
             allow_context: false,
             allow_tools: Vec::new(),
+            allow_send_message: false,
             url_allowlist: Vec::new(),
             events: Vec::new(),
         };

@@ -206,6 +206,26 @@ base_url = "https://api.openai.com/v1"
 #                   blocking lock, unlike event delivery). A name that
 #                   is not a built-in is a LOAD ERROR naming the valid
 #                   ones, not a silent no-op.
+#   allow_send_message
+#                   Let the plugin call host-send-user-message
+#                   (v0.12.0): it may start or steer a turn with text
+#                   of its own. Default false.
+#                   THIS IS THE ONE GRANT THAT SPENDS YOUR MONEY. Every
+#                   other capability lets a plugin learn something,
+#                   change what the agent believes, or run a tool you
+#                   could have run yourself; this one causes billed
+#                   turns against your provider. nanopi prints the
+#                   escalated [Extensions] warning whenever it is set,
+#                   alone, without needing a second grant to pair with.
+#                   The text is ALWAYS echoed to you verbatim and
+#                   attributed to the plugin — there is no quiet path.
+#                   Three bounds, all announced, none silent: one
+#                   unconsumed message per plugin; no message during a
+#                   turn that plugin's own message started; and at most
+#                   20 turns per plugin per session, which is a backstop
+#                   against a runaway subscriber, not a budget.
+#                   Unavailable in headless mode (nanopi -p), where the
+#                   call is REFUSED rather than quietly dropped.
 #                   A call that RAN comes back as
 #                     {"content": "...", "is_error": false}
 #                   and anything that did NOT run comes back as a bare
@@ -288,6 +308,16 @@ base_url = "https://api.openai.com/v1"
 # [[extensions]]
 # path = "~/.nanopi/extensions/audit-watcher.wasm"
 # events = ["tool_execution_start", "session_start", "session_shutdown"]
+
+# A plugin that drives the agent: it watches for a failing build and
+# asks nanopi to fix it, unprompted. Grant this only to a plugin you
+# want spending your provider budget on your behalf — nanopi warns
+# about it at startup, and every message it sends appears in your
+# scrollback attributed to it.
+# [[extensions]]
+# path = "~/.nanopi/extensions/autofix.wasm"
+# events = ["tool_execution_end"]
+# allow_send_message = true
 
 # ─── API key: pick ONE of the two below ─────────────────────────────
 

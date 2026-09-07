@@ -248,6 +248,30 @@ pub struct ExtensionConfig {
     /// A plugin's own tools are not addressable: `host-call-tool`
     /// reaches built-in tools only.
     pub allow_tools: Vec<String>,
+
+    /// v0.12: enable `host-send-user-message` — this plugin may start or
+    /// steer a turn with text of its own choosing
+    /// (`docs/plugin-capabilities.md` §2.4). Default: `false`.
+    ///
+    /// **This is the only grant that spends the user's money.** Every
+    /// other capability lets a plugin learn something, change what the
+    /// agent believes, or run a tool the user could have run; this one
+    /// makes the agent take a turn against a provider and bill for it.
+    /// A plugin subscribed to `turn_start` that calls it without a guard
+    /// is an unbounded loop with a price tag, which is why §2.4 mandates
+    /// two loop-guard rules and why stage 4 added a third — a per-session
+    /// cap on turns one plugin may cause
+    /// (`plugin_send::MAX_PLUGIN_TURNS_PER_SESSION`).
+    ///
+    /// The text is ALWAYS echoed to the user verbatim, attributed to the
+    /// plugin. There is no silent path: a message the host accepts is a
+    /// message the user sees, and a message the host refuses is refused
+    /// in band with a reason, never dropped (invariant 9).
+    ///
+    /// Off in headless (`nanopi -p`) regardless of this flag — the whole
+    /// path is TUI-only, and the call is refused rather than no-op'd.
+    pub allow_send_message: bool,
+
     /// Hosts `host-http-get` may reach. Empty denies every URL, so
     /// `allow_network = true` alone reaches nothing. Compared against
     /// the URL's parsed host, never a substring.
@@ -293,6 +317,7 @@ impl Default for ExtensionConfig {
             allow_store: false,
             allow_context: false,
             allow_tools: Vec::new(),
+            allow_send_message: false,
             url_allowlist: Vec::new(),
             events: Vec::new(),
         }
@@ -580,6 +605,41 @@ mod tests {
              other grant"
         );
         assert!(cfg.extensions[1].allow_context);
+    }
+
+    /// The grant that spends money. Same default-closed rule, and worth
+    /// its own test rather than folding into the every-grant one above:
+    /// a regression that flipped this default on would let any
+    /// installed plugin bill the user.
+    #[test]
+    fn allow_send_message_parses_and_defaults_off() {
+        let cfg: Config = toml::from_str(
+            "[[extensions]]\npath = \"a.wasm\"\n\n\
+             [[extensions]]\npath = \"b.wasm\"\nallow_send_message = true\n",
+        )
+        .expect("parses");
+        assert!(
+            !cfg.extensions[0].allow_send_message,
+            "spending the user's money must be opt-in — this is the one \
+             grant whose default being wrong costs cash"
+        );
+        assert!(cfg.extensions[1].allow_send_message);
+    }
+
+    /// `ExtensionConfig` carries `deny_unknown_fields` since stage 2,
+    /// so the near-miss spellings a user is likeliest to write are load
+    /// ERRORS naming the key, not grants that parse and do nothing.
+    #[test]
+    fn a_typod_send_grant_is_a_load_error_not_a_silent_no_grant() {
+        let err = toml::from_str::<Config>(
+            "[[extensions]]\npath = \"a.wasm\"\nallow_send_messages = true\n",
+        )
+        .expect_err("a typo must not parse into a silently ungranted plugin");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allow_send_messages"),
+            "and it must name the offending key: {msg}"
+        );
     }
 
     /// Test guard: point NANOPI_HOME at an empty temp dir so tests
