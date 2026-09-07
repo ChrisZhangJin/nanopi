@@ -1189,6 +1189,55 @@ fn a_replaced_bridge_refuses_instead_of_running_the_old_instance() {
     );
 }
 
+/// The refusal happens BEFORE the guest runs, not after it.
+///
+/// Both checks produce the same `Err`, so the test above passes with
+/// the pre-call check deleted — verified by reverting it, which came
+/// back GREEN. The two are only distinguishable by whether the guest
+/// ran, and the only handle on that from outside is time: `busy` burns
+/// ~1s of guest time (that is what
+/// `a_busy_plugin_drops_the_event_and_counts_it` relies on), so a
+/// refusal that returns in a fraction of that cannot have executed it.
+/// This matters beyond tidiness — the guest of a replaced instance may
+/// write files or send HTTP requests, and side effects are the one part
+/// of a call a refusal cannot take back.
+#[test]
+fn a_refused_call_never_enters_the_guest() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("events fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+
+    // Establish the cost of actually running it, on this machine, so
+    // the bound below is not a guess about CPU speed.
+    let started = std::time::Instant::now();
+    old.execute_tool("busy", "{}").expect("busy must run while live");
+    let ran_for = started.elapsed();
+    assert!(
+        ran_for > std::time::Duration::from_millis(60),
+        "busy is the slow tool this test is built on; it took {ran_for:?}"
+    );
+
+    let _new = load(name.clone());
+
+    let started = std::time::Instant::now();
+    let err = old
+        .execute_tool("busy", "{}")
+        .expect_err("the replaced instance must refuse");
+    let refused_in = started.elapsed();
+    assert!(err.contains("/reload"), "{err}");
+    assert!(
+        refused_in < ran_for / 4,
+        "the refusal took {refused_in:?} against a {ran_for:?} run — the guest ran \
+         and was only refused afterwards"
+    );
+}
+
 /// The commands half, same shape. A plugin command is dispatched
 /// through the bridge too, and the palette can hand out a stale handler
 /// (a spawned command task holds it across the reload).
@@ -1293,6 +1342,10 @@ fn a_replaced_bridge_receives_no_more_events() {
             .0
     };
     let old = load(name.clone());
+    // Read before anything else touches the instance, so the value put
+    // back on the live row below is the generation this bridge was
+    // loaded as, whatever the calls in between do.
+    let old_id = old.instance_id();
 
     // One delivery before the reload, so the tally proves the plugin
     // was receiving.
@@ -1300,13 +1353,23 @@ fn a_replaced_bridge_receives_no_more_events() {
     let new = load(name.clone());
     old.handle_event("turn_start", "{}");
 
-    // Read through the NEW bridge — the old one refuses tool calls now,
-    // and both instances share nothing but the name, so the new
-    // instance's tally is its own.
     let seen = new.execute_tool("events_seen", "{}").expect("events_seen");
     assert_eq!(
         seen.content, "{\"total\":0,\"by_event\":{}}",
         "the fresh instance must not have seen the delivery aimed at the replaced one"
+    );
+
+    // The assertion above is necessary but NOT sufficient, and reverting
+    // the check proves it: the two instances share nothing but a name,
+    // so the fresh tally is zero whether or not the delivery reached the
+    // OLD guest. Ask the old guest directly, by putting it back on the
+    // live row so its own tools answer again. It must still be at 1 —
+    // the delivery after the reload must not have landed anywhere.
+    nanopi::wasm::generation::activate(&name, old_id);
+    let old_seen = old.execute_tool("events_seen", "{}").expect("events_seen");
+    assert_eq!(
+        old_seen.content, "{\"total\":1,\"by_event\":{\"turn_start\":1}}",
+        "the replaced instance received the event it was supposed to be past"
     );
     assert_eq!(
         old.dropped_events(),

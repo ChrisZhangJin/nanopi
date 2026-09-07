@@ -1694,6 +1694,10 @@ impl ComponentBridge {
 }
 
 impl WasmExecuteBridge for ComponentBridge {
+    fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     fn execute_tool(&self, name: &str, args_json: &str) -> Result<ToolOutput, String> {
         // BEFORE the export check and before the lock. A replaced
         // instance has no business answering questions about its tool

@@ -164,6 +164,18 @@ pub trait WasmExecuteBridge: Send + Sync {
     /// can mark `is_error=true` for the renderer.
     fn execute_tool(&self, name: &str, args_json: &str) -> Result<ToolOutput, String>;
 
+    /// Which generation of its plugin this bridge is, per
+    /// `crate::wasm::generation`. `0` is "not tracked", which is right
+    /// for the test doubles — they are never replaced.
+    ///
+    /// On the trait rather than the concrete bridge because `load`
+    /// hands back an `Arc<dyn WasmExecuteBridge>`, and the only caller
+    /// is a test that has to put a replaced instance back on the live
+    /// row to ask its GUEST what it saw. Nothing in `src/` calls it.
+    fn instance_id(&self) -> u64 {
+        0
+    }
+
     /// Slash commands this plugin advertised at load time. Empty for a
     /// component that does not export `list-commands`, which is the
     /// common case and the reason this has a default.
