@@ -433,6 +433,14 @@ world extension-events {
     /// stdin for the same event, so a plugin and a hook see exactly the
     /// same thing.
     ///
+    /// `message_end` carries the assistant's reply in
+    /// `arguments.response`, capped at 16 KiB. When the cap engages,
+    /// `arguments.response_truncated` is `true` AND the text itself ends
+    /// with `[nanopi: response truncated, N of M bytes]` —
+    /// `arguments.response_length` is always the whole reply's length,
+    /// never the truncated copy's. Do not conclude anything from a
+    /// `response` you have not checked for that marker.
+    ///
     /// The return value is IGNORED. `handle-event` is observe-only —
     /// return `"{}"`.
     ///

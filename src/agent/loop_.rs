@@ -1499,10 +1499,13 @@ impl Agent {
         // already ended anyway).
         if self.permission.hooks_active() {
             let turn_label = self.turn_count.to_string();
-            let arguments = serde_json::json!({
-                "turn_count": self.turn_count,
-                "response_length": final_text.len(),
-            });
+            // Stage 5 (`docs/plugin-capabilities.md` §5): the payload
+            // carries the assistant's text, not just its length. Built
+            // in `hook.rs` so the truncation bound and its self-
+            // announcement live next to the payload type and stay
+            // unit-testable in both builds.
+            let arguments =
+                crate::agent::hook::message_end_arguments(self.turn_count, &final_text);
             if !self.hooks.message_end.is_empty() {
                 let (outcome, _) = run_hooks(
                     &self.hooks.message_end,
@@ -2876,6 +2879,88 @@ mod tests {
             }
             Ok(Usage::default())
         }
+    }
+
+    /// Stage 5 end to end: the assistant's text reaches a subscriber.
+    ///
+    /// `hook.rs` unit-tests the payload builder, but a builder nobody
+    /// calls is exactly the failure mode `message_end` already had —
+    /// the field was there and carried a number. This runs a real turn
+    /// and reads what the subscriber was handed.
+    #[tokio::test]
+    async fn message_end_delivers_the_assistant_text_to_subscribers() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Capture {
+            payload: std::sync::Mutex<Option<String>>,
+        }
+        impl EventHandler for Capture {
+            fn handle_event(&self, event: &str, payload: &str) {
+                if event == "message_end" {
+                    *self.payload.lock().unwrap() = Some(payload.to_string());
+                }
+            }
+        }
+
+        let cap = Arc::new(Capture::default());
+        let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+            plugin_name: Arc::from("watcher"),
+            events: crate::agent::hook::EVENT_NAMES.to_vec(),
+            handler: cap.clone(),
+        }]);
+
+        let dir = tmp();
+        let session_path = dir.join("message-end-text.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProviderForEvents {
+                step: Arc::new(AtomicUsize::new(0)),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: subs,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.run_turn("go", &tx, None, None).await.unwrap();
+
+        let raw = cap
+            .payload
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("message_end was never delivered");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["arguments"]["response"], "done",
+            "the assistant's text must be in the payload; got {raw}"
+        );
+        assert_eq!(v["arguments"]["response_truncated"], false);
+        assert_eq!(v["arguments"]["response_length"], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A blocked tool call must tell the model WHAT blocked it.

@@ -549,7 +549,7 @@ see what the model said**:
 | `tool_execution_start` | `{tool_name, arguments}` | ✅ |
 | `tool_execution_end` | `{tool_input, tool_response:{content,is_error}}` | ✅ |
 | `turn_start` / `turn_end` | `{turn_count, iteration, had_tool_calls}` | ❌ |
-| `message_end` | `{turn_count, **response_length**}` | ❌ a length |
+| `message_end` | `{turn_count, response_length}` → **`{turn_count, response_length, response, response_truncated}`** | ✅ since stage 5 (§5.1) |
 | `session_*` | `{reason}` | ❌ |
 
 So the imports above make "remember what the user prefers" work, and
@@ -569,6 +569,93 @@ it has two real costs:
    announce itself rather than silently cutting.
 
 Deliberately staged separately from the imports for that reason.
+
+### 5.1 Shipped (stage 5, 2026-09-07)
+
+`message_end`'s `arguments` is now four fields:
+
+```json
+{
+  "turn_count": 3,
+  "response_length": 21384,
+  "response": "…the assistant's text…",
+  "response_truncated": true
+}
+```
+
+**The two costs, as decided.**
+
+**Cost 1 — shell hooks: accepted as-is, no guard.** Three reasons, in
+order of weight:
+
+- **The channel already carries the whole conversation except this
+  half.** A `[[hooks.input]]` script receives the user's prompt
+  verbatim in `arguments.prompt`; a `[[hooks.tool_execution_end]]`
+  script receives complete tool output, which routinely includes file
+  contents far more sensitive than a reply about them. The assistant's
+  text is not a new *class* of data on the hook channel — it is the one
+  piece missing from a channel that already had the rest. A guard here
+  would protect nothing that is not already exposed one event over.
+- **A guard would have to break the byte-identical contract.** The
+  payload being the same bytes for a hook and a plugin is what makes
+  "ship a `.wasm` and a shell script and have them see the same thing"
+  true (`docs/v0.12-events.md` §1). Gating `response` on a config key
+  means two payload shapes for one event, and the WIT doc comment
+  becomes conditional — the plugin author then has to handle absence,
+  which is exactly the "is the field there or not" guesswork the shared
+  payload exists to remove.
+- **Opt-in would leave the gap open.** A capability that only exists
+  when the user finds a flag is a capability most memory extensions
+  will not have. Stage 5's purpose is that "remember what was
+  concluded" *works*, not that it is available.
+
+What is NOT acceptable, and is what the compatibility work actually
+consists of: **`response_length` keeps its exact old meaning** — the
+byte length of the whole reply, never of the truncated copy. It is
+additive-only for an existing script: `response_length` reads the same
+after this change as before, and everything new is a key a script that
+does not know about it will not look at. Pinned by
+`response_length_still_means_the_whole_reply_after_truncation`.
+
+Hooks are also where the size cost lands hardest — a hook is a fresh
+process per event, and its stdin is the copy — which is the other half
+of why the bound below is not optional.
+
+**Cost 2 — size: 16 KiB, announced three ways.**
+`hook::MESSAGE_END_RESPONSE_MAX_BYTES = 16 * 1024`. A 400-line code
+answer is ~12 KiB, so a typical full reply survives intact and only the
+pathological one is cut. The cut lands on a UTF-8 char boundary — a
+byte-count cut panics `&str` slicing on any non-ASCII reply, which in
+this project means most of them.
+
+The spec's requirement was that the truncation announce itself. It does
+so redundantly, and the redundancy is the point:
+
+| Signal | Who sees it |
+|---|---|
+| `response_truncated: true` | a consumer that thought to check |
+| `response_length` > `response.len()` | a consumer comparing them |
+| `\n[nanopi: response truncated, 16384 of 51234 bytes]` appended to `response` | **a consumer that only reads `response`** |
+
+Only the third one protects the naive reader, and the naive reader is
+the realistic one: a memory plugin summarising "what was concluded"
+reads `response` and nothing else. Without the in-band marker it would
+conclude from half a sentence and never know. This is invariant 9's rule
+— a subscriber must never believe it has something it does not — applied
+to a payload instead of to an import. The marker's own bytes are counted
+*outside* the bound: shrinking the body to fit the marker would be the
+one way to truncate silently.
+
+**One thing found and not fixed.** `message_end`'s payload carries
+`tool_name: "3"` — the turn number, because the emit site passes the
+turn label through `run_hooks`' `tool_name` parameter to give `matcher`
+something to test against. The field is a lie for all four turn events
+(`before_agent_start`, `turn_start`, `turn_end`, `message_end`), not
+just this one, and it is pre-existing. Left alone deliberately: it is
+load-bearing for the documented "matcher is tested against the turn
+number" behaviour (`docs/v0.12-events.md` §7), so changing it is a
+breaking change to a working feature, not a bug fix. Recorded here so
+the next reader does not think stage 5 introduced it.
 
 ## Invariants
 
@@ -608,6 +695,11 @@ Deliberately staged separately from the imports for that reason.
     verbatim exactly once, and nothing is rendered that will not reach a
     turn. Added in stage 4, replacing §Required tests' echo *ordering*;
     see there for why ordering was the wrong assertion.
+
+17. Added in stage 5: a truncated payload always says it was truncated,
+    in the field a consumer actually reads. Corollary of 9 on the
+    payload side — a plugin must never conclude from half a reply
+    believing it had the whole one.
 
 ## Required tests
 
@@ -682,6 +774,22 @@ Deliberately staged separately from the imports for that reason.
 - a call during the turn its own message started is refused;
 - a message arriving mid-stream steers; too late queues as a follow-up.
 
+### `message_end` payload (stage 5)
+
+- the assistant's text is in `arguments.response`, and reaches a real
+  subscriber from the real emit site — not merely buildable by the
+  payload helper;
+- `response_length` is the length of the WHOLE reply even when
+  `response` was cut, so an existing `[[hooks.message_end]]` script
+  reads the same number it read before stage 5;
+- an over-bound reply is truncated, and says so *inside* `response` —
+  a consumer that reads no other field cannot mistake half a sentence
+  for the whole one;
+- an under-bound reply carries no marker (the announcement must not be
+  noise on every turn);
+- the cut lands on a char boundary, so a non-ASCII reply does not panic
+  the payload build.
+
 ### Notify
 
 - output carries the plugin's name;
@@ -696,7 +804,7 @@ Deliberately staged separately from the imports for that reason.
 | 2 | `host-set-context` | Needs turn assembly and prompt attribution. Makes the rules loader and preference memory work | **Done** |
 | 3 | `host-call-tool` + `allow_tools` | Largest blast radius: registry access, hook firing, re-entrancy. Wants stages 1–2's grant plumbing already in place | **Done** |
 | 4 | `host-send-user-message` | Loop guard is the whole difficulty | **Done** (2026-09-07). §2.4's two rules turned out not to bound the loop they target; a per-session cap was added, see the note there. §Required tests' echo ordering was replaced by a biconditional |
-| 5 | `message_end` payload carrying assistant text | Changes shell-hook behavior; decide separately (§5) | Still a separate decision, unchanged by stage 4 |
+| 5 | `message_end` payload carrying assistant text | Changes shell-hook behavior; decide separately (§5) | **Done** (2026-09-07). Both costs decided in §5.1: shell hooks receive the text with no guard (the channel already carries the prompt and every tool result; a guard would break the byte-identical contract), with `response_length` holding its old meaning so no existing script changes reading; 16 KiB bound announced in-band as well as by flag |
 
 ## What is not adopted from PI
 

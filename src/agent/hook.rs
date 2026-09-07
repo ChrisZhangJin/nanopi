@@ -244,6 +244,73 @@ pub fn event_payload_json(
     .expect("serialize HookInput")
 }
 
+/// Stage 5 (`docs/plugin-capabilities.md` §5): the byte bound on the
+/// assistant text carried by `message_end`'s `arguments`.
+///
+/// The text crosses the process boundary twice per turn — once to every
+/// `[[hooks.message_end]]` command's stdin, once to every subscribed
+/// WASM plugin — so an unbounded reply is an unbounded copy on a tool
+/// that is meant to run on constrained hardware. 16 KiB holds a typical
+/// full reply (a 400-line code answer is ~12 KiB) while capping the
+/// pathological one.
+pub const MESSAGE_END_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+
+/// Build `message_end`'s `arguments`, carrying the assistant's text.
+///
+/// Stage 5 of `docs/plugin-capabilities.md` §5. Before this, the payload
+/// was `{turn_count, response_length}` — a number — so a plugin could
+/// see the user's words (`input`) and every tool result
+/// (`tool_execution_end`) but never what the model said.
+///
+/// Three fields, and the shape is deliberate on two counts:
+///
+/// - **`response_length` keeps its old meaning**: the length in bytes of
+///   the WHOLE reply, never of the truncated copy. A script reading it
+///   today keeps reading the same number after this change; and when
+///   truncation happens it is the field that says how much there was.
+/// - **Truncation announces itself three ways** — `response_truncated:
+///   true`, a `response_length` larger than `response`, and an in-band
+///   marker appended to the text itself. The in-band marker is the one
+///   that matters: a consumer that only looks at `response` (the obvious
+///   thing to do) must not be able to draw a conclusion from half a
+///   sentence without seeing that the sentence was cut. Invariant 9's
+///   rule — never let a subscriber believe something it should not —
+///   applied to a payload rather than to an import.
+pub fn message_end_arguments(turn_count: u32, final_text: &str) -> Value {
+    let full_len = final_text.len();
+    let (response, truncated) = truncate_response(final_text);
+    serde_json::json!({
+        "turn_count": turn_count,
+        "response_length": full_len,
+        "response": response,
+        "response_truncated": truncated,
+    })
+}
+
+/// Cut `text` to [`MESSAGE_END_RESPONSE_MAX_BYTES`] on a UTF-8 char
+/// boundary, appending a marker that says so. Returns `(text, was_cut)`.
+///
+/// The marker is counted OUTSIDE the bound: the bound exists to stop a
+/// 400 KiB reply, and a hundred-odd extra bytes on the rare truncated
+/// payload is not the cost worth optimizing. Cutting the marker itself
+/// to fit would be the one way to truncate silently.
+fn truncate_response(text: &str) -> (String, bool) {
+    if text.len() <= MESSAGE_END_RESPONSE_MAX_BYTES {
+        return (text.to_string(), false);
+    }
+    let mut cut = MESSAGE_END_RESPONSE_MAX_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + 64);
+    out.push_str(&text[..cut]);
+    out.push_str(&format!(
+        "\n[nanopi: response truncated, {cut} of {} bytes]",
+        text.len()
+    ));
+    (out, true)
+}
+
 /// One hook definition (parsed from settings.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
@@ -822,6 +889,83 @@ mod tests {
         assert!(matcher_matches("^(read|grep)$", "read"));
         assert!(matcher_matches("^(read|grep)$", "grep"));
         assert!(!matcher_matches("^(read|grep)$", "bash"));
+    }
+
+    /// Stage 5: the whole point — the assistant's text is IN the
+    /// payload, not summarized as a length.
+    #[test]
+    fn message_end_payload_carries_the_assistant_text() {
+        let args = message_end_arguments(3, "the answer is 42");
+        assert_eq!(args["response"], "the answer is 42");
+        assert_eq!(args["response_truncated"], false);
+        assert_eq!(args["turn_count"], 3);
+        assert_eq!(args["response_length"], 16);
+    }
+
+    /// Backward compatibility, stated as a test: a
+    /// `[[hooks.message_end]]` script reading `response_length` today
+    /// keeps reading the length of the WHOLE reply, even when the copy
+    /// it also now receives was cut. If `response_length` were quietly
+    /// redefined as "length of `response`" every existing script would
+    /// start reporting 16384 for every long turn.
+    #[test]
+    fn response_length_still_means_the_whole_reply_after_truncation() {
+        let long = "x".repeat(MESSAGE_END_RESPONSE_MAX_BYTES + 5_000);
+        let args = message_end_arguments(1, &long);
+        assert_eq!(
+            args["response_length"].as_u64().unwrap() as usize,
+            long.len(),
+            "response_length must be the full reply's length, not the truncated copy's"
+        );
+        assert!(
+            args["response"].as_str().unwrap().len() < long.len(),
+            "the copy must actually be bounded"
+        );
+    }
+
+    /// The spec's requirement: truncation ANNOUNCES itself rather than
+    /// silently cutting. In band, in the text a naive consumer reads —
+    /// not only in a sibling flag it may never look at.
+    #[test]
+    fn truncation_announces_itself_in_the_text_itself() {
+        let long = "y".repeat(MESSAGE_END_RESPONSE_MAX_BYTES * 2);
+        let args = message_end_arguments(1, &long);
+        assert_eq!(args["response_truncated"], true);
+        let text = args["response"].as_str().unwrap();
+        assert!(
+            text.contains("[nanopi: response truncated,"),
+            "a consumer reading only `response` must see that it was cut; got tail {:?}",
+            &text[text.len().saturating_sub(80)..]
+        );
+        assert!(
+            text.contains(&long.len().to_string()),
+            "the marker must say how much there was"
+        );
+        // Untruncated payloads carry no marker — the announcement must
+        // not be noise on every turn.
+        let short = message_end_arguments(1, "hi");
+        assert!(!short["response"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+    }
+
+    /// Cutting a byte count out of UTF-8 lands mid-codepoint on any
+    /// non-ASCII reply (this project's docs and prompts are half
+    /// Chinese), which panics `&str` slicing.
+    #[test]
+    fn truncation_lands_on_a_char_boundary() {
+        // 3 bytes per char, so the 16384-byte mark is mid-character.
+        let long = "中".repeat(MESSAGE_END_RESPONSE_MAX_BYTES);
+        let args = message_end_arguments(1, &long);
+        let text = args["response"].as_str().unwrap();
+        assert!(args["response_truncated"] == true);
+        let body = text.split("\n[nanopi:").next().unwrap();
+        assert!(
+            body.chars().all(|c| c == '中'),
+            "truncation must not emit a partial codepoint"
+        );
+        assert!(body.len() <= MESSAGE_END_RESPONSE_MAX_BYTES);
     }
 
     #[test]

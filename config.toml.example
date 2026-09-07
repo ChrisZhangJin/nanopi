@@ -436,6 +436,13 @@ base_url = "https://api.openai.com/v1"
 # timeout = 2000
 
 # Ex 9: fire a notification when a turn completes.
+#
+# The payload's `arguments` carries the assistant's reply itself in
+# `response` (since v0.12), alongside `response_length` — which is, as
+# before, the length of the WHOLE reply. A reply over 16 KiB arrives
+# cut, with `response_truncated = true` and a trailing
+# `[nanopi: response truncated, N of M bytes]` marker in the text, so a
+# script that reads only `response` can still tell.
 # [[hooks.message_end]]
 # matcher = "*"
 # command = "notify-send \"nanopi turn done\""
