@@ -343,9 +343,16 @@ base_url = "https://api.openai.com/v1"
 #
 # Each hook is a bash command run at a lifecycle event.
 # Fields:
-#   matcher  regex against tool_name (or session_id for session_*).
+#   matcher  regex against tool_name (or session_id for session_*,
+#            the turn number for the four lifecycle events, and the
+#            compaction reason for session_*_compact).
 #            Defaults to "*" (match all) — required-looking blocks
 #            that omit it work fine.
+#            `input` has NOTHING to match against (a user message is
+#            not a tool call), so `matcher` there must be "*": any
+#            other value is a startup error naming the problem, rather
+#            than a hook that loads and never fires. Filter inside the
+#            command instead — the prompt is in arguments.prompt.
 #   type     "command" (only value in v0.6+); optional.
 #   command  Path/expression run via `bash -c "..."`. Supports ~,
 #            $HOME, ${HOME}.

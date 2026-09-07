@@ -117,6 +117,72 @@ impl HookEvent {
     }
 }
 
+/// What an event's `matcher` is tested against.
+///
+/// One `matcher` field means four different things across the eleven
+/// events (`docs/v0.12-events.md` §7 calls this out as the price of the
+/// shell layer's uniform config shape) — and for one event it means
+/// nothing at all. This enum makes that fifth case a property of the
+/// event rather than a comment at the emit site, which is what lets
+/// `validate_hooks` refuse a matcher that cannot work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatcherSubject {
+    ToolName,
+    /// The turn counter, as a decimal string. Surprising but real:
+    /// `matcher = "^3$"` fires on turn 3.
+    TurnNumber,
+    SessionId,
+    /// `threshold` or `manual`.
+    CompactionReason,
+    /// **Nothing.** The emit site has no subject to offer, so the
+    /// matcher is tested against `""` and only `*` can ever match.
+    Nothing,
+}
+
+impl MatcherSubject {
+    /// Whether a real (non-`*`) matcher can ever fire against this
+    /// subject. The whole T2.7 rule in one line, expressed over the
+    /// subject rather than over the event, so a future event with no
+    /// matchable subject inherits it by declaring
+    /// [`MatcherSubject::Nothing`] and nothing else.
+    pub fn admits_a_matcher(self) -> bool {
+        match self {
+            MatcherSubject::ToolName
+            | MatcherSubject::TurnNumber
+            | MatcherSubject::SessionId
+            | MatcherSubject::CompactionReason => true,
+            MatcherSubject::Nothing => false,
+        }
+    }
+}
+
+impl HookEvent {
+    /// What this event's `matcher` is tested against at its emit site.
+    ///
+    /// Verified against `src/agent/loop_.rs`' `run_hooks` call sites and
+    /// `run_session_hooks`. Kept beside the events rather than derived
+    /// from the call sites because it is what `validate_hooks` needs at
+    /// config-load time, long before any emit site runs.
+    pub fn matcher_subject(self) -> MatcherSubject {
+        match self {
+            HookEvent::ToolExecutionStart | HookEvent::ToolExecutionEnd => {
+                MatcherSubject::ToolName
+            }
+            HookEvent::BeforeAgentStart
+            | HookEvent::TurnStart
+            | HookEvent::TurnEnd
+            | HookEvent::MessageEnd => MatcherSubject::TurnNumber,
+            HookEvent::SessionStart | HookEvent::SessionShutdown => MatcherSubject::SessionId,
+            HookEvent::SessionBeforeCompact | HookEvent::SessionCompact => {
+                MatcherSubject::CompactionReason
+            }
+            // `loop_.rs` passes `""` here: the user message is not a
+            // tool call and there is nothing else to match on.
+            HookEvent::Input => MatcherSubject::Nothing,
+        }
+    }
+}
+
 /// The eleven PI event names deliverable to WASM plugins, in
 /// `docs/v0.12-events.md` §7's table order. This is the vocabulary
 /// `parse_event_grants` validates config-supplied `events` entries
@@ -318,6 +384,11 @@ pub struct HookConfig {
     /// Empty or `*` = match all. Default when omitted is `"*"`, which is
     /// the useful case for session_start / session_shutdown where there's no
     /// tool name to match.
+    ///
+    /// What it is matched against depends on the event — see
+    /// [`HookEvent::matcher_subject`]. For an event whose subject is
+    /// [`MatcherSubject::Nothing`] (`input`), anything but `*` is a
+    /// load-time error rather than a hook that never fires.
     #[serde(default = "default_matcher")]
     pub matcher: String,
     /// Shell command. Supports `~`, `$HOME`, `${HOME}` expansion.
@@ -388,13 +459,42 @@ pub fn matcher_matches(matcher: &str, tool_name: &str) -> bool {
 }
 
 /// Validate all hook matchers at config-load time. Returns the first
-/// invalid matcher (line-agnostic).
-pub fn validate_hooks(hooks: &[HookConfig]) -> Result<(), String> {
+/// problem (line-agnostic).
+///
+/// Two rules, both load-time errors:
+///
+/// 1. **The matcher must be valid regex.** (Since v0.5.)
+/// 2. **The matcher must have something to match against.** An event
+///    whose [`HookEvent::matcher_subject`] is [`MatcherSubject::Nothing`]
+///    tests `matcher` against `""`, so anything but `*` can never fire.
+///    That was the defect `docs/v0.12-manual-test-plan.md` §T2.7
+///    reproduced for `[[hooks.input]]`: a config with
+///    `matcher = "hello"` parsed clean, started nothing, and said
+///    nothing. This project's rule for a config key that cannot do what
+///    it appears to do is a load-time error naming the problem — the
+///    same rule as a retired hook key (`retired_hook_key_error`) and as
+///    an `allow_tools` entry naming a tool that does not exist. Applied
+///    here, per event class rather than per event name, so a future
+///    event with no matchable subject inherits it without anyone
+///    remembering to.
+pub fn validate_hooks(event: HookEvent, hooks: &[HookConfig]) -> Result<(), String> {
     for (i, h) in hooks.iter().enumerate() {
-        if !h.matcher.is_empty() && h.matcher != "*" {
-            regex::Regex::new(&h.matcher)
-                .map_err(|e| format!("hook #{i} matcher {:?} is invalid regex: {e}", h.matcher))?;
+        if h.matcher.is_empty() || h.matcher == "*" {
+            continue;
         }
+        if !event.matcher_subject().admits_a_matcher() {
+            return Err(format!(
+                "[[hooks.{}]] #{i}: matcher {:?} can never match — the \"{}\" event carries no \
+                 tool name, so `matcher` is tested against an empty string. Use `matcher = \"*\"` \
+                 (or omit it) and filter inside your command. See \
+                 docs/v0.12-events.md §7.",
+                event.pi_name(),
+                h.matcher,
+                event.pi_name(),
+            ));
+        }
+        regex::Regex::new(&h.matcher)
+            .map_err(|e| format!("hook #{i} matcher {:?} is invalid regex: {e}", h.matcher))?;
     }
     Ok(())
 }
@@ -989,7 +1089,7 @@ mod tests {
                 timeout: 1000,
             },
         ];
-        assert!(validate_hooks(&v).is_ok());
+        assert!(validate_hooks(HookEvent::ToolExecutionStart, &v).is_ok());
     }
 
     #[test]
@@ -1000,7 +1100,145 @@ mod tests {
             command: "x".into(),
             timeout: 1000,
         }];
-        assert!(validate_hooks(&v).is_err());
+        assert!(validate_hooks(HookEvent::ToolExecutionStart, &v).is_err());
+    }
+
+    /// T2.7: `[[hooks.input]]` with `matcher = "hello"` used to parse
+    /// clean, register, and then never fire — the matcher was tested
+    /// against `""`. Silence was the defect; a load-time error naming
+    /// the problem is this project's rule for a config key that cannot
+    /// do what it appears to do.
+    #[test]
+    fn a_matcher_on_an_event_with_no_subject_is_a_load_error() {
+        let v = vec![HookConfig {
+            matcher: "hello".into(),
+            kind: "command".into(),
+            command: "cat >> /tmp/input.log".into(),
+            timeout: 1000,
+        }];
+        let err = validate_hooks(HookEvent::Input, &v)
+            .expect_err("a matcher that can never fire must not load silently");
+        // The message must name the key, the matcher, and WHY — an
+        // error that just says "invalid" sends the user back to §T2.7.
+        assert!(err.contains("hooks.input"), "{err}");
+        assert!(err.contains("\"hello\""), "{err}");
+        assert!(err.contains("can never match"), "{err}");
+        assert!(err.contains("no tool name"), "{err}");
+        assert!(err.contains("matcher = \"*\""), "{err}");
+    }
+
+    /// The two spellings that ARE meaningful for such an event still
+    /// load. Erroring on these would break every working `input` hook.
+    #[test]
+    fn star_and_omitted_matchers_still_load_for_input() {
+        for m in ["*", ""] {
+            let v = vec![HookConfig {
+                matcher: m.into(),
+                kind: "command".into(),
+                command: "x".into(),
+                timeout: 1000,
+            }];
+            assert!(
+                validate_hooks(HookEvent::Input, &v).is_ok(),
+                "matcher {m:?} must stay valid for input"
+            );
+        }
+    }
+
+    /// The rule is per event CLASS, not per event name. Every event
+    /// whose matcher has a real subject must keep accepting a real
+    /// matcher — including the turn-numbered ones, where `^3$` fires on
+    /// turn 3, and the session ones, which existing tests here rely on
+    /// (`^prod-`, `^threshold$`).
+    #[test]
+    fn events_with_a_real_matcher_subject_still_accept_matchers() {
+        for event in [
+            HookEvent::ToolExecutionStart,
+            HookEvent::ToolExecutionEnd,
+            HookEvent::BeforeAgentStart,
+            HookEvent::TurnStart,
+            HookEvent::TurnEnd,
+            HookEvent::MessageEnd,
+            HookEvent::SessionStart,
+            HookEvent::SessionShutdown,
+            HookEvent::SessionBeforeCompact,
+            HookEvent::SessionCompact,
+        ] {
+            assert_ne!(
+                event.matcher_subject(),
+                MatcherSubject::Nothing,
+                "{} has a documented matcher subject",
+                event.pi_name()
+            );
+            let v = vec![HookConfig {
+                matcher: "^something$".into(),
+                kind: "command".into(),
+                command: "x".into(),
+                timeout: 1000,
+            }];
+            assert!(
+                validate_hooks(event, &v).is_ok(),
+                "{} must still accept a real matcher",
+                event.pi_name()
+            );
+        }
+    }
+
+    /// Every *subject* must have decided whether it admits a matcher.
+    ///
+    /// The exhaustive `match` is the test: adding a sixth
+    /// `MatcherSubject` without deciding fails to compile here, which is
+    /// the only mechanism that reaches a future event nobody has written
+    /// yet. `every_event_declares_…` below cannot distinguish this rule
+    /// from a hardcoded `== Input`, because `input` is currently the only
+    /// member of the class — this is what covers that gap.
+    #[test]
+    fn every_matcher_subject_has_decided_whether_it_admits_a_matcher() {
+        for subject in [
+            MatcherSubject::ToolName,
+            MatcherSubject::TurnNumber,
+            MatcherSubject::SessionId,
+            MatcherSubject::CompactionReason,
+            MatcherSubject::Nothing,
+        ] {
+            let expected = match subject {
+                // A subject the matcher is tested against — a real
+                // matcher can fire.
+                MatcherSubject::ToolName
+                | MatcherSubject::TurnNumber
+                | MatcherSubject::SessionId
+                | MatcherSubject::CompactionReason => true,
+                // No subject: only `*` can ever match, so a real
+                // matcher is a config error, not a filter.
+                MatcherSubject::Nothing => false,
+            };
+            assert_eq!(subject.admits_a_matcher(), expected, "{subject:?}");
+        }
+    }
+
+    /// The class must be derived, not enumerated by hand: every one of
+    /// the eleven events has to declare what its matcher matches, and
+    /// exactly the ones declaring `Nothing` are the ones that refuse a
+    /// matcher. A future event added with no matchable subject then
+    /// inherits the error without anyone remembering to wire it up.
+    #[test]
+    fn every_event_declares_its_matcher_subject_and_the_class_decides() {
+        for name in EVENT_NAMES {
+            let event: HookEvent =
+                serde_json::from_value(json!(name)).expect("EVENT_NAMES must round-trip");
+            let v = vec![HookConfig {
+                matcher: "x".into(),
+                kind: "command".into(),
+                command: "c".into(),
+                timeout: 1000,
+            }];
+            let refused = validate_hooks(event, &v).is_err();
+            assert_eq!(
+                refused,
+                event.matcher_subject() == MatcherSubject::Nothing,
+                "{name}: refusal must follow from matcher_subject(), nothing else"
+            );
+        }
     }
 
     #[test]

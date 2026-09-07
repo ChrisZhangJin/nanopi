@@ -204,7 +204,7 @@ matcher = "^bash$"
 command = "logger 'nanopi 即将执行 shell'"
 ```
 
-TOML key 是 snake_case（`tool_execution_start`，不是 `ToolExecutionStart`）。完整协议见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 第 6 节。
+TOML key 是 snake_case（`tool_execution_start`，不是 `ToolExecutionStart`）。`matcher` 是正则，具体拿什么去匹配取决于事件：工具名、session id、turn 号，或压缩原因。`input` 是唯一一个没有东西可匹配的事件 —— 用户消息不是工具调用 —— 所以那里的 `matcher` 只能是 `"*"`，写别的会在启动时直接报错并说明原因，而不是加载成功却永远不触发。完整协议见 [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) 第 6 节。
 
 ### v0.12 改名
 

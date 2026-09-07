@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::agent::hook::HookConfig;
+use crate::agent::hook::{HookConfig, HookEvent};
 use crate::agent::loop_::HooksConfig;
 
 #[derive(Debug, Error)]
@@ -176,20 +176,20 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
     }
 
     // Validate regex matchers up front; surface errors at startup.
-    crate::agent::hook::validate_hooks(&hooks.tool_execution_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.tool_execution_end).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.input)
+    crate::agent::hook::validate_hooks(HookEvent::ToolExecutionStart, &hooks.tool_execution_start).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::ToolExecutionEnd, &hooks.tool_execution_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::Input, &hooks.input)
         .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_shutdown).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.before_agent_start)
+    crate::agent::hook::validate_hooks(HookEvent::SessionStart, &hooks.session_start).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::SessionShutdown, &hooks.session_shutdown).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::BeforeAgentStart, &hooks.before_agent_start)
         .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.turn_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.turn_end).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.message_end).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_before_compact)
+    crate::agent::hook::validate_hooks(HookEvent::TurnStart, &hooks.turn_start).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::TurnEnd, &hooks.turn_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::MessageEnd, &hooks.message_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::SessionBeforeCompact, &hooks.session_before_compact)
         .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(&hooks.session_compact).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::SessionCompact, &hooks.session_compact).map_err(SettingsError::Matcher)?;
 
     Ok(hooks)
 }
@@ -326,6 +326,60 @@ command = "echo hi"
             err.contains("tool_execution_start"),
             "error should name the replacement: {err}"
         );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2.7, end to end: the exact config from the manual test plan
+    /// must now be refused at load, not accepted and then ignored.
+    ///
+    /// The unit tests in `hook.rs` cover the rule; this covers the
+    /// wiring — `load_settings` validates each of the eleven lists
+    /// separately, and passing the wrong `HookEvent` to any of those
+    /// eleven calls would make the check apply to the wrong list
+    /// silently.
+    #[test]
+    fn an_input_hook_with_a_real_matcher_fails_to_load() {
+        let _guard = lock();
+        let dir = tmp();
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", &dir);
+        std::fs::write(
+            dir.join("settings.toml"),
+            r#"
+[[hooks.input]]
+matcher = "hello"
+command = "cat >> /tmp/input.log"
+"#,
+        )
+        .unwrap();
+
+        let r = load_settings(&PathBuf::from("/tmp"));
+        let err = match r {
+            Err(SettingsError::Matcher(m)) => m,
+            other => panic!("expected a Matcher error, got {other:?}"),
+        };
+        assert!(err.contains("hooks.input"), "{err}");
+        assert!(err.contains("can never match"), "{err}");
+
+        // The same file with `*` still loads — the error must not have
+        // taken the working configuration down with the broken one.
+        std::fs::write(
+            dir.join("settings.toml"),
+            r#"
+[[hooks.input]]
+matcher = "*"
+command = "cat >> /tmp/input.log"
+"#,
+        )
+        .unwrap();
+        let h = load_settings(&PathBuf::from("/tmp")).expect("`*` must still load");
+        assert_eq!(h.input.len(), 1);
 
         if let Some(p) = prev {
             std::env::set_var("NANOPI_HOME", p);

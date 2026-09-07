@@ -209,7 +209,7 @@ matcher = "^bash$"
 command = "logger 'nanopi about to shell out'"
 ```
 
-Keys are `snake_case` (`tool_execution_start`, not `ToolExecutionStart`). Full protocol in [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) §6.
+Keys are `snake_case` (`tool_execution_start`, not `ToolExecutionStart`). `matcher` is a regex, and what it is tested against depends on the event: the tool name, the session id, the turn number, or the compaction reason. `input` is the one event with nothing to match against — a user message is not a tool call — so `matcher` there must be `"*"`, and any other value is a startup error rather than a hook that silently never fires. Full protocol in [`docs/v0.5-research.md`](https://github.com/ChrisZhangJin/nanopi/blob/main/docs/v0.5-research.md) §6.
 
 ### Renamed in v0.12
 

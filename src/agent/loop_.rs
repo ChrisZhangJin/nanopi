@@ -911,9 +911,13 @@ impl Agent {
                 let (outcome, new_args) = run_hooks(
                     &self.hooks.input,
                     HookEvent::Input,
-                    // No tool name here, so `matcher` is tested against "" —
-                    // only `*` (or an omitted matcher) can ever match. Any
-                    // real regex silently never fires.
+                    // No tool name here, so `matcher` is tested against ""
+                    // — only `*` (or an omitted matcher) can ever match.
+                    // This is `MatcherSubject::Nothing`, and since T2.7 a
+                    // config that puts a real regex here is a load-time
+                    // error rather than a hook that silently never fires
+                    // (`hook::validate_hooks`). Anything reaching here
+                    // therefore has `*`.
                     "",
                     None,
                     arguments.clone(),
