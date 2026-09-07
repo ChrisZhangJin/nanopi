@@ -1140,3 +1140,197 @@ fn a_runaway_event_handler_is_bounded_by_the_event_budget() {
         .expect("greet call after the deadline trap");
     assert!(!out.is_error, "{}", out.content);
 }
+
+// ── hot reload (v0.12) ────────────────────────────────────────────────
+//
+// The hazard these pin is not "the old bridge is freed too early" — it
+// is that the old bridge still WORKS. `WasmTool`, `WasmCommandHandler`
+// and `WasmEventHandler` each hold an `Arc<dyn WasmExecuteBridge>`, so a
+// call in flight when `/reload` lands would otherwise run the replaced
+// instance and have its result read as the new plugin's.
+
+/// Load the same plugin NAME twice, as a reload does, and the first
+/// bridge must refuse rather than execute — naming the reload, in-band
+/// (`docs/plugin-capabilities.md` invariant 3).
+#[test]
+fn a_replaced_bridge_refuses_instead_of_running_the_old_instance() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("fixture must load")
+            .0
+    };
+
+    let old = load(name.clone());
+    // Works before the reload — otherwise the assertion below would
+    // pass for the wrong reason.
+    assert_eq!(
+        old.execute_tool("rot13", r#"{"text":"abc"}"#).unwrap().content,
+        "nop"
+    );
+
+    let new = load(name.clone());
+
+    let err = old
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect_err("the replaced instance must refuse");
+    assert!(
+        err.contains("/reload") && err.contains(&*name),
+        "the refusal must name the reload and the plugin: {err}"
+    );
+
+    // And the replacement is fully callable — a refusal mechanism that
+    // also broke the new instance would pass the assertion above.
+    assert_eq!(
+        new.execute_tool("rot13", r#"{"text":"abc"}"#).unwrap().content,
+        "nop"
+    );
+}
+
+/// The commands half, same shape. A plugin command is dispatched
+/// through the bridge too, and the palette can hand out a stale handler
+/// (a spawned command task holds it across the reload).
+#[test]
+fn a_replaced_bridge_refuses_commands_too() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    // The example fixture is the one with `list-commands`; the events
+    // fixture deliberately has none.
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+    let command = old
+        .command_specs()
+        .first()
+        .map(|s| s.name.clone())
+        .expect("the events fixture exports at least one command");
+    assert!(matches!(
+        old.execute_command(&command, ""),
+        Ok(CommandAction::Print(_)) | Ok(CommandAction::Error(_)) | Ok(CommandAction::SendUserMessage(_))
+    ));
+
+    let _new = load(name.clone());
+
+    let err = old
+        .execute_command(&command, "")
+        .expect_err("the replaced instance must refuse the command");
+    assert!(
+        err.contains("/reload"),
+        "the refusal must name the reload: {err}"
+    );
+}
+
+/// A reload that lands WHILE a tool call is inside the guest.
+///
+/// This is the case the pre-call check cannot cover: the bridge holds
+/// its mutex for the whole guest call, so the swap necessarily happened
+/// mid-call. The call is allowed to finish — there is no way to
+/// interrupt guest code that is already running, short of the epoch
+/// deadline killing it — and its RESULT is then refused rather than
+/// reported, because reporting it would attribute the replaced
+/// instance's work to the plugin now loaded. The wording says the call
+/// ran and its side effects stand.
+#[test]
+fn a_reload_landing_mid_call_refuses_the_result_rather_than_reporting_it() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("events fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+
+    let busy_bridge = old.clone();
+    // ~1s of guest time, as `a_busy_plugin_drops_the_event_and_counts_it`
+    // uses it, so the reload below lands while this is still inside the
+    // guest.
+    let call = std::thread::spawn(move || busy_bridge.execute_tool("busy", "{}"));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // The swap is published directly rather than by standing a second
+    // instance up, and the first version of this test is why: a real
+    // `load` spends ~815ms in Cranelift, which is LONGER than the busy
+    // tool runs, so the reload landed after the call had already
+    // finished and the test passed vacuously
+    // (`Ok(ToolOutput { content: "done (255)" })`). This is the exact
+    // pair of calls `load` ends with, so what is being skipped is the
+    // compile, not the mechanism.
+    nanopi::wasm::generation::activate(&name, nanopi::wasm::generation::next_id());
+
+    let err = call
+        .join()
+        .expect("busy call thread")
+        .expect_err("a result from the replaced instance must not be reported as success");
+    assert!(
+        err.contains("WHILE this call was running"),
+        "the refusal must say the call ran, not that it was refused before starting: {err}"
+    );
+    assert!(
+        err.contains("side effects"),
+        "the user has to be told the call's side effects stand: {err}"
+    );
+}
+
+/// Event delivery to a replaced instance stops, and stops SILENTLY —
+/// `dropped_events` means "the plugin was busy" and is read as a
+/// tuning signal, so counting a reload there would misreport it.
+#[test]
+fn a_replaced_bridge_receives_no_more_events() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, vec!["turn_start".to_string()])
+            .expect("events fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+
+    // One delivery before the reload, so the tally proves the plugin
+    // was receiving.
+    old.handle_event("turn_start", "{}");
+    let new = load(name.clone());
+    old.handle_event("turn_start", "{}");
+
+    // Read through the NEW bridge — the old one refuses tool calls now,
+    // and both instances share nothing but the name, so the new
+    // instance's tally is its own.
+    let seen = new.execute_tool("events_seen", "{}").expect("events_seen");
+    assert_eq!(
+        seen.content, "{\"total\":0,\"by_event\":{}}",
+        "the fresh instance must not have seen the delivery aimed at the replaced one"
+    );
+    assert_eq!(
+        old.dropped_events(),
+        0,
+        "a reload is not the plugin being busy — dropped_events must not count it"
+    );
+}
+
+/// A plugin that vanishes from `[[extensions]]` is retired: nothing is
+/// live for it, so an in-flight call refuses rather than running code
+/// the user has removed from their config.
+#[test]
+fn a_retired_plugin_has_no_live_instance_left() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), name.clone(), Vec::new())
+        .expect("fixture must load");
+    assert!(bridge.execute_tool("rot13", r#"{"text":"abc"}"#).is_ok());
+
+    nanopi::wasm::generation::retire(&name);
+
+    let err = bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect_err("a retired plugin must not still be callable");
+    assert!(err.contains("/reload"), "{err}");
+}
