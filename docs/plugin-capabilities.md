@@ -688,6 +688,15 @@ the next reader does not think stage 5 introduced it.
     send guard including the spent session budget) survives a guest
     trap; guest memory does not. The budget in particular: otherwise
     trapping is how a plugin buys another twenty turns.
+
+    v0.12.0's `/reload` extends this to instance *replacement*, for the
+    same reason: the store is on disk and a reload is not a factory
+    reset, and the send guard plus the spent budget survive because
+    otherwise reloading is how a plugin buys another twenty turns.
+    The context contribution is the single exception — it survives a
+    reload, but is dropped when the plugin is no longer in the config
+    or no longer has `allow_context`, because a contribution nothing
+    live can account for is text in the prompt with no owner.
 15. A plugin-initiated tool call is never written to the session
     transcript — it would replay as a `tool_use` the model never
     requested.
@@ -696,7 +705,15 @@ the next reader does not think stage 5 introduced it.
     turn. Added in stage 4, replacing §Required tests' echo *ordering*;
     see there for why ordering was the wrong assertion.
 
-17. Added in stage 5: a truncated payload always says it was truncated,
+17. Added in v0.12.0's hot reload: a call held by an instance that
+    `/reload` has replaced is refused in-band (invariant 3's vocabulary,
+    naming the reload) rather than executed, and the check runs AFTER
+    the guest returns as well as before it starts — so a result
+    produced by replaced code is never reported as a success. The
+    refusal states that side effects the call already had still stand,
+    because they do. A replaced instance receives no further events.
+
+18. Added in stage 5: a truncated payload always says it was truncated,
     in the field a consumer actually reads. Corollary of 9 on the
     payload side — a plugin must never conclude from half a reply
     believing it had the whole one.
@@ -789,6 +806,22 @@ the next reader does not think stage 5 introduced it.
   noise on every turn);
 - the cut lands on a char boundary, so a non-ASCII reply does not panic
   the payload build.
+
+### Hot reload (v0.12.0)
+
+- reloading the same plugin re-registers the SAME tool names (the case
+  `register_external`'s collision refusal makes non-obvious);
+- a plugin dropped from the config is unregistered and reported;
+- a plugin whose `.wasm` stops loading keeps its previous instance and
+  its grant row;
+- a context contribution survives a reload with `allow_context` and is
+  dropped without it;
+- the report line names failures and says the old instance was kept,
+  names every dropped contribution, and says "no WASM support" rather
+  than reading as "reloaded nothing".
+
+The staleness refusals themselves are in `docs/claims-and-races.md`
+§Races, with invariant 13.
 
 ### Notify
 

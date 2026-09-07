@@ -250,6 +250,27 @@ than which variable the call site passes — which is the entire defect.
 | a plugin's handler panics or traps | delivery to the next subscriber continues | ✅ |
 | a plugin returns a value from `handle-event` | ignored | type |
 
+### Plugin hot reload (v0.12.0)
+
+| Race | Required result | |
+|---|---|---|
+| `/reload` lands while a tool call is inside the guest | the result is DISCARDED and the call refused in-band, naming the reload; the refusal says the side effects it already had stand | ✅ |
+| `/reload` lands before a queued call enters the guest | refused before the guest runs at all, so no side effects | ✅ |
+| a slash command runs against a replaced instance | same refusal as a tool call, both before and after | ✅ |
+| an event is emitted to a replaced instance | not delivered, and NOT counted in `dropped_events` — nothing was dropped from a live subscriber | ✅ |
+| a plugin's `.wasm` fails to load during `/reload` | the previously loaded instance stays live and callable, keeps its subscription and its grant row, and the failure is named in red | ✅ |
+| a plugin is removed from `[[extensions]]` and reloaded | its tools and commands are unregistered, its instance has no live generation left, and the count is reported | ✅ |
+| a plugin reloads to shed its spent per-session message budget | it does not: the budget and the loop guard are host-side and survive | ✅ |
+| a reloaded plugin re-registers a tool name it already owned | accepted, because unregister runs before register — `register_external` still refuses a name it does not own | ✅ |
+
+Two orderings are load-bearing and neither is arbitrary. Loading the
+new components happens BEFORE unregistering the old, so a load failure
+leaves the old instance intact rather than leaving the user with
+neither. And the generation table is published as the LAST statement of
+a successful load, so a plugin that fails halfway never marks its old
+instance stale — rollback is the absence of an action, not a
+compensating one.
+
 Delivery is explicitly **not** guaranteed, and that asymmetry is
 deliberate: a busy plugin must never be able to extend a turn. An
 audit plugin therefore cannot treat its own log as complete — which is
@@ -311,6 +332,11 @@ When adding a status line, an `AgentEvent`, or a `note!`:
     at startup.
 12. Anything written to stderr while raw mode is active terminates
     lines with `\r\n`.
+13. A call held by a plugin instance that `/reload` replaced is refused,
+    never reported as a success — invariant 1's rule applied to
+    replacement: the result of code that is gone is not proof of
+    anything. `/reload` never leaves a plugin in a half-state: it
+    reloads, keeps the old instance, or says which, out loud.
 
 ## Required tests
 
@@ -340,7 +366,21 @@ Grouped by the invariant they defend. All present unless noted.
 - a turn delivers every event it can reach (guards against a missing
   `deliver_with` at any of the eleven sites, which is otherwise
   completely silent);
-- a panicking handler does not stop delivery to the next subscriber.
+- a panicking handler does not stop delivery to the next subscriber;
+- a replaced plugin instance refuses a tool call and a slash command
+  rather than running them, and refuses a call that was ALREADY inside
+  the guest when the swap landed — the second is the one that closes
+  the window, and the first version of that test passed vacuously
+  (`done (255)`) because a real second `load` spends ~815ms in
+  Cranelift, longer than the call it was racing; it now publishes the
+  swap with the same `next_id` + `activate` pair `load` ends with, so
+  what is skipped is the compile, not the mechanism;
+- a replaced instance receives no further events;
+- a retired plugin has no live generation left;
+- a reload does not refund a plugin's spent session budget (this one
+  lives in the integration binary: `plugin_send`'s state is
+  process-wide and its own unit tests serialize on a private lock that
+  is not `crate::test_lock()`).
 
 ### Rendering
 

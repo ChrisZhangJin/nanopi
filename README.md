@@ -342,7 +342,13 @@ The budget applies to **guest** code only. Epoch interruption is instrumentation
 
 Commands are stricter, and the two rules genuinely differ. A **tool** collision is first-wins: the tool already registered stays and the newcomer is skipped. A **command** collision refuses *both* claimants — if two plugins each register `/deploy`, neither gets it, because silently picking a winner would mean `/deploy` runs whichever plugin happened to load first. A command whose name belongs to a built-in like `/compact` is skipped. Every case prints a warning naming the plugin(s), and never affects that plugin's other commands or any of its tools.
 
-Plugins are loaded once per Agent — at startup, and on `/new`, `/resume`, `/fork`, `/import`. `/reload` deliberately does **not** re-read `[[extensions]]`, and says so; swapping plugins under a live registry needs an unregister path that doesn't exist yet.
+Plugins are loaded at startup and on `/new`, `/resume`, `/fork`, `/import` — and, as of v0.12.0, on `/reload`, which re-reads `[[extensions]]` and hot-swaps the live registry.
+
+**Hot reload.** `/reload` loads the new `.wasm` files *first*, then unregisters the old tools and commands, then registers the new ones — so a plugin whose file has stopped loading keeps the instance that is already running, and `/reload` says so in red rather than leaving you with neither the old plugin nor the new one. It reports what it did: how many plugins reloaded, how many tools and commands they brought, which plugins the config no longer lists (unregistered), and which failed. Grants are re-read from the config, so revoking `allow_network` takes effect on `/reload`; a failed plugin keeps its old grant row, because that row describes what is actually still running.
+
+A tool call already in flight when a reload lands is **refused, not executed and not silently substituted**: the plugin's old instance recognises that it has been replaced and returns an `error:` string naming the reload as the reason, both before the call starts and after the guest returns. The second check is the one that matters — you are never told a call succeeded when its result came from code that has since been replaced. Side effects the call already had (a file written, an HTTP request sent) stand, and the refusal says so. Events are not delivered to a replaced instance at all.
+
+Host-side plugin state survives a reload, deliberately: the plugin's host-store files (they are on disk, and a reload is not a factory reset), and the `plugin_send` loop guard and spent per-session message budget (otherwise `/reload` would be a budget refund, and a plugin could reload itself out of its own limit). The one exception is a plugin's system-prompt contribution, which is dropped if the plugin is gone from the config or has lost `allow_context` — keeping it would put text in the prompt that nothing live can account for.
 
 ## Versions
 
