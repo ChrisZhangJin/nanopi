@@ -8,6 +8,11 @@ pub mod event;
 pub mod keys;
 pub mod paths;
 pub mod models;
+/// Unconditionally compiled, like `subscriber` below and for the same
+/// reason: turn assembly in `agent::loop_` reads it, and that path must
+/// stay free of `#[cfg(feature = "wasm")]`. Without the feature the
+/// registry is simply always empty.
+pub mod plugin_context;
 pub mod resources;
 pub mod session;
 pub mod settings;

@@ -87,8 +87,8 @@ world extension {
     /// against the older WIT simply never references these functions,
     /// and a component that references no import needs nothing linked
     /// for it. The host links them unconditionally and the old binaries
-    /// keep loading — the three committed fixtures predate these three
-    /// imports and prove it on every test run.
+    /// keep loading — the three committed fixtures predate every one of
+    /// these imports and prove it on every test run.
     ///
     /// So new capabilities go here, on `world extension`, and are
     /// inherited by `extension-commands` / `extension-events` through
@@ -180,6 +180,64 @@ world extension {
     /// useless for telling the user something. `host-notify` goes
     /// through `insert_before`, so it scrolls into history and stays.
     import host-notify: func(text: string) -> string;
+
+    /// Declare text this plugin wants present in the model's context.
+    /// Returns `""` on success, or an `error: ` string.
+    ///
+    /// Gated on `allow_context = true` in the plugin's `[[extensions]]`
+    /// entry. Without it every call returns an `error: ` string and
+    /// nothing enters the prompt. It is gated because this text is read
+    /// by the MODEL AS INSTRUCTION — it is the one import that changes
+    /// what the agent believes rather than what the plugin knows — and
+    /// combined with `allow_network = true` it lets a remote source
+    /// shape the agent's behaviour, which is why that combination gets
+    /// an escalated warning at load.
+    ///
+    /// REPLACES this plugin's previous contribution — it is STATE, not
+    /// an append. That is what makes it safe under a dropped delivery:
+    /// the value is idempotent, so a call the host never made simply
+    /// means the previous contribution stands for one more turn. An
+    /// append would grow without bound and would make a late arrival
+    /// observable. Passing `""` clears the contribution entirely.
+    ///
+    /// TAKES EFFECT AT THE NEXT TURN'S ASSEMBLY, not mid-turn. The host
+    /// folds contributions into the system prompt once per turn, before
+    /// the request is built; a call made while a turn is already in
+    /// flight lands on the following one. This is the same
+    /// idempotent-state framing as above — there is no partially
+    /// applied contribution.
+    ///
+    /// Bounded at 4 KiB per plugin, measured in BYTES, and each plugin
+    /// is capped separately. The bound is small because this text
+    /// enters EVERY request for the rest of the session: an unbounded
+    /// contribution silently multiplies the cost of every turn, which
+    /// is the opposite of what nanopi is for.
+    ///
+    /// A refusal is in-band and CHANGES NOTHING. An over-bound call
+    /// returns an `error: ` string and the PREVIOUS contribution still
+    /// stands — since this is replace-semantics, a refusal that also
+    /// cleared the existing value would turn being told "no" into
+    /// losing what you had.
+    ///
+    /// THE HOST APPLIES THE ATTRIBUTION. The text is rendered under a
+    /// `[context contributed by extension "<stem>"]` header built from
+    /// this plugin's `.wasm` file stem, so the model can tell a
+    /// plugin's injected instructions from the user's own. Unlike
+    /// `host-notify`, multi-line text is normal here and is kept as-is
+    /// — but a body containing a header-shaped line cannot open a block
+    /// attributed to another plugin; the host neutralizes the sequence.
+    ///
+    /// A contribution SURVIVES A GUEST TRAP, like the store and for the
+    /// same reason: it is host-side state, and a trap resets the
+    /// instance.
+    ///
+    /// The host also announces every CHANGE to the contribution in the
+    /// user's scrollback. A contribution is invisible by nature — the
+    /// user never sees the system prompt — so a plugin silently
+    /// rewriting the agent's instructions is exactly what nanopi
+    /// refuses to allow. The announcement is per change, not per turn
+    /// or per call, so re-declaring the same text is silent.
+    import host-set-context: func(text: string) -> string;
 
     /// Return the tools this plugin provides, as a JSON array:
     ///

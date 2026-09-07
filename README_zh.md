@@ -289,6 +289,7 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 | `host-store-get` | `(key: string) -> string` | `allow_store` | 读该插件在 `key` 下存的值。键不存在时读到 `""`。 |
 | `host-store-set` | `(key: string, value: string) -> string` | `allow_store` | 替换该插件在 `key` 下的值。字节落到文件系统后返回 `""`，否则返回以 `error: ` 开头的字符串。 |
 | `host-notify` | `(text: string) -> string` | 始终可用 | 往用户的 scrollback 里写一行，前缀由宿主用该插件的名字加上。按轮次限流。 |
+| `host-set-context` | `(text: string) -> string` | `allow_context` | 声明一段要进入模型上下文的文字，并标注来自该插件。每次调用**替换**该插件上一次的贡献；传 `""` 表示清除。返回 `""`，否则返回以 `error: ` 开头的字符串。 |
 
 数据跨边界用 JSON 字符串而不是 WIT record —— 只用一种原始类型，ABI 就小到两边都不需要 codegen 步骤。
 
@@ -303,6 +304,8 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 `host-notify` 不设门控，因为它是输出而不是访问 —— 它碰不到任何东西，也不留下任何东西。它唯一能造成的问题是淹没你的注意力，所以约束它的是限流而不是权限门：超出每轮的额度后，多出来的行会被丢弃，并由一行 `… N more suppressed` 说明丢了多少；被丢弃的那几次调用返回的是 `error: ` 字符串，所以插件不会以为自己说了话其实没说。前缀由宿主根据 `.wasm` 文件名主干加上，payload 永远不会被拿去解析前缀，所以一个插件无法冒充另一个。它和 `host-log` 的区别在于文字最终落在哪里：`host-log` 写的是裸 stderr，会落进 TUI 管理的区域并被下一次重绘擦掉，而 `host-notify` 会滚进历史里留下来。
 
 `host-store-get` / `host-store-set` 由 `allow_store = true` 门控，而且它们收的是**键，不是路径** —— 插件给出一个 map 的键，落到哪个文件完全由宿主决定（`~/.nanopi/extensions/<stem>/store.json`，每个插件一个 JSON 对象）。所以上面那套路径约束在这里既不适用也不需要：插件手上根本没有一条能指向外部的路径。上限是总共 1 MiB、1000 个键、键最长 128 字符；每一次拒绝都在带内返回，并且什么都不写入 —— 不会出现「告诉插件失败了，值却还是进去了」。`host-store-set` 返回 `""` 意味着字节已经到了文件系统：宿主用临时文件加 rename 提交，所以崩溃之后留下的要么是完整的旧文件、要么是完整的新文件，不会是撕裂的半个。两个插件的 `.wasm` 文件名主干相同、且其中任一开了 `allow_store` 时，两个都会加载失败，而不是悄悄共用一个 store。
+
+`host-set-context` 由 `allow_context = true` 门控。它是唯一一个改变**智能体所相信的东西**、而不是插件所知道的东西的 import：插件声明的文字会在每一轮开始时被折进 system prompt。归属头部 —— `[context contributed by extension "memory"]` —— 由宿主写入，因为没有它，模型就分不清插件注入的指令和你自己的指令。每次调用是**替换**而不是追加，所以它是幂等状态，十轮也不会攒出十份；传 `""` 清除。上限是每个插件 4 KiB，按字节算，而且刻意定得小：这段文字在这个会话余下的时间里会进入**每一个**请求。超限的调用在带内被拒，并且**之前那份贡献依然有效** —— 被告知「不行」不会顺带把你已有的东西弄丢。每一次变更都会在你的 scrollback 里公示并点明是哪个插件 —— 否则这份贡献是不可见的，因为你从来看不到 system prompt —— 而且这条公示与插件自己的 `host-notify` 额度**分开记账**，所以插件没法先用噪声把额度耗光、再把它埋掉。与 `allow_network = true` 组合是 nanopi 目前最锋利的一对权限，启动时会告警：那意味着一个远端来源可以塑造智能体的行为。
 
 `host-http-get` 有两道门：先是 `allow_network = true`，然后 URL 的 host 必须匹配 `url_allowlist`。**空 allowlist 拒绝一切**，所以只把开关打开本身还是什么都访问不到。匹配比对的是解析出的 host 而不是子串 —— allowlist 为 `api.github.com` 时，`https://evil.com/?x=api.github.com` 和 `https://api.github.com@evil.com/` 都会被拒。
 

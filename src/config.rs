@@ -153,8 +153,31 @@ impl Default for ToolExecMode {
 /// otherwise those host functions return an in-band `error: `-prefixed
 /// string. In-band rather than a trap so a plugin can handle a denied
 /// capability as an ordinary failure instead of dying.
+/// `deny_unknown_fields` is what turns a typo'd grant
+/// (`allow_stroe = true`, `allow_contxt = true`) into a parse error
+/// instead of a silently-ignored no-op. The failure it prevents is
+/// specific and bad: the user believes they granted a capability, the
+/// plugin is refused every call, and nothing anywhere says why — the
+/// config looks right because the misspelled key is simply not a key.
+/// A grant is exactly the kind of setting that must not fail quietly.
+///
+/// This was a DELIBERATE DEFERRED DECISION from stage 1, not an
+/// oversight: the stage-1 plan pinned the gap with a test whose doc
+/// comment said flipping it had to be deliberate and visible. This is
+/// that flip, and it supersedes that pin.
+///
+/// The cost is acknowledged rather than hidden: a config carrying a
+/// stray key that loads today will now fail loudly, which is a
+/// behaviour change for existing users. No `alias` softens it, same as
+/// the retired hook keys in `settings.rs`. Every `[[extensions]]` key
+/// appearing in `config.toml.example`, both READMEs,
+/// `docs/v0.12-events.md`, `docs/v0.12-manual-test-plan.md` and
+/// `docs/pi-vs-nanopi.md` was surveyed and is a real field; the only
+/// undefined one anywhere is `allow_tools` in
+/// `docs/plugin-capabilities.md` §2.5, which is a stage-3 spec example
+/// that is never loaded.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExtensionConfig {
     /// `.wasm` file or directory of `.wasm` files. Supports `~/` and
     /// `$HOME/` expansion.
@@ -186,6 +209,24 @@ pub struct ExtensionConfig {
     /// stem, so two plugins with the same stem where either sets this
     /// are a load error rather than a silent shared store.
     pub allow_store: bool,
+
+    /// v0.12: enable `host-set-context` — text this plugin declares is
+    /// folded into the system prompt at turn assembly, under a header
+    /// naming the plugin. Default: `false`.
+    ///
+    /// Gated because the plugin is writing text the MODEL READS AS
+    /// INSTRUCTION. That is a different kind of capability from
+    /// `allow_fs` or `allow_store`: those let a plugin learn things,
+    /// this one lets it change what the agent believes. Combined with
+    /// `allow_network = true` it lets a remote source shape the agent's
+    /// behaviour, which is why that combination warns at plugin load
+    /// (`docs/plugin-capabilities.md` §3).
+    ///
+    /// Bounded at 4 KiB per plugin, replace-not-append, and every
+    /// change is announced in the user's scrollback — a contribution is
+    /// invisible by nature, since the user never sees the system
+    /// prompt.
+    pub allow_context: bool,
     /// Hosts `host-http-get` may reach. Empty denies every URL, so
     /// `allow_network = true` alone reaches nothing. Compared against
     /// the URL's parsed host, never a substring.
@@ -229,6 +270,7 @@ impl Default for ExtensionConfig {
             allow_network: false,
             allow_fs: false,
             allow_store: false,
+            allow_context: false,
             url_allowlist: Vec::new(),
             events: Vec::new(),
         }
@@ -446,30 +488,74 @@ mod tests {
         assert!(cfg.extensions[1].allow_store);
     }
 
-    /// Pins the CURRENT behavior, which is not what one might assume:
-    /// `ExtensionConfig` does NOT carry `#[serde(deny_unknown_fields)]`
-    /// — only `HooksSection` does (`agent/hook.rs`, the retired-key
-    /// rule) — so a typo'd grant inside `[[extensions]]` is silently
-    /// ignored rather than refused.
+    /// SUPERSEDES stage 1's
+    /// `a_typod_extension_grant_is_currently_ignored_not_refused`,
+    /// which pinned the opposite behaviour and said in its own doc
+    /// comment that flipping it had to be deliberate and visible. This
+    /// is the flip: `ExtensionConfig` now carries
+    /// `deny_unknown_fields`, so a typo'd grant is a load error.
     ///
-    /// That is a real gap: `allow_stroe = true` reads as a plugin the
-    /// user believes they granted a store and did not, and nothing says
-    /// otherwise. It is NOT fixed here, because turning it on would
-    /// start rejecting configs that load today, which is a decision
-    /// about every `[[extensions]]` key rather than about `allow_store`
-    /// (see the SUMMARY). This test exists so the gap is written down
-    /// and so flipping it later is a deliberate, visible change instead
-    /// of an accident.
+    /// The error must NAME the offending field and the valid
+    /// alternatives, because "unknown field" alone leaves a user
+    /// staring at a key that looks correct.
     #[test]
-    fn a_typod_extension_grant_is_currently_ignored_not_refused() {
-        let cfg: Config = toml::from_str(
-            "[[extensions]]\npath = \"a.wasm\"\nallow_stroe = true\n",
+    fn a_typod_extension_grant_is_a_load_error_naming_the_valid_fields() {
+        let err = toml::from_str::<Config>(
+            "[[extensions]]\npath = \"a.wasm\"\nallow_contxt = true\n",
         )
-        .expect("today this parses — see the doc comment, this is the gap");
-        assert!(
-            !cfg.extensions[0].allow_store,
-            "the typo grants nothing, which is the safe half of the gap"
+        .expect_err(
+            "a misspelled grant must be REFUSED — silently ignoring it leaves \
+             the user believing they granted a capability they did not",
         );
+        let msg = err.to_string();
+        assert!(msg.contains("allow_contxt"), "must name the typo: {msg}");
+        assert!(
+            msg.contains("allow_context"),
+            "must offer the valid spelling: {msg}"
+        );
+    }
+
+    /// The other half, and the half that catches an accidentally
+    /// renamed or removed field: a config using EVERY valid
+    /// `[[extensions]]` key must still load. Without this,
+    /// `deny_unknown_fields` plus a rename would turn working configs
+    /// into load errors and only this test would notice.
+    #[test]
+    fn a_config_using_every_valid_extension_key_still_loads() {
+        let cfg: Config = toml::from_str(
+            "[[extensions]]\n\
+             path = \"a.wasm\"\n\
+             max_files = 8\n\
+             allow_network = true\n\
+             allow_fs = true\n\
+             allow_store = true\n\
+             allow_context = true\n\
+             url_allowlist = [\"example.com\"]\n\
+             events = [\"input\"]\n",
+        )
+        .expect("every documented key must remain valid");
+        let e = &cfg.extensions[0];
+        assert_eq!(e.max_files, 8);
+        assert!(e.allow_network && e.allow_fs && e.allow_store && e.allow_context);
+        assert_eq!(e.url_allowlist, vec!["example.com".to_string()]);
+        assert_eq!(e.events, vec!["input".to_string()]);
+    }
+
+    /// The new grant parses and is OFF unless asked for — every
+    /// capability grant defaults closed.
+    #[test]
+    fn allow_context_parses_and_defaults_off() {
+        let cfg: Config = toml::from_str(
+            "[[extensions]]\npath = \"a.wasm\"\n\n\
+             [[extensions]]\npath = \"b.wasm\"\nallow_context = true\n",
+        )
+        .expect("parses");
+        assert!(
+            !cfg.extensions[0].allow_context,
+            "writing the model's instructions must be opt-in, like every \
+             other grant"
+        );
+        assert!(cfg.extensions[1].allow_context);
     }
 
     /// Test guard: point NANOPI_HOME at an empty temp dir so tests

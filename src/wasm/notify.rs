@@ -50,10 +50,40 @@ use std::sync::{LazyLock, Mutex};
 /// slow turn accumulate an arbitrary amount.
 pub const MAX_NOTIFY_PER_TURN: usize = 10;
 
+/// HOST-AUTHORED disclosures a plugin may cause per turn, counted
+/// SEPARATELY from `MAX_NOTIFY_PER_TURN`.
+///
+/// The separation is the point, and it is a security property rather
+/// than tidiness. A context contribution is invisible — the user never
+/// sees the system prompt — so the disclosure line is the only thing
+/// that makes the capability visible at all. If it were spent from the
+/// plugin's own notify budget, a plugin could call `host-notify` ten
+/// times, exhaust the allowance, and THEN rewrite the agent's
+/// instructions with the change never disclosed: the user would see
+/// only `… N more suppressed`, which does not say that the system
+/// prompt changed. A mechanism an adversary can switch off by making
+/// noise is not a mechanism.
+///
+/// It still needs a bound of its own, because a plugin can flip its
+/// contribution back and forth and every flip is a real change. So it
+/// gets its own allowance with its own announced suppression, and
+/// ordinary plugin lines are unaffected either way — neither budget can
+/// exhaust the other.
+pub const MAX_HOST_DISCLOSURE_PER_TURN: usize = 10;
+
 struct Sink {
     queue: VecDeque<String>,
     /// Lines accepted this turn, against `MAX_NOTIFY_PER_TURN`.
     accepted: usize,
+    /// Host-authored disclosures accepted this turn, against
+    /// `MAX_HOST_DISCLOSURE_PER_TURN`. A separate counter so a plugin
+    /// flooding `host-notify` cannot suppress the disclosure of its own
+    /// context change — see that constant.
+    host_accepted: usize,
+    /// Disclosures dropped since the last suppression line, kept apart
+    /// from `suppressed` for the same reason: summing announcements
+    /// must not let one budget's overflow be reported as the other's.
+    host_suppressed: usize,
     /// Lines dropped since the last suppression line was emitted. Not
     /// since the start of the turn: each announcement reports the batch
     /// it covers, so summing the announcements gives the turn's total
@@ -70,6 +100,8 @@ static SINK: LazyLock<Mutex<Sink>> = LazyLock::new(|| {
     Mutex::new(Sink {
         queue: VecDeque::new(),
         accepted: 0,
+        host_accepted: 0,
+        host_suppressed: 0,
         suppressed: 0,
         sink_installed: false,
     })
@@ -139,6 +171,48 @@ pub fn notify(plugin: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Emit a HOST-AUTHORED disclosure about `plugin`, on the host's own
+/// budget rather than the plugin's.
+///
+/// Used for the `host-set-context` change announcement. Everything
+/// about it that differs from [`notify`] is deliberate:
+///
+/// It does not touch `accepted`, so a plugin cannot bury the
+/// disclosure of a context change by first flooding `host-notify` —
+/// see [`MAX_HOST_DISCLOSURE_PER_TURN`]. Its own allowance is separate
+/// and its own overflow announces itself separately.
+///
+/// It is still ATTRIBUTED to the plugin it concerns, because the reader
+/// needs to know WHOSE instructions changed; the prefix is built here
+/// from `plugin`, never parsed out of anything a guest supplied.
+///
+/// It returns nothing. There is no plugin-visible result, because this
+/// is not the plugin's message: the caller has already decided a change
+/// happened, and the plugin is not entitled to know whether the user's
+/// terminal was told. Nothing here can turn into an `error: ` string
+/// the guest sees.
+///
+/// The CALLER is responsible for only calling this on an actual change
+/// — `plugin_context::set` returns whether the value changed for
+/// exactly that reason. A per-call or per-turn announcement would
+/// repeat forever and train the user to ignore the one line that makes
+/// this capability visible.
+pub fn disclose(plugin: &str, text: &str) {
+    let line = format!("[{plugin}] {}", flatten(text));
+    let mut sink = lock();
+    if sink.host_accepted >= MAX_HOST_DISCLOSURE_PER_TURN {
+        sink.host_suppressed += 1;
+        return;
+    }
+    sink.host_accepted += 1;
+    if sink.sink_installed {
+        sink.queue.push_back(line);
+    } else {
+        drop(sink);
+        crate::note!("{line}");
+    }
+}
+
 /// Take everything queued, plus a suppression line when anything was
 /// dropped since the last one.
 ///
@@ -148,15 +222,28 @@ pub fn drain() -> Vec<String> {
     let mut sink = lock();
     let mut out: Vec<String> = sink.queue.drain(..).collect();
     let dropped = std::mem::take(&mut sink.suppressed);
+    // Reported on its own line, not summed into the plugin's count: the
+    // two budgets are independent, and folding a dropped host
+    // disclosure into "N more suppressed" would tell the user a plugin
+    // was too chatty when what actually happened is that a context
+    // change went unannounced.
+    let host_dropped = std::mem::take(&mut sink.host_suppressed);
     let installed = sink.sink_installed;
     drop(sink);
-    if dropped > 0 {
-        let line = format!("… {dropped} more suppressed");
+    let mut emit = |line: String| {
         if installed {
             out.push(line);
         } else {
             crate::note!("{line}");
         }
+    };
+    if dropped > 0 {
+        emit(format!("… {dropped} more suppressed"));
+    }
+    if host_dropped > 0 {
+        emit(format!(
+            "… {host_dropped} more context change(s) not shown"
+        ));
     }
     out
 }
@@ -168,7 +255,13 @@ pub fn drain() -> Vec<String> {
 /// survives to the next drain — clearing it here would turn the last
 /// few suppressed lines of every turn into silent losses.
 pub fn reset_turn() {
-    lock().accepted = 0;
+    let mut sink = lock();
+    sink.accepted = 0;
+    // Re-armed alongside the plugin allowance, and like it, the
+    // `host_suppressed` COUNT is deliberately left alone: a disclosure
+    // dropped at the end of a turn is still a context change the user
+    // was not shown.
+    sink.host_accepted = 0;
 }
 
 /// Collapse to a single line. See the module doc: the host prefix
@@ -191,6 +284,8 @@ mod tests {
         sink.queue.clear();
         sink.accepted = 0;
         sink.suppressed = 0;
+        sink.host_accepted = 0;
+        sink.host_suppressed = 0;
         sink.sink_installed = true;
         g
     }
@@ -329,6 +424,82 @@ mod tests {
             out[0].chars().count() <= crate::wasm::loader::MAX_ACTION_PAYLOAD + 32,
             "prefix plus the cap, not the original length: {}",
             out[0].chars().count()
+        );
+    }
+
+    /// THE EVASION THIS EXISTS TO CLOSE. A plugin exhausts its own
+    /// `host-notify` allowance, then changes its context contribution.
+    /// The disclosure must still reach the user.
+    ///
+    /// If the disclosure were spent from `MAX_NOTIFY_PER_TURN`, the
+    /// drop at the top of `notify` would swallow it and the user would
+    /// see only `… N more suppressed` — a line that says a plugin was
+    /// chatty, not that the agent's instructions were rewritten. Making
+    /// noise would switch off the only mechanism that makes an
+    /// invisible capability visible.
+    #[test]
+    fn a_plugin_over_its_notify_budget_cannot_bury_a_context_disclosure() {
+        let _g = guard();
+        // Spend every one of the plugin's own lines, and then some.
+        for i in 0..MAX_NOTIFY_PER_TURN + 5 {
+            let _ = notify("sneaky", &format!("noise {i}"));
+        }
+        // NOW rewrite the agent's instructions.
+        disclose("sneaky", "context contribution set (42 bytes)");
+
+        let out = drain();
+        let disclosures: Vec<&String> = out
+            .iter()
+            .filter(|l| l.contains("context contribution set"))
+            .collect();
+        assert_eq!(
+            disclosures.len(),
+            1,
+            "the disclosure must survive an exhausted notify budget — \
+             otherwise a plugin switches it off by making noise: {out:?}"
+        );
+        assert!(
+            disclosures[0].starts_with("[sneaky]"),
+            "and it must still name WHOSE instructions changed: {:?}",
+            disclosures[0]
+        );
+    }
+
+    /// The converse, so the separation is not one-directional: host
+    /// disclosures must not eat the plugin's own allowance either.
+    #[test]
+    fn host_disclosures_do_not_consume_the_plugins_notify_budget() {
+        let _g = guard();
+        for i in 0..MAX_HOST_DISCLOSURE_PER_TURN {
+            disclose("p", &format!("change {i}"));
+        }
+        // The plugin's own allowance is untouched by all of that.
+        for i in 0..MAX_NOTIFY_PER_TURN {
+            notify("p", &format!("line {i}"))
+                .expect("the plugin's budget is its own, unspent by disclosures");
+        }
+    }
+
+    /// The disclosure budget is bounded too — a plugin flipping its
+    /// contribution back and forth makes real changes, and every one of
+    /// them is a real disclosure. Over the bound they are dropped, and
+    /// the drop announces itself rather than going silent.
+    #[test]
+    fn disclosures_over_their_own_bound_are_dropped_and_announced() {
+        let _g = guard();
+        for i in 0..MAX_HOST_DISCLOSURE_PER_TURN + 3 {
+            disclose("flapping", &format!("change {i}"));
+        }
+        let out = drain();
+        let announcements: Vec<&String> = out
+            .iter()
+            .filter(|l| l.contains("not shown"))
+            .collect();
+        assert_eq!(announcements.len(), 1, "one announcement, not one per drop: {out:?}");
+        assert!(
+            announcements[0].contains('3'),
+            "the count must be the real number dropped: {:?}",
+            announcements[0]
         );
     }
 
