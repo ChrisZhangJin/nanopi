@@ -176,6 +176,11 @@ write. Do not upgrade a mark without reading the assertions.
 | steer arrives after the receiver is dropped | `steer_or_queue` echoes `[queued]` and queues it in the TUI | ✅ |
 | steer arrives during cancellation | `drain_steer_to_follow_ups` keeps it as a follow-up | ✅ |
 | steer echoed but never delivered | forbidden — the echo is emitted only after the send succeeds | ✅ |
+| a plugin's `host-send-user-message` arrives with a turn running | steers it, same `Steering` variant a typed line takes — the plugin does not get a parallel path | ✅ |
+| — arrives with no live channel | queued in `plugin_send`'s overflow and started as the next turn; **last** of the three follow-up sources, behind the human's queued line | ✅ |
+| — accepted but the process/turn dies before the echo | the echo obligation and the routing decision are taken together under one lock, so the two cannot disagree: `echoes + queued == accepted sends`, exactly, as a partition | ✅ |
+| — refused (guard, cap, or no sink) | in-band `error: …` naming the reason; nothing routed, nothing echoed, nothing disclosed | ✅ |
+| a plugin traps after spending part of its session cap | the guard state is process-wide and survives the rebuild — trapping is not a way to reset the cap | ✅ |
 
 The persistence half is unpinned: `steer_message_injected_as_user_turn`
 asserts the message reaches `ctx.messages` and stops there. The
@@ -290,7 +295,11 @@ When adding a status line, an `AgentEvent`, or a `note!`:
 6. A message does not bracket itself when its renderer adds framing.
 7. A hook pair (`*_before_*` / `*_*`) either both fire or neither does.
 8. A steer that is echoed to the user is delivered, or demoted to a
-   follow-up that runs. It is never silently dropped.
+   follow-up that runs. It is never silently dropped. Since v0.12 this
+   binds plugin-initiated messages too, as a biconditional rather than
+   an ordering: no send without an echo, and no echo without a send.
+   `b90b27f` is why the ordering the spec originally asked for
+   (echo-then-send) is the one that loses text.
 9. Every replayed `tool_use` id has a matching result after load.
 10. Plugin event delivery is best-effort and never extends a turn; a
     blocked action still delivers its event.

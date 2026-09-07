@@ -227,6 +227,44 @@ rules:
 Refusal is in-band: `error: a message from this plugin is already
 pending`.
 
+Rule 1 clears at HAND-OFF — the moment the text actually reaches a turn
+— not when the call returns. Clearing it on return makes the rule
+decorative. Rule 2 is **per plugin, not global**: plugin B may still
+send during a turn plugin A started, or the audit-plus-rules pair this
+document's own §"The problem this fixes" is motivated by would silence
+each other.
+
+> **Added in stage 4, not part of the original two rules.** The two
+> rules above do not bound the loop they are aimed at, and implementing
+> them made that plain. Consider a `turn_end` subscriber that sends once
+> per turn: A sends → a turn runs → A's subscriber sends again → a turn
+> runs → forever. Rule 2 is satisfied every time, because each new turn's
+> origin is a *new* turn; rule 1 is satisfied too, because each message
+> is consumed before the next is submitted. The pair reads like a loop
+> guard and is not one.
+>
+> So there is a **third bound: a per-session cap of 20 turns per
+> plugin** (`plugin_send::MAX_PLUGIN_TURNS_PER_SESSION`), refused with
+> `error: this plugin has started too many turns in this session (20)`.
+> Announced, never silent, per invariant 9. Per plugin, like both real
+> rules — a shared budget would let one looping plugin spend another's.
+> Per session rather than per hour, because a wall-clock window lets a
+> patient loop run forever. Only ACCEPTED messages count, so a plugin
+> cannot lock itself out with its own refusals, and the count is
+> process-wide state that survives a guest trap — otherwise trapping is
+> how a plugin buys another twenty turns.
+>
+> Twenty is set against what the bound protects: the user's money. A
+> plugin with a legitimate reason to drive the agent does it a handful
+> of times per session; one on its fiftieth turn is looping. The cap is
+> a backstop, not a budget.
+
+**Headless.** `src/mode/print.rs` does not consume `CommandAction` and
+has no steer channel, so under `nanopi -p` the sink is never installed
+and the call is refused with `error: sending a message is not available
+right now`. Refused, not no-op'd: invariant 9 means a plugin must never
+believe it sent something it did not.
+
 ### 2.5 Calling nanopi's tools
 
 ```wit
@@ -472,7 +510,14 @@ gives `events` + `allow_network`:
 - `allow_store` + `allow_network` — a durable profile that can leave
   the machine;
 - `allow_tools` containing `bash` — arbitrary execution, which makes
-  every other grant on that plugin decorative.
+  every other grant on that plugin decorative;
+- `allow_send_message` — **alone**, added in stage 4. Unlike the
+  `allow_network` pairs it needs no partner to be dangerous: every other
+  grant lets a plugin learn something, change what the agent believes,
+  or run a tool the user could have run themselves, while this one
+  causes turns the user is BILLED for. Its `/tools` token spells that
+  out (`allow_send_message(can start billed turns)`) rather than sitting
+  as a bare flag among six others an operator is scanning past.
 
 ## 4. Interactions
 
@@ -547,12 +592,22 @@ Deliberately staged separately from the imports for that reason.
 11. Injected context is attributed to its plugin in the prompt.
 12. `host-notify` output is prefixed by the host; a plugin cannot
     impersonate another.
-13. A plugin cannot start a turn that its own message started.
-14. Host-side plugin state (store, context contribution) survives a
-    guest trap; guest memory does not.
+13. A plugin cannot send during a turn that its own message started —
+    per plugin, not globally, so another plugin may still speak during
+    it. Stage 4 found this insufficient on its own: with a per-turn
+    subscriber it holds forever while the loop runs unbounded, so a
+    per-session cap of 20 plugin-caused turns backs it up (§2.4).
+14. Host-side plugin state (store, context contribution, and stage 4's
+    send guard including the spent session budget) survives a guest
+    trap; guest memory does not. The budget in particular: otherwise
+    trapping is how a plugin buys another twenty turns.
 15. A plugin-initiated tool call is never written to the session
     transcript — it would replay as a `tool_use` the model never
     requested.
+16. Every accepted `host-send-user-message` is rendered to the user
+    verbatim exactly once, and nothing is rendered that will not reach a
+    turn. Added in stage 4, replacing §Required tests' echo *ordering*;
+    see there for why ordering was the wrong assertion.
 
 ## Required tests
 
@@ -600,7 +655,29 @@ Deliberately staged separately from the imports for that reason.
 
 ### Send message
 
-- the text is echoed to the user before it is sent;
+- ~~the text is echoed to the user before it is sent~~ — **amended in
+  stage 4; the ordering this asked for is the one that loses text.**
+  What is required is a biconditional, not a wall-clock order:
+  - **no send without an echo** — every accepted message is owed exactly
+    one verbatim rendering, whether it steered a running turn or queued
+    to start the next one;
+  - **no echo without a send** — nothing is rendered that is not also
+    going to reach a turn.
+
+  `b90b27f` is the reason. With the echo genuinely first, the one case
+  that can fail — the turn ending between the call and the dispatch,
+  dropping the receiver — printed `[steer] …` and then discarded the
+  text. The user watched their message land and it was gone. So the code
+  attempts the send FIRST and records the echo only on the branch that
+  succeeded.
+
+  Ordering is also the wrong assertion on its own terms: the user cannot
+  observe which of two operations happened first inside one lock, only
+  whether the two agree. A test that pins the order passes on an
+  implementation that echoes and then drops. The biconditional is
+  testable as one countable invariant — `echoes + queued == accepted
+  sends`, exactly, as a partition — and that is how it is pinned
+  (`plugin_send::every_accepted_message_is_owed_exactly_one_rendering_and_no_other_is`).
 - a second call while one is pending is refused;
 - a call during the turn its own message started is refused;
 - a message arriving mid-stream steers; too late queues as a follow-up.
@@ -613,13 +690,13 @@ Deliberately staged separately from the imports for that reason.
 
 ## Staging
 
-| Stage | Contents | Why here |
-|---|---|---|
-| 1 | `host-store-*`, `host-notify` | No interaction with the agent loop. Makes the audit extension fully workable |
-| 2 | `host-set-context` | Needs turn assembly and prompt attribution. Makes the rules loader and preference memory work |
-| 3 | `host-call-tool` + `allow_tools` | Largest blast radius: registry access, hook firing, re-entrancy. Wants stages 1–2's grant plumbing already in place |
-| 4 | `host-send-user-message` | Loop guard is the whole difficulty |
-| 5 | `message_end` payload carrying assistant text | Changes shell-hook behavior; decide separately (§5) |
+| Stage | Contents | Why here | Status |
+|---|---|---|---|
+| 1 | `host-store-*`, `host-notify` | No interaction with the agent loop. Makes the audit extension fully workable | **Done** |
+| 2 | `host-set-context` | Needs turn assembly and prompt attribution. Makes the rules loader and preference memory work | **Done** |
+| 3 | `host-call-tool` + `allow_tools` | Largest blast radius: registry access, hook firing, re-entrancy. Wants stages 1–2's grant plumbing already in place | **Done** |
+| 4 | `host-send-user-message` | Loop guard is the whole difficulty | **Done** (2026-09-07). §2.4's two rules turned out not to bound the loop they target; a per-session cap was added, see the note there. §Required tests' echo ordering was replaced by a biconditional |
+| 5 | `message_end` payload carrying assistant text | Changes shell-hook behavior; decide separately (§5) | Still a separate decision, unchanged by stage 4 |
 
 ## What is not adopted from PI
 
