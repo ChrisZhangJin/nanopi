@@ -107,6 +107,11 @@ base_url = "https://api.openai.com/v1"
 # Plugins load once per Agent — at startup and on /new, /resume,
 # /fork, /import. `/reload` does NOT re-read this section.
 #
+# An UNKNOWN KEY inside [[extensions]] is a config LOAD ERROR as of
+# v0.12.0, not a silently-ignored line. A misspelled grant
+# (allow_stroe = true) used to read as a capability the user believed
+# they had granted and had not, with nothing anywhere saying so.
+#
 # Fields:
 #   path            .wasm file or directory. Supports ~ and $HOME.
 #   max_files       Cap when path is a directory. Default 64.
@@ -136,6 +141,32 @@ base_url = "https://api.openai.com/v1"
 #                   Combining allow_store with allow_network = true is
 #                   warned about at startup: a durable profile built up
 #                   across restarts, plus a way off the machine.
+#   allow_context   Let the plugin call host-set-context (v0.12.0).
+#                   Default false. The plugin declares text and the
+#                   host folds it into the system prompt at the start
+#                   of each turn, under a header naming the plugin:
+#                     [context contributed by extension "memory"]
+#                   That attribution is not decoration — without it the
+#                   model cannot tell a plugin's instructions from
+#                   yours.
+#                   REPLACES, never appends: each call supersedes the
+#                   plugin's previous contribution, so ten turns cannot
+#                   accumulate ten copies. Passing "" clears it.
+#                   Bounded at 4 KiB per plugin, measured in bytes,
+#                   each plugin capped separately. Small on purpose:
+#                   this text enters EVERY request for the rest of the
+#                   session, so an unbounded contribution multiplies
+#                   the cost of every turn. Over the bound the call is
+#                   refused in-band and the PREVIOUS contribution still
+#                   stands.
+#                   Every CHANGE is announced in your scrollback, naming
+#                   the plugin — a contribution is invisible otherwise,
+#                   since you never see the system prompt. Re-declaring
+#                   the same text says nothing.
+#                   Combining allow_context with allow_network = true is
+#                   warned about at startup, and it is the sharpest of
+#                   these combinations: a remote source it controls can
+#                   then shape how the agent behaves.
 #   allow_network   Let the plugin call host-http-get. Default false.
 #                   Only http/https; requests time out after 10s, and
 #                   redirects are not followed, so a 3xx cannot walk a
@@ -199,11 +230,13 @@ base_url = "https://api.openai.com/v1"
 # path = "~/.nanopi/extensions/"
 # max_files = 16
 
-# A memory plugin: watches what you type and remembers it across
-# restarts. No network, so what it accumulates stays on this machine.
+# A memory plugin: watches what you type, remembers it across restarts,
+# and puts what it learned in front of the model. No network, so what it
+# accumulates stays on this machine.
 # [[extensions]]
 # path = "~/.nanopi/extensions/memory.wasm"
 # allow_store = true
+# allow_context = true
 # events = ["input", "message_end"]
 
 # A plugin that only watches lifecycle events (e.g. an audit logger) —

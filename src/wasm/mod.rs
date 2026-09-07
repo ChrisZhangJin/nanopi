@@ -155,6 +155,23 @@ impl PluginHost {
                      the machine. Grant both only if you trust the plugin.",
                 ));
             }
+            // And `allow_context` + `allow_network` (§3), which is the
+            // sharpest of the three: a plugin that can fetch text AND
+            // put it in the model's system prompt can shape the
+            // agent's behaviour from a remote source it controls,
+            // without ever touching a tool. Same placement, before the
+            // paths expand, so a directory entry warns once rather
+            // than once per file.
+            if cfg.allow_context && cfg.allow_network {
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    "has both `allow_context` and `allow_network = true` — this \
+                     plugin can fetch text from the network AND place it in the \
+                     model's system prompt, so a remote source can shape how \
+                     the agent behaves. Grant both only if you trust the plugin \
+                     and the hosts in its url_allowlist.",
+                ));
+            }
             let (events_granted, refusal_reports) = crate::agent::hook::parse_event_grants(&cfg.events);
             for report in &refusal_reports {
                 notices.push(crate::render::notice::Notice::warn(
@@ -195,6 +212,7 @@ impl PluginHost {
                     cfg.allow_fs,
                     cfg.allow_network,
                     cfg.allow_store,
+                    cfg.allow_context,
                     store::PluginStore::default_root(),
                     plugin_name.clone(),
                     events_granted.clone(),
@@ -467,6 +485,7 @@ mod tests {
             allow_network: false,
             allow_fs: false,
             allow_store: false,
+            allow_context: false,
             url_allowlist: Vec::new(),
             events: Vec::new(),
         };
@@ -563,6 +582,56 @@ mod tests {
         assert!(
             warned,
             "the escalated warning must name BOTH grants: {:?}",
+            summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §3's third escalated combination: fetch text from the network
+    /// and put it in the model's system prompt, and a remote source
+    /// shapes the agent's behaviour.
+    #[test]
+    fn allow_context_plus_allow_network_warns() {
+        let root = tmp();
+        let cfg = ExtensionConfig {
+            path: root.join("nope.wasm"),
+            allow_context: true,
+            allow_network: true,
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        let warned = summary.notices.iter().any(|n| {
+            n.level == crate::render::notice::Level::Warn
+                && n.message.contains("allow_context")
+                && n.message.contains("allow_network")
+        });
+        assert!(
+            warned,
+            "the escalated warning must name BOTH grants: {:?}",
+            summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The grant on its own is a normal opt-in, not a warning — a
+    /// warning on every `allow_context` would be noise the user learns
+    /// to skip past, which is what makes the paired warning worth
+    /// reading.
+    #[test]
+    fn allow_context_alone_does_not_warn() {
+        let root = tmp();
+        let cfg = ExtensionConfig {
+            path: root.join("nope.wasm"),
+            allow_context: true,
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        assert!(
+            !summary.notices.iter().any(|n| {
+                n.level == crate::render::notice::Level::Warn
+                    && n.message.contains("allow_context")
+            }),
+            "{:?}",
             summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&root);
