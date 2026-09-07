@@ -311,6 +311,7 @@ fn expand_path(p: &Path) -> std::path::PathBuf {
 
 pub mod host;
 pub mod loader;
+pub mod store;
 
 #[cfg(test)]
 mod tests {
