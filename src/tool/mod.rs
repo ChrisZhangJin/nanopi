@@ -494,6 +494,32 @@ impl ToolRegistry {
         v
     }
 
+    /// Every plugin that currently has at least one tool registered,
+    /// once each, sorted.
+    ///
+    /// The reload path's starting point: it has to know what is
+    /// registered NOW to work out which plugins vanished from
+    /// `[[extensions]]` since the last load, and asking the registry is
+    /// the only account of that which cannot drift — a list kept
+    /// alongside would be one more thing to update in both Agent
+    /// construction paths.
+    ///
+    /// Built-ins contribute nothing, by construction: they report
+    /// `ToolSource::Builtin`, which carries no name.
+    pub fn plugin_names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .tools
+            .values()
+            .filter_map(|t| match t.source() {
+                ToolSource::Plugin { name, .. } => Some(name),
+                ToolSource::Builtin => None,
+            })
+            .collect();
+        n.sort();
+        n.dedup();
+        n
+    }
+
     pub fn names(&self) -> Vec<String> {
         let mut n: Vec<_> = self.tools.keys().cloned().collect();
         n.sort();

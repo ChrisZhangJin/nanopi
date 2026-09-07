@@ -44,6 +44,17 @@ pub struct PluginLoadSummary {
     /// Per-file failures — path plus the reason. Non-fatal: a broken
     /// plugin is reported and skipped, it does not stop startup.
     pub errors: Vec<(std::path::PathBuf, String)>,
+    /// Names of plugins that loaded AND hold `allow_context`.
+    ///
+    /// Carried out of the load rather than re-derived from the config by
+    /// the caller, for `plugin_grants`'s reason in the other direction:
+    /// the config on disk is not necessarily the config a running
+    /// plugin was loaded under, and `ExtensionConfig` is behind the
+    /// feature flag anyway. The reload path needs exactly this to decide
+    /// whether a plugin's context contribution may stand — a plugin
+    /// that no longer holds the grant cannot retract what it left in the
+    /// system prompt.
+    pub context_holders: Vec<String>,
     /// Everything worth telling the user, COLLECTED rather than
     /// printed as it happens. Loading interleaves warnings with
     /// progress, so printing inline produced a flat wall in which a
@@ -127,6 +138,7 @@ impl PluginHost {
         let mut errors = Vec::new();
         let mut notices: Vec<crate::render::notice::Notice> = Vec::new();
         let mut grants: Vec<crate::plugin_grants::PluginGrants> = Vec::new();
+        let mut context_holders: Vec<String> = Vec::new();
         let mut loaded = 0usize;
 
         // One engine shared by every plugin — compiled code caches
@@ -146,6 +158,7 @@ impl PluginHost {
                     commands,
                     subscribers,
                     grants: Vec::new(),
+                    context_holders: Vec::new(),
                     loaded: 0,
                     errors: vec![(anchor, e)],
                     notices: Vec::new(),
@@ -345,6 +358,9 @@ impl PluginHost {
                     Ok((bridge, specs)) => {
                         let plugin_path: std::sync::Arc<str> =
                             path.display().to_string().into();
+                        if cfg.allow_context {
+                            context_holders.push(plugin_name.to_string());
+                        }
                         grants.push(crate::plugin_grants::PluginGrants {
                             plugin_name: plugin_name.to_string(),
                             path: path.display().to_string(),
@@ -434,6 +450,7 @@ impl PluginHost {
 
         PluginLoadSummary {
             notices,
+            context_holders,
             tools,
             commands,
             subscribers,
@@ -510,7 +527,7 @@ impl Default for PluginHost {
 /// The plugin's identity: its `.wasm` file stem. One helper so the
 /// store directory name, the `host-notify` attribution, and the
 /// collision check cannot drift apart.
-fn plugin_stem(path: &Path) -> std::sync::Arc<str> {
+pub(crate) fn plugin_stem(path: &Path) -> std::sync::Arc<str> {
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("wasm-plugin")

@@ -217,6 +217,93 @@ fn load_extensions(
     (Vec::new(), Default::default(), Vec::new())
 }
 
+/// What one `/reload` did to `[[extensions]]`.
+///
+/// Unconditionally compiled, like `plugin_grants` and `subscriber` and
+/// for the same reason: `mode::tui` is on the reading side of this seam,
+/// so the `/reload` handler stays free of `#[cfg(feature = "wasm")]`.
+/// Without the feature `supported` is false, every list is empty, and
+/// [`Self::line`] says so.
+///
+/// The notes are carried rather than printed. Loading normally reports
+/// through `render::notice` to stderr, which is correct at startup and
+/// wrong here — the TUI owns the screen by the time `/reload` runs, and
+/// a stderr write lands on top of it. The handler renders these into
+/// scrollback instead.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExtensionReloadReport {
+    /// Plugins that loaded fresh. These are the ones now live.
+    pub replaced: Vec<String>,
+    /// Plugins whose reload FAILED, with the reason. Their previously
+    /// loaded instance is still live — see `Agent::reload_extensions`.
+    pub failed: Vec<(String, String)>,
+    /// Plugins that vanished from `[[extensions]]` and are now gone:
+    /// unregistered, and their bridge retired so an in-flight call
+    /// refuses instead of running.
+    pub retired: Vec<String>,
+    /// Plugin tools registered after the reload.
+    pub tools: usize,
+    /// Plugin slash commands registered after the reload.
+    pub commands: usize,
+    /// Plugins whose context contribution was dropped, because they are
+    /// gone or no longer hold `allow_context`.
+    pub dropped_contributions: Vec<String>,
+    /// Warnings and errors worth putting in scrollback, already
+    /// rendered as single lines.
+    pub notes: Vec<String>,
+    /// False in a build without the `wasm` feature.
+    pub supported: bool,
+}
+
+impl ExtensionReloadReport {
+    /// The `/reload` report line's extensions clause.
+    ///
+    /// Never "extensions reloaded" on its own: the whole reason
+    /// `[[extensions]]` was skipped for two releases and SAID so is
+    /// that a reload claiming more than it did is worse than one that
+    /// admits a gap. So a failure is named in the line itself rather
+    /// than left to the notes below it.
+    pub fn line(&self) -> String {
+        if !self.supported {
+            return "extensions unchanged (this build has no WASM support)".to_string();
+        }
+        if self.replaced.is_empty()
+            && self.failed.is_empty()
+            && self.retired.is_empty()
+            && self.tools == 0
+        {
+            return "no extensions configured".to_string();
+        }
+        let mut parts = vec![format!(
+            "{} extension(s) reloaded ({} tool(s), {} command(s))",
+            self.replaced.len(),
+            self.tools,
+            self.commands
+        )];
+        if !self.retired.is_empty() {
+            parts.push(format!("{} removed", self.retired.len()));
+        }
+        if !self.failed.is_empty() {
+            parts.push(format!(
+                "{} FAILED, previous instance kept: {}",
+                self.failed.len(),
+                self.failed
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.dropped_contributions.is_empty() {
+            parts.push(format!(
+                "dropped context contribution from {}",
+                self.dropped_contributions.join(", ")
+            ));
+        }
+        parts.join(" · ")
+    }
+}
+
 /// Print command-registry diagnostics to stderr. Kept out of
 /// `resolve_commands` so tests can inspect them without noise —
 /// same split as `print_skill_diagnostics`.
@@ -409,6 +496,243 @@ impl Agent {
         }
 
         diagnostics
+    }
+
+    /// `/reload`'s `[[extensions]]` half: stand every configured plugin
+    /// back up from disk and swap it into the live Agent.
+    ///
+    /// The order is LOAD, then unregister, then register, and each step
+    /// is placed where it is for a reason that has a failure mode
+    /// attached:
+    ///
+    /// **Load first**, before anything is unregistered, so a plugin that
+    /// fails to compile or instantiate costs nothing: it never reached
+    /// `generation::activate`, so its PREVIOUS instance is still the
+    /// live one and its tools are still registered and callable. That is
+    /// the deliberate answer to "the old one is already unregistered, do
+    /// you keep it or end up with neither" — keep it, and say so in the
+    /// report line, which also names it. Ending up with neither is
+    /// defensible but strictly worse here: the user asked to pick up an
+    /// edit, and the edit not compiling should not also take away the
+    /// working plugin they had a second ago.
+    ///
+    /// **Unregister before register**, because `register_external`
+    /// refuses rather than overwrites — re-registering the same tool
+    /// names without clearing them first would report a collision for
+    /// every single one and reload nothing.
+    ///
+    /// **Unregister only the plugins that actually loaded**, plus the
+    /// ones that vanished from the config. A failed plugin's rows must
+    /// stay exactly as they were.
+    ///
+    /// Host-side plugin state (`docs/plugin-capabilities.md` invariant
+    /// 14) is decided per kind rather than wholesale, because "survives
+    /// a trap" does not settle it — a reload is a user action, not a
+    /// guest fault:
+    ///
+    /// - **`host-store` files survive.** They are the plugin's
+    ///   persistence across RESTARTS; a reload that wiped them would
+    ///   make `/reload` a destructive command by surprise. The fresh
+    ///   instance gets a `PluginStore` on the same stem, i.e. the same
+    ///   file.
+    /// - **`plugin_send`'s loop guard and spent session budget
+    ///   survive**, untouched by this function. Same argument as the
+    ///   trap, one step sharper: the cap exists so a plugin cannot spend
+    ///   the user's money in a loop, and if a reload reset it, the cap
+    ///   would be resettable by the very plugin that could ask the model
+    ///   to suggest a reload. It is keyed by plugin name in
+    ///   process-wide state, so this needs no code — only a test.
+    /// - **A `plugin_context` contribution survives a reload for a
+    ///   plugin that is still loaded WITH `allow_context`.** That is
+    ///   `/reload`'s existing claim and it stands.
+    /// - **…and is DROPPED otherwise**, which is the amendment: for a
+    ///   plugin that vanished from the config, and for one that reloaded
+    ///   without `allow_context`. The old doc comment argued survival on
+    ///   the grounds that dropping would "silently disable a loaded
+    ///   plugin's capability with no way to get it back short of a
+    ///   restart" — that argument is about a plugin that is still there
+    ///   and still holds the grant. In the other two cases keeping it
+    ///   inverts the same complaint: text attributed to an extension
+    ///   would stay in the model's system prompt with nothing able to
+    ///   retract it, again short of a restart. The report line names
+    ///   every contribution dropped, so it is never silent.
+    ///
+    /// Grants themselves are not migrated at all, and cannot be: the new
+    /// instance is built from the config now on disk, so
+    /// `allow_tools = ["read"]` becoming `["bash"]` simply IS the new
+    /// bridge's gate set, and `/tools`'s grant row is rebuilt from the
+    /// same load. A grant that disappears takes the capability with it
+    /// immediately; state accumulated under it (a store file, a
+    /// contribution) is handled by the two rules above.
+    #[cfg(feature = "wasm")]
+    pub fn reload_extensions(
+        &mut self,
+        extensions: &[crate::config::ExtensionConfig],
+    ) -> ExtensionReloadReport {
+        use crate::render::notice::Level;
+        use crate::tool::ToolSource;
+
+        let mut report = ExtensionReloadReport {
+            supported: true,
+            ..Default::default()
+        };
+        let previous = self.registry.plugin_names();
+
+        let summary = crate::wasm::PluginHost::new().load_all(extensions, &self.cwd);
+
+        // Info notices are dropped here, unlike at startup: `tools: a,
+        // b` per plugin is exactly what the report line already
+        // summarizes, and a reload is a keystroke the user may repeat.
+        // Warnings and errors are not — a grant warning that only
+        // appears at startup would go unseen by a user who edits the
+        // config and reloads.
+        report.notes = summary
+            .notices
+            .iter()
+            .filter(|n| n.level != Level::Info)
+            .map(|n| match &n.subject {
+                Some(s) => format!("{s}: {}", n.message),
+                None => n.message.clone(),
+            })
+            .collect();
+
+        let mut loaded: Vec<String> = summary
+            .grants
+            .iter()
+            .map(|g| g.plugin_name.clone())
+            .collect();
+        loaded.sort();
+        loaded.dedup();
+
+        report.failed = summary
+            .errors
+            .iter()
+            .map(|(path, e)| (crate::wasm::plugin_stem(path).to_string(), e.clone()))
+            .collect();
+        let failed_names: Vec<String> =
+            report.failed.iter().map(|(n, _)| n.clone()).collect();
+
+        report.retired = previous
+            .iter()
+            .filter(|n| !loaded.contains(n) && !failed_names.contains(n))
+            .cloned()
+            .collect();
+
+        for name in loaded.iter().chain(report.retired.iter()) {
+            self.registry.unregister_plugin(name);
+        }
+        // Only for the vanished. A replaced plugin's old bridge was
+        // already made stale by the new instance's `activate`; a FAILED
+        // plugin's bridge must stay live, which is why this loop is not
+        // over `previous`.
+        for name in &report.retired {
+            crate::wasm::generation::retire(name);
+        }
+
+        for tool in summary.tools {
+            let subject = match tool.source() {
+                ToolSource::Plugin { path, .. } => path,
+                ToolSource::Builtin => String::new(),
+            };
+            if let Err(collision) = self.registry.register_external(tool) {
+                report.notes.push(format!(
+                    "{subject}: extension tool {collision:?} collides with an \
+                     existing tool — skipping it (rename it in the plugin)"
+                ));
+            } else {
+                report.tools += 1;
+            }
+        }
+
+        // Commands are judged as a SET — a name claimed twice registers
+        // for neither — so the kept commands of a failed plugin go in as
+        // candidates alongside the fresh ones rather than being merged
+        // afterwards. Merging afterwards would let a new plugin quietly
+        // take a name the kept instance still answers to.
+        let mut candidates = summary.commands;
+        candidates.extend(
+            self.plugin_commands
+                .iter()
+                .filter(|c| failed_names.iter().any(|n| n.as_str() == &*c.plugin_name))
+                .cloned(),
+        );
+        let resolved = crate::command::resolve_commands(candidates);
+        for d in &resolved.diagnostics {
+            report.notes.push(d.message.clone());
+        }
+        report.commands = resolved.commands.len();
+        self.plugin_commands = resolved.commands;
+
+        // Same shape for subscriptions: the kept instance's `Arc` is
+        // folded back in as-is, because its handler holds the bridge
+        // that is still live and a rebuilt handler would point at a
+        // bridge that no longer exists.
+        let mut subs: Vec<std::sync::Arc<crate::subscriber::Subscriber>> = summary
+            .subscribers
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+        subs.extend(
+            self.event_subscribers
+                .shared()
+                .into_iter()
+                .filter(|s| failed_names.iter().any(|n| n.as_str() == &*s.plugin_name)),
+        );
+        self.event_subscribers = crate::subscriber::EventSubscribers::from_shared(subs);
+
+        // Grant rows follow the same rule, and for the sharpest version
+        // of the reason: a row describes what the RUNNING plugin holds,
+        // so a kept instance must keep its old row — rebuilding it from
+        // the config on disk would show grants nothing is running under.
+        let mut grants = summary.grants;
+        grants.extend(
+            self.plugin_grants
+                .iter()
+                .filter(|g| failed_names.contains(&g.plugin_name))
+                .cloned(),
+        );
+        grants.sort_by(|a, b| a.plugin_name.cmp(&b.plugin_name));
+        self.plugin_grants = grants;
+
+        for name in report.retired.iter().chain(
+            loaded
+                .iter()
+                .filter(|n| !summary.context_holders.contains(n)),
+        ) {
+            if crate::plugin_context::set(name, "").unwrap_or(false) {
+                report.dropped_contributions.push(name.clone());
+            }
+        }
+        report.dropped_contributions.sort();
+
+        report.replaced = loaded;
+
+        // The model's `tools` array is rebuilt from the registry, not
+        // patched: a renamed plugin tool would otherwise stay in the
+        // request forever, advertised and uncallable. The system prompt
+        // is the caller's job — it recomposes the base for skills in the
+        // same pass.
+        self.context.tools = self.registry.all_specs();
+        // And the dispatch, so a `host-call-tool` from a plugin sees the
+        // post-reload registry rather than the one that existed when the
+        // last turn started. Per-turn refresh would get there eventually
+        // (`run_turn`), but an event handler firing between now and the
+        // next turn would not.
+        self.install_plugin_dispatch();
+
+        report
+    }
+
+    /// No-op stand-in without the `wasm` feature, mirroring
+    /// `load_extensions`. Returns a report whose `supported` is false so
+    /// `/reload`'s line says "no WASM support" rather than claiming a
+    /// reload of nothing.
+    #[cfg(not(feature = "wasm"))]
+    pub fn reload_extensions(
+        &mut self,
+        _extensions: &[crate::config::ExtensionConfig],
+    ) -> ExtensionReloadReport {
+        ExtensionReloadReport::default()
     }
 }
 

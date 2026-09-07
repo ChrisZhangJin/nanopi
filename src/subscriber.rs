@@ -53,14 +53,44 @@ impl EventSubscribers {
     /// event name so [`deliver_with`](Self::deliver_with) never has to
     /// scan every subscriber for every event.
     pub fn from_subscribers(subscribers: Vec<Subscriber>) -> Self {
+        Self::from_shared(subscribers.into_iter().map(Arc::new).collect())
+    }
+
+    /// [`from_subscribers`](Self::from_subscribers) for subscriptions
+    /// that already exist.
+    ///
+    /// v0.12 hot reload needs it: when one plugin fails to reload, its
+    /// previously loaded instance stays live, and its existing
+    /// subscription has to be folded back in alongside the freshly built
+    /// ones. Rebuilding it is not an option — the handler owns an `Arc`
+    /// to the exact bridge that is still live, and a new handler would
+    /// point at a bridge that no longer exists.
+    pub fn from_shared(subscribers: Vec<Arc<Subscriber>>) -> Self {
         let mut index: HashMap<&'static str, Vec<Arc<Subscriber>>> = HashMap::new();
         for s in subscribers {
-            let s = Arc::new(s);
             for &event in &s.events {
                 index.entry(event).or_default().push(s.clone());
             }
         }
         Self(Arc::new(index))
+    }
+
+    /// Every subscription in the table, once each.
+    ///
+    /// The index stores one `Arc` per (subscriber, event) pair, so the
+    /// dedup is by pointer identity — comparing plugin names instead
+    /// would collapse two subscriptions from one plugin, and the reload
+    /// path would silently drop one of them.
+    pub fn shared(&self) -> Vec<Arc<Subscriber>> {
+        let mut out: Vec<Arc<Subscriber>> = Vec::new();
+        for subs in self.0.values() {
+            for s in subs {
+                if !out.iter().any(|existing| Arc::ptr_eq(existing, s)) {
+                    out.push(s.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Deliver `event` to every subscriber, building the payload at most
