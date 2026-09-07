@@ -375,6 +375,34 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Remove every tool supplied by one plugin. Returns the names
+    /// removed, in sorted order.
+    ///
+    /// Keyed on the plugin, never on a tool name, and that is the whole
+    /// safety argument: an `unregister(name)` could be handed `"bash"`,
+    /// so refusing built-ins would have to be a runtime check somebody
+    /// remembers to write. Here the wrong thing is unwritable — a
+    /// built-in reports `ToolSource::Builtin` and no plugin name can
+    /// ever match it.
+    ///
+    /// The counterpart to `register_external`, and the missing half
+    /// that made `/reload` skip `[[extensions]]`: without a way back
+    /// out, reloading could only ever add, so a plugin whose tool was
+    /// renamed would leave the old name registered and callable.
+    pub fn unregister_plugin(&mut self, plugin: &str) -> Vec<String> {
+        let mut removed: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|(_, t)| matches!(t.source(), ToolSource::Plugin { name, .. } if name == plugin))
+            .map(|(n, _)| n.clone())
+            .collect();
+        removed.sort();
+        for name in &removed {
+            self.tools.remove(name);
+        }
+        removed
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         // Fast path: exact match. Normal case, zero overhead.
         if let Some(t) = self.tools.get(name) {
@@ -670,6 +698,117 @@ mod tests {
         assert_eq!(entries.len(), 7, "the refused tool must not appear");
         let bash = entries.iter().find(|(s, _)| s.name == "bash").unwrap();
         assert_eq!(bash.1, ToolSource::Builtin, "bash is still the built-in");
+    }
+
+    // ───────────────── unregister_plugin, for /reload ─────────────────
+
+    /// Like `FakePluginTool` but the plugin name is a parameter, which
+    /// is the whole point here: unregistering must be scoped to ONE
+    /// plugin, and a fixture with a hardcoded name cannot show that.
+    struct NamedPluginTool {
+        tool: &'static str,
+        plugin: &'static str,
+    }
+    #[async_trait]
+    impl Tool for NamedPluginTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.tool.into(),
+                description: "from a plugin".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+            unreachable!("not executed in these tests")
+        }
+        fn source(&self) -> ToolSource {
+            ToolSource::Plugin {
+                name: self.plugin.into(),
+                path: format!("/tmp/{}.wasm", self.plugin),
+            }
+        }
+    }
+
+    /// The missing half of `register_external`. Without it `/reload`
+    /// could only ever ADD tools, which is why it skips
+    /// `[[extensions]]` entirely today.
+    #[test]
+    fn unregister_plugin_removes_exactly_that_plugins_tools() {
+        let mut r = ToolRegistry::standard();
+        for (tool, plugin) in [("greet", "alpha"), ("wave", "alpha"), ("query", "beta")] {
+            r.register_external(Arc::new(NamedPluginTool { tool, plugin }))
+                .expect("no collision");
+        }
+        assert_eq!(r.names().len(), 10, "7 built-ins + 3 plugin tools");
+
+        let removed = r.unregister_plugin("alpha");
+        assert_eq!(removed, vec!["greet".to_string(), "wave".to_string()]);
+
+        // beta is untouched: unregistering is per plugin, not global.
+        assert!(r.get("query").is_some(), "beta's tool must survive");
+        assert!(r.get("greet").is_none());
+        assert!(r.get("wave").is_none());
+        assert_eq!(r.names().len(), 8, "7 built-ins + beta's one tool");
+    }
+
+    /// The safety property, and the reason the signature takes a plugin
+    /// name rather than a tool name: there is no argument that removes
+    /// a built-in. `"bash"` here is a PLUGIN called bash, not the tool.
+    #[test]
+    fn unregister_plugin_can_never_remove_a_builtin() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+
+        for plugin in ["bash", "read", "write", "", "*"] {
+            let removed = r.unregister_plugin(plugin);
+            assert!(
+                removed.is_empty(),
+                "plugin name {plugin:?} removed {removed:?} — built-ins must be unreachable"
+            );
+        }
+        assert_eq!(r.names(), before, "the built-in set is unchanged");
+    }
+
+    /// Reload is register-after-unregister, so the second registration
+    /// must not hit the collision refusal that `register_external`
+    /// exists to enforce. This is the actual `/reload` sequence.
+    #[test]
+    fn a_plugins_tool_can_be_reregistered_after_unregistering_it() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(NamedPluginTool {
+            tool: "greet",
+            plugin: "alpha",
+        }))
+        .expect("first registration");
+
+        // Re-registering without unregistering is still refused.
+        let err = r
+            .register_external(Arc::new(NamedPluginTool {
+                tool: "greet",
+                plugin: "alpha",
+            }))
+            .expect_err("collision must still be refused");
+        assert_eq!(err, "greet");
+
+        assert_eq!(r.unregister_plugin("alpha"), vec!["greet".to_string()]);
+        r.register_external(Arc::new(NamedPluginTool {
+            tool: "greet",
+            plugin: "alpha",
+        }))
+        .expect("re-registration after unregister must succeed");
+        assert!(r.get("greet").is_some());
+    }
+
+    /// Unregistering a plugin that supplied nothing is not an error —
+    /// `/reload` cannot know in advance which plugins registered tools,
+    /// and making it a `Result` would push that bookkeeping onto every
+    /// caller for no gain.
+    #[test]
+    fn unregistering_an_unknown_plugin_is_a_no_op() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+        assert!(r.unregister_plugin("never-installed").is_empty());
+        assert_eq!(r.names(), before);
     }
 
     // ───────────────── mutation_key (v0.11.0) ─────────────────
