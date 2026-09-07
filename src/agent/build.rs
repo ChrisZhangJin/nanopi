@@ -290,6 +290,13 @@ impl Agent {
             plugin_commands,
             event_subscribers,
         };
+        // Published here as well as per turn, so a plugin that calls
+        // `host-call-tool` from a `session_start` handler — i.e. before
+        // any turn exists — gets a working dispatch rather than
+        // `error: tool calls are not available right now`. BOTH Agent
+        // construction paths do this; the stage-2 lesson is that a
+        // field set in one of them silently dies in the other.
+        agent.install_plugin_dispatch();
         (agent, diagnostics)
     }
 
@@ -348,6 +355,11 @@ impl Agent {
         // invoking them. TUI resume paths were setting this manually;
         // interactive/print `--continue` was not.
         self.context.tools = self.registry.all_specs();
+
+        // The second of the two Agent construction paths — see
+        // `build_fresh`. A dispatch installed in only one of them works
+        // until the first `--continue` and then silently does not.
+        self.install_plugin_dispatch();
 
         let LoadSkillsResult {
             skills,

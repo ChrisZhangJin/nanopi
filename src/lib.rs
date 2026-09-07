@@ -13,6 +13,12 @@ pub mod models;
 /// stay free of `#[cfg(feature = "wasm")]`. Without the feature the
 /// registry is simply always empty.
 pub mod plugin_context;
+/// Unconditionally compiled, for the same reason as `plugin_context`
+/// above: `agent::loop_` is on the reading side of this seam, so the
+/// tool-execution path stays free of `#[cfg(feature = "wasm")]`.
+/// Without the feature nothing ever installs a dispatch and nothing
+/// ever calls one.
+pub mod plugin_tools;
 pub mod resources;
 pub mod session;
 pub mod settings;

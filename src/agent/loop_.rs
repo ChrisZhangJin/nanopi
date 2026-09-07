@@ -734,6 +734,34 @@ impl Agent {
         }
     }
 
+    /// Publish everything `host-call-tool` needs to drive
+    /// `run_one_tool` (`crate::plugin_tools`).
+    ///
+    /// Unconditionally compiled, no `cfg`, for the same reason
+    /// `refresh_system_prompt` is: without the `wasm` feature nothing
+    /// ever calls the dispatch, so installing one is a few clones and
+    /// no behaviour.
+    ///
+    /// Called at Agent construction AND once per `run_turn`. The
+    /// per-turn refresh is the load-bearing half: `session_id` and
+    /// `session_path` change under `/new`, `/resume` and `/fork`, and a
+    /// dispatch that bound one at startup would hand every
+    /// `tool_execution_start` hook a stale session id for the rest of
+    /// the process — `docs/claims-and-races.md` §3's session-identity
+    /// row. It is also why the dispatch carries the id rather than
+    /// looking one up.
+    pub fn install_plugin_dispatch(&self) {
+        crate::plugin_tools::install(crate::plugin_tools::Dispatch {
+            registry: self.registry.clone(),
+            cwd: self.cwd.clone(),
+            permission: self.permission.clone(),
+            hooks: self.hooks.clone(),
+            subscribers: self.event_subscribers.clone(),
+            session_path: self.session_path.clone(),
+            session_id: self.session_id.clone(),
+        });
+    }
+
     pub async fn run_turn(
         &mut self,
         user_msg: &str,
@@ -756,6 +784,10 @@ impl Agent {
         // the next one. The WIT doc says so, so a plugin author is not
         // surprised.
         self.refresh_system_prompt();
+        // Same site, same reason: a per-turn refresh keeps the
+        // dispatch's session identity live across `/new`, `/resume` and
+        // `/fork`. See `install_plugin_dispatch`.
+        self.install_plugin_dispatch();
         // If the accumulated context is too big, compact it before adding
         // the new user message so the new message survives intact.
         self.maybe_compact(tx).await;
@@ -1608,6 +1640,7 @@ impl Agent {
                             hooks.clone(),
                             subscribers.clone(),
                             tx.clone(),
+                            ToolCallOrigin::Model,
                         )
                         .await;
                         // Recorded through a shared handle rather than
@@ -1785,15 +1818,92 @@ impl Agent {
 /// tool result into context; persistence already happened inside
 /// `run_one_tool`.
 #[derive(Clone)]
-struct ToolCallOutcome {
-    call_id: String,
-    content: String,
-    is_error: bool,
+pub(crate) struct ToolCallOutcome {
+    #[allow(dead_code)]
+    pub(crate) call_id: String,
+    pub(crate) content: String,
+    pub(crate) is_error: bool,
     /// Multimodal image attachments from the tool (empty for text-only
     /// tools). Forwarded into context so the next request to a vision
     /// model can carry the image blocks.
-    images: Vec<crate::tool::ImageAttachment>,
+    pub(crate) images: Vec<crate::tool::ImageAttachment>,
 }
+
+/// Who asked for this tool call.
+///
+/// `docs/plugin-capabilities.md` §"One code path, an origin flag" is
+/// the design: `host-call-tool` must NOT get a second, narrower
+/// execution path, because a second path is a second place for the
+/// hook contract, the cwd guard and the result shape to drift. So
+/// `run_one_tool` stays the only one and this flag decides what a
+/// plugin-initiated call does differently.
+///
+/// It decides exactly THREE things — the spec said two, and the spec
+/// was amended in this stage rather than left disagreeing with the
+/// code:
+///
+/// 1. whether a [`SessionEntry`] is written. The session file is the
+///    transcript of the conversation with the MODEL. A plugin's call
+///    was not part of that conversation, and replaying it on `--continue`
+///    would put a `tool_use` block in the model's history that it never
+///    emitted (invariant 15).
+/// 2. whether an [`AgentEvent`] is sent. The events drive the model's
+///    view and the TUI's tool cards; a plugin's call belongs in neither.
+///    The user learns about it through `notify::disclose` instead, which
+///    is a one-line disclosure on the host budget rather than a card.
+/// 3. the execution deadline. §"It needs its own timeout" requires a
+///    bound, and the origin is the only thing that knows whether one
+///    applies: a model-initiated call is user-visible and user-awaited,
+///    so it is effectively unbounded, while a plugin's runs with nothing
+///    on screen.
+pub(crate) enum ToolCallOrigin {
+    /// The provider asked for it. Byte-identical behaviour to before
+    /// this enum existed.
+    Model,
+    /// A plugin asked for it through `host-call-tool`.
+    Plugin {
+        /// Wall-clock bound on `tool.execute` only — see the comment at
+        /// the execution site for why not the whole function.
+        deadline: std::time::Duration,
+    },
+}
+
+impl ToolCallOrigin {
+    /// Whether this call belongs in the session transcript.
+    fn records_session(&self) -> bool {
+        matches!(self, ToolCallOrigin::Model)
+    }
+    /// Whether this call may emit `AgentEvent`s.
+    fn emits_events(&self) -> bool {
+        matches!(self, ToolCallOrigin::Model)
+    }
+    /// Whether the result text will be read by the MODEL rather than by
+    /// a plugin. Only the hook-refusal wording depends on this, and it
+    /// is a separate question from the two gates above even though the
+    /// answer happens to coincide: the refusal is a message, not a side
+    /// effect.
+    fn audience_is_the_model(&self) -> bool {
+        matches!(self, ToolCallOrigin::Model)
+    }
+    fn deadline(&self) -> Option<std::time::Duration> {
+        match self {
+            ToolCallOrigin::Model => None,
+            ToolCallOrigin::Plugin { deadline } => Some(*deadline),
+        }
+    }
+}
+
+/// The exact prefix a plugin-initiated call's content carries when a
+/// `tool_execution_start` hook blocked it.
+///
+/// A shared constant rather than a field on [`ToolCallOutcome`]: the
+/// struct is built in several places and only this one distinction is
+/// needed, and `plugin_tools` matching on a constant this module owns
+/// is a contract, not string surgery over a message someone else
+/// composed. §2.5 fixes the plugin-visible form as
+/// `error: blocked by hook: <reason>`, so the `error: ` prefix is added
+/// exactly once, by `plugin_tools::call_blocking`.
+pub(crate) const PLUGIN_BLOCKED_PREFIX: &str = "blocked by hook: ";
 
 /// Split a parallel batch into groups that must not run concurrently
 /// with each other.
@@ -1843,7 +1953,8 @@ fn group_by_mutation_key(
 /// Run a single tool call: hooks → execute → persist → render. Pure
 /// function over its arguments; safe to call concurrently from
 /// `execute_tool_calls`.
-async fn run_one_tool(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_one_tool(
     call: ToolCall,
     registry: ToolRegistry,
     session_path: PathBuf,
@@ -1853,6 +1964,7 @@ async fn run_one_tool(
     hooks: HooksConfig,
     subscribers: crate::subscriber::EventSubscribers,
     tx: mpsc::Sender<AgentEvent>,
+    origin: ToolCallOrigin,
 ) -> ToolCallOutcome {
     // ToolExecutionStart hooks. `hook::PER_DELTA_EVENTS` (message_update,
     // tool_execution_update) are the two per-delta events that will never
@@ -1884,7 +1996,7 @@ async fn run_one_tool(
         // `AgentEvent::ToolCall` was forwarded off the provider stream
         // before this hook ran, so without this the card shows the
         // pre-transform command forever.
-        if effective_args != call.arguments {
+        if effective_args != call.arguments && origin.emits_events() {
             let _ = tx
                 .send(AgentEvent::ToolCallRewritten {
                     call_id: call.id.clone(),
@@ -1917,27 +2029,44 @@ async fn run_one_tool(
             //
             // The hook's own reason is preserved verbatim and last, so
             // a hook author's message stays the most visible part.
-            let result_text = format!(
-                "blocked by a user-configured `tool_execution_start` hook — this is a \
-                 policy refusal from the user's nanopi configuration, not a sandbox or \
-                 environment failure. Hook's reason: {reason}"
-            );
-            let _ = session::append_entry(
-                &session_path,
-                &SessionEntry::ToolResult {
-                    tool_call_id: call.id.clone(),
-                    timestamp: time::now_iso8601(),
-                    content: result_text.clone(),
-                    is_error: true,
-                    images: Vec::new(),
-                },
-            );
-            let _ = tx
-                .send(AgentEvent::TextDelta {
-                    content_index: 0,
-                    text: format!("\n[{} blocked: {}]\n", call.name, reason),
-                })
-                .await;
+            //
+            // A PLUGIN gets the short form instead, and gets it here
+            // rather than by trimming the paragraph afterwards. §2.5
+            // fixes the plugin-visible string as
+            // `error: blocked by hook: <reason>`, and the paragraph
+            // above exists for the model's benefit specifically — a
+            // plugin author reading `blocked by hook:` has the
+            // mechanism named already and does not need the sandbox
+            // hypothesis ruled out.
+            let result_text = if origin.audience_is_the_model() {
+                format!(
+                    "blocked by a user-configured `tool_execution_start` hook — this is a \
+                     policy refusal from the user's nanopi configuration, not a sandbox or \
+                     environment failure. Hook's reason: {reason}"
+                )
+            } else {
+                format!("{PLUGIN_BLOCKED_PREFIX}{reason}")
+            };
+            if origin.records_session() {
+                let _ = session::append_entry(
+                    &session_path,
+                    &SessionEntry::ToolResult {
+                        tool_call_id: call.id.clone(),
+                        timestamp: time::now_iso8601(),
+                        content: result_text.clone(),
+                        is_error: true,
+                        images: Vec::new(),
+                    },
+                );
+            }
+            if origin.emits_events() {
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: format!("\n[{} blocked: {}]\n", call.name, reason),
+                    })
+                    .await;
+            }
             return ToolCallOutcome {
                 call_id: call.id,
                 content: result_text,
@@ -1947,25 +2076,80 @@ async fn run_one_tool(
         }
     }
 
-    // Persist tool call.
-    let _ = session::append_entry(
-        &session_path,
-        &SessionEntry::ToolCall {
-            id: call.id.clone(),
-            timestamp: time::now_iso8601(),
-            tool_name: call.name.clone(),
-            arguments: effective_args.clone(),
-        },
-    );
+    // Persist tool call. Model origin only — see `ToolCallOrigin`.
+    if origin.records_session() {
+        let _ = session::append_entry(
+            &session_path,
+            &SessionEntry::ToolCall {
+                id: call.id.clone(),
+                timestamp: time::now_iso8601(),
+                tool_name: call.name.clone(),
+                arguments: effective_args.clone(),
+            },
+        );
+    }
 
     // Resolve and execute. Wall-clock timed so the TUI can show
     // "Took 0.3s" next to the marker.
+    //
+    // THE DEADLINE GOES AROUND `tool.execute` AND NOTHING ELSE.
+    //
+    // Wrapping the whole of `run_one_tool` instead would drop the
+    // future wherever it happened to be — including between
+    // `tool_execution_start` firing and `tool_execution_end` — leaving
+    // the hook pair unbalanced. That is exactly the defect `87a81b4`
+    // fixed for `/compact`, and it is the first row of
+    // `docs/claims-and-races.md`'s opening table. Manufacturing a
+    // second instance of it in order to bound a timeout would be a bad
+    // trade, so the timeout is local and the function still runs to its
+    // end, hooks included.
+    //
+    // 30 SECONDS, and the number is not arbitrary. `host-http-get`
+    // carries 10s, which is too tight for a legitimate `find` over a
+    // large tree or a `cargo`-shaped `bash`. A model-initiated call is
+    // effectively unbounded because it is user-visible and
+    // user-awaited; a plugin's runs with nothing on screen, so it needs
+    // a bound, and 30s sits deliberately above the network bound and
+    // far below "unbounded". The engine's epoch interruption cannot
+    // substitute for this: it bounds GUEST code and cannot preempt a
+    // host function that is already executing.
+    //
+    // KNOWN LIMIT, not a claim: a process the timed-out tool spawned (a
+    // `bash` child) may outlive the deadline. The elapse unblocks the
+    // PLUGIN; the child is not killed. `tool.execute`'s own future is
+    // dropped, which is what `kill_on_drop` acts on for the bash tool,
+    // but anything already detached from it is out of reach here.
     let started = std::time::Instant::now();
     let (mut content, mut is_error, images) = match registry.get(&call.name) {
         Some(tool) => {
             let ctx = ToolContext { cwd: cwd.clone() };
-            match tool.execute(effective_args.clone(), &ctx).await {
-                Ok(o) => (o.content, o.is_error, o.images),
+            let executed = match origin.deadline() {
+                None => tool.execute(effective_args.clone(), &ctx).await.map(Some),
+                Some(d) => {
+                    match tokio::time::timeout(d, tool.execute(effective_args.clone(), &ctx))
+                        .await
+                    {
+                        Ok(r) => r.map(Some),
+                        // Elapsed. Fall through as a failed call so the
+                        // rest of the function — `tool_execution_end`
+                        // included — still runs.
+                        Err(_) => Ok(None),
+                    }
+                }
+            };
+            match executed {
+                Ok(Some(o)) => (o.content, o.is_error, o.images),
+                Ok(None) => (
+                    format!(
+                        "tool call exceeded the {}s plugin deadline",
+                        origin
+                            .deadline()
+                            .map(|d| d.as_secs())
+                            .unwrap_or_default()
+                    ),
+                    true,
+                    Vec::new(),
+                ),
                 Err(e) => (format!("tool error: {e}"), true, Vec::new()),
             }
         }
@@ -1999,17 +2183,19 @@ async fn run_one_tool(
         );
     }
 
-    // Persist result.
-    let _ = session::append_entry(
-        &session_path,
-        &SessionEntry::ToolResult {
-            tool_call_id: call.id.clone(),
-            timestamp: time::now_iso8601(),
-            content: content.clone(),
-            is_error,
-            images: images.clone(),
-        },
-    );
+    // Persist result. Model origin only — see `ToolCallOrigin`.
+    if origin.records_session() {
+        let _ = session::append_entry(
+            &session_path,
+            &SessionEntry::ToolResult {
+                tool_call_id: call.id.clone(),
+                timestamp: time::now_iso8601(),
+                content: content.clone(),
+                is_error,
+                images: images.clone(),
+            },
+        );
+    }
 
     // ToolExecutionEnd hooks. Payload mirrors Claude Code's post-tool-use
     // wire schema so hooks can inspect what actually happened —
@@ -2086,15 +2272,17 @@ async fn run_one_tool(
     // (or red) card containing command + output preview + timing.
     // Rustyline mode picks the same event apart and prints a compact
     // marker line instead.
-    let _ = tx
-        .send(AgentEvent::ToolResult {
-            call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: content.clone(),
-            is_error,
-            elapsed_ms: elapsed.as_millis() as u64,
-        })
-        .await;
+    if origin.emits_events() {
+        let _ = tx
+            .send(AgentEvent::ToolResult {
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: content.clone(),
+                is_error,
+                elapsed_ms: elapsed.as_millis() as u64,
+            })
+            .await;
+    }
 
     ToolCallOutcome {
         call_id: call.id,
@@ -2719,6 +2907,7 @@ mod tests {
             hooks,
             Default::default(),
             tx,
+            ToolCallOrigin::Model,
         )
         .await;
 
