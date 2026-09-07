@@ -3394,9 +3394,15 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
 /// stay behind `/model` to avoid accidentally dropping an in-flight
 /// streaming connection.
 ///
-/// What it touches: `agent.skills`, `agent.hooks`, `agent.context.
-/// system` (rebuilt via `compose_system_prompt` so newly installed
-/// skills appear in `<available_skills>`). What it does NOT touch:
+/// What it touches: `agent.skills`, `agent.hooks`, `agent.
+/// system_base` (rebuilt via `compose_system_prompt` so newly
+/// installed skills appear in `<available_skills>`, then re-derived
+/// into `context.system`). It rebuilds the BASE only: an active plugin
+/// context contribution SURVIVES a reload, which is consistent with
+/// `[[extensions]]` not being reloaded below — a contribution is not a
+/// skill, and dropping it here would silently disable a loaded
+/// plugin's capability with no way to get it back short of a restart.
+/// What it does NOT touch:
 /// `agent.provider`, `agent.model`, `agent.base_url`, `agent.api_key`,
 /// session state, or messages.
 ///
@@ -3449,13 +3455,19 @@ async fn handle_reload(
                 a.hooks = h.clone();
             }
             let tool_names = a.registry.names();
-            a.context.system = Some(crate::agent::build::compose_system_prompt(
+            // Through `set_system_base`, not a direct assignment to
+            // `context.system`: this replaces the BASE, and an active
+            // plugin context contribution survives the reload (see the
+            // doc comment above — `[[extensions]]` is not reloaded
+            // either).
+            let base = crate::agent::build::compose_system_prompt(
                 &a.cwd,
                 &tool_names,
                 &a.skills,
                 a.no_context_files,
                 &a.prompt_overrides,
-            ));
+            );
+            a.set_system_base(base);
             let h = &a.hooks;
             h.tool_execution_start.len()
                 + h.tool_execution_end.len()
@@ -5002,6 +5014,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         }
     }
 

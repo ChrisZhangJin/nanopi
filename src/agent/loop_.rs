@@ -145,6 +145,33 @@ pub struct Agent {
     /// `/reload` re-read an edited `SYSTEM.md` from disk, which is the
     /// whole point of `/reload`.
     pub prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    /// v0.12: exactly what `compose_system_prompt` returned, held apart
+    /// from `context.system`.
+    ///
+    /// `context.system` is a DERIVED value — this base plus
+    /// `plugin_context::render_blocks()` — and nothing ever appends to
+    /// it. That is the whole design, and the alternatives are both
+    /// worse:
+    ///
+    /// Injecting inside `compose_system_prompt` captures nothing. It
+    /// runs ONCE, at Agent construction; a plugin calls
+    /// `host-set-context` LATER, while handling an event, when no
+    /// plugin has contributed yet.
+    ///
+    /// Appending to `context.system` per turn stacks — turn ten would
+    /// carry ten copies — and re-deriving the base by stripping the
+    /// suffix back off is rejected outright: it breaks the moment a
+    /// plugin's own text happens to contain the header, which makes
+    /// correctness depend on a string search over attacker-controlled
+    /// text. Keeping the base in its own field costs one `String` and
+    /// removes the question.
+    ///
+    /// `compose_system_prompt` is deliberately NOT re-run per turn: it
+    /// reads AGENTS.md / CLAUDE.md and the skills tree from disk, which
+    /// is real I/O on the critical path of a tool whose whole point is
+    /// running on constrained hardware. The per-turn cost here is one
+    /// string concatenation and one lock over a small map.
+    pub system_base: Option<String>,
 }
 
 /// Give every replayed tool call a result, synthesizing one where the
@@ -389,6 +416,14 @@ impl Agent {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            // `None`, and `hydrate_resumed` composes it. The session
+            // file records messages and tool calls only, never the
+            // system prompt, so there is nothing to restore here — and
+            // that absence is precisely what makes deriving
+            // `context.system` safe: a plugin's contribution cannot
+            // reach the transcript and bake itself into every later
+            // `--continue`.
+            system_base: None,
         })
     }
 
@@ -667,6 +702,38 @@ impl Agent {
         self.pending_follow_ups.extend(queue.drain(..));
     }
 
+    /// Set the composed system-prompt base and re-derive
+    /// `context.system` from it.
+    ///
+    /// The single door through which a base is written, so the two
+    /// fields cannot drift. Every caller that used to assign
+    /// `context.system = Some(compose_system_prompt(…))` goes through
+    /// here instead.
+    pub fn set_system_base(&mut self, base: String) {
+        self.system_base = Some(base);
+        self.refresh_system_prompt();
+    }
+
+    /// Re-derive `context.system` as base + plugin contributions.
+    ///
+    /// Unconditionally compiled, no `cfg`: without the `wasm` feature
+    /// `render_blocks()` returns `""` and this is a clone of the base,
+    /// so a build without plugins produces a byte-identical prompt.
+    /// That `""` contract is exactly what makes the `cfg` unnecessary.
+    ///
+    /// Assignment, never append — see the `system_base` doc comment for
+    /// why the base lives in its own field.
+    pub fn refresh_system_prompt(&mut self) {
+        if let Some(base) = &self.system_base {
+            let blocks = crate::plugin_context::render_blocks();
+            self.context.system = Some(if blocks.is_empty() {
+                base.clone()
+            } else {
+                format!("{base}{blocks}")
+            });
+        }
+    }
+
     pub async fn run_turn(
         &mut self,
         user_msg: &str,
@@ -674,6 +741,21 @@ impl Agent {
         cancel: Option<tokio_util::sync::CancellationToken>,
         steer_rx: Option<mpsc::Receiver<SteerMessage>>,
     ) -> Result<String, AgentError> {
+        // v0.12: fold in any plugin context contributions, BEFORE
+        // compaction. Two reasons for that order and that grain:
+        //
+        // Before `maybe_compact`, because the contribution enters every
+        // request and `estimate_chars` has to count it — a compaction
+        // decision that pretended it were free would understate the
+        // context by up to 4 KiB per plugin.
+        //
+        // Once per turn rather than per provider iteration, because
+        // §2.2 frames the contribution as idempotent state: a call the
+        // host never made simply means the previous contribution stands
+        // for one more turn, and a contribution set mid-turn lands on
+        // the next one. The WIT doc says so, so a plugin author is not
+        // surprised.
+        self.refresh_system_prompt();
         // If the accumulated context is too big, compact it before adding
         // the new user message so the new message survives intact.
         self.maybe_compact(tx).await;
@@ -2078,6 +2160,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -2174,6 +2257,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -2265,6 +2349,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -2405,6 +2490,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -2496,6 +2582,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         // Enough tail that find_compact_boundary actually cuts —
         // otherwise `compact` returns None, the function returns before
@@ -2736,6 +2823,7 @@ mod tests {
                 plugin_commands: Vec::new(),
                 event_subscribers: subs,
                 prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+                system_base: None,
             };
 
             let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -2811,6 +2899,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -2886,6 +2975,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -2981,6 +3071,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -3047,6 +3138,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let ct = tokio_util::sync::CancellationToken::new();
@@ -3179,6 +3271,7 @@ mod tests {
                 event_subscribers: Default::default(),
                 prompt_overrides:
                     crate::agent::prompt_override::PromptOverrides::default(),
+                system_base: None,
             };
 
             let ct = tokio_util::sync::CancellationToken::new();
@@ -3279,6 +3372,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         // Two messages buffered and a token already cancelled, so
@@ -3342,6 +3436,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -3422,6 +3517,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -3524,6 +3620,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         (agent, dir)
     }
@@ -3671,6 +3768,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -3760,6 +3858,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         agent.fire_session_start("startup").await;
         agent.fire_session_shutdown("quit").await;
@@ -3827,6 +3926,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         agent.fire_session_start("startup").await;
 
@@ -4630,6 +4730,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -4698,6 +4799,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -4819,6 +4921,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -4959,6 +5062,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
@@ -5078,6 +5182,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
@@ -5134,6 +5239,7 @@ mod tests {
             skills: Vec::new(),
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             plugin_commands: Vec::new(),
@@ -5193,6 +5299,7 @@ mod tests {
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         }
     }
 

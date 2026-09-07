@@ -257,6 +257,13 @@ impl Agent {
         );
 
         let agent = Agent {
+            // Both fields, from the same compose. `system_base` is what
+            // every later turn re-derives `system` from once plugins
+            // start contributing; at construction they are equal
+            // because no plugin has contributed yet — which is exactly
+            // why injecting inside `compose_system_prompt` would
+            // capture nothing.
+            system_base: Some(prompt.clone()),
             context: Context {
                 system: Some(prompt),
                 messages: Vec::new(),
@@ -348,15 +355,21 @@ impl Agent {
         } = load_skills(skill_load.into_options());
         self.skills = skills;
 
-        if self.context.system.is_none() {
+        // The guard is on `system_base`, not `context.system`: the base
+        // is what a resumed session needs to have, and `context.system`
+        // is derived from it. Guarding on the derived field would
+        // recompose whenever the base existed but the derivation had
+        // not run yet.
+        if self.system_base.is_none() {
             let tool_names = self.registry.names();
-            self.context.system = Some(compose_system_prompt(
+            let prompt = compose_system_prompt(
                 &self.cwd,
                 &tool_names,
                 &self.skills,
                 self.no_context_files,
                 &self.prompt_overrides,
-            ));
+            );
+            self.set_system_base(prompt);
         }
 
         diagnostics
@@ -861,5 +874,285 @@ mod tests {
 
             std::fs::remove_dir_all(&cwd).ok();
         });
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v0.12 turn assembly: `system_base` + plugin context
+    // contributions. The seam driven here is `Agent`'s prompt fields
+    // plus `refresh_system_prompt` — NOT the provider. `context.system`
+    // is exactly what `stream_turn` reads, so asserting on it after a
+    // refresh is asserting on what goes on the wire.
+    // ────────────────────────────────────────────────────────────────
+
+    /// A minimal Agent carrying only what turn assembly touches.
+    fn prompt_agent(cwd: &Path, base: &str) -> Agent {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+        let session_path = cwd.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let mut a = Agent {
+            context: crate::agent::context::Context::default(),
+            provider: Box::new(OpenAiProvider::new("", "", "")),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: crate::util::uuid::v7().to_string(),
+            cwd: cwd.to_path_buf(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Default::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: true,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: Default::default(),
+            plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: PromptOverrides::default(),
+            system_base: None,
+        };
+        a.set_system_base(base.to_string());
+        a
+    }
+
+    /// The test that guarantees stage 2 costs a user with no plugins
+    /// nothing. Equality, not `contains`: a stray separator or trailing
+    /// newline would pass a `contains` and still change every request.
+    #[test]
+    fn with_no_contribution_the_prompt_is_byte_identical_to_the_base() {
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("nocontrib");
+        let base = "BASE PROMPT";
+        let mut a = prompt_agent(&cwd, base);
+        a.refresh_system_prompt();
+        assert_eq!(
+            a.context.system.as_deref(),
+            Some(base),
+            "no plugin contributing must leave the prompt exactly as composed"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The whole point of the task: the contribution is made AFTER the
+    /// Agent is built, which is when a plugin actually calls
+    /// `host-set-context` — while handling an event, not at load. A
+    /// build-time-only injection cannot pass this.
+    #[test]
+    fn a_contribution_set_after_the_agent_is_built_reaches_the_prompt() {
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("aftrbuild");
+        let mut a = prompt_agent(&cwd, "BASE PROMPT");
+        // Agent exists, prompt already composed — only NOW does the
+        // plugin contribute.
+        crate::plugin_context::set("memory", "User prefers Rust.").expect("accepted");
+        a.refresh_system_prompt();
+        let got = a.context.system.clone().unwrap_or_default();
+        assert!(got.starts_with("BASE PROMPT"), "{got:?}");
+        assert!(
+            got.contains("[context contributed by extension \"memory\"]"),
+            "the contribution must be present and attributed: {got:?}"
+        );
+        assert!(got.contains("User prefers Rust."), "{got:?}");
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The no-stacking test. This is the one that fails if anything
+    /// appends to `context.system` instead of deriving it from
+    /// `system_base` — ten turns with one contribution active must not
+    /// carry ten copies of it (invariant 10).
+    #[test]
+    fn ten_refreshes_leave_exactly_one_block() {
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("tenrefresh");
+        let mut a = prompt_agent(&cwd, "BASE PROMPT");
+        crate::plugin_context::set("memory", "one contribution").expect("accepted");
+        for _ in 0..10 {
+            a.refresh_system_prompt();
+        }
+        let got = a.context.system.clone().unwrap_or_default();
+        assert_eq!(
+            got.matches("[context contributed by extension \"memory\"]").count(),
+            1,
+            "ten refreshes, one block: {got:?}"
+        );
+        assert_eq!(got.matches("one contribution").count(), 1, "{got:?}");
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Clearing leaves no residue — not a blank line, not a dangling
+    /// separator. Byte-equality with the base is the only assertion
+    /// that can see the difference.
+    #[test]
+    fn clearing_a_contribution_returns_the_prompt_to_the_base() {
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("clearing");
+        let base = "BASE PROMPT";
+        let mut a = prompt_agent(&cwd, base);
+        crate::plugin_context::set("memory", "temporary").expect("accepted");
+        a.refresh_system_prompt();
+        assert_ne!(a.context.system.as_deref(), Some(base));
+        crate::plugin_context::set("memory", "").expect("clearing is not a refusal");
+        a.refresh_system_prompt();
+        assert_eq!(
+            a.context.system.as_deref(),
+            Some(base),
+            "a cleared contribution must leave the prompt byte-identical to \
+             the base, with no residue"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// `build.rs`'s two documented invariants, pinned against THIS
+    /// change specifically: (a) a custom `--system-prompt` replaces
+    /// only the identity/tools/guidelines section — context files,
+    /// skills and the cwd line still apply; (b) the base section still
+    /// ends with the "Current working directory:" line, so the
+    /// append/context/skills tail is byte-identical across both
+    /// branches. The contribution goes AFTER all of it, because it is
+    /// concatenated onto whatever `compose_system_prompt` returned,
+    /// once both branches have converged.
+    #[test]
+    fn a_custom_system_prompt_keeps_its_tail_with_a_contribution_active() {
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let prev = std::env::var_os("NANOPI_HOME");
+        let home = tmpdir("home");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = tmpdir("customprompt");
+        std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES HERE").unwrap();
+
+        let overrides =
+            PromptOverrides::from_cli(Some("MY CUSTOM IDENTITY".into()), Vec::new(), false);
+        let base = compose_system_prompt(&cwd, &tools(), &[], false, &overrides);
+
+        let mut a = prompt_agent(&cwd, &base);
+        crate::plugin_context::set("memory", "CONTRIBUTED TEXT").expect("accepted");
+        a.refresh_system_prompt();
+        let got = a.context.system.clone().unwrap_or_default();
+
+        // (a) the custom prompt is in, and the context-file tail still
+        // applies despite it.
+        assert!(got.contains("MY CUSTOM IDENTITY"), "{got:?}");
+        assert!(got.contains("PROJECT RULES HERE"), "{got:?}");
+        // (b) the base section still carries the cwd line.
+        let cwd_line = format!("Current working directory: {}", cwd.display());
+        assert!(got.contains(&cwd_line), "{got:?}");
+        // The base is untouched as a PREFIX — which is what proves the
+        // contribution was concatenated after both branches converged
+        // rather than spliced into the middle.
+        assert!(
+            got.starts_with(&base),
+            "the composed base must survive verbatim as a prefix: {got:?}"
+        );
+        // And the contribution comes after the whole tail.
+        let contributed = got.find("CONTRIBUTED TEXT").expect("contribution present");
+        let rules = got.find("PROJECT RULES HERE").expect("context file present");
+        assert!(
+            rules < contributed,
+            "the contribution belongs AFTER the context-files/skills tail: {got:?}"
+        );
+
+        crate::plugin_context::clear_all();
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The resume guard, moved to the right field: `hydrate_resumed`
+    /// composes a base when there is none and leaves an existing one
+    /// alone.
+    #[test]
+    fn hydrate_resumed_sets_the_base_only_when_absent() {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let prev = std::env::var_os("NANOPI_HOME");
+        let home = tmpdir("home");
+        std::env::set_var("NANOPI_HOME", &home);
+        let cwd = tmpdir("hydratebase");
+
+        let hydrate = |agent: &mut Agent| {
+            let _ = agent.hydrate_resumed(
+                Box::new(OpenAiProvider::new("", "", "")),
+                ToolRegistry::standard(),
+                PermissionGate::from_cli(false, None),
+                HooksConfig::default(),
+                "m".into(),
+                "http://x".into(),
+                "".into(),
+                SkillLoadPolicy::default(),
+                true,
+                PromptOverrides::default(),
+                &[],
+            );
+        };
+
+        // Absent → composed.
+        let (path, _h) = crate::session::new_session(&cwd, "m", "http://x").expect("session");
+        let mut agent = Agent::load_session(&path, &cwd).expect("load");
+        assert!(agent.system_base.is_none(), "load_session persists no prompt");
+        hydrate(&mut agent);
+        let composed = agent.system_base.clone().expect("composed on resume");
+        assert!(!composed.is_empty());
+
+        // Present → untouched.
+        let (path2, _h2) = crate::session::new_session(&cwd, "m", "http://x").expect("session");
+        let mut agent2 = Agent::load_session(&path2, &cwd).expect("load");
+        agent2.set_system_base("PRESERVED BASE".into());
+        hydrate(&mut agent2);
+        assert_eq!(
+            agent2.system_base.as_deref(),
+            Some("PRESERVED BASE"),
+            "an existing base must not be recomposed over"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("NANOPI_HOME", p);
+        } else {
+            std::env::remove_var("NANOPI_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// `/reload` recomposes the BASE; an active contribution survives.
+    /// Driven through `set_system_base`, which is what the handler
+    /// calls — a contribution is not a skill, and `/reload` does not
+    /// reload `[[extensions]]`.
+    #[test]
+    fn reloading_the_base_leaves_an_active_contribution_standing() {
+        let _g = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("reloadbase");
+        let mut a = prompt_agent(&cwd, "OLD BASE");
+        crate::plugin_context::set("memory", "SURVIVES RELOAD").expect("accepted");
+        a.refresh_system_prompt();
+
+        a.set_system_base("NEW BASE".into());
+        let got = a.context.system.clone().unwrap_or_default();
+        assert!(got.starts_with("NEW BASE"), "the base was replaced: {got:?}");
+        assert!(!got.contains("OLD BASE"), "{got:?}");
+        assert!(
+            got.contains("SURVIVES RELOAD"),
+            "a reload rebuilds the base, not the contributions: {got:?}"
+        );
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&cwd).ok();
     }
 }
