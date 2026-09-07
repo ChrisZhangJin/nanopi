@@ -24,6 +24,12 @@ pub mod plugin_tools;
 /// rows, so the TUI needs no `#[cfg(feature = "wasm")]`. Without the
 /// feature the vec is always empty and the section is omitted.
 pub mod plugin_grants;
+/// Unconditionally compiled, same seam again: `mode::tui` installs the
+/// sink, drains the echoes and marks the turn origin, so the turn loop
+/// needs no `#[cfg(feature = "wasm")]`. Without the feature nothing
+/// ever calls `send`, both drains are always empty, and the loop is
+/// byte-identical.
+pub mod plugin_send;
 pub mod resources;
 pub mod session;
 pub mod settings;

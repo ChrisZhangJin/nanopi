@@ -516,6 +516,14 @@ pub async fn run_tui_mode(
     // sees.
     #[cfg(feature = "wasm")]
     crate::wasm::notify::install_sink();
+    // And from here on there is a turn loop, so `host-send-user-message`
+    // has somewhere to put a message. No `cfg`: `plugin_send` is
+    // non-gated on purpose, and without the feature nothing ever calls
+    // `send`. Installed with NO channel yet — that state means "queue
+    // it, a turn will pick it up", which is different from "not
+    // installed", which is `-p` mode and refuses. `-p` never reaches
+    // this line, which is the whole of Q4's implementation.
+    crate::plugin_send::install(crate::plugin_send::Sink { steer_tx: None });
     let mut app = App::new(
         header.id.to_string(),
         model.to_string(),
@@ -1699,6 +1707,35 @@ async fn run_app(
                         Style::default().fg(Color::Cyan),
                     )]))?;
                 }
+                // Verbatim echoes owed for plugin messages that reached
+                // a running turn (`host-send-user-message`). Drained
+                // here for the same reason `host-notify` is: the host
+                // function is a synchronous wasmtime closure with no
+                // `Term`. No `cfg` — `plugin_send` is non-gated, and
+                // without the feature this is always empty.
+                //
+                // `render_user_echo`, not `insert_line`: this text IS a
+                // user message as far as the model is concerned, so it
+                // must look like one. The attribution says whose.
+                for p in crate::plugin_send::take_echoes() {
+                    render_user_echo(term, &format!("[steer from {}] {}", p.plugin, p.text))?;
+                }
+                // A plugin message that arrived with no turn running
+                // starts one. Without this the overflow queue would
+                // only ever drain at the END of a turn, so a plugin
+                // that spoke at `session_start` — before any turn had
+                // ever run — would sit unheard until the user typed
+                // something, which is the silent-drop shape all over
+                // again.
+                if app.status != Status::Streaming && turn_task.is_none() {
+                    if let Some(text) = pick_follow_up(None, &mut follow_up_slot) {
+                        handle_action(
+                            KeyAction::StartTurn(text),
+                            app, term, &agent_slot,
+                            &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                        ).await?;
+                    }
+                }
                 // Redraw only when there's a live counter to update.
                 if app.turn_started_at.is_some()
                     || app.tool_started_at.is_some()
@@ -1810,11 +1847,14 @@ async fn run_app(
                         // steer that missed its turn is noticed out here,
                         // in a window where the agent has been taken out
                         // of the slot and cannot be written to.
-                        let follow_up = {
+                        //
+                        // v0.12 adds a THIRD source, last of the three:
+                        // see `pick_follow_up`.
+                        let from_agent = {
                             let mut g = agent_slot.lock().await;
                             g.as_mut().and_then(|a| a.pending_follow_ups.pop_front())
-                        }
-                        .or_else(|| follow_up_slot.pop_front());
+                        };
+                        let follow_up = pick_follow_up(from_agent, &mut follow_up_slot);
                         if let Some(text) = follow_up {
                             handle_action(
                                 KeyAction::StartTurn(text),
@@ -3092,6 +3132,21 @@ async fn handle_action(
             // turn is beginning.
             #[cfg(feature = "wasm")]
             crate::wasm::notify::reset_turn();
+            // The SAME boundary, deliberately not a second one. Two
+            // turn boundaries drift, and the drift would be a hole in
+            // §2.4's rule 2. `reset_turn` promotes whatever origin the
+            // follow-up drain staged: a plugin's queued message makes
+            // this the plugin's own turn, and anything else makes it a
+            // human's. No `cfg` — `plugin_send` is non-gated.
+            crate::plugin_send::reset_turn();
+            // Republished every turn, not once at startup. The steer
+            // sender is created fresh above, so a sink kept from the
+            // previous turn would hold one whose receiver is already
+            // gone and every plugin message would queue instead of
+            // steering.
+            crate::plugin_send::install(crate::plugin_send::Sink {
+                steer_tx: steer_tx.clone(),
+            });
         }
         KeyAction::SteerTurn(msg) => {
             steer_or_queue(term, steer_tx.as_ref(), follow_up, msg).await?;
@@ -3190,6 +3245,48 @@ async fn handle_action(
         }
     }
     Ok(())
+}
+
+/// Choose the next turn's text from the three follow-up sources, in
+/// order.
+///
+/// 1. `Agent::pending_follow_ups` — a `SteerMessage::FollowUp` handled
+///    inside the turn, or a steer `drain_steer_to_follow_ups` demoted.
+/// 2. `follow_up_slot` — a human's line that missed its turn, noticed
+///    out here in the window where the agent is out of the slot.
+/// 3. `plugin_send`'s overflow — a plugin message with no live channel.
+///
+/// **The plugin goes LAST, and that is a decision rather than an
+/// accident of writing order.** A human's queued line is something the
+/// user typed and watched land; a plugin's is something software
+/// decided to spend their money on. Putting the plugin first would let
+/// a plugin cut in front of the person at the keyboard.
+///
+/// Extracted purely so the ORDER is reachable from a test — the loop
+/// body it came from needs a live `Term` and agent slot.
+///
+/// **Caller obligation, and it is load-bearing.** This CONSUMES from
+/// all three sources: source 3 additionally clears §2.4's rule 1 and
+/// stages the turn origin. So whatever it returns must actually reach
+/// `KeyAction::StartTurn`, which early-returns when
+/// `app.status == Status::Streaming` — and a plugin message dropped in
+/// that early return would be one the guard had already counted as
+/// delivered, wedging the plugin and losing the text: `b90b27f`'s shape
+/// with a stuck flag on top. Both call sites establish the
+/// precondition — the ticker checks `status != Streaming && turn_task
+/// .is_none()` before calling, and the turn-completion site sets
+/// `status = Idle` well above. Do not add a third call site without it.
+fn pick_follow_up(
+    from_agent: Option<String>,
+    slot: &mut std::collections::VecDeque<String>,
+) -> Option<String> {
+    from_agent
+        .or_else(|| slot.pop_front())
+        // `take_pending` also stages the turn origin, which is what
+        // makes §2.4's rule 2 true for a turn a plugin STARTED (as
+        // opposed to one it steered). `KeyAction::StartTurn`'s
+        // `plugin_send::reset_turn()` promotes it a moment later.
+        .or_else(|| crate::plugin_send::take_pending().map(|p| p.text))
 }
 
 /// Route a mid-stream message into the running turn, or queue it as the
@@ -4905,6 +5002,78 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
 mod tests {
     use super::*;
     use crate::agent::hook::HookConfig;
+    use std::collections::VecDeque;
+
+    /// `plugin_send`'s state is process-wide, so the drain-order tests
+    /// must not interleave with each other.
+    fn send_guard() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = L.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_send::install(crate::plugin_send::Sink { steer_tx: None });
+        while crate::plugin_send::take_pending().is_some() {}
+        let _ = crate::plugin_send::take_echoes();
+        // Clear rule 2's origin as well: the sibling test below leaves
+        // a turn attributed to `p`, and inheriting it would refuse the
+        // very send this test is set up to make.
+        crate::plugin_send::mark_turn_origin(None);
+        crate::plugin_send::reset_turn();
+        g
+    }
+
+    /// **The human outranks the plugin.** All three sources are loaded
+    /// at once and drained to exhaustion, so the assertion is about
+    /// ORDER and not merely about each source being reachable — a
+    /// version that reads the plugin first still returns all three
+    /// strings and would pass a weaker test.
+    ///
+    /// A human's queued line is something the user typed and watched
+    /// land; a plugin's is something software decided to spend their
+    /// money on.
+    #[test]
+    fn the_plugin_overflow_is_drained_last_of_the_three_sources() {
+        let _g = send_guard();
+        crate::plugin_send::send("p", "from the plugin").expect("queued, no live channel");
+
+        let mut slot: VecDeque<String> = VecDeque::new();
+        slot.push_back("from the human".to_string());
+
+        assert_eq!(
+            pick_follow_up(Some("from the agent".into()), &mut slot).as_deref(),
+            Some("from the agent"),
+            "1st: a FollowUp handled inside the turn, or a demoted steer"
+        );
+        assert_eq!(
+            pick_follow_up(None, &mut slot).as_deref(),
+            Some("from the human"),
+            "2nd: the human's queued line must beat the plugin's message"
+        );
+        assert_eq!(
+            pick_follow_up(None, &mut slot).as_deref(),
+            Some("from the plugin"),
+            "3rd, and only once the human has been served"
+        );
+        assert_eq!(pick_follow_up(None, &mut slot), None, "and then nothing");
+    }
+
+    /// The drain is also the only place that learns WHOSE turn is about
+    /// to start, which is what makes §2.4's rule 2 true for a turn a
+    /// plugin STARTED as opposed to one it steered. `StartTurn`'s
+    /// `plugin_send::reset_turn()` promotes it a moment later; this
+    /// test stands in for that call.
+    #[test]
+    fn draining_the_overflow_stages_the_turn_origin() {
+        let _g = send_guard();
+        crate::plugin_send::send("p", "x").expect("queued");
+        let mut slot: VecDeque<String> = VecDeque::new();
+        assert_eq!(pick_follow_up(None, &mut slot).as_deref(), Some("x"));
+        crate::plugin_send::reset_turn();
+        let err = crate::plugin_send::send("p", "again")
+            .expect_err("the turn that just started is this plugin's own");
+        assert_eq!(
+            err, "this plugin cannot send during a turn its own message started",
+            "{err}"
+        );
+    }
 
     /// Tabs must be expanded to spaces before we hand a line to
     /// ratatui. Otherwise the terminal's own tab expansion paints
