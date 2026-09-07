@@ -84,6 +84,33 @@ base_url = "https://api.openai.com/v1"
 # ordering bug; otherwise leave the default.
 # tool_exec_mode = "sequential"
 
+# ─── Per-tool execution mode (v0.12) ────────────────────────────────
+#
+# A tool can declare that it is unsafe to run alongside anything else,
+# and one such tool anywhere in a batch serializes the whole batch.
+# Today exactly one built-in declares it: `bash`.
+#
+# Why bash: its `command` is an opaque shell string, so nothing can
+# infer which files it will open. `edit` and `write` name their `path`,
+# so same-file calls are serialized per path and different files still
+# run concurrently. bash gets neither. Two concurrent bash calls doing
+# read-modify-write on one file — any `sed -i`, formatter or codemod —
+# used to race, and BOTH reported success while one silently reverted
+# the other.
+#
+# This table overrides that, in both directions. It is yours to set and
+# yours to own:
+#
+#   [tool_exec_overrides]
+#   bash = "parallel"     # give me the speed back; I know what my
+#                         # commands touch
+#   read = "sequential"   # or force something to serialize
+#
+# A key naming a tool that does not exist is a startup error, not a
+# silent no-op — a misspelled `bahs` would otherwise leave you thinking
+# concurrent bash is simply still broken. Plugin tools are governed by
+# their own executionMode and cannot be listed here.
+
 # ─── WASM extensions (v0.11.0) ──────────────────────────────────────
 #
 # Requires a build with `--features wasm`. The stock release binary

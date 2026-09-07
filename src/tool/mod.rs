@@ -337,6 +337,40 @@ pub trait Tool: Send + Sync {
     fn source(&self) -> ToolSource {
         ToolSource::Builtin
     }
+
+    /// Whether this tool is safe to run alongside other tools in the
+    /// same batch.
+    ///
+    /// Defaulted to [`ExecutionMode::Parallel`] because most tools
+    /// either only read, or declare what they touch through
+    /// [`mutation_key`] so the batcher can serialize them per path.
+    /// `bash` can do neither: its `command` is opaque, so nothing can
+    /// be inferred about what it will open. See [`ExecutionMode`].
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Parallel
+    }
+}
+
+/// Whether a tool may run concurrently with the rest of its batch.
+///
+/// Matches PI's per-tool `executionMode` (`docs/v0.5-research.md`
+/// §"hasSequentialToolCall"), and closes the bug
+/// `parallel_bash_calls_on_one_file_lose_an_update` was written to
+/// document: `mutation_key` only understands `edit` and `write`, so two
+/// concurrent `bash` calls landed in separate groups, raced on the same
+/// file, and **both reported success** — the loss never reached the
+/// model.
+///
+/// `Sequential` is a property of the batch, not of one pair: a
+/// `Sequential` tool anywhere in the batch serializes the whole batch,
+/// which is what PI does. Finer would be wrong here rather than merely
+/// slower — the reason `bash` is unsafe is that nobody knows what it
+/// touches, so there is no other call it can be proven safe against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Parallel,
+    Sequential,
 }
 
 /// Registry of tools, keyed by name.

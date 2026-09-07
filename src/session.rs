@@ -980,7 +980,6 @@ mod tests {
     fn active_session_roundtrip() {
         let _h = crate::TempNanopiHome::new();
         // Use NANOPI_HOME to isolate from real ~/.nanopi.
-        let tmp_home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let (path, _) = new_session(&cwd, "m", "https://api.example/v1").unwrap();
@@ -1032,7 +1031,6 @@ mod tests {
     #[test]
     fn resolve_session_default_is_new() {
         let _h = crate::TempNanopiHome::new();
-        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let choice = resolve_session(&cwd, false, None, None, None).expect("resolve");
@@ -1044,7 +1042,6 @@ mod tests {
     #[test]
     fn resolve_session_continue_without_history_falls_back_to_new() {
         let _h = crate::TempNanopiHome::new();
-        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let choice = resolve_session(&cwd, true, None, None, None).expect("resolve");
@@ -1056,7 +1053,6 @@ mod tests {
     #[test]
     fn resolve_session_continue_returns_active_path() {
         let _h = crate::TempNanopiHome::new();
-        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (path, _h) = new_session(&cwd, "m", "http://x").unwrap();
@@ -1074,7 +1070,6 @@ mod tests {
     #[test]
     fn resolve_session_by_id_returns_path() {
         let _h = crate::TempNanopiHome::new();
-        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let (path, header) = new_session(&cwd, "m", "http://x").unwrap();
@@ -1379,7 +1374,6 @@ mod tests {
     #[test]
     fn resolve_session_by_id_missing_returns_error() {
         let _h = crate::TempNanopiHome::new();
-        let home = _h.path().to_path_buf();
         let cwd = home_tmp();
 
         let r = resolve_session(&cwd, false, Some("does-not-exist"), None, None);

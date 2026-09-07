@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_default() {
-        let tmp = crate::TempNanopiHome::new();
+        let _tmp = crate::TempNanopiHome::new();
         let f = load();
         assert!(f.thinking_level.is_none());
         assert!(f.hide_thinking.is_none());
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip_scalars() {
-        let tmp = crate::TempNanopiHome::new();
+        let _tmp = crate::TempNanopiHome::new();
 
         let mut f = SettingsFile::default();
         f.thinking_level = Some(ThinkingLevel::High);
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn save_preserves_user_comment_and_unknown_section() {
-        let tmp = crate::TempNanopiHome::new();
+        let _tmp = crate::TempNanopiHome::new();
 
         // Pre-seed the file with a comment + legacy [hooks] block that
         // the interaction loader must NOT touch.
@@ -263,7 +263,7 @@ command = \"echo hello\"
 
     #[test]
     fn keybindings_roundtrip() {
-        let tmp = crate::TempNanopiHome::new();
+        let _tmp = crate::TempNanopiHome::new();
 
         let mut kb = HashMap::new();
         kb.insert(

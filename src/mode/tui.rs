@@ -512,6 +512,7 @@ pub async fn run_tui_mode(
             prompt_overrides,
             initial_follow_up: None,
             tool_exec_mode: cfg_for_build.tool_exec_mode,
+            tool_exec_overrides: cfg_for_build.tool_exec_overrides.clone(),
             extensions: cfg_for_build.extensions.clone(),
         });
         print_skill_diagnostics(&diags);
@@ -2266,6 +2267,7 @@ async fn handle_action(
                 prompt_overrides: app.prompt_overrides.clone(),
                 initial_follow_up: None,
                 tool_exec_mode: cfg_now.tool_exec_mode,
+                tool_exec_overrides: cfg_now.tool_exec_overrides.clone(),
                 extensions: cfg_now.extensions,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
@@ -5518,6 +5520,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),

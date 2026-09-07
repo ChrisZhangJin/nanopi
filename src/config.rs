@@ -117,11 +117,30 @@ pub struct Config {
     /// this (e.g. `write` then `read` where the read must see the
     /// write's output).
     ///
-    /// The `[[extensions]]` tool's `executionMode` (Pi's per-tool
-    /// override) is reserved for a future release; today this field
-    /// applies globally.
+    /// This field is the GLOBAL setting. Per-tool overrides live in
+    /// `tool_exec_overrides` below, and a tool's own declaration
+    /// (`Tool::execution_mode`) sits between the two: global mode
+    /// picks the batching strategy, a `Sequential` tool in the batch
+    /// forces serial regardless, and an override outranks the tool.
     #[serde(default)]
     pub tool_exec_mode: ToolExecMode,
+    /// v0.12: per-tool overrides of the tool's own declared
+    /// `executionMode`.
+    ///
+    /// ```toml
+    /// [tool_exec_overrides]
+    /// bash = "parallel"    # I know what my commands touch
+    /// read = "sequential"  # belt and braces
+    /// ```
+    ///
+    /// Outranks `Tool::execution_mode` in both directions. A key naming
+    /// a tool that does not exist is a load-time error, not a silent
+    /// no-op — the same rule retired hook keys and `allow_tools`
+    /// entries follow, and for the same reason: a setting that appears
+    /// to do something and does nothing is worse than one that is
+    /// refused.
+    #[serde(default)]
+    pub tool_exec_overrides: std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
 }
 
 /// Global tool execution mode. Deserialized from
@@ -359,6 +378,7 @@ impl Config {
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
             tool_exec_mode: ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
         }
     }
 }
@@ -381,7 +401,55 @@ pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
         merged = merge(merged, load_one(&local_path)?);
     }
 
+    validate_tool_exec_overrides(&merged)?;
+
     Ok(merged)
+}
+
+/// A `[tool_exec_overrides]` key must name a real built-in tool.
+///
+/// Same rule as a retired hook key and an `allow_tools` entry naming a
+/// tool that does not exist: refused at load, naming the valid set.
+/// A misspelled `bahs = "sequential"` would otherwise parse clean and
+/// change nothing, and the user would conclude that concurrent bash is
+/// simply still broken.
+///
+/// Checked after the merge, not inside `load_one`, so a key set
+/// globally and corrected locally is judged on the value that actually
+/// takes effect.
+///
+/// Deliberately limited to BUILT-INS. Plugin tools are not known until
+/// `[[extensions]]` load, which happens after this, and a plugin's own
+/// `Tool::execution_mode` already governs it; accepting arbitrary names
+/// here would trade this error for the silent no-op it exists to
+/// prevent.
+fn validate_tool_exec_overrides(cfg: &Config) -> Result<(), ConfigError> {
+    let known = crate::tool::ToolRegistry::standard().names();
+    let unknown: Vec<&str> = cfg
+        .tool_exec_overrides
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.iter().any(|n| n == k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let path = global_config_path().unwrap_or_else(|| PathBuf::from("config.toml"));
+    Err(ConfigError::Toml {
+        path,
+        source: toml::de::Error::custom(format!(
+            "[tool_exec_overrides] names {}, which {} not a built-in tool. \
+             Valid names: {}. (Plugin tools are governed by their own \
+             executionMode and cannot be overridden here.)",
+            unknown
+                .iter()
+                .map(|u| format!("`{u}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if unknown.len() == 1 { "is" } else { "are" },
+            known.join(", ")
+        )),
+    })
 }
 
 /// Path to the global config file. Honors NANOPI_HOME for test
@@ -481,6 +549,17 @@ fn merge(a: Config, b: Config) -> Config {
             b.tool_exec_mode
         } else {
             a.tool_exec_mode
+        },
+        // Per-tool overrides merge per KEY, project winning on a
+        // collision. Not concatenated like `extensions`: one tool
+        // cannot hold two modes at once, so "both additive" has no
+        // meaning here — and not whole-table override either, which
+        // would make a project setting one tool silently discard every
+        // global setting for the others.
+        tool_exec_overrides: {
+            let mut m = a.tool_exec_overrides;
+            m.extend(b.tool_exec_overrides);
+            m
         },
     }
 }
@@ -708,6 +787,52 @@ command = "echo hi"
         );
     }
 
+    /// A `[tool_exec_overrides]` key naming a tool that does not exist
+    /// is refused at load, naming the valid set — the same rule as a
+    /// retired hook key. `bahs = "sequential"` would otherwise parse
+    /// clean, change nothing, and leave the user concluding that
+    /// concurrent bash is simply still broken.
+    #[test]
+    fn an_unknown_tool_exec_override_is_a_load_error_naming_the_valid_set() {
+        let _h = crate::TempNanopiHome::new();
+        let cwd = std::env::temp_dir().join(format!("np-teo-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(cwd.join(".nanopi")).unwrap();
+        std::fs::write(
+            cwd.join(".nanopi").join("config.toml"),
+            "[tool_exec_overrides]\nbahs = \"sequential\"\n",
+        )
+        .unwrap();
+
+        let err = load_config(&cwd).expect_err("must refuse an unknown tool name");
+        let msg = err.to_string();
+        assert!(msg.contains("bahs"), "must name the offending key: {msg}");
+        assert!(
+            msg.contains("bash"),
+            "must list the valid names so the typo is obvious: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// And a correct one loads.
+    #[test]
+    fn a_valid_tool_exec_override_loads() {
+        let _h = crate::TempNanopiHome::new();
+        let cwd = std::env::temp_dir().join(format!("np-teo-ok-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(cwd.join(".nanopi")).unwrap();
+        std::fs::write(
+            cwd.join(".nanopi").join("config.toml"),
+            "[tool_exec_overrides]\nbash = \"parallel\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(&cwd).expect("valid override must load");
+        assert_eq!(
+            cfg.tool_exec_overrides.get("bash"),
+            Some(&crate::tool::ExecutionMode::Parallel)
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     /// A merely-misspelled hook key (never a shipped name) is still a
     /// hard error — it just isn't rewritten by the retired-key table.
     #[test]
@@ -748,6 +873,7 @@ command = "echo hi"
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
             tool_exec_mode: ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
         };
         let b = Config {
             model: None,
@@ -762,6 +888,7 @@ command = "echo hi"
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
             tool_exec_mode: ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));

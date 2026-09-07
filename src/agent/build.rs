@@ -92,6 +92,11 @@ pub struct AgentBuildInputs {
     pub initial_follow_up: Option<String>,
     /// v0.11.0: tool execution mode (parallel or sequential).
     pub tool_exec_mode: crate::config::ToolExecMode,
+    /// v0.12: per-tool `executionMode` overrides from
+    /// `[tool_exec_overrides]`, already validated against the registry
+    /// by `config::load_config`.
+    pub tool_exec_overrides:
+        std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
     /// v0.11.0: `[[extensions]]` from config.toml. Each entry points at
     /// a `.wasm` component (or a directory of them) whose exported
     /// tools get registered alongside the built-ins. Ignored entirely
@@ -243,6 +248,7 @@ impl Agent {
             prompt_overrides,
             initial_follow_up,
             tool_exec_mode,
+            tool_exec_overrides,
             extensions,
         } = inputs;
 
@@ -298,6 +304,7 @@ impl Agent {
             prompt_overrides,
             pending_follow_ups: initial_follow_up.into_iter().collect(),
             tool_exec_mode,
+            tool_exec_overrides,
             plugin_commands,
             plugin_grants,
             event_subscribers,
@@ -910,6 +917,7 @@ mod tests {
             no_context_files: true,
             pending_follow_ups: Default::default(),
             tool_exec_mode: Default::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),

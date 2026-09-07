@@ -119,6 +119,12 @@ pub struct Agent {
     /// configure sequential via `tool_exec_mode` in config.toml).
     /// Set at build time and reused on every turn.
     pub tool_exec_mode: crate::config::ToolExecMode,
+    /// v0.12: per-tool `executionMode` overrides from
+    /// `[tool_exec_overrides]`. Outranks the tool's own
+    /// `Tool::execution_mode` in both directions, so a user who wants
+    /// concurrent `bash` back can have it. Empty by default, in which
+    /// case every tool's own declaration stands.
+    pub tool_exec_overrides: std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
     /// v0.11.0: slash commands registered by WASM plugins, already
     /// filtered for collisions. Held here for the same reason `skills`
     /// is: the TUI snapshots it after every rebuild rather than
@@ -415,6 +421,7 @@ impl Agent {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             // Populated by `hydrate_resumed`, which is what loads the
             // plugins — `load_session` only replays JSONL and knows
             // nothing about config.
@@ -1622,7 +1629,9 @@ impl Agent {
         // below, which straddle group boundaries.
         let groups: Vec<Vec<ToolCall>> = match self.tool_exec_mode {
             crate::config::ToolExecMode::Sequential => calls.into_iter().map(|c| vec![c]).collect(),
-            crate::config::ToolExecMode::Parallel => group_by_mutation_key(&registry, &cwd, calls),
+            crate::config::ToolExecMode::Parallel => {
+                group_batch(&registry, &cwd, calls, &self.tool_exec_overrides)
+            }
         };
 
         let futs: Vec<_> = groups
@@ -1938,11 +1947,52 @@ pub(crate) const PLUGIN_BLOCKED_PREFIX: &str = "blocked by hook: ";
 /// `execute_tool_calls`, but `execute_tool_calls` is `pub` and reachable
 /// with raw names, and a missed normalization here would silently
 /// degrade to "no serialization" rather than fail loudly.
-fn group_by_mutation_key(
+/// Batch a set of calls into groups that may run concurrently, where
+/// each group runs serially inside itself.
+///
+/// Two rules, checked in this order:
+///
+/// 1. **A `Sequential` tool anywhere serializes the whole batch.** Its
+///    unsafety is that nothing can be inferred about what it touches,
+///    so there is no call it can be proven safe against. See
+///    [`crate::tool::ExecutionMode`].
+/// 2. Otherwise group by [`crate::tool::mutation_key`] as before, so
+///    two writes to one path serialize and writes to different paths
+///    do not.
+///
+/// `overrides` is the user's `[tool_exec_overrides]` and outranks the
+/// tool's own declaration in both directions — including making `bash`
+/// parallel again, which is theirs to choose and theirs to own.
+fn group_batch(
     registry: &ToolRegistry,
     cwd: &Path,
     calls: Vec<ToolCall>,
+    overrides: &std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
 ) -> Vec<Vec<ToolCall>> {
+    let mode_of = |call: &ToolCall| -> crate::tool::ExecutionMode {
+        let name = registry
+            .canonical_name(&call.name)
+            .unwrap_or_else(|| call.name.clone());
+        if let Some(m) = overrides.get(&name) {
+            return *m;
+        }
+        registry
+            .get(&name)
+            .map(|t| t.execution_mode())
+            .unwrap_or(crate::tool::ExecutionMode::Parallel)
+    };
+
+    if calls
+        .iter()
+        .any(|c| mode_of(c) == crate::tool::ExecutionMode::Sequential)
+    {
+        // One group, so the existing per-group serialization runs the
+        // whole batch in the order the model emitted it. Deliberately
+        // NOT `calls.into_iter().map(|c| vec![c])` — that is the
+        // opposite, N groups running concurrently.
+        return vec![calls];
+    }
+
     let mut groups: Vec<Vec<ToolCall>> = Vec::new();
     let mut index: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     for call in calls {
@@ -2358,6 +2408,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -2456,6 +2507,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -2549,6 +2601,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -2691,6 +2744,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: subs,
@@ -2784,6 +2838,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: subs,
@@ -2940,6 +2995,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: subs,
@@ -3109,6 +3165,7 @@ mod tests {
                 no_context_files: false,
                 pending_follow_ups: Default::default(),
                 tool_exec_mode: crate::config::ToolExecMode::default(),
+                tool_exec_overrides: Default::default(),
                 plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
                 event_subscribers: subs,
@@ -3186,6 +3243,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3263,6 +3321,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3360,6 +3419,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3428,6 +3488,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::Sequential,
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3561,6 +3622,7 @@ mod tests {
                 no_context_files: false,
                 pending_follow_ups: Default::default(),
                 tool_exec_mode: mode,
+                tool_exec_overrides: Default::default(),
                 plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
                 event_subscribers: Default::default(),
@@ -3664,6 +3726,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3729,6 +3792,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3811,6 +3875,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -3943,6 +4008,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -4092,6 +4158,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -4183,6 +4250,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -4252,6 +4320,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5024,6 +5093,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5066,10 +5136,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The counterpart to `execute_tool_calls_runs_in_parallel_not_sequence`:
+    /// with no override, two `bash` calls are SERIAL, and the wall
+    /// clock is the only thing that can show it.
+    ///
+    /// This is the cost of the fix, asserted rather than left implicit:
+    /// a model that emits two long `bash` calls in one batch now waits
+    /// for the sum instead of the max. That is the trade
+    /// `parallel_bash_calls_on_one_file_lose_an_update` buys — both
+    /// commands used to report success while one silently reverted the
+    /// other — and `[tool_exec_overrides]` is how a user takes the
+    /// speed back if they want it.
+    #[tokio::test]
+    async fn a_default_batch_of_two_bash_calls_is_serial() {
+        use std::time::Instant;
+
+        let dir = tmp();
+        let session_path = dir.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        let start = Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 1; echo a"}),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 1; echo b"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("batch");
+        let elapsed = start.elapsed();
+
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1900),
+            "two bash calls must SERIALIZE by default (>=1.9s), got {elapsed:?} \
+             — if this is fast again, bash lost its Sequential declaration"
+        );
+    }
+
     #[tokio::test]
     async fn execute_tool_calls_runs_in_parallel_not_sequence() {
         use std::time::Instant;
 
+        // Two `bash` calls no longer run concurrently BY DEFAULT —
+        // `bash` declares ExecutionMode::Sequential, because concurrent
+        // bash silently lost updates (see
+        // `parallel_bash_calls_on_one_file_lose_an_update`, which was
+        // `#[ignore]`d as a known bug until that landed).
+        //
+        // This test is still worth keeping, and still worth writing
+        // with bash: it is the only tool that can prove concurrency by
+        // wall clock. So it opts back in through the user-facing
+        // override, which also makes it the pin for that override
+        // actually reaching `execute_tool_calls` rather than only
+        // `group_batch`. `a_default_batch_of_two_bash_calls_is_serial`
+        // is its counterpart for the default.
         let dir = tmp();
         let session_path = dir.join("p.jsonl");
         std::fs::write(&session_path, "").unwrap();
@@ -5094,6 +5232,11 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+                m
+            },
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5217,6 +5360,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5365,6 +5509,7 @@ mod tests {
             system_base: None,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5525,6 +5670,7 @@ mod tests {
             system_base: None,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5583,6 +5729,7 @@ mod tests {
             system_base: None,
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5638,6 +5785,7 @@ mod tests {
             no_context_files: false,
             pending_follow_ups: Default::default(),
             tool_exec_mode: mode,
+            tool_exec_overrides: Default::default(),
             plugin_commands: Vec::new(),
             plugin_grants: Vec::new(),
             event_subscribers: Default::default(),
@@ -5738,12 +5886,18 @@ mod tests {
     /// specifically bash-against-bash, where the two sides are
     /// symmetric and neither has an atomic section.
     ///
-    /// Expected today: FAILS, and which change survives is genuinely
-    /// nondeterministic. Both tools report success — nothing surfaces
-    /// the loss to the model. Ignored so CI stays green; run with
-    /// `cargo test -- --ignored` to demonstrate the bug.
+    /// **Fixed by per-tool `executionMode`.** `bash` declares
+    /// [`crate::tool::ExecutionMode::Sequential`], and a `Sequential`
+    /// tool anywhere in a batch serializes the whole batch, so the two
+    /// commands can no longer overlap. Previously this test was
+    /// `#[ignore]`d as a known bug — it failed nondeterministically
+    /// while BOTH tools reported success, so nothing surfaced the loss
+    /// to the model. It is the pin for the fix now, not a
+    /// demonstration of the bug.
+    ///
+    /// Teeth: set `bash`'s `execution_mode` back to `Parallel`, or add
+    /// `bash = "parallel"` to `[tool_exec_overrides]`, and this reds.
     #[tokio::test]
-    #[ignore = "known bug: no per-path mutation queue, concurrent bash loses updates"]
     async fn parallel_bash_calls_on_one_file_lose_an_update() {
         let dir = tmp();
         let target = dir.join("foo.txt");
@@ -6003,6 +6157,81 @@ mod tests {
     /// The grouping contract, tested directly on the pure function so
     /// the ordering properties `execute_tool_calls` relies on are pinned
     /// without timing.
+    /// A `Sequential` tool anywhere collapses the batch to one group,
+    /// which is what serializes it. The opposite mistake — N groups of
+    /// one — looks similar and runs everything concurrently, so this
+    /// asserts the shape and not just the count.
+    #[test]
+    fn a_sequential_tool_anywhere_serializes_the_whole_batch() {
+        let reg = ToolRegistry::standard();
+        let cwd = tmp();
+        let calls = vec![
+            ToolCall { id: "r".into(), name: "read".into(), arguments: json!({"path": "a"}) },
+            ToolCall { id: "b".into(), name: "bash".into(), arguments: json!({"command": "true"}) },
+            ToolCall { id: "g".into(), name: "grep".into(), arguments: json!({"pattern": "x"}) },
+        ];
+        let groups = group_batch(&reg, &cwd, calls, &Default::default());
+        assert_eq!(groups.len(), 1, "one group = serial; got {groups:?}");
+        assert_eq!(groups[0].len(), 3, "all three calls in that one group");
+        // Model order preserved inside the group.
+        let ids: Vec<&str> = groups[0].iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["r", "b", "g"]);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Without a `Sequential` tool the batcher behaves exactly as
+    /// before, which is what keeps the fix from costing every batch.
+    #[test]
+    fn a_batch_with_no_sequential_tool_still_groups_by_path() {
+        let reg = ToolRegistry::standard();
+        let cwd = tmp();
+        let calls = vec![
+            ToolCall { id: "r".into(), name: "read".into(), arguments: json!({"path": "a"}) },
+            ToolCall { id: "g".into(), name: "grep".into(), arguments: json!({"pattern": "x"}) },
+        ];
+        let groups = group_batch(&reg, &cwd, calls, &Default::default());
+        assert_eq!(groups.len(), 2, "still concurrent; got {groups:?}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The override outranks the tool in BOTH directions. The
+    /// parallel-bash direction is the one worth pinning: it is the
+    /// user taking back a safety default, which they are allowed to do
+    /// and which a one-directional implementation would silently
+    /// ignore.
+    #[test]
+    fn a_user_override_outranks_the_tools_own_declaration() {
+        let reg = ToolRegistry::standard();
+        let cwd = tmp();
+        let bash_and_read = || {
+            vec![
+                ToolCall { id: "b".into(), name: "bash".into(), arguments: json!({"command": "true"}) },
+                ToolCall { id: "r".into(), name: "read".into(), arguments: json!({"path": "a"}) },
+            ]
+        };
+
+        // bash forced back to parallel: two groups again.
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+        assert_eq!(
+            group_batch(&reg, &cwd, bash_and_read(), &ov).len(),
+            2,
+            "an explicit `bash = \"parallel\"` must be honored"
+        );
+
+        // read forced to sequential: one group, even though bash is
+        // the only tool that declares it.
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("read".to_string(), crate::tool::ExecutionMode::Sequential);
+        ov.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+        assert_eq!(
+            group_batch(&reg, &cwd, bash_and_read(), &ov).len(),
+            1,
+            "`read = \"sequential\"` must serialize the batch"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     #[test]
     fn group_by_mutation_key_shapes_the_batch() {
         let dir = tmp();
@@ -6017,7 +6246,16 @@ mod tests {
             arguments: args,
         };
 
-        let groups = group_by_mutation_key(
+        // `bash` is forced back to Parallel for this test ONLY. It is
+        // about mutation-key grouping, and bash's Sequential
+        // declaration would collapse the whole batch to one group
+        // before the key logic ever ran — a real behaviour, pinned by
+        // `a_sequential_tool_anywhere_serializes_the_whole_batch`, but
+        // not the one under test here.
+        let mut bash_parallel = std::collections::BTreeMap::new();
+        bash_parallel.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+
+        let groups = group_batch(
             &registry,
             &dir,
             vec![
@@ -6036,6 +6274,7 @@ mod tests {
                     json!({"path": "a.txt", "oldText": "x", "newText": "w"}),
                 ),
             ],
+            &bash_parallel
         );
 
         let ids: Vec<Vec<&str>> = groups
@@ -6072,7 +6311,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
 
-        let groups = group_by_mutation_key(
+        let groups = group_batch(
             &ToolRegistry::standard(),
             &dir,
             vec![
@@ -6087,6 +6326,7 @@ mod tests {
                     arguments: json!({"path": "a.txt", "oldText": "x", "newText": "y"}),
                 },
             ],
+            &Default::default()
         );
 
         assert_eq!(groups.len(), 1, "mangled names must canonicalize and group");

@@ -55,6 +55,18 @@ impl Default for BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
+    /// The one built-in that cannot be batched with anything.
+    ///
+    /// `command` is an opaque shell string, so neither `mutation_key`
+    /// nor anything else can say which files it will open — two
+    /// concurrent `bash` calls on one file raced and both reported
+    /// success, which is the bug
+    /// `loop_::parallel_bash_calls_on_one_file_lose_an_update` was
+    /// written to document and now pins as fixed.
+    fn execution_mode(&self) -> crate::tool::ExecutionMode {
+        crate::tool::ExecutionMode::Sequential
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash".into(),
