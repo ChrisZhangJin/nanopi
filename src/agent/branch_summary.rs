@@ -69,7 +69,11 @@ fn flatten_entries(entries: &[SessionEntry]) -> String {
                 let extra = user_message.as_deref().unwrap_or("");
                 out.push_str(&format!("[skill {name}] {extra}\n\n"));
             }
-            SessionEntry::Header { .. } | SessionEntry::ModelChange { .. } => {}
+            // Neither is conversation content: a branch summary is
+            // about what was discussed, not about knob positions.
+            SessionEntry::Header { .. }
+            | SessionEntry::ModelChange { .. }
+            | SessionEntry::ThinkingChange { .. } => {}
         }
     }
     out

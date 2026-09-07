@@ -2173,6 +2173,21 @@ async fn handle_action(
             {
                 let mut g = agent_slot.lock().await;
                 if let Some(a) = g.as_mut() {
+                    // Persisted for the same reason as the model
+                    // switch above: how much the model was allowed to
+                    // think is part of why an answer looks the way it
+                    // does, and without this a session where the user
+                    // went to `max` halfway through replays as though
+                    // every answer was produced under the level in
+                    // force at the end.
+                    let _ = crate::session::append_entry(
+                        &a.session_path,
+                        &crate::session::SessionEntry::ThinkingChange {
+                            timestamp: crate::util::time::now_iso8601(),
+                            from: current.map(|l| l.to_string()),
+                            to: next.map(|l| l.to_string()),
+                        },
+                    );
                     a.context.thinking = next;
                 }
             }
@@ -2201,6 +2216,31 @@ async fn handle_action(
             if let Some(a) = g.as_mut() {
                 let new_provider =
                     crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&a.base_url), &new_model)), app.inline_think_tags);
+                // Persist the switch. `SessionEntry::ModelChange` has
+                // existed since the session format did — replay skips
+                // it, `/export` renders it, and a roundtrip test covers
+                // it — but NOTHING EVER WROTE ONE. So a session where
+                // the user switched models mid-conversation replayed as
+                // though one model had answered throughout, and
+                // `/export` could never show the switch it knows how to
+                // render. Same shape as the two persistence gaps in
+                // `docs/claims-and-races.md`: a reader with no writer,
+                // and a test that asserted serialization rather than
+                // that anything produced it.
+                //
+                // Written BEFORE the swap takes effect so `from` is
+                // still the outgoing model. Best-effort like every
+                // other `append_entry` on this path: a session file
+                // that cannot be appended to must not cost the user
+                // their model switch.
+                let _ = crate::session::append_entry(
+                    &a.session_path,
+                    &crate::session::SessionEntry::ModelChange {
+                        timestamp: crate::util::time::now_iso8601(),
+                        from: a.model.clone(),
+                        to: new_model.clone(),
+                    },
+                );
                 a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();

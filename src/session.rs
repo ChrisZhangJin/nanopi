@@ -105,6 +105,24 @@ pub enum SessionEntry {
         from: String,
         to: String,
     },
+    /// Written when the user cycles the thinking level mid-session.
+    ///
+    /// Symmetric with `ModelChange`, and for the same reason: how much
+    /// the model was allowed to think is part of why an answer looks
+    /// the way it does. A session where the user switched to `max`
+    /// halfway through otherwise replays as one where every answer was
+    /// produced under the level in force at the END.
+    ///
+    /// `None` is a real value on both sides — thinking off is a
+    /// setting, not a missing one — so both fields are `Option`.
+    /// Serialized as `null` rather than omitted so a reader can tell
+    /// "off" from "an old entry that predates this field".
+    #[serde(rename = "thinking_change")]
+    ThinkingChange {
+        timestamp: String,
+        from: Option<String>,
+        to: Option<String>,
+    },
     /// Written when the agent compacts context to save tokens. Records the
     /// generated summary and how many messages it replaced. Replay logic
     /// (Agent::load_session) treats the summary as a user message.
@@ -614,7 +632,11 @@ pub fn tree_items(entries: &[SessionEntry]) -> Vec<TreeRow> {
             SessionEntry::ToolResult { .. } => {}
             // Header lives once at line 0 — not user-facing content.
             SessionEntry::Header { .. } => {}
+            // Knob positions, not turns. The tree picker is a list of
+            // things you might rewind TO; you cannot rewind to a model
+            // switch.
             SessionEntry::ModelChange { .. } => {}
+            SessionEntry::ThinkingChange { .. } => {}
         }
     }
     out
@@ -943,18 +965,36 @@ mod tests {
             },
         )
         .unwrap();
+        append_entry(
+            &path,
+            &SessionEntry::ThinkingChange {
+                timestamp: time::now_iso8601(),
+                // `None` on one side is the case worth carrying: it is
+                // "thinking off", a real setting, and it must survive
+                // as `null` rather than vanish.
+                from: None,
+                to: Some("max".into()),
+            },
+        )
+        .unwrap();
 
         let (read_header, entries) = read_session(&path).unwrap();
         assert_eq!(read_header.id, header.id);
         assert_eq!(read_header.cwd, cwd);
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
 
         // Each entry type roundtripped correctly.
-        matches!(entries[0], SessionEntry::Message { .. });
-        matches!(entries[1], SessionEntry::ToolCall { .. });
-        matches!(entries[2], SessionEntry::ToolResult { .. });
-        matches!(entries[3], SessionEntry::Message { .. });
-        matches!(entries[4], SessionEntry::ModelChange { .. });
+        //
+        // These were bare `matches!(...)` STATEMENTS: the macro returns
+        // a bool, the `;` discarded it, and the five lines asserted
+        // nothing whatsoever. Any entry could have deserialized as any
+        // other variant and this test stayed green.
+        assert!(matches!(entries[0], SessionEntry::Message { .. }));
+        assert!(matches!(entries[1], SessionEntry::ToolCall { .. }));
+        assert!(matches!(entries[2], SessionEntry::ToolResult { .. }));
+        assert!(matches!(entries[3], SessionEntry::Message { .. }));
+        assert!(matches!(entries[4], SessionEntry::ModelChange { .. }));
+        assert!(matches!(entries[5], SessionEntry::ThinkingChange { .. }));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&home);
@@ -1289,6 +1329,41 @@ mod tests {
 
     /// SessionEntry::Compaction serializes as `type = "compaction"` and
     /// round-trips its summary + replaced_count.
+    /// `None` must serialize as `null`, not be omitted.
+    ///
+    /// Thinking off is a SETTING, so a reader has to be able to tell
+    /// "the user turned it off" from "this entry predates the field".
+    /// Omitting it collapses the two, and `#[serde(default)]` on the
+    /// reading side would then silently report every old entry as
+    /// "off".
+    #[test]
+    fn a_thinking_change_to_or_from_off_keeps_its_nulls() {
+        let e = SessionEntry::ThinkingChange {
+            timestamp: "2026-09-07T00:00:00Z".into(),
+            from: Some("high".into()),
+            to: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains(r#""to":null"#),
+            "`to: None` must be an explicit null, got {json}"
+        );
+        assert_eq!(
+            json.matches("null").count(),
+            1,
+            "only the one absent side is null: {json}"
+        );
+
+        // And it survives the trip.
+        match serde_json::from_str::<SessionEntry>(&json).unwrap() {
+            SessionEntry::ThinkingChange { from, to, .. } => {
+                assert_eq!(from.as_deref(), Some("high"));
+                assert_eq!(to, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn compaction_entry_serde_roundtrips() {
         let entry = SessionEntry::Compaction {

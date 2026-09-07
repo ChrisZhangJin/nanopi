@@ -232,6 +232,8 @@ rather than merely untidy.
 | Race | Required result | |
 |---|---|---|
 | `/new`, `/resume`, `/fork`, `/import` then exit | the exit line names the session you ended in (`app.session_id`) | ⬜ T3.7 |
+| `/model` mid-session | a `ModelChange` entry is appended, so a resumed transcript shows the switch | ⬜ T3.9 |
+| thinking level cycled mid-session | a `ThinkingChange` entry is appended, with explicit `null` for off | ⬜ T3.9 |
 | in-session switch then a lifecycle hook | the hook payload carries the live session id | ✅ |
 | a compaction hook fires | `session_id` is the real id; the reason lives in `arguments.reason` | ✅ |
 
@@ -240,6 +242,29 @@ at the tail of a several-hundred-line async fn with no seam to inject a
 fake `App`, and extracting a helper would pin the formatting rather
 than which variable the call site passes — which is the entire defect.
 `docs/v0.12-manual-test-plan.md` T3.7 covers it instead.
+
+The two `⬜ T3.9` rows are the same seam, and they are marked honestly
+rather than optimistically for a specific reason. `SessionEntry::ModelChange`
+had a serde definition, replay handling, `/export` rendering and a
+roundtrip test **since the session format existed, and no writer** — so
+`/model` mid-session left no trace and a resumed transcript read as
+though one model had answered throughout. It survived that long
+precisely because nothing pinned the CALL SITE: the roundtrip test
+asserted that the variant serializes, which it always did.
+
+Both writers now exist (`ModelChange` wired, `ThinkingChange` added with
+it) and both sit inside `handle_action`, which needs a live `Term` and
+agent slot. So the *writing* is again unpinned, and saying otherwise
+would repeat the mistake in the documentation instead of the code. What
+IS pinned: the entries roundtrip, and `ThinkingChange`'s `None` stays an
+explicit `null` (`a_thinking_change_to_or_from_off_keeps_its_nulls`) so
+"off" cannot be confused with "an entry predating the field".
+
+Worth noting how the old test failed: its assertions were bare
+`matches!(entry, Variant { .. });` STATEMENTS. The macro returns a bool,
+the `;` discarded it, and five lines asserted nothing at all — verified
+by rewriting one to the wrong variant and watching it still pass. They
+are `assert!(matches!(…))` now.
 
 ### Plugin events
 
