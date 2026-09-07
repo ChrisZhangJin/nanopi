@@ -171,7 +171,7 @@ write. Do not upgrade a mark without reading the assertions.
 | Race | Required result | |
 |---|---|---|
 | steer arrives mid-iteration | pumped at the next iteration top and pushed into context | ✅ |
-| — and persisted to the session | `append_entry` alongside the context push | ⬜ |
+| — and persisted to the session | `append_entry` alongside the context push | ✅ `steer_message_injected_as_user_turn` |
 | steer arrives during a turn that ends without tool calls | demoted to a follow-up, which auto-starts the next turn — never dropped | ✅ `b90b27f` |
 | steer arrives after the receiver is dropped | `steer_or_queue` echoes `[queued]` and queues it in the TUI | ✅ |
 | steer arrives during cancellation | `drain_steer_to_follow_ups` keeps it as a follow-up | ✅ |
@@ -182,11 +182,12 @@ write. Do not upgrade a mark without reading the assertions.
 | — refused (guard, cap, or no sink) | in-band `error: …` naming the reason; nothing routed, nothing echoed, nothing disclosed | ✅ |
 | a plugin traps after spending part of its session cap | the guard state is process-wide and survives the rebuild — trapping is not a way to reset the cap | ✅ |
 
-The persistence half is unpinned: `steer_message_injected_as_user_turn`
-asserts the message reaches `ctx.messages` and stops there. The
-`append_entry` beside it could be deleted and every test would still
-pass — the failure would surface only on `--continue`, as a resumed
-session missing a turn the user typed.
+The persistence half is now pinned, and was worse than this table
+recorded: `steer_message_injected_as_user_turn` did not assert
+`ctx.messages` either — it asserted only the returned `final_text`. Both
+halves are asserted now, and deleting the `append_entry` reds it with
+`left: 0, right: 1`. The failure it guards would have surfaced only on
+`--continue`, as a resumed session missing a turn the user typed.
 
 The third and fourth rows cover a **dropped receiver**; the second
 covers a **live receiver nobody returns to**. Conflating them is what
@@ -202,7 +203,7 @@ hid `b90b27f`: two of the three exits called
 | a hook blocks | the tool does not run; the model is told it was policy; subscribers still receive the event | ✅ |
 | a WASM plugin traps | reported as a failed call; the plugin stays callable afterwards | ✅ |
 | user cancels mid-tool | the turn aborts; a directive-only marker enters context, and does NOT embed partial text | ✅ |
-| — and that marker is persisted | `append_entry` beside the context push | ⬜ |
+| — and that marker is persisted | `append_entry` beside the context push | ✅ `run_turn_cancel_drops_stream_and_marks_context_aborted` |
 | a plugin's tool call fires an event back into the calling plugin | the delivery is dropped by `try_lock` and counted; the call proceeds | ✅ `a_busy_plugin_drops_the_event_and_counts_it` |
 | a plugin's tool call | no `SessionEntry`, no `AgentEvent` — the transcript is the conversation with the model | ✅ `a_plugin_initiated_call_leaves_the_session_file_byte_unchanged`, `a_plugin_origin_call_emits_no_agent_event` |
 | a plugin's tool call outruns its 30s deadline | reported as a failed call; the `tool_execution_start`/`end` pair stays balanced | ✅ `a_timed_out_call_still_fires_tool_execution_end` |

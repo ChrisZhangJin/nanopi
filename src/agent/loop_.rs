@@ -3873,6 +3873,34 @@ mod tests {
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
+
+        // The marker must also be PERSISTED — the half that was
+        // unpinned (`docs/claims-and-races.md` tool-execution table).
+        // The assertions above read `agent.context`, so the
+        // `append_entry` one statement away could be deleted and this
+        // test stayed green. It matters more here than for an ordinary
+        // message: on `--continue` a transcript without the marker
+        // replays as an assistant turn that simply stops mid-answer,
+        // so the resumed model has no way to know it was aborted and
+        // does the exact thing the marker exists to prevent — continue
+        // the dead answer instead of reading the new question.
+        let persisted = std::fs::read_to_string(&agent.session_path).unwrap();
+        let markers = persisted
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .filter(|v| {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("aborted by the user"))
+            })
+            .count();
+        assert_eq!(
+            markers, 1,
+            "the abort marker must be persisted exactly once; session file was:\n{persisted}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5356,6 +5384,45 @@ mod tests {
 
         let final_text = agent.run_turn("go", &tx, None, Some(steer_rx)).await.expect("turn");
         assert_eq!(final_text, "firstdone");
+
+        // The steer must land in the context the model sees...
+        assert!(
+            agent.context.messages.iter().any(|m| match m {
+                crate::agent::context::ContextMessage::User { content } =>
+                    content.iter().any(|b| matches!(
+                        b,
+                        crate::agent::context::ContentBlock::Text { text }
+                            if text.contains("hi steer")
+                    )),
+                _ => false,
+            }),
+            "the steer must be pushed into the context as a user message"
+        );
+
+        // ...AND be persisted, which is the half that was unpinned
+        // (`docs/claims-and-races.md` steering table). The two are one
+        // statement apart in the pump, and only the first was asserted:
+        // the `append_entry` could be deleted and this test stayed
+        // green. The failure would surface only on `--continue`, as a
+        // resumed session missing a turn the user typed — the worst
+        // place to find it, because the transcript is the only record
+        // that the user said it at all.
+        let persisted = std::fs::read_to_string(&session_path).unwrap();
+        let steer_entries = persisted
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter(|v| {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("hi steer"))
+            })
+            .count();
+        assert_eq!(
+            steer_entries, 1,
+            "the steer must be persisted exactly once; session file was:\n{persisted}"
+        );
 
         // Drain channel.
         drop(tx);
