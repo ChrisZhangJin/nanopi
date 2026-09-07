@@ -570,6 +570,7 @@ fn expand_path(p: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(expanded)
 }
 
+pub mod generation;
 pub mod host;
 pub mod loader;
 pub mod notify;

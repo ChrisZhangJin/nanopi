@@ -1309,7 +1309,15 @@ impl PluginEngine {
             None => (Vec::new(), Vec::new(), None),
         };
 
+        // Claimed here, published at the very bottom of this function.
+        // The gap is deliberate: everything between can still fail, and
+        // a failed load must leave the PREVIOUS instance live so the
+        // reload path can keep it (see `generation::activate`).
+        let instance_id = crate::wasm::generation::next_id();
+        let activate_as = plugin_name.clone();
         let bridge: Arc<dyn WasmExecuteBridge> = Arc::new(ComponentBridge {
+            plugin_name: plugin_name.clone(),
+            instance_id,
             specs: specs.clone(),
             command_specs,
             budget_ticks: self.budget_ticks,
@@ -1345,6 +1353,12 @@ impl PluginEngine {
                 handle_event,
             }),
         });
+        // LAST, after every fallible step above. This is the line that
+        // makes the new instance the live one and the previous one
+        // stale, so a load that returned `Err` earlier has, by
+        // construction, changed nothing about which bridge answers
+        // calls.
+        crate::wasm::generation::activate(&activate_as, instance_id);
         Ok((bridge, specs))
     }
 }
@@ -1483,6 +1497,15 @@ struct BridgeInner {
 }
 
 struct ComponentBridge {
+    /// Who this bridge belongs to, and WHICH instance of them it is.
+    ///
+    /// Duplicated from `rebuild` on purpose: every entry path below
+    /// consults them before taking the lock, and reaching through
+    /// `rebuild` — the trap-recovery ingredients — to answer "am I still
+    /// the live instance" would read as if the two were related. See
+    /// `crate::wasm::generation`.
+    plugin_name: Arc<str>,
+    instance_id: u64,
     specs: Vec<ToolSpec>,
     /// Fixed at load. Never re-read — see `PluginRebuild::build`.
     command_specs: Vec<crate::command::CommandSpec>,
@@ -1613,6 +1636,51 @@ impl PluginRebuild {
 }
 
 impl ComponentBridge {
+    /// `None` while this bridge is the live instance of its plugin;
+    /// `Some(refusal)` once `/reload` has replaced it.
+    ///
+    /// The refusal is a plain string because every caller turns it into
+    /// the in-band `error: …` the house rule requires (invariant 3):
+    /// `execute_tool`'s `Err` becomes `plugin error: …` with
+    /// `is_error = true`, and the command path renders it the same way.
+    /// Refusing rather than executing is the point — a stale bridge
+    /// still WORKS, and that is precisely the failure: it would run the
+    /// replaced instance and let the result be read as the new
+    /// plugin's.
+    fn staleness(&self) -> Option<String> {
+        if crate::wasm::generation::is_live(&self.plugin_name, self.instance_id) {
+            return None;
+        }
+        Some(format!(
+            "plugin {:?} was replaced by /reload — this call was refused rather \
+             than run against the instance it was loaded from. Call it again to \
+             reach the reloaded plugin.",
+            &*self.plugin_name
+        ))
+    }
+
+    /// The same refusal for a call that had already ENTERED the guest
+    /// when the reload landed.
+    ///
+    /// Separate wording because the honest thing to say is different: it
+    /// ran. The result is discarded — attributing it to the plugin now
+    /// loaded would be the silent lie this whole mechanism exists to
+    /// prevent — but any side effects it had (a written file, an HTTP
+    /// request, a store key) already happened, and the user has to be
+    /// told that rather than left to assume nothing did.
+    fn staleness_after_running(&self) -> Option<String> {
+        if crate::wasm::generation::is_live(&self.plugin_name, self.instance_id) {
+            return None;
+        }
+        Some(format!(
+            "plugin {:?} was replaced by /reload WHILE this call was running. The \
+             result is discarded rather than reported as the reloaded plugin's, \
+             but any side effects the call already had stand. Call it again to \
+             reach the reloaded plugin.",
+            &*self.plugin_name
+        ))
+    }
+
     /// Swap in a fresh store + instance after a trap, so the next call
     /// starts clean. On failure the old, unusable instance is left in
     /// place — the next call then reports the original trap style of
@@ -1627,6 +1695,14 @@ impl ComponentBridge {
 
 impl WasmExecuteBridge for ComponentBridge {
     fn execute_tool(&self, name: &str, args_json: &str) -> Result<ToolOutput, String> {
+        // BEFORE the export check and before the lock. A replaced
+        // instance has no business answering questions about its tool
+        // list either — its answer describes code that is gone — and
+        // checking first means a reload never has to wait behind a
+        // stale bridge's mutex.
+        if let Some(refusal) = self.staleness() {
+            return Err(refusal);
+        }
         if !self.specs.iter().any(|s| s.name == name) {
             return Err(format!("plugin does not export tool {name:?}"));
         }
@@ -1672,6 +1748,18 @@ impl WasmExecuteBridge for ComponentBridge {
             }
         };
 
+        // Checked AGAIN, now that the guest call is over. The first
+        // check cannot cover a reload that lands mid-call: this bridge
+        // holds the lock for the whole guest call, so the swap happened
+        // while we were inside. Without this the pre-check would only
+        // narrow the window rather than close it, and the surviving case
+        // is the worst-looking one — a `[reloaded]` line on screen and,
+        // immediately after it, a successful result from the code that
+        // line said was replaced.
+        if let Some(refusal) = self.staleness_after_running() {
+            return Err(refusal);
+        }
+
         let wire: WireToolOutput = serde_json::from_str(&out_json).map_err(|e| {
             format!("execute-tool returned invalid JSON: {e} (got {out_json:?})")
         })?;
@@ -1692,6 +1780,10 @@ impl WasmExecuteBridge for ComponentBridge {
         name: &str,
         args: &str,
     ) -> Result<crate::command::CommandAction, String> {
+        // Same first, and for the same reason as `execute_tool`.
+        if let Some(refusal) = self.staleness() {
+            return Err(refusal);
+        }
         // Checked against `command_specs`, never `specs`: the two are
         // separate namespaces, and merging them would let a command
         // name reach `execute-tool` or the reverse.
@@ -1727,6 +1819,15 @@ impl WasmExecuteBridge for ComponentBridge {
             }
         };
 
+        // And again after the call, closing the mid-call window — see
+        // `execute_tool`. A command is more likely to hit this than a
+        // tool call is: `/reload` and a plugin command are both typed
+        // at the same prompt, and a slow command is exactly when a user
+        // reaches for another key.
+        if let Some(refusal) = self.staleness_after_running() {
+            return Err(refusal);
+        }
+
         let wire: WireCommandAction = serde_json::from_str(&out_json).map_err(|e| {
             format!("execute-command returned invalid JSON: {e} (got {out_json:?})")
         })?;
@@ -1759,6 +1860,16 @@ impl WasmExecuteBridge for ComponentBridge {
     }
 
     fn handle_event(&self, event: &str, payload_json: &str) {
+        // A replaced instance is not delivered to. Silently, unlike the
+        // tool and command paths: delivery is observe-only (§3) and has
+        // no caller waiting on a result, so there is nobody to refuse
+        // to — and NOT counted in `dropped_events`, which means "the
+        // plugin was busy" and is read as a tuning signal. The live
+        // instance's own subscriber entry is what receives this event;
+        // the reload replaced the subscriber table too.
+        if self.staleness().is_some() {
+            return;
+        }
         if !self.event_subscriptions.iter().any(|e| e == event) {
             return;
         }
