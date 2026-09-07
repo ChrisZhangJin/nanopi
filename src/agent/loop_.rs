@@ -2358,7 +2358,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_delivers_every_event_it_can_reach() {
         use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
 
         #[derive(Default)]
@@ -4102,7 +4102,6 @@ mod tests {
     /// text+tool_call assistant turn round-trips through load_session as
     /// one Assistant message holding both blocks, followed by the Tool
     /// result and the next assistant text.
-    #[test]
     /// The unresumable-session bug.
     ///
     /// A `tool_call` is persisted before the tool runs, so losing the
