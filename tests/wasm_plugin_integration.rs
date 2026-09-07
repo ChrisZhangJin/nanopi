@@ -1334,3 +1334,85 @@ fn a_retired_plugin_has_no_live_instance_left() {
         .expect_err("a retired plugin must not still be callable");
     assert!(err.contains("/reload"), "{err}");
 }
+
+/// Host-side plugin state that a reload must NOT reset: the plugin's
+/// spent session budget.
+///
+/// Lives in THIS binary, not beside the other reload tests in
+/// `agent::build`, and the reason is a race rather than tidiness:
+/// `plugin_send`'s state is process-wide and its own unit tests
+/// serialize on a private lock that is NOT `crate::test_lock()`, so a
+/// new lib test touching that state would race them. A separate test
+/// process has the state to itself.
+///
+/// The claim being pinned is the trap argument one step sharper: the cap
+/// exists so a plugin cannot spend the user's money in a loop, and a
+/// reload that refunded it would make the cap resettable by the very
+/// plugin that could ask the model to suggest a reload.
+#[test]
+fn a_reload_does_not_refund_a_plugins_spent_session_budget() {
+    use nanopi::agent::build::{AgentBuildInputs, SkillLoadPolicy};
+    use nanopi::agent::loop_::{Agent, HooksConfig};
+    use nanopi::agent::permission::{PermissionGate, TrustLevel};
+    use nanopi::agent::prompt_override::PromptOverrides;
+    use nanopi::config::ExtensionConfig;
+    use nanopi::provider::openai::OpenAiProvider;
+    use nanopi::tool::ToolRegistry;
+
+    let dir = std::env::temp_dir().join(format!("nanopi-reload-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let plugin = dir.join("reload-budget.wasm");
+    std::fs::copy(fixture(), &plugin).unwrap();
+    let ext = || ExtensionConfig {
+        path: plugin.clone(),
+        allow_send_message: true,
+        ..Default::default()
+    };
+
+    let mut agent = Agent::build_fresh(AgentBuildInputs {
+        cwd: dir.clone(),
+        registry: ToolRegistry::standard(),
+        provider: Box::new(OpenAiProvider::new("", "", "")),
+        session_path: dir.join("session.jsonl"),
+        session_id: "test".into(),
+        permission: PermissionGate::new(false, TrustLevel::Distrusted),
+        hooks: HooksConfig::default(),
+        model: "m".into(),
+        base_url: "http://localhost".into(),
+        api_key: String::new(),
+        skill_load: SkillLoadPolicy {
+            no_discovery: true,
+            ..Default::default()
+        },
+        no_context_files: true,
+        prompt_overrides: PromptOverrides::default(),
+        initial_follow_up: None,
+        tool_exec_mode: Default::default(),
+        tool_exec_overrides: Default::default(),
+        extensions: vec![ext()],
+    })
+    .0;
+
+    nanopi::plugin_send::install(nanopi::plugin_send::Sink { steer_tx: None });
+    let cap = nanopi::plugin_send::MAX_PLUGIN_TURNS_PER_SESSION;
+    for i in 0..cap {
+        nanopi::plugin_send::send("reload-budget", "hi")
+            .unwrap_or_else(|e| panic!("send {i} of {cap} should be within the cap: {e}"));
+        nanopi::plugin_send::take_pending();
+        // In THIS order: rule 2 refuses a plugin sending during a turn
+        // its own message started, and `take_pending` stages exactly
+        // that origin for `reset_turn` to promote — so it has to be
+        // cleared before the promotion, not after.
+        nanopi::plugin_send::mark_turn_origin(None);
+        nanopi::plugin_send::reset_turn();
+    }
+    let spent = nanopi::plugin_send::send("reload-budget", "hi")
+        .expect_err("the cap must be reached");
+
+    let report = agent.reload_extensions(&[ext()]);
+    assert_eq!(report.replaced, vec!["reload-budget".to_string()]);
+
+    let after = nanopi::plugin_send::send("reload-budget", "hi")
+        .expect_err("a reload must not refund the cap");
+    assert_eq!(after, spent, "the same refusal, before and after the reload");
+}
