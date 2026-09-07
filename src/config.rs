@@ -642,33 +642,6 @@ mod tests {
         );
     }
 
-    /// Test guard: point NANOPI_HOME at an empty temp dir so tests
-    /// don't pick up the real ~/.nanopi/config.toml. Restore on drop.
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _dir: TempDir,
-    }
-    impl HomeGuard {
-        fn new() -> Self {
-            let dir = TempDir::new();
-            let prev = std::env::var_os("NANOPI_HOME");
-            std::env::set_var("NANOPI_HOME", dir.path());
-            Self { prev, _dir: dir }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(p) => std::env::set_var("NANOPI_HOME", p),
-                None => std::env::remove_var("NANOPI_HOME"),
-            }
-        }
-    }
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_lock()
-    }
-
     #[test]
     fn builtin_defaults() {
         let c = Config::builtin_defaults();
@@ -678,8 +651,7 @@ mod tests {
 
     #[test]
     fn missing_files_use_defaults() {
-        let _g = lock();
-        let _h = HomeGuard::new();
+        let _h = crate::TempNanopiHome::new();
         let tmp = TempDir::new();
         let c = load_config(tmp.path()).unwrap();
         assert_eq!(c.model, None);
@@ -687,8 +659,7 @@ mod tests {
 
     #[test]
     fn project_overrides_global() {
-        let _g = lock();
-        let _h = HomeGuard::new();
+        let _h = crate::TempNanopiHome::new();
         let tmp = TempDir::new();
         tmp.write(
             ".nanopi/config.toml",
@@ -704,8 +675,7 @@ base_url = "https://project.example/v1"
 
     #[test]
     fn invalid_toml_is_error() {
-        let _g = lock();
-        let _h = HomeGuard::new();
+        let _h = crate::TempNanopiHome::new();
         let tmp = TempDir::new();
         tmp.write(".nanopi/config.toml", "this is not valid toml = === =");
         let r = load_config(tmp.path());
@@ -716,8 +686,7 @@ base_url = "https://project.example/v1"
     /// the retired key and its replacement.
     #[test]
     fn retired_hook_key_is_a_hard_error_naming_the_replacement() {
-        let _g = lock();
-        let _h = HomeGuard::new();
+        let _h = crate::TempNanopiHome::new();
         let tmp = TempDir::new();
         tmp.write(
             ".nanopi/config.toml",
@@ -743,8 +712,7 @@ command = "echo hi"
     /// hard error — it just isn't rewritten by the retired-key table.
     #[test]
     fn misspelled_hook_key_is_still_an_error() {
-        let _g = lock();
-        let _h = HomeGuard::new();
+        let _h = crate::TempNanopiHome::new();
         let tmp = TempDir::new();
         tmp.write(
             ".nanopi/config.toml",
@@ -803,8 +771,7 @@ command = "echo hi"
 
     #[test]
     fn config_loads_inline_api_key_and_hooks() {
-        let _g = lock();
-        let _h = HomeGuard::new();
+        let _h = crate::TempNanopiHome::new();
         let tmp = TempDir::new();
         tmp.write(
             ".nanopi/config.toml",

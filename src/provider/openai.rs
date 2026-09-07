@@ -1001,11 +1001,8 @@ mod tests {
         use crate::tool::ToolRegistry;
         use crate::util::{time, uuid};
 
-        let _g = crate::test_lock();
-        let prev_home = std::env::var_os("NANOPI_HOME");
-        let home = std::env::temp_dir().join(format!("nanopi-resume-tools-{}", uuid::v7()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = std::env::temp_dir().join(format!("nanopi-resume-cwd-{}", uuid::v7()));
         std::fs::create_dir_all(&cwd).unwrap();
@@ -1090,11 +1087,6 @@ mod tests {
                 .is_some());
         }
 
-        if let Some(p) = prev_home {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }

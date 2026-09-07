@@ -4366,26 +4366,15 @@ mod tests {
 
     // ─────── v0.6: --continue / active_session ───────
 
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_lock()
-    }
-
     /// No active session registered for this cwd → returns None.
     #[test]
     fn active_session_returns_none_when_no_history() {
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let got = crate::session::active_session(&cwd);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
         assert!(got.is_none(), "expected None, got {got:?}");
@@ -4395,10 +4384,8 @@ mod tests {
     /// that session's path.
     #[test]
     fn active_session_returns_path_after_use() {
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let (path, _header) = crate::session::new_session(&cwd, "m", "http://x").expect("new");
@@ -4407,11 +4394,6 @@ mod tests {
         let got = crate::session::active_session(&cwd).expect("some");
         assert_eq!(got, path);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -4422,10 +4404,8 @@ mod tests {
     /// into a single summary user message on load. Tail is preserved.
     #[test]
     fn load_session_replays_compaction() {
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = tmp();
 
         let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
@@ -4488,11 +4468,6 @@ mod tests {
             _ => panic!("expected trailing user"),
         }
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -4765,10 +4740,8 @@ mod tests {
     #[test]
     fn load_session_replays_tool_calls() {
         use crate::agent::context::{AssistantBlock, ContextMessage};
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = tmp();
 
         let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
@@ -4908,11 +4881,6 @@ mod tests {
             m => panic!("expected Assistant with lone ToolCall, got {m:?}"),
         }
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }

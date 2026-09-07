@@ -536,10 +536,8 @@ mod tests {
     /// clean and the test doesn't pick up the developer's real ~/.nanopi.
     #[test]
     fn compose_injects_cwd_context_file() {
-        let _g = crate::test_lock();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmpdir("cwd");
         std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES HERE").unwrap();
@@ -559,11 +557,6 @@ mod tests {
         assert!(!bare.contains("<project_context>"));
         assert!(!bare.contains("PROJECT RULES HERE"));
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -585,10 +578,8 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::test_lock();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmpdir("cwd");
         let (path, _hdr) =
@@ -621,11 +612,6 @@ mod tests {
             "hydrate_resumed must repopulate ctx.tools from the registry"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -646,10 +632,8 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::test_lock();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmpdir("cwd");
         let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
@@ -695,11 +679,6 @@ mod tests {
         cmds.sort();
         assert_eq!(cmds, vec!["explain", "todo"]);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -719,18 +698,11 @@ mod tests {
     /// restoring the previous value afterward. Mirrors the pattern used
     /// throughout this module's existing tests.
     fn with_empty_global_home<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _g = crate::test_lock();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let result = f(&home);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         result
     }
@@ -1052,11 +1024,9 @@ mod tests {
     /// once both branches have converged.
     #[test]
     fn a_custom_system_prompt_keeps_its_tail_with_a_contribution_active() {
-        let _g = crate::test_lock();
+        let _h = crate::TempNanopiHome::new();
         crate::plugin_context::clear_all();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let home = _h.path().to_path_buf();
         let cwd = tmpdir("customprompt");
         std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES HERE").unwrap();
 
@@ -1092,11 +1062,6 @@ mod tests {
         );
 
         crate::plugin_context::clear_all();
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -1110,11 +1075,9 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::test_lock();
+        let _h = crate::TempNanopiHome::new();
         crate::plugin_context::clear_all();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let home = _h.path().to_path_buf();
         let cwd = tmpdir("hydratebase");
 
         let hydrate = |agent: &mut Agent| {
@@ -1152,11 +1115,6 @@ mod tests {
             "an existing base must not be recomposed over"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
