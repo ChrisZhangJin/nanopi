@@ -239,6 +239,50 @@ world extension {
     /// or per call, so re-declaring the same text is silent.
     import host-set-context: func(text: string) -> string;
 
+    /// Run one of nanopi's BUILT-IN tools and get its result
+    /// (`docs/plugin-capabilities.md` §2.5).
+    ///
+    /// `name` is a built-in tool name (`bash`, `edit`, `find`, `grep`,
+    /// `ls`, `read`, `write`) and `args-json` is that tool's ordinary
+    /// JSON argument object.
+    ///
+    /// GATED PER TOOL, on `allow_tools` in this plugin's
+    /// `[[extensions]]` entry. Absent or `[]` refuses everything: the
+    /// grant is per tool rather than per plugin because
+    /// `host-call-tool("bash", …)` is arbitrary execution, which walks
+    /// straight past `allow_fs`'s cwd confinement and
+    /// `url_allowlist`'s per-host approval. `allow_tools =
+    /// ["find","read"]` says "may walk and read, may not write or
+    /// exec", which no per-plugin flag can express. A name in
+    /// `allow_tools` that is not a built-in is a LOAD ERROR, not a
+    /// silent no-op.
+    ///
+    /// BUILT-IN TOOLS ONLY. A target supplied by another extension is
+    /// refused, naming the extension. Two plugins each granted the
+    /// other's tool would deadlock — the tool path takes a blocking
+    /// lock on purpose, because the caller wants the result — so the
+    /// cycle is removed by construction rather than detected.
+    ///
+    /// RETURNS the tool result as JSON when a tool actually ran:
+    /// `{"content": "...", "is_error": false}`. A call that did NOT
+    /// run comes back as a bare `error: …` string instead, because a
+    /// refusal is not a tool result. Image attachments are dropped —
+    /// there is no channel here for them.
+    ///
+    /// BOUNDED at 30 seconds. Past that the call returns
+    /// `error: tool call exceeded the 30s plugin deadline`; note that a
+    /// process the tool spawned may outlive it.
+    ///
+    /// The user's `tool_execution_start` / `tool_execution_end` hooks
+    /// fire on these calls exactly as they do on the model's, and a
+    /// hook block returns `error: blocked by hook: <reason>` with the
+    /// tool not run. A plugin does not outrank the user's policy.
+    ///
+    /// The call writes NOTHING to the session transcript and emits no
+    /// agent event — the transcript is the conversation with the model.
+    /// The user is told about it by a one-line host disclosure instead.
+    import host-call-tool: func(name: string, args-json: string) -> string;
+
     /// Return the tools this plugin provides, as a JSON array:
     ///
     ///   [

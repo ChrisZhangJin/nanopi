@@ -66,6 +66,15 @@ pub struct PluginState {
     /// be set in BOTH places `PluginState` is built — see
     /// `PluginRebuild::build`.
     allow_context: bool,
+    /// Built-in tool names this plugin may invoke through
+    /// `host-call-tool`. Empty denies every tool.
+    ///
+    /// A `Vec`, not a flag, because the grant is per tool: see
+    /// `ExtensionConfig::allow_tools`. Like `allow_context` it carries
+    /// no handle — the dispatch is process-wide — so this list IS the
+    /// capability, and it must be set in BOTH places `PluginState` is
+    /// built. See `PluginRebuild::build`.
+    allow_tools: Vec<String>,
     /// This plugin's keyed store. Held behind an `Arc` so it can be
     /// shared with `PluginRebuild` and therefore SURVIVE a trap —
     /// `ComponentBridge::reset` throws away the store's `Store` and
@@ -171,6 +180,103 @@ const CONTEXT_DENIED: &str = "error: context contribution denied (set \
 ///
 /// A REFUSED call discloses nothing, because nothing changed, and
 /// announcing a change that did not happen would be a false claim.
+/// `host-call-tool`, minus wasmtime. Returns §2.5's string: the JSON
+/// frame when a tool ran, a bare `error: …` when it did not.
+///
+/// A free function beside `store_set_gated` / `set_context_gated`, for
+/// the same test-seam reason: the gate is callable with no wasmtime, no
+/// runtime, and no installed dispatch.
+///
+/// THE ORDER OF THESE CHECKS IS LOAD-BEARING, and it matches
+/// `host-http-get`'s (capability switch first, target validity after):
+///
+/// 1. `allow_tools` does not name the tool → refuse, naming the grant.
+///    FIRST, so a plugin author is told the grant is missing rather
+///    than being handed a "not a built-in" complaint about a tool that
+///    was never going to run either way.
+/// 2. the target does not resolve → `error: unknown tool "x"`.
+/// 3. the target is another extension's tool → refuse, naming the
+///    extension. ONE MATCH ARM, and the real reason is a deadlock, not
+///    tidiness: `ComponentBridge::execute_tool` takes a BLOCKING
+///    `self.inner.lock()`, unlike `handle_event`'s `try_lock`. Two
+///    plugins each granted the other's tool would hang — A's guest call
+///    holds A's lock and invokes B's tool, B's guest invokes A's tool,
+///    and A's `execute_tool` waits on the lock A's own in-flight call
+///    is holding. `try_lock` guards EVENT delivery but not the tool
+///    path, which is supposed to wait, because the caller wants the
+///    result. Built-ins-only removes the cycle by construction. Do NOT
+///    add cycle detection and do NOT touch either lock.
+/// 4. only now the call itself.
+/// 5. and ON A RESULT (never on a refusal) the host discloses it.
+///
+/// THE DISCLOSURE IS HERE, IN ONE PLACE, so a refusal cannot reach it:
+/// a plugin acting with nothing on screen is the repudiation threat
+/// `docs/claims-and-races.md` exists for. It goes through
+/// `notify::disclose`, which has its own per-turn budget, for stage 2's
+/// reason — a disclosure an adversary can suppress by flooding
+/// `host-notify` is not a disclosure. `MAX_NOTIFY_PER_TURN` is NOT
+/// widened.
+///
+/// The line names the plugin and the tool and says whether it errored;
+/// it does NOT carry the tool's OUTPUT. An unbounded body in the user's
+/// scrollback is a different failure, and `read` on a large file would
+/// be exactly that.
+fn call_tool_gated(
+    allow_tools: &[String],
+    plugin_name: &str,
+    registry_source: impl Fn(&str) -> Option<crate::tool::ToolSource>,
+    name: &str,
+    args_json: &str,
+) -> String {
+    if !allow_tools.iter().any(|t| t == name) {
+        return format!(
+            "error: tool {name:?} is not in this plugin's allow_tools ({}) \
+             — add it to allow_tools on this plugin's [[extensions]] entry",
+            if allow_tools.is_empty() {
+                "empty, so every tool is denied".to_string()
+            } else {
+                allow_tools.join(", ")
+            }
+        );
+    }
+    // Resolved through the INSTALLED DISPATCH's registry rather than a
+    // second registry handle: one source of truth for "what is a tool
+    // right now", and that registry is the one the model sees.
+    // Checked BEFORE resolution, not after: `registry_source` reads the
+    // installed dispatch, so with none installed every name resolves to
+    // `None` and the author would be told their tool does not exist
+    // when what actually happened is that tool calls are not available
+    // yet. Two different problems must not share one message.
+    if !crate::plugin_tools::is_installed() {
+        return crate::plugin_tools::call_blocking(plugin_name, name, args_json);
+    }
+    match registry_source(name) {
+        None => format!("error: unknown tool {name:?}"),
+        Some(crate::tool::ToolSource::Plugin { name: owner, .. }) => format!(
+            "error: tool {name:?} is supplied by extension {owner:?} — \
+             host-call-tool reaches built-in tools only"
+        ),
+        Some(crate::tool::ToolSource::Builtin) => {
+            let out = crate::plugin_tools::call_blocking(plugin_name, name, args_json);
+            // A refusal is not a call. `call_blocking` returns the bare
+            // `error: ` form for anything that did not run, and the
+            // JSON frame for anything that did — including a tool that
+            // ran and failed, which DID happen and is disclosed.
+            if !out.starts_with("error: ") {
+                let errored = out.contains("\"is_error\":true");
+                crate::wasm::notify::disclose(
+                    plugin_name,
+                    &format!(
+                        "called the {name:?} tool{}",
+                        if errored { " — it failed" } else { "" }
+                    ),
+                );
+            }
+            out
+        }
+    }
+}
+
 fn set_context_gated(allow_context: bool, plugin_name: &str, text: &str) -> String {
     if !allow_context {
         return CONTEXT_DENIED.to_string();
@@ -867,6 +973,30 @@ impl PluginEngine {
                 },
             )
             .map_err(|e| format!("link host-set-context failed: {e}"))?;
+
+        // Host import: `host-call-tool(name, args-json) -> string`.
+        //
+        // Gated per tool on `allow_tools`, inside the free function so
+        // the gate is testable without wasmtime. Linked HERE, in
+        // `build_linker`, which is what makes the post-trap rebuild
+        // inherit it. Nothing traps: every branch returns a string.
+        linker
+            .root()
+            .func_wrap(
+                "host-call-tool",
+                |store: wasmtime::StoreContextMut<'_, PluginState>,
+                 (name, args_json): (String, String)| {
+                    let state = store.data();
+                    Ok((call_tool_gated(
+                        &state.allow_tools,
+                        &state.plugin_name,
+                        crate::plugin_tools::tool_source,
+                        &name,
+                        &args_json,
+                    ),))
+                },
+            )
+            .map_err(|e| format!("link host-call-tool failed: {e}"))?;
         Ok(linker)
     }
 
@@ -885,6 +1015,7 @@ impl PluginEngine {
         allow_network: bool,
         allow_store: bool,
         allow_context: bool,
+        allow_tools: Vec<String>,
         store_root: PathBuf,
         plugin_name: Arc<str>,
         events_granted: Vec<String>,
@@ -914,6 +1045,7 @@ impl PluginEngine {
                 allow_network,
                 allow_store,
                 allow_context,
+                allow_tools: allow_tools.clone(),
                 store: plugin_store.clone(),
                 plugin_name: plugin_name.clone(),
             },
@@ -1104,6 +1236,7 @@ impl PluginEngine {
                 allow_network,
                 allow_store,
                 allow_context,
+                allow_tools,
                 // The SAME `Arc`, not a fresh `PluginStore`. This is
                 // what makes a committed value outlive a trap.
                 store: plugin_store,
@@ -1299,6 +1432,7 @@ struct PluginRebuild {
     allow_network: bool,
     allow_store: bool,
     allow_context: bool,
+    allow_tools: Vec<String>,
     /// Shared with the live `PluginState`, deliberately. Host-side
     /// plugin state must survive a trap; guest memory must not.
     store: Arc<crate::wasm::store::PluginStore>,
@@ -1337,6 +1471,11 @@ impl PluginRebuild {
                 // is the silent post-trap death this comment warns
                 // about.
                 allow_context: self.allow_context,
+                // Same trap: the grant is the whole capability, so a
+                // rebuild that dropped it would leave the plugin
+                // loaded, advertised, and unable to call anything —
+                // the silent post-trap death this comment warns about.
+                allow_tools: self.allow_tools.clone(),
                 store: self.store.clone(),
                 plugin_name: self.plugin_name.clone(),
             },
@@ -1690,6 +1829,7 @@ mod tests {
             allow_network: false,
             allow_store: true,
             allow_context: false,
+            allow_tools: Vec::new(),
             store: store.clone(),
             plugin_name: "memory".into(),
         };
@@ -1742,6 +1882,164 @@ mod tests {
     /// matters — a gate that returned an error while still storing the
     /// value would put a plugin's text in front of the model on a
     /// capability the user never granted.
+    /// A source function standing in for the installed dispatch's
+    /// registry, so the gate is exercised with no wasmtime and no
+    /// runtime.
+    /// The gate short-circuits when no dispatch is installed, so tests
+    /// that exercise the LATER steps must install one.
+    fn install_test_dispatch() {
+        crate::plugin_tools::install(crate::plugin_tools::Dispatch {
+            registry: crate::tool::ToolRegistry::standard(),
+            cwd: std::env::temp_dir(),
+            permission: crate::agent::permission::PermissionGate::from_cli(false, None),
+            hooks: Default::default(),
+            subscribers: Default::default(),
+            session_path: std::env::temp_dir().join("nanopi-gate-nope.jsonl"),
+            session_id: "s".into(),
+        });
+    }
+
+    fn source_of(kind: Option<crate::tool::ToolSource>) -> impl Fn(&str) -> Option<crate::tool::ToolSource> {
+        move |_| kind.clone()
+    }
+
+    /// Step 1 of the gate order, and the reason it is step 1: an author
+    /// with no grant is told the grant is missing.
+    #[test]
+    fn without_the_grant_every_tool_is_refused_naming_allow_tools() {
+        // A dispatch IS installed, so the refusal has to come from the
+        // grant check rather than from the gate short-circuiting on
+        // "no dispatch". Without this the test would still go red if
+        // the gate were removed, but for the wrong reason.
+        install_test_dispatch();
+        for granted in [vec![], vec!["read".to_string()]] {
+            let got = call_tool_gated(
+                &granted,
+                "p",
+                source_of(Some(crate::tool::ToolSource::Builtin)),
+                "bash",
+                "{}",
+            );
+            assert!(
+                got.starts_with("error: ") && got.contains("allow_tools"),
+                "an ungranted tool must be refused in-band, naming the grant \
+                 (granted = {granted:?}): {got}"
+            );
+            assert!(got.contains("bash"), "and naming the tool: {got}");
+        }
+        crate::plugin_tools::uninstall();
+    }
+
+    /// Built-ins only. The refusal names the SUPPLYING extension, which
+    /// is what tells an author the target exists but is out of reach.
+    #[test]
+    fn a_plugin_supplied_target_is_refused_naming_the_extension() {
+        install_test_dispatch();
+        let got = call_tool_gated(
+            &["query".to_string()],
+            "p",
+            source_of(Some(crate::tool::ToolSource::Plugin {
+                name: "other".into(),
+                path: "/tmp/other.wasm".into(),
+            })),
+            "query",
+            "{}",
+        );
+        crate::plugin_tools::uninstall();
+        assert!(got.starts_with("error: "), "{got}");
+        assert!(
+            got.contains("other"),
+            "the refusal must name the supplying extension: {got}"
+        );
+        assert!(
+            got.contains("built-in tools only"),
+            "and say what the rule is: {got}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_granted_name_is_an_unknown_tool() {
+        install_test_dispatch();
+        let got = call_tool_gated(&["ghost".to_string()], "p", source_of(None), "ghost", "{}");
+        crate::plugin_tools::uninstall();
+        assert_eq!(got, "error: unknown tool \"ghost\"", "{got}");
+    }
+
+    /// A granted call that actually RUNS is disclosed exactly once,
+    /// and a refused one discloses nothing — it did not happen.
+    #[test]
+    fn a_call_that_ran_is_disclosed_and_a_refused_one_is_not() {
+        let _l = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("nanopi-gate-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "hi\n").unwrap();
+        let session_path = dir.join("session.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        crate::wasm::notify::install_sink();
+        crate::wasm::notify::reset_turn();
+        let _ = crate::wasm::notify::drain();
+        crate::plugin_tools::install(crate::plugin_tools::Dispatch {
+            registry: crate::tool::ToolRegistry::standard(),
+            cwd: dir.clone(),
+            permission: crate::agent::permission::PermissionGate::from_cli(false, None),
+            hooks: Default::default(),
+            subscribers: Default::default(),
+            session_path,
+            session_id: "s".into(),
+        });
+
+        // Refused first: nothing may be disclosed.
+        let refused = call_tool_gated(
+            &[],
+            "p",
+            crate::plugin_tools::tool_source,
+            "read",
+            r#"{"path":"f.txt"}"#,
+        );
+        assert!(refused.starts_with("error: "), "{refused}");
+        let after_refusal = crate::wasm::notify::drain();
+        assert!(
+            after_refusal.is_empty(),
+            "a refused call discloses NOTHING — it did not happen: {after_refusal:?}"
+        );
+
+        // Exhaust the plugin's OWN notify quota first. Host disclosure
+        // rides a separate counter on purpose: a plugin that floods
+        // `host-notify` must not thereby buy itself silent tool calls.
+        // Without this the reversion "route the disclosure through the
+        // quota-consuming notify()" stays green, and the separation the
+        // whole design rests on would be untested.
+        for i in 0..crate::wasm::notify::MAX_NOTIFY_PER_TURN {
+            let _ = crate::wasm::notify::notify("p", &format!("flood {i}"));
+        }
+        let _ = crate::wasm::notify::drain();
+
+        // Then a granted one, which must be disclosed exactly once.
+        let ran = call_tool_gated(
+            &["read".to_string()],
+            "p",
+            crate::plugin_tools::tool_source,
+            "read",
+            r#"{"path":"f.txt"}"#,
+        );
+        crate::plugin_tools::uninstall();
+        assert!(ran.contains("\"is_error\":false"), "the call must have run: {ran}");
+        let lines = crate::wasm::notify::drain();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one disclosure per call that ran: {lines:?}"
+        );
+        assert!(lines[0].contains("[p]"), "attributed to the plugin: {lines:?}");
+        assert!(lines[0].contains("read"), "and naming the tool: {lines:?}");
+        assert!(
+            !lines[0].contains("hi"),
+            "but NOT carrying the tool output — an unbounded body in \
+             scrollback is a different failure: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn without_allow_context_the_call_is_refused_and_stores_nothing() {
         let _g = context_guard();
@@ -1873,6 +2171,47 @@ mod tests {
         crate::plugin_context::clear_all();
     }
 
+    /// The recurring failure of stages 1 and 2, third time: a grant
+    /// wired into `PluginEngine::load` but not `PluginRebuild::build`
+    /// works until the plugin's first trap and then silently dies,
+    /// because `reset` replaces the whole `PluginState`.
+    #[test]
+    fn a_rebuild_after_a_trap_keeps_the_allow_tools_grant() {
+        let engine = PluginEngine::new().expect("engine init");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/example-plugin.component.wasm");
+        let bytes = std::fs::read(&path).expect("committed fixture");
+        let component =
+            Component::from_binary(&engine.engine, &bytes).expect("fixture compiles");
+        let (root, store) = store_fixture("toolmem");
+
+        let rebuild = PluginRebuild {
+            engine: engine.engine.clone(),
+            component,
+            linker: engine.build_linker().expect("linker"),
+            url_allowlist: Vec::new(),
+            cwd: std::env::temp_dir(),
+            allow_fs: false,
+            allow_network: false,
+            allow_store: false,
+            allow_context: false,
+            allow_tools: vec!["read".to_string(), "find".to_string()],
+            store: Arc::new(store),
+            plugin_name: "toolmem".into(),
+        };
+        let inner = rebuild
+            .build(engine.budget_ticks)
+            .expect("rebuild must succeed");
+        assert_eq!(
+            inner.store.data().allow_tools,
+            vec!["read".to_string(), "find".to_string()],
+            "the per-tool grant must be carried across a trap, not silently \
+             dropped — a plugin that keeps its tools listed but loses the \
+             right to call them is the worst of both"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Invariant 14 plus §4's "plugin reset after a trap" row. The
     /// contribution is process-wide so it survives on its own; the
     /// GRANT is the half that would go missing if `PluginRebuild` were
@@ -1901,6 +2240,7 @@ mod tests {
             allow_network: false,
             allow_store: false,
             allow_context: true,
+            allow_tools: Vec::new(),
             store: Arc::new(store),
             plugin_name: "ctxmem".into(),
         };
@@ -2087,7 +2427,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, specs) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), std::env::temp_dir(), "fixture".into(), Vec::new())
             .expect("runaway fixture must still LOAD — only execute-tool spins");
         assert_eq!(specs.len(), 1, "fixture advertises one tool");
 
@@ -2123,7 +2463,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), std::env::temp_dir(), "fixture".into(), Vec::new())
             .expect("example fixture loads");
 
         for i in 0..3 {
@@ -2436,7 +2776,7 @@ mod tests {
             .join("tests/fixtures/example-plugin.component.wasm");
         let engine = PluginEngine::new().expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), std::env::temp_dir(), "fixture".into(), Vec::new())
             .expect("example fixture loads");
 
         let good = r#"{"text":"abc"}"#;
@@ -2469,7 +2809,7 @@ mod tests {
         std::fs::write(&p, b"definitely not a wasm component").unwrap();
         // `unwrap_err()` needs the Ok half to be Debug, and
         // `Arc<dyn WasmExecuteBridge>` isn't — match instead.
-        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new()) {
+        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), std::env::temp_dir(), "fixture".into(), Vec::new()) {
             Ok(_) => panic!("garbage bytes must not compile as a component"),
             Err(e) => assert!(e.contains("compile"), "got {e}"),
         }

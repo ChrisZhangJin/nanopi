@@ -172,10 +172,10 @@ impl Default for ToolExecMode {
 /// the retired hook keys in `settings.rs`. Every `[[extensions]]` key
 /// appearing in `config.toml.example`, both READMEs,
 /// `docs/v0.12-events.md`, `docs/v0.12-manual-test-plan.md` and
-/// `docs/pi-vs-nanopi.md` was surveyed and is a real field; the only
-/// undefined one anywhere is `allow_tools` in
-/// `docs/plugin-capabilities.md` §2.5, which is a stage-3 spec example
-/// that is never loaded.
+/// `docs/pi-vs-nanopi.md` was surveyed and is a real field. (Stage 2's
+/// survey found exactly one undefined key anywhere, `allow_tools` in
+/// `docs/plugin-capabilities.md` §2.5's stage-3 example; stage 3 made it
+/// a real field, so the survey now has no exceptions.)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExtensionConfig {
@@ -227,6 +227,27 @@ pub struct ExtensionConfig {
     /// invisible by nature, since the user never sees the system
     /// prompt.
     pub allow_context: bool,
+    /// Built-in tools this plugin may invoke through `host-call-tool`
+    /// (`docs/plugin-capabilities.md` §2.5). Empty — the default —
+    /// denies every tool.
+    ///
+    /// PER TOOL, not per plugin, and that is the whole point. `bash` is
+    /// arbitrary execution: it walks straight past `allow_fs`'s cwd
+    /// confinement and past `url_allowlist`'s per-host approval, so a
+    /// single `allow_tools = true` would make every other grant on the
+    /// plugin decorative. `allow_tools = ["find", "read"]` expresses
+    /// "may walk and read, may not write or exec", which no per-plugin
+    /// flag can. Listing `bash` warns at plugin load.
+    ///
+    /// Empty denies everything rather than allowing everything, the
+    /// same direction `url_allowlist` and `events` already take.
+    ///
+    /// A name here that is not a built-in (`bash`, `edit`, `find`,
+    /// `grep`, `ls`, `read`, `write`) is a LOAD ERROR for that plugin,
+    /// not a silent no-op — the same rule a retired hook key follows.
+    /// A plugin's own tools are not addressable: `host-call-tool`
+    /// reaches built-in tools only.
+    pub allow_tools: Vec<String>,
     /// Hosts `host-http-get` may reach. Empty denies every URL, so
     /// `allow_network = true` alone reaches nothing. Compared against
     /// the URL's parsed host, never a substring.
@@ -271,6 +292,7 @@ impl Default for ExtensionConfig {
             allow_fs: false,
             allow_store: false,
             allow_context: false,
+            allow_tools: Vec::new(),
             url_allowlist: Vec::new(),
             events: Vec::new(),
         }
@@ -530,6 +552,7 @@ mod tests {
              allow_fs = true\n\
              allow_store = true\n\
              allow_context = true\n\
+             allow_tools = [\"read\"]\n\
              url_allowlist = [\"example.com\"]\n\
              events = [\"input\"]\n",
         )
@@ -537,6 +560,7 @@ mod tests {
         let e = &cfg.extensions[0];
         assert_eq!(e.max_files, 8);
         assert!(e.allow_network && e.allow_fs && e.allow_store && e.allow_context);
+        assert_eq!(e.allow_tools, vec!["read".to_string()]);
         assert_eq!(e.url_allowlist, vec!["example.com".to_string()]);
         assert_eq!(e.events, vec!["input".to_string()]);
     }

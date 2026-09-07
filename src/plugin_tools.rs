@@ -106,6 +106,27 @@ pub fn install(d: Dispatch) {
     *lock() = Some(d);
 }
 
+/// Whether a dispatch is installed at all.
+///
+/// The gate in `loader.rs` asks BEFORE resolving a tool name, because
+/// resolution goes through the dispatch's registry: without this, "no
+/// dispatch yet" and "no such tool" would collapse into one message.
+pub fn is_installed() -> bool {
+    lock().is_some()
+}
+
+/// Resolve a tool name through the INSTALLED dispatch's registry.
+///
+/// One source of truth for "what is a tool right now" — that registry
+/// is the one the model sees, plugin tools included, which is exactly
+/// why a plugin-supplied target is detectable here at all.
+pub fn tool_source(name: &str) -> Option<crate::tool::ToolSource> {
+    lock()
+        .as_ref()
+        .and_then(|d| d.registry.get(name))
+        .map(|t| t.source())
+}
+
 /// Forget the installed dispatch. Test-only today; kept next to
 /// `install` so the pair is visible in one place.
 #[cfg(test)]

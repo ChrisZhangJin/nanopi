@@ -172,6 +172,37 @@ impl PluginHost {
                      and the hosts in its url_allowlist.",
                 ));
             }
+            // `allow_tools` containing `bash` is §3's escalated
+            // combination and the sharpest grant in the whole file:
+            // arbitrary execution walks past `allow_fs`'s cwd
+            // confinement and past `url_allowlist`'s per-host
+            // approval, which makes every other grant on this plugin
+            // decorative. Warned ALONE, unlike the `allow_network`
+            // pairs above, because nothing needs to be paired with it.
+            //
+            // Following the `allow_context`-alone precedent in the
+            // other direction: a plugin with `allow_tools = ["read"]`
+            // and no `bash` does NOT warn, or the warning becomes noise
+            // the user learns to skip past.
+            if cfg.allow_tools.iter().any(|t| t == "bash") {
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    "has `bash` in allow_tools — this plugin can execute                      arbitrary commands, which walks past allow_fs's cwd                      confinement and url_allowlist's per-host approval and                      makes every other grant on it decorative. Grant it only                      if you trust the plugin completely.",
+                ));
+            }
+            // A name in `allow_tools` that is not a built-in is a LOAD
+            // ERROR for this entry, not a silent no-op — the same rule
+            // a retired hook key follows. Checked against
+            // `ToolRegistry::standard()`, the CLOSED built-in set,
+            // which is also why a plugin-supplied name is unknowable
+            // here and has to be refused at call time instead.
+            let builtins = crate::tool::ToolRegistry::standard().names();
+            let unknown: Vec<String> = cfg
+                .allow_tools
+                .iter()
+                .filter(|t| !builtins.iter().any(|b| b == *t))
+                .cloned()
+                .collect();
             let (events_granted, refusal_reports) = crate::agent::hook::parse_event_grants(&cfg.events);
             for report in &refusal_reports {
                 notices.push(crate::render::notice::Notice::warn(
@@ -183,6 +214,21 @@ impl PluginHost {
                 events_granted.into_iter().map(|s| s.to_string()).collect();
             for path in self.resolve_paths(std::slice::from_ref(cfg)) {
                 let plugin_name: std::sync::Arc<str> = plugin_stem(&path);
+                if !unknown.is_empty() {
+                    errors.push((
+                        path.clone(),
+                        format!(
+                            "allow_tools names {} — host-call-tool reaches                              built-in tools only, and the built-ins are: {}.                              A misspelled grant is refused rather than                              silently granting nothing.",
+                            unknown
+                                .iter()
+                                .map(|t| format!("{t:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            builtins.join(", "),
+                        ),
+                    ));
+                    continue;
+                }
                 if let Some(others) = colliding_stems.get(&*plugin_name) {
                     errors.push((
                         path.clone(),
@@ -213,6 +259,7 @@ impl PluginHost {
                     cfg.allow_network,
                     cfg.allow_store,
                     cfg.allow_context,
+                    cfg.allow_tools.clone(),
                     store::PluginStore::default_root(),
                     plugin_name.clone(),
                     events_granted.clone(),
@@ -486,6 +533,7 @@ mod tests {
             allow_fs: false,
             allow_store: false,
             allow_context: false,
+            allow_tools: Vec::new(),
             url_allowlist: Vec::new(),
             events: Vec::new(),
         };
@@ -631,6 +679,89 @@ mod tests {
                 n.level == crate::render::notice::Level::Warn
                     && n.message.contains("allow_context")
             }),
+            "{:?}",
+            summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A misspelled or plugin-supplied name in `allow_tools` is a LOAD
+    /// ERROR, not a silent no-op. The same rule a retired hook key
+    /// follows, and for the same reason: a grant that fails quietly
+    /// leaves the user believing they granted a capability they did
+    /// not.
+    #[test]
+    fn an_unknown_name_in_allow_tools_is_a_load_error_naming_the_builtins() {
+        let root = tmp();
+        let path = root.join("nope.wasm");
+        std::fs::write(&path, "not a component").unwrap();
+        let cfg = ExtensionConfig {
+            path,
+            allow_tools: vec!["nope".to_string()],
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        assert_eq!(summary.loaded, 0);
+        let err = summary
+            .errors
+            .first()
+            .map(|(_, e)| e.clone())
+            .unwrap_or_default();
+        assert!(
+            err.contains("allow_tools") && err.contains("nope"),
+            "the load error must name the grant and the bad name, and must \
+             not read as a compile failure: {err}"
+        );
+        for builtin in ["bash", "edit", "find", "grep", "ls", "read", "write"] {
+            assert!(
+                err.contains(builtin),
+                "and must list the valid built-ins ({builtin} missing): {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `bash` in `allow_tools` is arbitrary execution, so it warns on
+    /// its own — no pairing needed.
+    #[test]
+    fn bash_in_allow_tools_warns() {
+        let root = tmp();
+        let cfg = ExtensionConfig {
+            path: root.join("nope.wasm"),
+            allow_tools: vec!["bash".to_string()],
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        assert!(
+            summary.notices.iter().any(|n| {
+                n.level == crate::render::notice::Level::Warn
+                    && n.message.contains("allow_tools")
+                    && n.message.contains("bash")
+            }),
+            "{:?}",
+            summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And a read-only grant does NOT warn, following the
+    /// `allow_context`-alone precedent: a warning on every
+    /// `allow_tools` becomes noise the user learns to skip past, which
+    /// is what makes the `bash` warning worth reading.
+    #[test]
+    fn a_read_only_allow_tools_does_not_warn() {
+        let root = tmp();
+        let cfg = ExtensionConfig {
+            path: root.join("nope.wasm"),
+            allow_tools: vec!["find".to_string(), "read".to_string()],
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        assert!(
+            !summary
+                .notices
+                .iter()
+                .any(|n| n.level == crate::render::notice::Level::Warn),
             "{:?}",
             summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
         );
