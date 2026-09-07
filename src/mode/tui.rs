@@ -474,6 +474,13 @@ pub async fn run_tui_mode(
     print_startup_banner(model, &header.id, &loaded_skills);
 
     let mut terminal = setup_terminal()?;
+    // From here on there IS a drain loop, so `host-notify` may queue
+    // instead of writing to stderr. Before this point (and in `-p`
+    // mode, which never gets here) it writes through `note!`, because a
+    // line queued for a drain that never runs is a line the user never
+    // sees.
+    #[cfg(feature = "wasm")]
+    crate::wasm::notify::install_sink();
     let mut app = App::new(
         header.id.to_string(),
         model.to_string(),
@@ -1630,6 +1637,26 @@ async fn run_app(
                     } else {
                         app.command_task = Some(task);
                     }
+                }
+                // Plugin `host-notify` lines. Drained here rather than
+                // pushed from the host function because that function
+                // is a synchronous wasmtime closure with no `Term` and
+                // no channel to this loop (see `wasm::notify`).
+                //
+                // `insert_line` — NOT `note!`. `note!` writes raw
+                // stderr into ratatui's managed region and is wiped by
+                // the next redraw (T4.7); a plugin addressing the user
+                // has to survive that, which is the whole distinction
+                // between `host-notify` and `host-log`.
+                #[cfg(feature = "wasm")]
+                for line in crate::wasm::notify::drain() {
+                    // Cyan, distinct from assistant text (green) and
+                    // from tool cards, so an attributed plugin line is
+                    // not mistaken for the model's own words.
+                    insert_line(term, Line::from(vec![Span::styled(
+                        line,
+                        Style::default().fg(Color::Cyan),
+                    )]))?;
                 }
                 // Redraw only when there's a live counter to update.
                 if app.turn_started_at.is_some()
@@ -3008,6 +3035,12 @@ async fn handle_action(
             *turn_task = Some(task);
             app.status = Status::Streaming;
             app.turn_started_at = Some(std::time::Instant::now());
+            // Re-arm each plugin's per-turn notify allowance. Done from
+            // the TUI's own turn-start path on purpose: the agent loop
+            // is off limits, and this is where the TUI already knows a
+            // turn is beginning.
+            #[cfg(feature = "wasm")]
+            crate::wasm::notify::reset_turn();
         }
         KeyAction::SteerTurn(msg) => {
             steer_or_queue(term, steer_tx.as_ref(), follow_up, msg).await?;

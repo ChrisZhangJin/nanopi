@@ -55,7 +55,68 @@ pub struct PluginState {
     allow_fs: bool,
     /// Whether `host-http-get` is permitted at all for this plugin.
     allow_network: bool,
+    /// Whether `host-store-get` / `host-store-set` are permitted at
+    /// all for this plugin.
+    allow_store: bool,
+    /// This plugin's keyed store. Held behind an `Arc` so it can be
+    /// shared with `PluginRebuild` and therefore SURVIVE a trap —
+    /// `ComponentBridge::reset` throws away the store's `Store` and
+    /// every byte of guest memory, and a store that went with it would
+    /// defeat the whole point of persistence being host-side
+    /// (`plugin-capabilities.md` invariant 14).
+    ///
+    /// Present even when `allow_store` is false: the gate is the flag,
+    /// not the absence of the handle, so there is exactly one place to
+    /// get the gate wrong.
+    store: Arc<crate::wasm::store::PluginStore>,
+    /// The `.wasm` file stem, computed once by `load_all`. Both the
+    /// store's directory name and the `host-notify` attribution come
+    /// from it — never from anything the guest supplied, which is what
+    /// makes impersonation unavailable rather than merely discouraged.
+    plugin_name: Arc<str>,
 }
+
+/// `host-store-get`, minus wasmtime. This free function is the test
+/// seam: the `func_wrap` closure below is three lines of plumbing over
+/// it, and closure bodies are not directly callable from a test.
+fn store_get_gated(
+    allow_store: bool,
+    store: &crate::wasm::store::PluginStore,
+    key: &str,
+) -> String {
+    if !allow_store {
+        return STORE_DENIED.to_string();
+    }
+    store.get(key)
+}
+
+/// `host-store-set`, minus wasmtime. Returns the WIT-level string:
+/// `""` for success, `error: …` for any refusal.
+///
+/// The `error: ` prefix is added HERE, exactly once. `PluginStore::set`
+/// returns a bare message body for the same reason `resolve_readable`
+/// does — so the prefix has one owner and `error: error: …` is not
+/// reachable.
+fn store_set_gated(
+    allow_store: bool,
+    store: &crate::wasm::store::PluginStore,
+    key: &str,
+    value: &str,
+) -> String {
+    if !allow_store {
+        return STORE_DENIED.to_string();
+    }
+    match store.set(key, value) {
+        Ok(()) => String::new(),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// The refusal both store imports return without the grant. Names the
+/// grant and where to set it, matching `host-fs-read`'s wording — a
+/// plugin author who sees only "denied" has nothing to act on.
+const STORE_DENIED: &str = "error: store access denied (set allow_store = true \
+                            on this plugin's [[extensions]] entry)";
 
 /// Resolve a plugin-supplied path, refusing anything outside `cwd`.
 ///
@@ -523,32 +584,24 @@ impl PluginEngine {
         });
     }
 
-    /// Read a `.wasm` file, compile it, link host imports, instantiate,
-    /// and query its exported `list-tools`.
+    /// Build the linker with every host import wired.
     ///
-    /// Returns the bridge (for later `execute-tool` calls) plus the tool
-    /// specs the plugin advertises. Callers register those specs into
-    /// `ToolRegistry` so the LLM sees them alongside built-in tools.
-    pub fn load(
-        &self,
-        wasm_path: &Path,
-        url_allowlist: Vec<String>,
-        cwd: PathBuf,
-        allow_fs: bool,
-        allow_network: bool,
-        events_granted: Vec<String>,
-    ) -> Result<(Arc<dyn WasmExecuteBridge>, Vec<ToolSpec>), String> {
-        let bytes = std::fs::read(wasm_path)
-            .map_err(|e| format!("read {} failed: {e}", wasm_path.display()))?;
-        // `{:#}` not `{}`: wasmtime returns an anyhow chain whose outer
-        // message is often just "WebAssembly translation error", with
-        // the actual cause one level down. Plain `{}` throws that away
-        // and leaves the user with nothing to act on.
-        let component = Component::from_binary(&self.engine, &bytes)
-            .map_err(|e| format!("compile {} failed: {e:#}", wasm_path.display()))?;
-
+    /// Split out of `load` so the trap-recovery path
+    /// (`PluginRebuild::build`) and the tests can get an identically
+    /// linked linker. A linker missing an import the component
+    /// references fails at `instantiate` with "import `x` has the wrong
+    /// type", which is an unhelpful way to discover that two code paths
+    /// drifted apart.
+    ///
+    /// Imports are linked UNCONDITIONALLY, gates and all. A capability
+    /// is refused by the gate flag inside the closure, never by
+    /// declining to link the function: an unlinked import is an
+    /// instantiate-time failure for any guest that references it, which
+    /// would turn "you did not grant this" into "your plugin is
+    /// broken". The in-band `error: ` string is the whole convention
+    /// (`plugin-capabilities.md` invariant 3).
+    fn build_linker(&self) -> Result<Linker<PluginState>, String> {
         let mut linker: Linker<PluginState> = Linker::new(&self.engine);
-        // Host import: `host-log(level: u8, message: string)`.
         // Always available — logging is not a capability that needs
         // gating. Levels mirror the WIT doc: 0 trace .. 3 error.
         linker
@@ -649,6 +702,103 @@ impl PluginEngine {
             )
             .map_err(|e| format!("link host-http-get failed: {e}"))?;
 
+        // Host imports: `host-store-get` / `host-store-set`.
+        //
+        // Gate order matches `host-http-get`: the capability switch
+        // first, inside the free functions, so a plugin author is told
+        // the grant is missing rather than being handed a quota
+        // message about a store that was never going to be written.
+        linker
+            .root()
+            .func_wrap(
+                "host-store-get",
+                |store: wasmtime::StoreContextMut<'_, PluginState>,
+                 (key,): (String,)| {
+                    let state = store.data();
+                    Ok((store_get_gated(state.allow_store, &state.store, &key),))
+                },
+            )
+            .map_err(|e| format!("link host-store-get failed: {e}"))?;
+        linker
+            .root()
+            .func_wrap(
+                "host-store-set",
+                |store: wasmtime::StoreContextMut<'_, PluginState>,
+                 (key, value): (String, String)| {
+                    let state = store.data();
+                    Ok((store_set_gated(
+                        state.allow_store,
+                        &state.store,
+                        &key,
+                        &value,
+                    ),))
+                },
+            )
+            .map_err(|e| format!("link host-store-set failed: {e}"))?;
+
+        // Host import: `host-notify(text: string) -> string`.
+        //
+        // No gate — output, not access (invariant 4 exempts this and
+        // `host-log`). The bound is the rate limit inside
+        // `notify::notify`, and the attribution comes from
+        // `state.plugin_name`, never from `text`.
+        linker
+            .root()
+            .func_wrap(
+                "host-notify",
+                |store: wasmtime::StoreContextMut<'_, PluginState>,
+                 (text,): (String,)| {
+                    let state = store.data();
+                    // A suppressed or truncated line reports as an
+                    // error. Returning `""` there would tell the plugin
+                    // it addressed the user when it did not, which is
+                    // invariant 9 exactly.
+                    Ok((
+                        match crate::wasm::notify::notify(&state.plugin_name, &text) {
+                            Ok(()) => String::new(),
+                            Err(e) => format!("error: {e}"),
+                        },
+                    ))
+                },
+            )
+            .map_err(|e| format!("link host-notify failed: {e}"))?;
+        Ok(linker)
+    }
+
+    /// Read a `.wasm` file, compile it, link host imports, instantiate,
+    /// and query its exported `list-tools`.
+    ///
+    /// Returns the bridge (for later `execute-tool` calls) plus the tool
+    /// specs the plugin advertises. Callers register those specs into
+    /// `ToolRegistry` so the LLM sees them alongside built-in tools.
+    pub fn load(
+        &self,
+        wasm_path: &Path,
+        url_allowlist: Vec<String>,
+        cwd: PathBuf,
+        allow_fs: bool,
+        allow_network: bool,
+        allow_store: bool,
+        store_root: PathBuf,
+        plugin_name: Arc<str>,
+        events_granted: Vec<String>,
+    ) -> Result<(Arc<dyn WasmExecuteBridge>, Vec<ToolSpec>), String> {
+        // Built here rather than in `load_all` so the `Arc` that
+        // `PluginState` and `PluginRebuild` share has one origin.
+        let plugin_store: Arc<crate::wasm::store::PluginStore> = Arc::new(
+            crate::wasm::store::PluginStore::new(store_root, &plugin_name),
+        );
+        let bytes = std::fs::read(wasm_path)
+            .map_err(|e| format!("read {} failed: {e}", wasm_path.display()))?;
+        // `{:#}` not `{}`: wasmtime returns an anyhow chain whose outer
+        // message is often just "WebAssembly translation error", with
+        // the actual cause one level down. Plain `{}` throws that away
+        // and leaves the user with nothing to act on.
+        let component = Component::from_binary(&self.engine, &bytes)
+            .map_err(|e| format!("compile {} failed: {e:#}", wasm_path.display()))?;
+
+        let linker = self.build_linker()?;
+
         let mut store = Store::new(
             &self.engine,
             PluginState {
@@ -656,6 +806,9 @@ impl PluginEngine {
                 cwd: cwd.clone(),
                 allow_fs,
                 allow_network,
+                allow_store,
+                store: plugin_store.clone(),
+                plugin_name: plugin_name.clone(),
             },
         );
         // Armed before `instantiate`, not after. A component built as a
@@ -842,6 +995,11 @@ impl PluginEngine {
                 cwd,
                 allow_fs,
                 allow_network,
+                allow_store,
+                // The SAME `Arc`, not a fresh `PluginStore`. This is
+                // what makes a committed value outlive a trap.
+                store: plugin_store,
+                plugin_name,
             },
             // The Store is not Sync, and a component instance is
             // single-threaded by construction. nanopi runs tool calls
@@ -924,7 +1082,11 @@ const MAX_COMMANDS_PER_PLUGIN: usize = 64;
 const MAX_COMMAND_DESCRIPTION: usize = 1024;
 /// Cap on a single action payload. A plugin returning 10 MB of `print`
 /// would otherwise be rendered into scrollback a line at a time.
-const MAX_ACTION_PAYLOAD: usize = 64 * 1024;
+///
+/// `pub` because `host-notify` writes to the same scrollback and so has
+/// the same ceiling — shared rather than a second `64 * 1024` that can
+/// drift from this one.
+pub const MAX_ACTION_PAYLOAD: usize = 64 * 1024;
 
 fn parse_command_specs(json: &str) -> Result<Vec<crate::command::CommandSpec>, String> {
     let wire: Vec<WireCommandSpec> = serde_json::from_str(json)
@@ -1027,6 +1189,11 @@ struct PluginRebuild {
     cwd: PathBuf,
     allow_fs: bool,
     allow_network: bool,
+    allow_store: bool,
+    /// Shared with the live `PluginState`, deliberately. Host-side
+    /// plugin state must survive a trap; guest memory must not.
+    store: Arc<crate::wasm::store::PluginStore>,
+    plugin_name: Arc<str>,
 }
 
 impl PluginRebuild {
@@ -1047,6 +1214,15 @@ impl PluginRebuild {
                 cwd: self.cwd.clone(),
                 allow_fs: self.allow_fs,
                 allow_network: self.allow_network,
+                // EVERY gate has to be repeated here. Setting one in
+                // `PluginEngine::load` and forgetting it here is the
+                // failure mode the `execute_command` comment below
+                // already warns about: the capability works until the
+                // plugin's first trap and then silently dies, because
+                // `reset` replaces the whole `PluginState`.
+                allow_store: self.allow_store,
+                store: self.store.clone(),
+                plugin_name: self.plugin_name.clone(),
             },
         );
         store.set_epoch_deadline(budget_ticks);
@@ -1287,6 +1463,141 @@ impl WasmExecuteBridge for ComponentBridge {
 mod tests {
     use super::*;
 
+    fn store_fixture(stem: &str) -> (PathBuf, crate::wasm::store::PluginStore) {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "nanopi-gate-test-{}-{}",
+            std::process::id(),
+            crate::util::uuid::v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        (
+            root.clone(),
+            crate::wasm::store::PluginStore::new(root, stem),
+        )
+    }
+
+    #[test]
+    fn store_imports_are_refused_without_the_grant() {
+        let (root, store) = store_fixture("memory");
+
+        let got = store_get_gated(false, &store, "k");
+        assert!(got.starts_with("error: "), "in-band, never a trap: {got:?}");
+        assert!(
+            got.contains("allow_store"),
+            "must name the grant so an author can act: {got:?}"
+        );
+        assert!(
+            got.contains("[[extensions]]"),
+            "must say where to set it: {got:?}"
+        );
+
+        let got = store_set_gated(false, &store, "k", "v");
+        assert!(got.starts_with("error: "), "{got:?}");
+        assert!(got.contains("allow_store"), "{got:?}");
+
+        // The refusal is complete: nothing on disk at all, so a denied
+        // plugin has not even had a directory created for it.
+        assert!(
+            !store.file().exists(),
+            "a denied set must not create the store file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn store_imports_work_with_the_grant() {
+        let (root, store) = store_fixture("memory");
+        assert_eq!(
+            store_get_gated(true, &store, "absent"),
+            "",
+            "absent reads as the empty string, not an error"
+        );
+        assert_eq!(
+            store_set_gated(true, &store, "k", "v"),
+            "",
+            "success is the empty string, per the WIT contract"
+        );
+        assert_eq!(store_get_gated(true, &store, "k"), "v");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `error: ` prefix has exactly one owner. `PluginStore::set`
+    /// returns a bare body; this layer adds the prefix.
+    #[test]
+    fn a_store_refusal_is_prefixed_exactly_once() {
+        let (root, store) = store_fixture("memory");
+        let huge = "x".repeat(crate::wasm::store::MAX_STORE_BYTES + 1);
+        let got = store_set_gated(true, &store, "big", &huge);
+        assert_eq!(
+            got, "error: store quota exceeded (1 MiB)",
+            "one prefix, and the spec's literal message"
+        );
+        assert!(!got.contains("error: error: "), "{got:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `PluginState` is built in TWO places, and a trap replaces the
+    /// whole thing via `ComponentBridge::reset` → `PluginRebuild::build`.
+    /// Wire a gate into `PluginEngine::load` and forget it here and the
+    /// capability works right up until the plugin's first trap, then
+    /// dies silently — which is the failure mode the `execute_command`
+    /// comment in `build` already warns about for commands.
+    ///
+    /// So this drives `build` directly and asserts the rebuilt state
+    /// carries the grant AND the same store, with a value committed
+    /// before the rebuild still readable after it (invariant 14: a
+    /// guest trap loses guest memory, never host-side plugin state).
+    #[test]
+    fn a_rebuild_after_a_trap_keeps_the_store_and_its_grant() {
+        let engine = PluginEngine::new().expect("engine init");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/example-plugin.component.wasm");
+        let bytes = std::fs::read(&path).expect("committed fixture");
+        let component =
+            Component::from_binary(&engine.engine, &bytes).expect("fixture compiles");
+
+        let (root, store) = store_fixture("memory");
+        let store = Arc::new(store);
+        // Committed BEFORE the rebuild, host-side.
+        store.set("survives", "yes").expect("set");
+
+        let rebuild = PluginRebuild {
+            engine: engine.engine.clone(),
+            component,
+            // The real linker, not a bare one — `build` instantiates,
+            // and an unlinked import fails there.
+            linker: engine.build_linker().expect("linker"),
+            url_allowlist: Vec::new(),
+            cwd: std::env::temp_dir(),
+            allow_fs: false,
+            allow_network: false,
+            allow_store: true,
+            store: store.clone(),
+            plugin_name: "memory".into(),
+        };
+        let inner = rebuild
+            .build(engine.budget_ticks)
+            .expect("rebuild must succeed");
+        let state = inner.store.data();
+        assert!(
+            state.allow_store,
+            "the grant must be carried across a trap, not silently dropped"
+        );
+        assert_eq!(
+            state.store.get("survives"),
+            "yes",
+            "the SAME store must come through the rebuild — a fresh one here \
+             would lose every committed value on the first trap"
+        );
+        assert_eq!(
+            &*state.plugin_name, "memory",
+            "and the notify attribution must survive too — dropping it here \
+             would silently re-attribute every line after the first trap"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn parse_event_requests_reads_json_array() {
         let requested = parse_event_requests(r#"["turn_start", "input"]"#).expect("valid");
@@ -1453,7 +1764,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, specs) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new())
             .expect("runaway fixture must still LOAD — only execute-tool spins");
         assert_eq!(specs.len(), 1, "fixture advertises one tool");
 
@@ -1489,7 +1800,7 @@ mod tests {
         )
         .expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new())
             .expect("example fixture loads");
 
         for i in 0..3 {
@@ -1802,7 +2113,7 @@ mod tests {
             .join("tests/fixtures/example-plugin.component.wasm");
         let engine = PluginEngine::new().expect("engine init");
         let (bridge, _) = engine
-            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, Vec::new())
+            .load(&fixture, Vec::new(), std::env::temp_dir(), false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new())
             .expect("example fixture loads");
 
         let good = r#"{"text":"abc"}"#;
@@ -1835,7 +2146,7 @@ mod tests {
         std::fs::write(&p, b"definitely not a wasm component").unwrap();
         // `unwrap_err()` needs the Ok half to be Debug, and
         // `Arc<dyn WasmExecuteBridge>` isn't — match instead.
-        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, Vec::new()) {
+        match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, std::env::temp_dir(), "fixture".into(), Vec::new()) {
             Ok(_) => panic!("garbage bytes must not compile as a component"),
             Err(e) => assert!(e.contains("compile"), "got {e}"),
         }

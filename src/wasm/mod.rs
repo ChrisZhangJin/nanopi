@@ -96,6 +96,26 @@ impl PluginHost {
             }
         };
 
+        // Store identity is the `.wasm` file stem, so two plugins with
+        // the same stem would share one `store.json` — one plugin
+        // silently reading and overwriting another's keys, which is
+        // exactly the cross-plugin disclosure the per-stem directory
+        // exists to prevent. Decided as a HARD LOAD ERROR for BOTH
+        // claimants, not "the later one loses": that is the precedent
+        // the command-name collision already set (`NEITHER registers`,
+        // see `wit/nanopi-extension.wit`), and it is the safe
+        // direction — with "later loses", which plugin gets the store
+        // depends on config order, so a user reordering their config
+        // would silently hand one plugin's memory to another.
+        //
+        // Computed across ALL configs before the per-path loop,
+        // because a collision is not visible while looking at one
+        // plugin: it needs every claimant at once, same as commands.
+        // Stems only collide destructively when at least one claimant
+        // actually has `allow_store` — two stem-sharing plugins with
+        // the grant off touch no store at all and load normally.
+        let colliding_stems = colliding_store_stems(self, configs);
+
         for cfg in configs {
             // Say it once per entry, before the paths expand — a
             // directory entry would otherwise repeat the warning per
@@ -122,6 +142,19 @@ impl PluginHost {
                      trust the plugin.",
                 ));
             }
+            // And again for `allow_store` + `allow_network`
+            // (`docs/plugin-capabilities.md` §3): a durable profile of
+            // the user that can leave the machine. Same placement,
+            // before the paths expand, for the same reason.
+            if cfg.allow_store && cfg.allow_network {
+                notices.push(crate::render::notice::Notice::warn(
+                    cfg.path.display().to_string(),
+                    "has both `allow_store` and `allow_network = true` — this \
+                     plugin can build a durable profile across restarts AND \
+                     reach the network, so anything it accumulates can leave \
+                     the machine. Grant both only if you trust the plugin.",
+                ));
+            }
             let (events_granted, refusal_reports) = crate::agent::hook::parse_event_grants(&cfg.events);
             for report in &refusal_reports {
                 notices.push(crate::render::notice::Notice::warn(
@@ -132,22 +165,63 @@ impl PluginHost {
             let events_granted: Vec<String> =
                 events_granted.into_iter().map(|s| s.to_string()).collect();
             for path in self.resolve_paths(std::slice::from_ref(cfg)) {
+                let plugin_name: std::sync::Arc<str> = plugin_stem(&path);
+                if let Some(others) = colliding_stems.get(&*plugin_name) {
+                    errors.push((
+                        path.clone(),
+                        format!(
+                            "file stem {:?} is claimed by more than one extension \
+                             ({}), and at least one of them sets \
+                             `allow_store` — they would share the single store \
+                             at {}. Refusing ALL of them rather than letting one \
+                             read and overwrite another's keys; rename one of \
+                             the `.wasm` files.",
+                            &*plugin_name,
+                            others.join(", "),
+                            store::PluginStore::new(
+                                store::PluginStore::default_root(),
+                                &plugin_name
+                            )
+                            .file()
+                            .display(),
+                        ),
+                    ));
+                    continue;
+                }
                 match engine.load(
                     &path,
                     cfg.url_allowlist.clone(),
                     cwd.to_path_buf(),
                     cfg.allow_fs,
                     cfg.allow_network,
+                    cfg.allow_store,
+                    store::PluginStore::default_root(),
+                    plugin_name.clone(),
                     events_granted.clone(),
                 ) {
                     Ok((bridge, specs)) => {
-                        let plugin_name: std::sync::Arc<str> = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("wasm-plugin")
-                            .into();
                         let plugin_path: std::sync::Arc<str> =
                             path.display().to_string().into();
+                        // The grant has to be visible SOMEWHERE at
+                        // startup. `/tools` is the natural home for it
+                        // (`plugin-capabilities.md` §3) but carries no
+                        // per-plugin grant data yet, so until that pipe
+                        // exists this notice is what keeps the grant
+                        // from being silent.
+                        if cfg.allow_store {
+                            notices.push(crate::render::notice::Notice::info(
+                                path.display().to_string(),
+                                format!(
+                                    "allow_store — keyed store at {}",
+                                    store::PluginStore::new(
+                                        store::PluginStore::default_root(),
+                                        &plugin_name
+                                    )
+                                    .file()
+                                    .display()
+                                ),
+                            ));
+                        }
                         for spec in specs {
                             tools.push(std::sync::Arc::new(host::WasmTool::new(
                                 spec,
@@ -283,6 +357,43 @@ impl Default for PluginHost {
     }
 }
 
+/// The plugin's identity: its `.wasm` file stem. One helper so the
+/// store directory name, the `host-notify` attribution, and the
+/// collision check cannot drift apart.
+fn plugin_stem(path: &Path) -> std::sync::Arc<str> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wasm-plugin")
+        .into()
+}
+
+/// Stems claimed by more than one resolved `.wasm` path where at least
+/// one claimant has `allow_store`, mapped to every path claiming them.
+///
+/// Returns an empty map in the ordinary case, so the per-path loop pays
+/// one hash lookup for a check that almost never fires.
+fn colliding_store_stems(
+    host: &PluginHost,
+    configs: &[ExtensionConfig],
+) -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::HashMap;
+    // stem -> (paths claiming it, whether any claimant grants the store)
+    let mut claims: HashMap<String, (Vec<String>, bool)> = HashMap::new();
+    for cfg in configs {
+        for path in host.resolve_paths(std::slice::from_ref(cfg)) {
+            let stem = plugin_stem(&path).to_string();
+            let entry = claims.entry(stem).or_insert_with(|| (Vec::new(), false));
+            entry.0.push(path.display().to_string());
+            entry.1 |= cfg.allow_store;
+        }
+    }
+    claims
+        .into_iter()
+        .filter(|(_, (paths, granted))| paths.len() > 1 && *granted)
+        .map(|(stem, (paths, _))| (stem, paths))
+        .collect()
+}
+
 /// Expand `~/` and `$HOME/` prefixes in a path. Same convention as
 /// `agent::hook::expand_command` — duplicate the few lines rather
 /// than couple two subsystems.
@@ -311,11 +422,14 @@ fn expand_path(p: &Path) -> std::path::PathBuf {
 
 pub mod host;
 pub mod loader;
+pub mod notify;
+pub mod store;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn tmp() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -352,6 +466,7 @@ mod tests {
             max_files: 64,
             allow_network: false,
             allow_fs: false,
+            allow_store: false,
             url_allowlist: Vec::new(),
             events: Vec::new(),
         };
@@ -363,6 +478,115 @@ mod tests {
             assert_eq!(p.parent(), Some(dir.as_path()));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `[[extensions]]` entries in different directories whose
+    /// `.wasm` files share a file stem. The bytes are not real
+    /// components — that is deliberate: the collision must be refused
+    /// BEFORE anything is compiled, so a load error naming the
+    /// collision (not a compile error) is the assertion.
+    fn same_stem_configs(allow_store_a: bool, allow_store_b: bool) -> (PathBuf, Vec<ExtensionConfig>) {
+        let root = tmp();
+        let mut cfgs = Vec::new();
+        for (sub, grant) in [("a", allow_store_a), ("b", allow_store_b)] {
+            let dir = root.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut f = std::fs::File::create(dir.join("mem.wasm")).unwrap();
+            writeln!(f, "not a component").unwrap();
+            cfgs.push(ExtensionConfig {
+                path: dir.join("mem.wasm"),
+                allow_store: grant,
+                ..Default::default()
+            });
+        }
+        (root, cfgs)
+    }
+
+    #[test]
+    fn same_stem_with_allow_store_is_a_load_error_for_both() {
+        let (root, cfgs) = same_stem_configs(true, false);
+        let summary = PluginHost::new().load_all(&cfgs, &root);
+        assert_eq!(
+            summary.errors.len(),
+            2,
+            "the command-name precedent is NEITHER registers, so both are \
+             refused — not just the later one: {:?}",
+            summary.errors
+        );
+        for (path, err) in &summary.errors {
+            assert!(
+                err.contains("file stem") && err.contains("allow_store"),
+                "the error must name the collision and the grant, not read as \
+                 a compile failure — {}: {err}",
+                path.display()
+            );
+            assert!(
+                err.contains("store.json"),
+                "and must point at the store they would have shared: {err}"
+            );
+        }
+        assert_eq!(summary.loaded, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_stem_without_allow_store_is_not_a_collision() {
+        let (root, cfgs) = same_stem_configs(false, false);
+        let summary = PluginHost::new().load_all(&cfgs, &root);
+        // Both still fail — they are not real components — but for
+        // COMPILING, not for colliding. Two stem-sharing plugins that
+        // touch no store have nothing to collide over.
+        for (_, err) in &summary.errors {
+            assert!(
+                !err.contains("file stem"),
+                "no store, no collision: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn allow_store_plus_allow_network_warns() {
+        let root = tmp();
+        let cfg = ExtensionConfig {
+            path: root.join("nope.wasm"),
+            allow_store: true,
+            allow_network: true,
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        let warned = summary.notices.iter().any(|n| {
+            n.level == crate::render::notice::Level::Warn
+                && n.message.contains("allow_store")
+                && n.message.contains("allow_network")
+        });
+        assert!(
+            warned,
+            "the escalated warning must name BOTH grants: {:?}",
+            summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn allow_store_alone_does_not_warn() {
+        let root = tmp();
+        let cfg = ExtensionConfig {
+            path: root.join("nope.wasm"),
+            allow_store: true,
+            ..Default::default()
+        };
+        let summary = PluginHost::new().load_all(&[cfg], &root);
+        assert!(
+            !summary
+                .notices
+                .iter()
+                .any(|n| n.level == crate::render::notice::Level::Warn),
+            "a durable store that cannot reach the network is not the \
+             escalated combination: {:?}",
+            summary.notices.iter().map(|n| &n.message).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
