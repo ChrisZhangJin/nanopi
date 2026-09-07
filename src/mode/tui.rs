@@ -3738,36 +3738,46 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
     }
 }
 
-/// `/reload` handler: re-reads `config.toml`, `settings.toml`, and
-/// re-discovers skills, then updates the live Agent in place. Mirrors
-/// PI's `session.reload()` (`agent-session.ts:2602`) minus the
-/// extension system and provider swap — mid-session provider swaps
-/// stay behind `/model` to avoid accidentally dropping an in-flight
-/// streaming connection.
+/// `/reload` handler: re-reads `config.toml`, `settings.toml`,
+/// re-discovers skills, and — since v0.12 — stands `[[extensions]]`
+/// back up from disk, then updates the live Agent in place. Mirrors
+/// PI's `session.reload()` (`agent-session.ts:2602`) minus the provider
+/// swap — mid-session provider swaps stay behind `/model` to avoid
+/// accidentally dropping an in-flight streaming connection.
 ///
 /// What it touches: `agent.skills`, `agent.hooks`, `agent.
 /// system_base` (rebuilt via `compose_system_prompt` so newly
 /// installed skills appear in `<available_skills>`, then re-derived
-/// into `context.system`). It rebuilds the BASE only: an active plugin
-/// context contribution SURVIVES a reload, which is consistent with
-/// `[[extensions]]` not being reloaded below — a contribution is not a
-/// skill, and dropping it here would silently disable a loaded
-/// plugin's capability with no way to get it back short of a restart.
-/// What it does NOT touch:
-/// `agent.provider`, `agent.model`, `agent.base_url`, `agent.api_key`,
-/// session state, or messages.
+/// into `context.system`), and everything
+/// `Agent::reload_extensions` owns — the plugin half of the registry,
+/// the plugin command palette, the event subscriber table, and the
+/// grant rows. It rebuilds the system BASE only: an active plugin
+/// context contribution SURVIVES a reload for a plugin that is still
+/// loaded and still holds `allow_context`. A contribution is not a
+/// skill, and dropping one from under a working plugin would silently
+/// disable its capability with no way back short of a restart.
+/// `reload_extensions` DOES drop the contribution of a plugin that
+/// vanished from the config or that came back without the grant, and
+/// names it in the report line — see the decision list on that method.
 ///
-/// `[[extensions]]` is deliberately NOT reloaded, and the report line
-/// says so rather than leaving the user to guess. Reloading is blocked,
-/// not merely skipped: `ToolRegistry` has no unregister, so a second
-/// `load_extensions` would hit `register_external`'s collision refusal
-/// for every tool and print a wall of spurious warnings; the
-/// `Arc<dyn Tool>` clones already handed out would keep the previous
-/// `ComponentBridge` alive, leaking a wasmtime `Store` and its epoch
-/// ticker thread per reload; and re-instantiating while a turn holds
-/// the bridge mutex hangs. Real hot-reload needs an unregister path
-/// plus a generation counter on the bridge — its own feature. Use
-/// `/new` or restart.
+/// What it does NOT touch: `agent.provider`, `agent.model`,
+/// `agent.base_url`, `agent.api_key`, session state, or messages. Nor
+/// any host-side plugin state: a plugin's `host-store` file, its
+/// `plugin_send` loop guard, and its spent session budget all survive,
+/// deliberately — see `Agent::reload_extensions`.
+///
+/// The three prerequisites the previous version of this comment named
+/// as missing are in place, which is what made the extension half
+/// possible: `ToolRegistry::unregister_plugin` (so a reload can remove
+/// as well as add, and re-registering the same names does not hit
+/// `register_external`'s collision refusal), `crate::wasm::generation`
+/// (so an `Arc<dyn Tool>` clone already handed out cannot keep calling
+/// the instance that was replaced — it refuses in-band instead), and
+/// load-before-unregister ordering (so nothing waits on the bridge
+/// mutex a turn may be holding: the reload never takes it). The
+/// wasmtime `Store` and its epoch ticker are not leaked per reload
+/// either — the ticker holds a `Weak<Engine>` and exits when the last
+/// bridge `Arc` drops.
 async fn handle_reload(
     term: &mut Term,
     app: &mut App,
@@ -3777,13 +3787,20 @@ async fn handle_reload(
 
     // ── 1. config.toml (only skills.disabled is applied live; model /
     //       base_url / api_key changes need /model or restart) ──
-    let config_note: Option<String> = match crate::config::load_config(&app.cwd) {
-        Ok(cfg) => {
-            app.skill_load.disabled = cfg.skills.disabled.clone();
-            None
-        }
-        Err(e) => Some(format!("config.toml: {e}")),
-    };
+    // `extensions` is `None`, not an empty vec, when the config failed
+    // to parse. The distinction is the whole point: an empty vec means
+    // "the user configured no extensions", which would UNLOAD every
+    // running plugin. A config that failed to parse says nothing about
+    // what the user wants loaded, and acting on it would turn a typo in
+    // `[skills]` into the silent removal of every plugin.
+    let (extensions, config_note): (Option<Vec<crate::config::ExtensionConfig>>, Option<String>) =
+        match crate::config::load_config(&app.cwd) {
+            Ok(cfg) => {
+                app.skill_load.disabled = cfg.skills.disabled.clone();
+                (Some(cfg.extensions.clone()), None)
+            }
+            Err(e) => (None, Some(format!("config.toml: {e}"))),
+        };
 
     // ── 2. settings.toml → hooks ──
     let (hooks_new, settings_note): (Option<HooksConfig>, Option<String>) =
@@ -3798,12 +3815,21 @@ async fn handle_reload(
     let n_diagnostics = skill_result.diagnostics.len();
 
     // ── 4. apply to the live agent under the async lock ──
+    let mut ext_report: Option<crate::agent::build::ExtensionReloadReport> = None;
     let n_hooks: usize = {
         let mut g = agent.lock().await;
         if let Some(a) = g.as_mut() {
             a.skills = skill_result.skills.clone();
             if let Some(ref h) = hooks_new {
                 a.hooks = h.clone();
+            }
+            // BEFORE `registry.names()` below, the same ordering
+            // constraint both Agent construction paths carry: the
+            // system prompt's tool list has to describe the registry
+            // as it is after the reload, or a plugin tool added by this
+            // very reload would be registered and unmentioned.
+            if let Some(ref exts) = extensions {
+                ext_report = Some(a.reload_extensions(exts));
             }
             let tool_names = a.registry.names();
             // Through `set_system_base`, not a direct assignment to
@@ -3830,14 +3856,35 @@ async fn handle_reload(
         }
     };
     app.skills_cache = skill_result.skills;
+    // The three plugin caches the TUI renders from — see
+    // `refresh_status`, which does the same for every other path. A
+    // reload that swapped the Agent's tables and left these stale would
+    // leave `/tools` and the command palette describing the plugins that
+    // used to be loaded.
+    {
+        let g = agent.lock().await;
+        if let Some(a) = g.as_ref() {
+            app.commands_cache = a.plugin_commands.clone();
+            app.subscriptions_cache = a.event_subscribers.subscriptions();
+            app.plugin_grants_cache = a.plugin_grants.clone();
+        }
+    }
 
     // ── 5. report to scrollback ──
     insert_line(
         term,
         L::from(vec![Span::styled(
             format!(
-                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s) · \
-                 extensions unchanged (use /new or restart){}",
+                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s) · {}{}",
+                match &ext_report {
+                    Some(r) => r.line(),
+                    // Only reachable when config.toml failed to parse,
+                    // which the note below spells out. Saying
+                    // "extensions unchanged" rather than nothing keeps
+                    // the v0.11 habit that made this feature possible:
+                    // the line always states what it did NOT do.
+                    None => "extensions unchanged (config.toml did not parse)".to_string(),
+                },
                 if let Some(e) = &config_note {
                     format!(" · {e}")
                 } else {
@@ -3867,7 +3914,40 @@ async fn handle_reload(
             )]),
         )?;
     }
-    if n_diagnostics == 0 && settings_note.is_none() && config_note.is_none() {
+    // Warnings and errors from the extension load. Rendered HERE, into
+    // scrollback, rather than through `render::notice`: that writes to
+    // stderr, which is correct at startup and lands on top of the TUI
+    // once it owns the screen. `reload_extensions` carries them out for
+    // exactly this reason.
+    for note in ext_report.iter().flat_map(|r| r.notes.iter()) {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                format!("  extension: {note}"),
+                Style::default().fg(Color::Yellow),
+            )]),
+        )?;
+    }
+    // A failed plugin gets its own line, not just a name in the summary
+    // above: the reason it failed is the only thing the user can act
+    // on, and it is what tells them the previous instance is still the
+    // one running.
+    for (name, err) in ext_report.iter().flat_map(|r| r.failed.iter()) {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                format!(
+                    "  extension {name}: failed to reload ({err}) — the \
+                     previously loaded instance is still running"
+                ),
+                Style::default().fg(Color::Red),
+            )]),
+        )?;
+    }
+    let ext_quiet = ext_report
+        .as_ref()
+        .is_none_or(|r| r.notes.is_empty() && r.failed.is_empty());
+    if n_diagnostics == 0 && settings_note.is_none() && config_note.is_none() && ext_quiet {
         insert_line(
             term,
             L::from(vec![Span::styled(
