@@ -101,12 +101,56 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// from a poisoned mutex still leaves the env var wrong.
 #[cfg(test)]
 pub struct TempNanopiHome {
-    // Field order is drop order: env restored, THEN the directory
-    // removed, THEN the lock released. Releasing the lock first would
-    // let a waiting test observe the temp dir mid-teardown.
+    // Field order is drop order: env restored and the directory removed
+    // (both inside `inner`), THEN the lock released. Releasing the lock
+    // first would let a waiting test observe the temp dir mid-teardown.
+    inner: ScopedEnvHome,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+/// The env swap and its restore, WITHOUT the lock.
+///
+/// Split out for exactly one caller: the test that verifies the restore
+/// happens on unwind. That test has to hold [`TEST_LOCK`] across its own
+/// assertion — reading `$NANOPI_HOME` after releasing the lock is racy
+/// by construction, and the first version of the test did precisely
+/// that and failed under `cargo test` without `--test-threads=1`. It
+/// captured a *concurrent* test's scratch path as its baseline. The
+/// mutex is not reentrant, so that test cannot construct a
+/// `TempNanopiHome`; it constructs this instead and supplies the lock
+/// itself.
+///
+/// Production-shaped code should never reach for this — use
+/// [`TempNanopiHome`], which cannot be used without the lock.
+#[cfg(test)]
+pub struct ScopedEnvHome {
     prev: Option<std::ffi::OsString>,
     dir: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ScopedEnvHome {
+    /// Caller MUST already hold [`TEST_LOCK`].
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("create scratch NANOPI_HOME");
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", dir.path());
+        Self { prev, dir }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedEnvHome {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(p) => std::env::set_var("NANOPI_HOME", p),
+            None => std::env::remove_var("NANOPI_HOME"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,12 +159,8 @@ impl TempNanopiHome {
     /// and hold both until the returned guard drops.
     pub fn new() -> Self {
         let guard = test_lock();
-        let dir = tempfile::tempdir().expect("create scratch NANOPI_HOME");
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", dir.path());
         Self {
-            prev,
-            dir,
+            inner: ScopedEnvHome::new(),
             _guard: guard,
         }
     }
@@ -128,17 +168,7 @@ impl TempNanopiHome {
     /// The scratch home itself, for tests that need to plant files in
     /// it or assert on what was written.
     pub fn path(&self) -> &std::path::Path {
-        self.dir.path()
-    }
-}
-
-#[cfg(test)]
-impl Drop for TempNanopiHome {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            Some(p) => std::env::set_var("NANOPI_HOME", p),
-            None => std::env::remove_var("NANOPI_HOME"),
-        }
+        self.inner.path()
     }
 }
 
@@ -184,16 +214,29 @@ mod test_lock_tests {
     /// scratch path still in the environment.
     #[test]
     fn the_scratch_home_is_restored_even_when_the_test_panics() {
+        // The lock is held by THIS test for the whole body, including
+        // the assertion. Reading $NANOPI_HOME after releasing it is
+        // racy by construction: the first version of this test did
+        // that, and under parallel execution it captured a concurrent
+        // test's scratch path as `before` and failed with
+        // `left: None, right: Some("/tmp/.tmp8S6bHd")`. Hence
+        // `ScopedEnvHome`, which does the swap without re-locking a
+        // mutex we already hold.
+        let _g = super::test_lock();
         let before = std::env::var_os("NANOPI_HOME");
 
-        let scratch = std::panic::catch_unwind(|| {
-            let home = super::TempNanopiHome::new();
+        let unwound = std::panic::catch_unwind(|| {
+            let home = super::ScopedEnvHome::new();
             let p = home.path().to_path_buf();
-            // Prove the guard is actually in effect before we unwind.
-            assert_eq!(std::env::var_os("NANOPI_HOME").map(Into::into), Some(p.clone()));
+            // Prove the swap is actually in effect before we unwind,
+            // so a no-op `new()` could not make this test vacuous.
+            assert_eq!(
+                std::env::var_os("NANOPI_HOME").map(std::path::PathBuf::from),
+                Some(p.clone())
+            );
             panic!("a test failing with the scratch home installed: {}", p.display());
         });
-        assert!(scratch.is_err(), "the closure must have panicked");
+        assert!(unwound.is_err(), "the closure must have panicked");
 
         assert_eq!(
             std::env::var_os("NANOPI_HOME"),
