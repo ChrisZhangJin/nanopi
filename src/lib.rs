@@ -75,6 +75,73 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A scratch `$NANOPI_HOME` that is put back when the test ends —
+/// **including when the test ends by panicking**.
+///
+/// Replaces ~127 hand-rolled blocks of the shape
+///
+/// ```ignore
+/// let _g = crate::test_lock();
+/// let prev = std::env::var_os("NANOPI_HOME");
+/// std::env::set_var("NANOPI_HOME", &home);
+/// ...body...
+/// if let Some(p) = prev { std::env::set_var("NANOPI_HOME", p) }
+/// else { std::env::remove_var("NANOPI_HOME") }
+/// ```
+///
+/// which restore correctly on the happy path and **not at all on
+/// unwind** — the restore is the last statement of the body, so a
+/// failing assertion skips it. That is the actual race behind the
+/// flaky suite: the first failure leaves `$NANOPI_HOME` pointing at a
+/// deleted temp dir, and every later test that reads it fails for a
+/// reason that has nothing to do with what it tests.
+///
+/// [`test_lock`] fixed the *reporting* (one failure no longer cascades
+/// into fourteen); this fixes the *leak*. Both are needed: recovering
+/// from a poisoned mutex still leaves the env var wrong.
+#[cfg(test)]
+pub struct TempNanopiHome {
+    // Field order is drop order: env restored, THEN the directory
+    // removed, THEN the lock released. Releasing the lock first would
+    // let a waiting test observe the temp dir mid-teardown.
+    prev: Option<std::ffi::OsString>,
+    dir: tempfile::TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TempNanopiHome {
+    /// Acquire the test lock, point `$NANOPI_HOME` at a fresh temp dir,
+    /// and hold both until the returned guard drops.
+    pub fn new() -> Self {
+        let guard = test_lock();
+        let dir = tempfile::tempdir().expect("create scratch NANOPI_HOME");
+        let prev = std::env::var_os("NANOPI_HOME");
+        std::env::set_var("NANOPI_HOME", dir.path());
+        Self {
+            prev,
+            dir,
+            _guard: guard,
+        }
+    }
+
+    /// The scratch home itself, for tests that need to plant files in
+    /// it or assert on what was written.
+    pub fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempNanopiHome {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(p) => std::env::set_var("NANOPI_HOME", p),
+            None => std::env::remove_var("NANOPI_HOME"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test_lock_tests {
     /// The cascade, reproduced and then shown not to happen.
@@ -105,6 +172,34 @@ mod test_lock_tests {
         // The real assertion: the NEXT acquire still works. Before this
         // change it panicked, and so did every one after it.
         let _g = recover();
+    }
+
+    /// The whole reason `TempNanopiHome` exists rather than another
+    /// copy of the set/restore block: the hand-rolled form puts the
+    /// restore at the END OF THE BODY, so a failing assertion jumps
+    /// over it and leaves `$NANOPI_HOME` pointing at a temp dir that is
+    /// about to be deleted.
+    ///
+    /// Teeth: delete the `Drop` impl and this test fails with the
+    /// scratch path still in the environment.
+    #[test]
+    fn the_scratch_home_is_restored_even_when_the_test_panics() {
+        let before = std::env::var_os("NANOPI_HOME");
+
+        let scratch = std::panic::catch_unwind(|| {
+            let home = super::TempNanopiHome::new();
+            let p = home.path().to_path_buf();
+            // Prove the guard is actually in effect before we unwind.
+            assert_eq!(std::env::var_os("NANOPI_HOME").map(Into::into), Some(p.clone()));
+            panic!("a test failing with the scratch home installed: {}", p.display());
+        });
+        assert!(scratch.is_err(), "the closure must have panicked");
+
+        assert_eq!(
+            std::env::var_os("NANOPI_HOME"),
+            before,
+            "NANOPI_HOME must be exactly what it was before the panicking test"
+        );
     }
 
     /// `.lock().unwrap()` is the idiom that caused the cascade, and it
