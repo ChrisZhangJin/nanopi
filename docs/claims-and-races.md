@@ -232,8 +232,8 @@ rather than merely untidy.
 | Race | Required result | |
 |---|---|---|
 | `/new`, `/resume`, `/fork`, `/import` then exit | the exit line names the session you ended in (`app.session_id`) | ⬜ T3.7 |
-| `/model` mid-session | a `ModelChange` entry is appended, so a resumed transcript shows the switch | ⬜ T3.9 |
-| thinking level cycled mid-session | a `ThinkingChange` entry is appended, with explicit `null` for off | ⬜ T3.9 |
+| `/model` mid-session | a `ModelChange` entry is appended, so a resumed transcript shows the switch | ⬜ T3.9 — **run 2026-09-08, passed** |
+| thinking level cycled mid-session | a `ThinkingChange` entry is appended, with explicit `null` for off | ⬜ T3.9 — **run 2026-09-08, found 2 defects** |
 | in-session switch then a lifecycle hook | the hook payload carries the live session id | ✅ |
 | a compaction hook fires | `session_id` is the real id; the reason lives in `arguments.reason` | ✅ |
 
@@ -259,6 +259,37 @@ would repeat the mistake in the documentation instead of the code. What
 IS pinned: the entries roundtrip, and `ThinkingChange`'s `None` stays an
 explicit `null` (`a_thinking_change_to_or_from_off_keeps_its_nulls`) so
 "off" cannot be confused with "an entry predating the field".
+
+**T3.9 was executed on 2026-09-08 and this is exactly what it was for.**
+The `ModelChange` half passed as written: the entry lands on disk and
+`/export` renders it. The `ThinkingChange` half produced **no entries at
+all** — and the writer was fine. Two separate defects sat in front of it:
+
+1. **The default `Shift+Tab` binding was dead.** A terminal sends
+   `ESC [ Z`; crossterm 0.28 reports `BackTab` **with** SHIFT; the
+   default binding is `BackTab` with no modifier, and the equivalence
+   check beside it listed every spelling except that one. Isolated by
+   rebinding `thinking_cycle` to `ctrl+y`, which made the whole feature
+   work immediately — proving the writer was never the problem. Fixed in
+   `af2134d`; the existing test had covered only the two spellings the
+   code already handled.
+2. **Extended thinking was inert on the entire Claude 5 family.**
+   `supports_thinking` listed 3.7 and 4.x only, and
+   `provider/anthropic.rs` sends the `thinking` field only when it
+   returns true — so the level did nothing, while `/thinking`, the status
+   bar and the persisted `ThinkingChange` entry all reported it as on.
+   Fixed in `d9964fb`.
+
+Both are the failure this section predicts, one layer further out than
+expected: nothing pinned the call site, so nothing noticed that the call
+site was **unreachable**. After the fixes, the full seven-step cycle
+persists, with `{"from":null,"to":"minimal"}` … `{"from":"max","to":null}`
+— explicit nulls on both ends, as required.
+
+A third, still-open item came out of the same row and is written up in
+`docs/BACKLOG.md`: `settings.toml`'s `thinking_level` is persisted and
+never read back — a writer with no reader, this section's own pattern
+inverted.
 
 Worth noting how the old test failed: its assertions were bare
 `matches!(entry, Variant { .. });` STATEMENTS. The macro returns a bool,
