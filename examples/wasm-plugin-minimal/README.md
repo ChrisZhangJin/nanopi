@@ -4,7 +4,10 @@ The smallest plugin that still exercises a capability gate. Copy this
 directory as a starting point.
 
 For the fuller version — four tools, `host-fs-read`, and more notes on the
-ABI — see [`../wasm-plugin/`](../wasm-plugin/).
+ABI — see [`../wasm-plugin/`](../wasm-plugin/). For one that is actually
+useful — durable project memory, and the only plugin here calling
+`host-call-tool` and `host-set-context` — see
+[`../wasm-plugin-memory/`](../wasm-plugin-memory/).
 
 ## What it does
 

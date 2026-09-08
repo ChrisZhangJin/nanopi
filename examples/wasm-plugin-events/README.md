@@ -14,8 +14,9 @@ extension  ⊂  extension-commands  ⊂  extension-events
 
 A plugin that only provides tools targets `extension`
 (`examples/wasm-plugin-minimal`); one that also registers slash
-commands targets `extension-commands` (`examples/wasm-plugin`); this
-one also observes lifecycle events, so it targets `extension-events`.
+commands targets `extension-commands` (`examples/wasm-plugin`, and
+`examples/wasm-plugin-memory`); this one also observes lifecycle
+events, so it targets `extension-events`.
 Because the ladder is linear, this plugin still exports
 `list-commands` / `execute-command` — as stubs, returning `[]` and an
 error respectively. That's the accepted cost of the ladder design over

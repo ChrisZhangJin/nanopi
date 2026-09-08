@@ -29,9 +29,15 @@ EVENTS_SRC   := examples/wasm-plugin-events
 EVENTS_WASM  := $(EVENTS_SRC)/target/wasm32-wasip1/release/nanopi_events_plugin.wasm
 EVENTS_OUT   := dist/nanopi-events-plugin.component.wasm
 
+# The memory plugin: tools plus one slash command, no events, so it
+# targets `extension-commands` like `plugin` does.
+MEMORY_SRC   := examples/wasm-plugin-memory
+MEMORY_WASM  := $(MEMORY_SRC)/target/wasm32-wasip1/release/nanopi_memory_plugin.wasm
+MEMORY_OUT   := dist/nanopi-memory-plugin.component.wasm
+
 .PHONY: all check clean ensure-target ensure-tools build pack \
-        wasm wasm-debug build-wasm plugin plugin-events test-wasm \
-        ensure-wasm-tools ensure-musl-cc
+        wasm wasm-debug build-wasm plugin plugin-events plugin-memory \
+        test-wasm ensure-wasm-tools ensure-musl-cc
 
 all: pack
 
@@ -199,6 +205,18 @@ plugin-events: ensure-wasm-tools
 	@echo
 	@echo "built $(EVENTS_OUT) — exports:"
 	@wasm-tools component wit $(EVENTS_OUT) | grep -E '^\s+export' || true
+
+plugin-memory: ensure-wasm-tools
+	cargo build --manifest-path $(MEMORY_SRC)/Cargo.toml \
+		--target wasm32-wasip1 --release
+	@mkdir -p dist
+	wasm-tools component embed wit/ $(MEMORY_WASM) \
+		-o dist/embedded-memory.wasm --world extension-commands
+	wasm-tools component new dist/embedded-memory.wasm -o $(MEMORY_OUT)
+	@rm -f dist/embedded-memory.wasm
+	@echo
+	@echo "built $(MEMORY_OUT) — exports:"
+	@wasm-tools component wit $(MEMORY_OUT) | grep -E '^\s+export' || true
 
 ensure-wasm-tools:
 	@command -v wasm-tools >/dev/null 2>&1 || { \
