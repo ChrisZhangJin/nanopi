@@ -175,21 +175,62 @@ pub fn load_settings(cwd: &Path) -> Result<HooksConfig, SettingsError> {
         hooks.session_compact.extend(s.hooks.session_compact);
     }
 
+    // Which files could the offending entry be in?
+    //
+    // Validation below runs on the MERGED vectors, so `#0` is an index
+    // into the merge, not into any one file — and hooks are additive
+    // across four locations. That was survivable while a matcher error
+    // was a warning you could ignore; now that it refuses startup, "go
+    // fix it" without saying where costs the user a hunt through four
+    // paths, two of which they may not know exist. Naming the
+    // candidates that are actually PRESENT is most of the value for
+    // none of the per-entry provenance plumbing.
+    let sources: Vec<String> = {
+        let mut v = Vec::new();
+        for p in [
+            crate::paths::global_config_path(),
+            crate::paths::global_settings_path(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if p.exists() {
+                v.push(p.display().to_string());
+            }
+        }
+        for rel in ["config.toml", "settings.toml"] {
+            let p = cwd.join(".nanopi").join(rel);
+            if p.exists() {
+                v.push(p.display().to_string());
+            }
+        }
+        v
+    };
+    let with_sources = |e: String| -> SettingsError {
+        if sources.is_empty() {
+            return SettingsError::Matcher(e);
+        }
+        SettingsError::Matcher(format!(
+            "{e}\n  hook config is merged from: {}",
+            sources.join(", ")
+        ))
+    };
+
     // Validate regex matchers up front; surface errors at startup.
-    crate::agent::hook::validate_hooks(HookEvent::ToolExecutionStart, &hooks.tool_execution_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::ToolExecutionEnd, &hooks.tool_execution_end).map_err(SettingsError::Matcher)?;
+    crate::agent::hook::validate_hooks(HookEvent::ToolExecutionStart, &hooks.tool_execution_start).map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::ToolExecutionEnd, &hooks.tool_execution_end).map_err(with_sources)?;
     crate::agent::hook::validate_hooks(HookEvent::Input, &hooks.input)
-        .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::SessionStart, &hooks.session_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::SessionShutdown, &hooks.session_shutdown).map_err(SettingsError::Matcher)?;
+        .map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::SessionStart, &hooks.session_start).map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::SessionShutdown, &hooks.session_shutdown).map_err(with_sources)?;
     crate::agent::hook::validate_hooks(HookEvent::BeforeAgentStart, &hooks.before_agent_start)
-        .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::TurnStart, &hooks.turn_start).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::TurnEnd, &hooks.turn_end).map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::MessageEnd, &hooks.message_end).map_err(SettingsError::Matcher)?;
+        .map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::TurnStart, &hooks.turn_start).map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::TurnEnd, &hooks.turn_end).map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::MessageEnd, &hooks.message_end).map_err(with_sources)?;
     crate::agent::hook::validate_hooks(HookEvent::SessionBeforeCompact, &hooks.session_before_compact)
-        .map_err(SettingsError::Matcher)?;
-    crate::agent::hook::validate_hooks(HookEvent::SessionCompact, &hooks.session_compact).map_err(SettingsError::Matcher)?;
+        .map_err(with_sources)?;
+    crate::agent::hook::validate_hooks(HookEvent::SessionCompact, &hooks.session_compact).map_err(with_sources)?;
 
     Ok(hooks)
 }
@@ -339,6 +380,18 @@ command = "cat >> /tmp/input.log"
         };
         assert!(err.contains("hooks.input"), "{err}");
         assert!(err.contains("can never match"), "{err}");
+        // `#0` indexes the MERGED vector, and hooks are additive across
+        // four files, so the message has to say which files were merged
+        // or "go fix it" gives the user nowhere to look. This matters
+        // now that the error refuses startup rather than warning.
+        assert!(
+            err.contains("merged from"),
+            "the error must name the files it read: {err}"
+        );
+        assert!(
+            err.contains(&dir.join("settings.toml").display().to_string()),
+            "the file actually holding the bad entry must be listed: {err}"
+        );
 
         // The same file with `*` still loads — the error must not have
         // taken the working configuration down with the broken one.
