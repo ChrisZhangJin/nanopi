@@ -35,9 +35,15 @@ MEMORY_SRC   := examples/wasm-plugin-memory
 MEMORY_WASM  := $(MEMORY_SRC)/target/wasm32-wasip1/release/nanopi_memory_plugin.wasm
 MEMORY_OUT   := dist/nanopi-memory-plugin.component.wasm
 
+# The report plugin: tools, a command AND one event subscription, so it
+# sits at the top of the ladder on `extension-events`.
+REPORT_SRC   := examples/wasm-plugin-report
+REPORT_WASM  := $(REPORT_SRC)/target/wasm32-wasip1/release/nanopi_report_plugin.wasm
+REPORT_OUT   := dist/nanopi-report-plugin.component.wasm
+
 .PHONY: all check clean ensure-target ensure-tools build pack \
         wasm wasm-debug build-wasm plugin plugin-events plugin-memory \
-        test-wasm ensure-wasm-tools ensure-musl-cc
+        plugin-report test-wasm ensure-wasm-tools ensure-musl-cc
 
 all: pack
 
@@ -217,6 +223,18 @@ plugin-memory: ensure-wasm-tools
 	@echo
 	@echo "built $(MEMORY_OUT) — exports:"
 	@wasm-tools component wit $(MEMORY_OUT) | grep -E '^\s+export' || true
+
+plugin-report: ensure-wasm-tools
+	cargo build --manifest-path $(REPORT_SRC)/Cargo.toml \
+		--target wasm32-wasip1 --release
+	@mkdir -p dist
+	wasm-tools component embed wit/ $(REPORT_WASM) \
+		-o dist/embedded-report.wasm --world extension-events
+	wasm-tools component new dist/embedded-report.wasm -o $(REPORT_OUT)
+	@rm -f dist/embedded-report.wasm
+	@echo
+	@echo "built $(REPORT_OUT) — exports:"
+	@wasm-tools component wit $(REPORT_OUT) | grep -E '^\s+export' || true
 
 ensure-wasm-tools:
 	@command -v wasm-tools >/dev/null 2>&1 || { \

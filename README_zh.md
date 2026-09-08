@@ -297,7 +297,7 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 完整可运行的例子在 [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin)，含编译命令。[`examples/wasm-plugin-minimal/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-minimal) 是更小的可直接复制的骨架 —— 两个工具，分成"样板"和"你要替换的部分"两段。
 
-如果你想要一个**能直接用**而不只是拿来读的插件，看 [`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory)：持久化的项目记忆。每条记忆是 `.nanopi/memory/` 下一个 markdown 文件，可 diff 可提交；注入模型上下文的只有那份精简索引，全文由模型按需调 `recall` 取。
+两个**能直接用**而不只是拿来读的插件：[`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) 是持久化的项目记忆 —— 每条记忆是 `.nanopi/memory/` 下一个 markdown 文件，可 diff 可提交；注入模型上下文的只有那份精简索引，全文由模型按需调 `recall` 取。[`examples/wasm-plugin-report/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-report) 跨会话记录每个工具的耗时与失败，用来回答「刚才为什么慢」—— `tool_execution_end` 带的那个 `duration_ms` 别处都不持久化。
 
 写插件、调试插件、能力门的分步指南在 [wiki](https://github.com/ChrisZhangJin/nanopi/wiki)（中英双语）。
 

@@ -302,7 +302,7 @@ Payloads cross the boundary as JSON strings rather than WIT records — one prim
 
 A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin), including the build command. [`examples/wasm-plugin-minimal/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-minimal) is a smaller skeleton to copy — two tools, split into boilerplate and the part you replace.
 
-For a plugin meant to be *used* rather than read, [`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) is durable project memory: facts are markdown files in `.nanopi/memory/` that you can diff and commit, and only the compact index enters the model's context — it calls `recall` for the full text of whatever looks relevant.
+For plugins meant to be *used* rather than read: [`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) is durable project memory — facts are markdown files in `.nanopi/memory/` that you can diff and commit, and only the compact index enters the model's context, with `recall` fetching the full text of whatever looks relevant. [`examples/wasm-plugin-report/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-report) records per-tool time and failures across sessions, which answers "why was that slow" — `tool_execution_end` carries a `duration_ms` that nothing else persists.
 
 Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki](https://github.com/ChrisZhangJin/nanopi/wiki) (English and Chinese).
 

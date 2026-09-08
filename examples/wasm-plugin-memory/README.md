@@ -159,5 +159,7 @@ budget, so a plugin cannot suppress it.
 
 - `examples/wasm-plugin-minimal/` — the smallest plugin, the one to copy
 - `examples/wasm-plugin/` — the fuller tools + commands reference
+- `examples/wasm-plugin-report/` — the other capability half: `allow_store`
+  plus events, recording per-tool time and failures
 - `examples/wasm-plugin-events/` — lifecycle event subscription
 - `docs/plugin-capabilities.md` — what a plugin may do, and why
