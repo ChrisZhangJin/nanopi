@@ -122,6 +122,20 @@ pub fn supports_vision(model_id: &str) -> bool {
 /// top-level params instead of ignoring them).
 pub fn supports_thinking(model_id: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
+    // Claude 5 family. Absent until now simply because this list was
+    // written while 4.x was current — not a deliberate exclusion. The
+    // omission was not cosmetic: `provider/anthropic.rs` only sends the
+    // `thinking` field when this returns true, so on a Claude 5 model
+    // the whole feature was silently inert. `/thinking` still relabelled
+    // and still wrote a `thinking_change` entry, so it looked like it
+    // worked. Verified against the live API: opus-5, sonnet-5 and
+    // fable-5 all return a `thinking` content block.
+    if m.starts_with("claude-opus-5")
+        || m.starts_with("claude-sonnet-5")
+        || m.starts_with("claude-fable-5")
+    {
+        return true;
+    }
     // Claude 4.x family — every current member supports thinking.
     if m.starts_with("claude-opus-4") || m.starts_with("claude-sonnet-4") {
         return true;
@@ -180,6 +194,14 @@ mod tests {
 
     #[test]
     fn supports_thinking_allows_current_claude_family() {
+        // Claude 5. These four lines are the regression: the gate in
+        // `provider/anthropic.rs` reads this function to decide whether
+        // to send `thinking` at all, so a missing family here disables
+        // extended thinking outright while the UI still reports a level.
+        assert!(supports_thinking("claude-opus-5"));
+        assert!(supports_thinking("claude-sonnet-5"));
+        assert!(supports_thinking("claude-fable-5"));
+        assert!(supports_thinking("claude-sonnet-5-20260501"));
         assert!(supports_thinking("claude-opus-4-7"));
         assert!(supports_thinking("claude-opus-4-7-20260101"));
         assert!(supports_thinking("claude-sonnet-4-6"));
