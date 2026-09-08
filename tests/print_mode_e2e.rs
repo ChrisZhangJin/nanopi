@@ -605,3 +605,109 @@ fn inline_think_tags_false_disables_splitting_even_for_leading_block() {
         "escape hatch should leave a leading block untouched: {out:?}"
     );
 }
+
+/// A `SettingsError` must abort startup, not degrade to "no hooks".
+///
+/// The matcher validator itself was correct and well-tested
+/// (`settings.rs` asserts `load_settings` returns the error), but both
+/// call sites — here and `mode/tui.rs` — caught it, printed
+/// `warning: failed to load settings`, and substituted
+/// `HooksConfig::default()`. That drops *every* hook in the file, not
+/// just the invalid entry, so a config with one bad `input` matcher and
+/// a working `check-rm-rf.sh` veto hook ran with the veto silently
+/// disarmed. Nothing pinned the call site, which is why a green unit
+/// test coexisted with the defect for the whole of v0.12.
+///
+/// Asserting on the exit status is the load-bearing part: the old code
+/// also left the sibling hook's marker file absent, so only "did the
+/// process refuse to run" separates fixed from broken.
+#[test]
+fn invalid_hook_matcher_refuses_to_start_rather_than_disarming_every_hook() {
+    let dir = std::env::temp_dir().join("nanopi-p-e2e-bad-matcher");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".nanopi")).expect("cfg dir");
+    let marker = dir.join("sibling-hook-ran");
+    std::fs::write(
+        dir.join(".nanopi/config.toml"),
+        format!(
+            // `input` carries no tool name, so any matcher other than
+            // `*` provably never fires.
+            "[[hooks.input]]\nmatcher = \"hello\"\ncommand = \"true\"\n\n\
+             [[hooks.session_start]]\nmatcher = \"*\"\ncommand = \"touch {}\"\n",
+            marker.display()
+        ),
+    )
+    .expect("write config");
+
+    // No SSE server: a settings error is resolved before any request,
+    // so reaching the network at all would itself be the failure.
+    let out = Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(&dir)
+        .args(["-p", "--base-url", "http://127.0.0.1:1"])
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-skills", "--no-context-files"])
+        .arg("hello world")
+        .env("NANOPI_HOME", dir.join("home"))
+        .output()
+        .expect("run nanopi -p");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !out.status.success(),
+        "an unsatisfiable matcher must be fatal, not a warning; \
+         exit={:?} stderr={stderr:?}",
+        out.status.code()
+    );
+    assert!(
+        stderr.contains("can never match"),
+        "the error must name the offending matcher: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("warning: failed to load settings"),
+        "the old fail-open path is gone; this must be an error, \
+         not a warning: {stderr:?}"
+    );
+}
+
+/// Control for the test above: a *valid* hook config must still start
+/// and complete a turn. Without this, "make every settings error fatal"
+/// could be satisfied by refusing to start whenever hooks are present.
+#[test]
+fn valid_hook_config_still_starts_and_completes_a_turn() {
+    let port = spawn_sse_server(vec![delta("content", "ANSWER"), finish("stop")]);
+
+    let dir = std::env::temp_dir().join("nanopi-p-e2e-good-matcher");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".nanopi")).expect("cfg dir");
+    std::fs::write(
+        dir.join(".nanopi/config.toml"),
+        "[[hooks.input]]\nmatcher = \"*\"\ncommand = \"true\"\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(&dir)
+        .args(["-p", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-skills", "--no-context-files"])
+        .arg("hello world")
+        .env("NANOPI_HOME", dir.join("home"))
+        .output()
+        .expect("run nanopi -p");
+
+    let stdout = strip_sgr(&String::from_utf8_lossy(&out.stdout));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "a valid `*` matcher must not be rejected; stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("ANSWER"),
+        "the turn should still complete: {stdout:?}"
+    );
+}

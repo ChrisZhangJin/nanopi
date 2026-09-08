@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::agent::loop_::{Agent, HooksConfig};
+use crate::agent::loop_::Agent;
 use crate::agent::permission::PermissionGate;
 use crate::event::AgentEvent;
 use crate::render::stdout::StdoutRenderer;
@@ -115,15 +115,16 @@ pub async fn run_print_mode(
     );
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
-    // For v0.5: no hooks loaded yet (settings.toml loader is a separate
-    // concern).
-    let hooks = match settings::load_settings(&cwd) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("warning: failed to load settings: {e}");
-            HooksConfig::default()
-        }
-    };
+    // Every `SettingsError` is a mistake in the user's own config —
+    // unparseable TOML, or a matcher that provably can never fire.
+    // Refusing to start is the only honest response: the fallback used
+    // to be `HooksConfig::default()`, which drops *every* hook in the
+    // file, not just the offending one. A `check-rm-rf.sh` veto hook
+    // then silently stops running while the warning scrolls away —
+    // zero protection with a one-line notice, the same failure shape
+    // T2.4 was written to eliminate. Same severity as an unknown hook
+    // event key, which has always been fatal.
+    let hooks = settings::load_settings(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let registry = ToolRegistry::standard();
 

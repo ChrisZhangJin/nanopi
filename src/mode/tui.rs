@@ -466,13 +466,10 @@ pub async fn run_tui_mode(
     // Re-read it here; a parse failure already surfaced through
     // load_settings, so fall back to defaults rather than re-report.
     let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
-    let hooks = match settings::load_settings(&cwd) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("warning: failed to load settings: {e}");
-            HooksConfig::default()
-        }
-    };
+    // See the matching comment in `mode/print.rs`: a settings error is
+    // always a user-config mistake, and the old `HooksConfig::default()`
+    // fallback silently disarmed every hook in the file.
+    let hooks = settings::load_settings(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let skill_load_for_rebuilds = skill_load.clone();
