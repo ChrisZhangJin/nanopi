@@ -3815,6 +3815,44 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
 /// wasmtime `Store` and its epoch ticker are not leaked per reload
 /// either — the ticker holds a `Weak<Engine>` and exits when the last
 /// bridge `Arc` drops.
+/// The `/reload` report line's extensions clause.
+///
+/// Pulled out as a pure function because it is where the only bug this
+/// line has had actually lived, and `handle_reload` itself has no test
+/// seam — `Term` is `Terminal<CrosstermBackend<Stdout>>`, not a
+/// `TestBackend`.
+///
+/// There are two distinct reasons `ext_report` can be `None`, and they
+/// need different words:
+///
+/// - **The agent is mid-turn.** It is MOVED OUT of the slot for the
+///   duration of a turn, so a `/reload` typed while the model is
+///   streaming finds it empty and reloads nothing at all — not skills,
+///   not hooks, not extensions. This used to fall through to the
+///   config-parse message below and report
+///   "extensions unchanged (config.toml did not parse)" against a
+///   perfectly valid config, sending the user to debug TOML when the
+///   real answer was "wait for the turn".
+/// - **`config.toml` genuinely failed to parse**, which the note
+///   underneath the line spells out.
+///
+/// Saying "unchanged" rather than nothing keeps the habit that made the
+/// extension reload possible in the first place: the line always states
+/// what it did NOT do. It just has to state it truthfully.
+fn reload_extensions_clause(
+    ext_report: Option<&crate::agent::build::ExtensionReloadReport>,
+    agent_busy: bool,
+) -> String {
+    match ext_report {
+        Some(r) => r.line(),
+        None if agent_busy => {
+            "nothing reloaded (a turn is in flight — run /reload again once it finishes)"
+                .to_string()
+        }
+        None => "extensions unchanged (config.toml did not parse)".to_string(),
+    }
+}
+
 async fn handle_reload(
     term: &mut Term,
     app: &mut App,
@@ -3853,6 +3891,15 @@ async fn handle_reload(
 
     // ── 4. apply to the live agent under the async lock ──
     let mut ext_report: Option<crate::agent::build::ExtensionReloadReport> = None;
+    // The agent is MOVED OUT of the slot for the duration of a turn, so
+    // a `/reload` typed mid-stream finds it empty and every branch below
+    // is skipped. That used to be reported as
+    // "extensions unchanged (config.toml did not parse)" — the fallback
+    // arm for a `None` report — which is a plain untruth when the config
+    // parses fine, and it sends the user off to debug TOML while the
+    // real answer is "a turn is running". Skills and hooks are silently
+    // not applied either, so the honest line names the whole no-op.
+    let mut agent_busy = false;
     let n_hooks: usize = {
         let mut g = agent.lock().await;
         if let Some(a) = g.as_mut() {
@@ -3889,6 +3936,7 @@ async fn handle_reload(
                 + h.session_start.len()
                 + h.session_shutdown.len()
         } else {
+            agent_busy = true;
             0
         }
     };
@@ -3913,15 +3961,7 @@ async fn handle_reload(
         L::from(vec![Span::styled(
             format!(
                 "[reloaded] {n_skills} skill(s), {n_hooks} hook(s) · {}{}",
-                match &ext_report {
-                    Some(r) => r.line(),
-                    // Only reachable when config.toml failed to parse,
-                    // which the note below spells out. Saying
-                    // "extensions unchanged" rather than nothing keeps
-                    // the v0.11 habit that made this feature possible:
-                    // the line always states what it did NOT do.
-                    None => "extensions unchanged (config.toml did not parse)".to_string(),
-                },
+                reload_extensions_clause(ext_report.as_ref(), agent_busy),
                 if let Some(e) = &config_note {
                     format!(" · {e}")
                 } else {
@@ -5460,6 +5500,53 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    /// A `/reload` typed mid-turn must not be blamed on the config.
+    ///
+    /// The agent is moved out of its slot for the duration of a turn, so
+    /// the reload does nothing; the `None` report then fell through to
+    /// the config-parse arm and asserted a parse failure that had not
+    /// happened. Verified against the real binary before and after:
+    /// with one identical config, an idle `/reload` reported
+    /// "1 extension(s) reloaded" while a mid-turn one reported
+    /// "config.toml did not parse".
+    #[test]
+    fn a_midturn_reload_says_a_turn_is_in_flight_not_that_the_config_is_broken() {
+        let busy = reload_extensions_clause(None, true);
+        assert!(
+            busy.contains("turn is in flight"),
+            "must name the real reason: {busy:?}"
+        );
+        assert!(
+            !busy.contains("did not parse"),
+            "a busy agent is not a broken config: {busy:?}"
+        );
+    }
+
+    /// The other `None` case must keep its own, different message —
+    /// otherwise the fix above just relabels a real parse failure.
+    #[test]
+    fn an_unparseable_config_still_says_so() {
+        let broken = reload_extensions_clause(None, false);
+        assert!(
+            broken.contains("did not parse"),
+            "a genuine parse failure must still say so: {broken:?}"
+        );
+        assert!(!broken.contains("turn is in flight"), "{broken:?}");
+    }
+
+    /// And a report that exists always wins over both.
+    #[test]
+    fn a_present_report_is_used_verbatim_even_when_busy() {
+        let r = crate::agent::build::ExtensionReloadReport {
+            supported: true,
+            replaced: vec!["p".into()],
+            tools: 2,
+            ..Default::default()
+        };
+        let line = reload_extensions_clause(Some(&r), true);
+        assert_eq!(line, r.line());
     }
 
     #[test]
