@@ -333,7 +333,7 @@ fn subscriptions_section(subs: &[(String, Vec<String>)]) -> Vec<Line<'static>> {
     for (plugin, events) in subs {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {plugin:<20}"),
+                format!("  {plugin:<20} "),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(events.join(", "), Style::default().fg(Color::DarkGray)),
@@ -368,7 +368,7 @@ fn grants_section(grants: &[crate::plugin_grants::PluginGrants]) -> Vec<Line<'st
     for g in grants {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<20}", g.plugin_name),
+                format!("  {:<20} ", g.plugin_name),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(g.summary(), Style::default().fg(Color::DarkGray)),
@@ -2985,7 +2985,7 @@ async fn handle_action(
                         term,
                         Line::from(vec![
                             Span::styled(
-                                format!("  /skill:{:<24}", s.name),
+                                format!("  /skill:{:<24} ", s.name),
                                 Style::default().fg(Color::Cyan),
                             ),
                             Span::styled(
@@ -3044,7 +3044,7 @@ async fn handle_action(
                     term,
                     Line::from(vec![
                         Span::styled(
-                            format!("  {:<20}", spec.name),
+                            format!("  {:<20} ", spec.name),
                             Style::default().fg(Color::Cyan),
                         ),
                         Span::styled(
@@ -5482,6 +5482,52 @@ mod tests {
         assert!(texts[1].contains("turn_end, turn_start"));
         assert!(texts[2].contains("logger"));
         assert!(texts[2].contains("input"));
+    }
+
+    /// A plugin name at or past the pad width must still be separated
+    /// from the value beside it.
+    ///
+    /// `format!("  {plugin:<20}")` pads only up to 20 columns, so a
+    /// longer name consumed the whole field and the next span began
+    /// immediately — real output read
+    /// `nanopi-events-plugin.componentinput, turn_start`. Both example
+    /// plugins ship names past that width, so this was the normal case,
+    /// not an edge one. The tests above use "watcher" and "logger",
+    /// which fit, which is why they never saw it.
+    #[test]
+    fn a_long_plugin_name_stays_separated_from_its_event_list() {
+        let long = "nanopi-events-plugin.component".to_string();
+        assert!(long.len() > 20, "fixture must exceed the pad width");
+        let subs = vec![(long.clone(), vec!["input".to_string()])];
+        let texts = line_texts(&subscriptions_section(&subs));
+        assert!(
+            !texts[1].contains(&format!("{long}input")),
+            "name ran into the event list: {:?}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains(&format!("{long} ")),
+            "expected whitespace after the name: {:?}",
+            texts[1]
+        );
+    }
+
+    /// Same defect, the `Plugin grants` section. Observed as
+    /// `nanopi-events-plugin.componentno grants`.
+    #[test]
+    fn a_long_plugin_name_stays_separated_from_its_grant_summary() {
+        let long = "nanopi-events-plugin.component";
+        let grants = vec![crate::plugin_grants::PluginGrants {
+            plugin_name: long.to_string(),
+            path: "/tmp/events.wasm".into(),
+            grants: vec![],
+        }];
+        let texts = line_texts(&grants_section(&grants));
+        assert!(
+            !texts[1].contains(&format!("{long}no grants")),
+            "name ran into the summary: {:?}",
+            texts[1]
+        );
     }
 
     #[test]
