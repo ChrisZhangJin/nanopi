@@ -43,50 +43,104 @@ See conversation on 2026-08-07 for the full analysis.
 
 ---
 
-## Test suite is flaky under parallel execution (env-var race)
+## ~~Test suite is flaky under parallel execution (env-var race)~~ — RESOLVED 2026-09-07
 
-**Current state (2026-08-25)**: `cargo test` fails roughly half the
-time on a clean tree, with a *different* test failing each run.
-Observed so far: `agent::hook::tests::run_hook_exit_0_means_allow`,
-`agent::hook::tests::run_hook_exit_2_means_block`,
-`agent::hook::tests::run_hook_json_decision_on_stdout`,
-`paths::tests::nanopi_home_honors_env`,
-`agent::loop_::tests::load_session_replays_tool_calls`,
-`provider::openai::tests::resumed_session_outgoing_request_has_tools`.
-Measured 3 failures in 6 runs at `3254017`, i.e. this predates the
-2026-08-25 bug-fix batch and is not caused by it.
+**Kept rather than deleted**, because the shape of the bug is worth
+remembering and because the entry predicted three fixes and the real one
+was a combination of two of them.
 
-**Cause**: 57 `std::env::set_var("NANOPI_HOME", …)` /
-`remove_var` calls live in tests across 9 modules — `settings.rs`,
-`session.rs`, `agent/loop_.rs`, `agent/build.rs`, `settings_toml.rs`,
-`config.rs`, `paths.rs`, `agent/permission.rs`,
-`provider/openai.rs`. The environment is process-global but cargo
-runs tests as parallel threads in one process, so any test that
-*sets* `NANOPI_HOME` races every test that *reads* it. Whichever
-loses picks up another test's temp dir and fails on a path that
-isn't there.
+**What it was**: ~3 of 10 `cargo test` runs failed, a different subset
+each time. 127 hand-rolled `set_var("NANOPI_HOME", …)` / restore blocks
+across 12 modules, in a process-global environment that cargo runs as
+parallel threads.
 
-**Confirmation**: `cargo test -- --test-threads=1` passes 409/409
-consistently. The failures are pure interference, not real defects.
+**Two independent defects, not one** — which is why partial fixes kept
+not working:
 
-**Why deferred**: this is CI hygiene, not a user-facing bug, and
-the fix is a real chunk of work rather than a one-liner.
+1. **The cascade.** `TEST_LOCK` existed to serialize these, but a test
+   that panicked WHILE HOLDING IT poisoned the mutex, and almost every
+   call site was `.lock().unwrap()`. One real failure was reported as
+   13-14, and the true one was not first in the list, so anyone
+   debugging had to take a baseline before they could believe a red
+   suite. Sixteen sites had already been converted to a recovering form
+   one at a time; seven had not — the tell that a copied idiom is the
+   wrong unit. Fixed by making `crate::test_lock()` the only way in,
+   with a test that walks `src/` and fails the build on a direct
+   acquisition (`a5f5ce9`).
 
-**What it would take**, roughly in order of preference:
-1. Thread the home directory through as a parameter (e.g. widen
-   `paths::nanopi_home()` to take an override, or put it on a
-   context struct) so tests never touch the environment. Cleanest,
-   biggest diff.
-2. Serialize the affected tests behind a shared `Mutex` — small
-   diff, but easy for a future test to forget the lock and silently
-   reintroduce the flake.
-3. `--test-threads=1` in CI. Cheapest, but hides the race rather
-   than fixing it and slows the suite.
+2. **The leak.** Every block put the restore at the END OF THE BODY, so
+   a failing assertion jumped over it and left `$NANOPI_HOME` pointing
+   at a temp dir about to be deleted. That is the race itself, and
+   recovering from a poisoned mutex does nothing about it. Fixed with
+   `TempNanopiHome`, an RAII guard whose restore runs on unwind
+   (`30e5ddf`, migrated in `1a8051a` and `8205d9c`).
 
-**Trigger to revisit**: CI going green is a prerequisite for
-trusting it as a merge gate. Worth doing before (or alongside)
-clearing the pre-existing `cargo fmt --check` and
-`cargo clippy -D warnings` failures, which are red on `main` for
-unrelated reasons — all three want one "make CI green" pass.
+**Two findings that only surfaced during the migration**, both of the
+same kind — a local copy that got the hard part right and the easy part
+wrong:
+
+- `config.rs` had its own `HomeGuard`: correct RAII restore, and it
+  never took the lock. Six tests mutated the environment with no
+  serialization at all.
+- `agent/permission.rs::persist_and_session_only_is_noop` had no guard
+  of any kind.
+
+**A trap worth recording**: replacing `HomeGuard` first produced a
+DEADLOCK, not a failure. Six tests held `lock()` and then constructed a
+guard that locks again; `std::sync::Mutex` is not reentrant. The symptom
+was a 400-second timeout with no output, which reads like a hung build
+rather than a test bug.
+
+**Outcome**: parallel runs 8/8 green, 836 lib tests (`--features wasm`),
+0 ignored, 0 warnings. One site is deliberately unmigrated —
+`paths::nanopi_home_honors_env` asserts on a literal path, so it sets
+the var inside the guard's scope on purpose.
+
+The entry's option 1 ("thread the home through as a parameter") remains
+the ideal and was NOT done: it is a far bigger diff, and
+`paths::expand_against` already gives new tests that pattern without
+touching the environment. What shipped is options 1+2 combined — one
+shared guard that owns both the lock and the env, so they cannot be
+acquired out of order.
+
+---
+
+## Provider registration from plugins
+
+**What it is**: let a WASM extension supply an LLM provider, so a user
+could add a backend without a nanopi release. Listed in ROADMAP M2's
+deferred set alongside per-tool `executionMode`, hot reload, and richer
+session metadata — all three of which have now shipped. This one is
+different in kind, not just in size.
+
+**Why deferred — three blockers, none of them "more code"**:
+
+1. **`fn id(&self) -> &'static str`.** A plugin's name is a runtime
+   string and cannot outlive the call. Honouring this means either
+   changing the trait signature (12 implementors, 10 of them test
+   doubles) or leaking. The signature was written for a set of
+   providers known at compile time.
+
+2. **Streaming inverts the data flow the sandbox is built on.** All nine
+   host imports are "the guest calls out, a string comes back", and
+   `plugin-capabilities.md` invariant 1 — every capability is an import,
+   `handle-event`'s return value stays discarded — rests on exactly
+   that. A provider must push `AgentEvent`s into a channel repeatedly
+   over one call: the HOST calling the GUEST, with the guest yielding
+   many times. In WIT that needs stream/future types or a polling
+   export. It is a new ABI shape, not a tenth import.
+
+3. **It inverts the sandbox's most expensive guarantee.** A provider
+   holds the api_key and decides which host the request goes to. Today
+   `allow_network` is a master switch, then a deny-by-default
+   host-matching `url_allowlist`, a 10 s timeout, a 1 MiB cap, and no
+   redirects. A plugin provider must bypass all of it to reach its own
+   endpoint. That is not another grant; it is a dedicated hole.
+
+**Trigger to revisit**: blocker 3 is a decision for the project owner,
+not an implementation detail — is a plugin-supplied provider exempt from
+`url_allowlist`, and if so what replaces it? Nothing should be built
+until that is answered, because the answer determines whether blockers 1
+and 2 are worth solving at all.
 
 ---

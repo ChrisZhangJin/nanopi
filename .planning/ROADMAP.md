@@ -70,14 +70,36 @@ Also landed in this milestone:
   plugins now load on resumed sessions, and a leading space no longer
   routes a slash command to the model as chat text.
 
-**Deferred to a later milestone** (from the parity review):
-- Per-tool `executionMode` override.
-- **Plugin hot reload.** `/reload` deliberately skips `[[extensions]]`
-  and says so; doing it properly needs an unregister path on
-  `ToolRegistry` plus a generation counter on `ComponentBridge`.
-- Provider registration from plugins; session-management hooks beyond
-  compaction; richer session metadata (thinking-level changes, labels,
-  custom entries).
+**Deferred to a later milestone** (from the parity review) — **all but
+one shipped in v0.12.0, 2026-09-07**:
+
+- ~~Per-tool `executionMode` override.~~ ✅ `003399f`. Not just
+  configurability: `bash` now declares itself Sequential, which fixed
+  the concurrent-bash data loss that had been sitting `#[ignore]`d as a
+  known bug. `[tool_exec_overrides]` takes the speed back.
+- ~~**Plugin hot reload.**~~ ✅ `34866aa`…`0a2f10c`. Both prerequisites
+  named here were built: `ToolRegistry::unregister_plugin` (keyed on the
+  plugin, never a tool name, so removing a built-in is unwritable) and
+  per-plugin instance ids. A call in flight when the swap lands is
+  refused in-band, with different wording depending on whether it had
+  already entered the guest — one says the result is discarded, the
+  other says side effects already stand.
+- ~~Richer session metadata.~~ ✅ `483aec8`, and it was three things:
+  **labels were already done** (`/name`); **`ModelChange` was a bug, not
+  a feature** — reader, replay, `/export` and a roundtrip test all
+  existed with NO WRITER since the session format did; **thinking-level
+  changes** were genuinely missing and are now `ThinkingChange`.
+  *Custom entries deliberately NOT built* — under-specified, and a
+  plugin-written entry runs into invariant 15. Needs a decision about
+  who writes and who reads.
+- **Provider registration from plugins** — still deferred, and moved to
+  `docs/BACKLOG.md` with the full argument. Short version: it is a new
+  ABI shape (streaming inverts the guest-calls-host flow every one of
+  the nine imports uses), it needs a `Provider` trait signature change,
+  and it requires deciding whether a plugin provider is exempt from
+  `url_allowlist`. **That last one is a decision for the project owner
+  and blocks the other two.**
+- Session-management hooks beyond compaction — untouched, no demand yet.
 
 ### M3 · Bugfix Line (v0.10.1) — shipped 2026-09-01
 
