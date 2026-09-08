@@ -1,40 +1,78 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.11.0
+milestone: v0.12.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-09-07T15:08:40.630Z"
-last_activity: 2026-09-04 — manual acceptance of v0.12. Eight defects
+status: ready-to-release
+last_updated: "2026-09-07T17:19:10.284Z"
+last_activity: "2026-09-07 — v0.12.0 feature-complete and bumped. plugin-capabilities stages 4-5, plugin hot reload, per-tool executionMode, session metadata, all three known defects, and the flaky-suite debt. 836 lib tests green, 0 ignored, 0 warnings, parallel 5/5. Not tagged and not pushed — both are the owner's call."
 ---
 
 # Project State
 
-Last activity: 2026-09-04 — manual acceptance of v0.12. Eight defects
-found by hand and fixed, all in the same family: nanopi describing its
-own actions more confidently than it performed them.
-both in: hook events renamed to PI's vocabulary with honest session payloads
-and retired keys refused (`7a15138`…`9caa4c5`), and WASM plugins can now
-observe all eleven lifecycle events under a config-granted,
-observe-only subscription (`5d2e90f`…`009f236`).
+Last activity: 2026-09-07 — v0.12.0 closed out. Every remaining item on
+the roadmap and in the v0.12 docs shipped except one, which is blocked
+on a decision rather than on work.
 
-The two extension systems can finally see the same events: shell hooks
-keep the veto, plugins get to watch, and both read one payload built
-once per event. What remains for v0.12 is a release decision, not a
-feature — `make bump VERSION=…` first, since `release.yml` hard-fails
-the whole matrix on a tag/VERSION mismatch *after* publishing an empty
-release.
+Three things are worth carrying forward more than the feature list:
+
+- **`ModelChange` had a reader, a replay path, an `/export` renderer and
+  a roundtrip test — and no writer, since the session format existed.**
+  It survived because the only test naming it asserted that the variant
+  serializes, which it always did. Its five checks were bare
+  `matches!(entry, Variant { .. });` STATEMENTS: the macro returns a
+  bool, the `;` discarded it, so the test asserted nothing at all.
+  Confirmed by rewriting one to the wrong variant and watching it pass.
+  When a variant looks unused, check for a writer, not just a reader.
+
+- **The flaky suite was two defects, not one**, which is why partial
+  fixes kept not working. A poisoning cascade made failures illegible
+  (one real failure reported as 13-14); a restore-on-the-happy-path-only
+  leak was the race itself. Recovering from the poisoned mutex did
+  nothing about the leak.
+
+- **Two spec claims were disproved by implementing them**, and the specs
+  were amended rather than quietly diverged from: `§Required tests`
+  demanded an echo-before-send ordering that recreates `b90b27f`, and
+  §2.4's two "mandatory" loop-guard rules do not bound the loop they
+  target (a `turn_end` subscriber satisfies both forever).
 
 ## Current Focus
 
-**M2 · Extensions (v0.11.0) — feature surface closed.** The four
-planned phases (P0–P3) shipped, both capability-gated host functions
-shipped, and plugin slash commands shipped on 2026-09-02.
+**v0.12.0 is feature-complete, tested, and version-bumped. What remains
+is not development.**
 
-Next is a decision, not a feature: whether v0.11.0 merges to `main` and
-ships. That is a release call. Note it needs `make bump VERSION=…`
-first — release branches do not carry their own version, and
-`release.yml` hard-fails the whole build matrix on a tag/VERSION
-mismatch *after* publishing an empty release. See ROADMAP M3.
+Three things are waiting, all of them the owner's call:
+
+1. **Tag and release.** `VERSION`, `Cargo.toml [package]` and
+   `Cargo.lock` are all `0.12.0` (`d3e0332`), and `nanopi --version`
+   reports it. The bump is done FIRST on purpose: `release.yml` gates
+   the build matrix on tag == VERSION *after* publishing the release
+   object, so a mismatch leaves an empty release and every job red.
+   Nothing is tagged and nothing is pushed.
+
+2. **Push the wiki.** 13 commits sit unpushed in
+   `/root/workspace/tmp/nanopi.wiki` (+2116/-220 across 17 files, both
+   languages). One is urgent rather than cosmetic: `Hooks.md` /
+   `Hooks-zh.md` were teaching the RETIRED event names, which are now a
+   hard config error — the published wiki currently tells users to write
+   a config that makes nanopi refuse to start.
+
+3. **Decide on provider registration from plugins**, the one deferred
+   item that did not ship. It is blocked on a security question, not on
+   effort: a plugin-supplied provider must reach its own endpoint, so it
+   necessarily bypasses `url_allowlist`. Is it exempt, and if so what
+   replaces the guard? That answer determines whether the other two
+   blockers (a `&'static str` in the `Provider` trait, and streaming
+   inverting the guest-calls-host direction all nine imports rely on)
+   are worth solving. Full argument in `docs/BACKLOG.md`.
+
+One judgement call made during this work that is cheap to reverse if you
+disagree: **`bash` now runs sequentially by default**, so a batch of two
+long bash calls costs the sum instead of the max. It buys the fix for
+concurrent bash silently losing updates while both calls reported
+success — a bug that had been sitting `#[ignore]`d. `[tool_exec_overrides]`
+with `bash = "parallel"` takes the speed back, and both directions are
+pinned by wall-clock tests.
 
 ## What's Built
 
@@ -102,40 +140,67 @@ mismatch *after* publishing an empty release. See ROADMAP M3.
 
 ## What's Next
 
-- **v0.11.0 release decision** — merge to `main` + bump + tag, or keep
-  developing. The release procedure (and its traps) is documented per
-  ROADMAP M3.
+- **Tag + release v0.12.0.** Bump already done (`d3e0332`). Merge to
+  `main`, tag `v0.12.0`, push. Nothing else blocks it.
 
-- Deferred plugin capabilities, none blocking: per-tool `executionMode`
-  override, provider registration from plugins, richer session
-  metadata. Plugin **hot reload** is the notable one — `/reload`
-  deliberately skips `[[extensions]]` because `ToolRegistry` has no
-  unregister path; doing it properly needs that plus a generation
-  counter on `ComponentBridge`.
+- **Push the wiki** — 13 commits unpushed, and the Hooks pages currently
+  published teach retired event names that are now a hard config error.
+
+- **Provider registration from plugins** — the one deferred capability
+  that did not ship. Blocked on a security decision (does a plugin
+  provider bypass `url_allowlist`?), not on effort. See
+  `docs/BACKLOG.md`.
+
+- **`custom entries` in the session format** — deliberately not built.
+  Needs a decision about who writes and who reads; a plugin-written
+  entry runs into invariant 15 (a plugin-initiated tool call is never
+  persisted, because it replays as a `tool_use` the model never
+  requested — the `f70e5cc` failure mode).
+
+- Everything else the roadmap deferred has shipped: per-tool
+  `executionMode` (`003399f`), plugin hot reload (`34866aa`…`0a2f10c`),
+  richer session metadata (`483aec8`). `ToolRegistry::unregister_plugin`
+  and per-plugin instance ids were the two prerequisites hot reload
+  needed, and both exist now.
+
+- Manual acceptance: `docs/v0.12-manual-test-plan.md` has an EMPTY
+  known-defect list for the first time. T2.8, T3.9 and the rewritten
+  T2.7 / T4.6 / T4.7 are new or changed and have not been run by a
+  human yet.
 
 ## Blockers/Concerns
 
-- **Pre-existing test flakiness under parallel execution.** ~3 of 10
-  `cargo test --lib` runs fail a varying subset. Reproduces at base
-  commits with none of the suspect code, so **take a baseline before
-  blaming a change**.
-  *Root cause (established 2026-09-01):* ~50 sites hand-roll
-  `NANOPI_HOME` set/restore. `TEST_LOCK` (`src/lib.rs`) is meant to
-  serialize them, but a test that panics **while holding it poisons
-  the mutex**, and almost every call site is `.lock().unwrap()` — so
-  one real failure cascades into 13–14 reported ones. Only
-  `settings_toml.rs::_lock()` recovers, via
-  `unwrap_or_else(|e| e.into_inner())`.
-  *Fix, two independent steps:* (1) swap every
-  `TEST_LOCK.lock().unwrap()` for the `into_inner()` recovery form —
-  kills the cascade so failures are legible; (2) collapse the 50
-  boilerplate blocks into one `with_temp_nanopi_home()` helper — kills
-  the race. New tests should inject paths instead of touching env;
-  `paths::expand_against` is the pattern.
-  Deterministically green with `-- --test-threads=1`: as of
-  2026-09-02, 508 lib tests in the default build, 550 with
-  `--features wasm`, plus 20 in `wasm_plugin_integration` and 6 in
-  `skills_integration`; 1 ignored.
+- ~~**Pre-existing test flakiness under parallel execution.**~~ —
+  **RESOLVED 2026-09-07.** Parallel runs are 8/8 green. If a run goes
+  red now, it is a real failure: **stop taking a baseline before
+  believing it.**
+  *It was two defects, not one*, which is why the earlier partial fixes
+  never held. (1) A test panicking while holding `TEST_LOCK` poisoned
+  it, and almost every site was `.lock().unwrap()`, so one real failure
+  was reported as 13–14 and the true one was not first — fixed by making
+  `crate::test_lock()` the only way in, with a test that walks `src/`
+  and fails the build on a direct acquisition (`a5f5ce9`). (2) All 127
+  hand-rolled blocks put the restore at the END OF THE BODY, so a
+  failing assertion skipped it and left `$NANOPI_HOME` pointing at a
+  temp dir about to be deleted — that was the race itself, and
+  recovering from the poisoned mutex did nothing about it. Fixed with
+  `TempNanopiHome`, RAII, restore on unwind (`30e5ddf`, `1a8051a`,
+  `8205d9c`).
+  *Two things the migration turned up*, both a local copy getting the
+  hard part right and the easy part wrong: `config.rs`'s own
+  `HomeGuard` restored correctly and never took the lock; and
+  `permission.rs::persist_and_session_only_is_noop` had no guard at all.
+  *A trap worth remembering*: swapping in the shared guard first
+  produced a DEADLOCK, not a failure — six tests held `lock()` and then
+  constructed a guard that locks again, and `std::sync::Mutex` is not
+  reentrant. The symptom was a 400-second timeout with no output, which
+  reads like a hung build rather than a test bug.
+  Current counts, `-- --test-threads=1`: **836 lib with `--features
+  wasm`, 716 default**, plus 37 `wasm_plugin_integration`, 11
+  `print_mode_e2e`, 6 `skills_integration`. **0 ignored, 0 warnings.**
+  New tests should still prefer injecting paths over touching env;
+  `paths::expand_against` is the pattern, and `TempNanopiHome` is for
+  when the env genuinely has to move.
 
 - ~~Non-canonicalized path guard in `src/tool/write.rs` /
   `src/tool/edit.rs`~~ — **RESOLVED.** Fixed across `1149f38`,
