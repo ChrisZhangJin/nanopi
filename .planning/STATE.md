@@ -3,15 +3,33 @@ gsd_state_version: 1.0
 milestone: v0.12.0
 milestone_name: milestone
 status: ready-to-release
-last_updated: "2026-09-07T17:19:10.284Z"
-last_activity: "2026-09-07 — v0.12.0 feature-complete and bumped. plugin-capabilities stages 4-5, plugin hot reload, per-tool executionMode, session metadata, all three known defects, and the flaky-suite debt. 836 lib tests green, 0 ignored, 0 warnings, parallel 5/5. Not tagged and not pushed — both are the owner's call."
+last_updated: "2026-09-08T09:10:00.000Z"
+last_activity: "2026-09-08 — the v0.12 manual test plan was executed end to end: 64/64 rows filled, a new hot-reload chapter written, and release notes rewritten. Six defects found and fixed with teeth (one of them breaks EVERY parallel tool batch); one found and deferred on a decision. 844 lib tests green with --features wasm, 0 ignored, 0 warnings, parallel 3/3. Still not tagged and not pushed — both are the owner's call."
 ---
 
 # Project State
 
-Last activity: 2026-09-07 — v0.12.0 closed out. Every remaining item on
-the roadmap and in the v0.12 docs shipped except one, which is blocked
-on a decision rather than on work.
+Last activity: 2026-09-08 — **the manual test plan was actually run.**
+All 64 rows are filled from a live-model session; the plan's
+known-defect list went from "empty" to "empty again, and this time
+somebody checked". Six defects came out of it, all fixed with
+reversion-verified regression tests.
+
+**Read this first if you are deciding whether to release:** one of the
+six was not cosmetic. `T4.4` exposed that **every parallel tool batch of
+two or more tools failed** on the Anthropic transport, after the tools
+had already run — cards drawn, side effects done, then the turn died
+before the model saw a single result (`2e386ef`). It hid behind a row
+whose own assertion passed and two automated tests that could not see
+it. If v0.12.0 had shipped on 2026-09-07 as "ready-to-release", that
+would have gone out.
+
+The other lesson is about where the defects were: **four of the six were
+in front of working code, not in it.** The `ThinkingChange` writer was
+correct and unreachable (dead default keybinding, plus a capability
+allowlist that omitted Claude 5). The matcher validator was correct and
+its error was swallowed at both call sites. A manual pass finds this
+class; a unit test sitting next to the correct code cannot.
 
 Three things are worth carrying forward more than the feature list:
 
@@ -38,8 +56,14 @@ Three things are worth carrying forward more than the feature list:
 
 ## Current Focus
 
-**v0.12.0 is feature-complete, tested, and version-bumped. What remains
-is not development.**
+**v0.12.0 is feature-complete, manually tested, and version-bumped.
+What remains is not development.**
+
+Manual acceptance is DONE as of 2026-09-08 —
+`docs/v0.12-manual-test-plan.md` has all 64 rows filled, a results
+summary, and a per-defect appendix. Two rows are honestly marked
+"automated coverage, manually unreachable" with the reason established
+rather than assumed.
 
 Three things are waiting, all of them the owner's call:
 
@@ -163,10 +187,36 @@ pinned by wall-clock tests.
   and per-plugin instance ids were the two prerequisites hot reload
   needed, and both exist now.
 
-- Manual acceptance: `docs/v0.12-manual-test-plan.md` has an EMPTY
-  known-defect list for the first time. T2.8, T3.9 and the rewritten
-  T2.7 / T4.6 / T4.7 are new or changed and have not been run by a
-  human yet.
+- ~~Manual acceptance~~ — **DONE 2026-09-08.** All 64 rows of
+  `docs/v0.12-manual-test-plan.md` are filled. The new/rewritten rows
+  the previous entry flagged all resolved: T2.8 passed (including the
+  three-way truncation declaration), T4.6 passed including all three
+  "must still reach the model" inputs, T4.7 passed including the
+  survives-a-redraw half — and **T2.7 and T3.9 failed and are now
+  fixed**. New chapter 5A covers plugin hot reload, which had no manual
+  coverage at all.
+
+- **Six defects found and fixed** (all with the reversion check):
+  `3e709a1` one bad matcher disarmed EVERY hook behind a scrolling
+  warning; `af2134d` the default `Shift+Tab` never fired in any real
+  terminal; `d9964fb` extended thinking was inert on all of Claude 5
+  while three UI surfaces reported it on; `2e386ef` every parallel tool
+  batch of 2+ tools failed after the tools ran; `de38681` plugin names
+  past 20 columns ran into the value beside them; `afca688` a mid-turn
+  `/reload` reloaded nothing and blamed a valid config.
+
+- **One defect deferred on a decision, not on effort**:
+  `settings.toml`'s `thinking_level` is written and never read back, so
+  the setting does not stick and `-p` has no way to enable thinking at
+  all. Needs a precedence order across CLI flag / session replay /
+  `settings.toml` before it is worth wiring. Written up in
+  `docs/BACKLOG.md`.
+
+- **One thing needing a yes/no from you**: the live API says
+  `claude-haiku-4-5` supports extended thinking;
+  `supports_thinking_rejects_older_and_unknown` asserts it does not.
+  The assertion looks deliberate so it was left alone, but one of the
+  two is wrong.
 
 ## Blockers/Concerns
 
@@ -195,9 +245,12 @@ pinned by wall-clock tests.
   constructed a guard that locks again, and `std::sync::Mutex` is not
   reentrant. The symptom was a 400-second timeout with no output, which
   reads like a hung build rather than a test bug.
-  Current counts, `-- --test-threads=1`: **836 lib with `--features
-  wasm`, 716 default**, plus 37 `wasm_plugin_integration`, 11
-  `print_mode_e2e`, 6 `skills_integration`. **0 ignored, 0 warnings.**
+  Current counts, `-- --test-threads=1`: **844 lib with `--features
+  wasm`, 724 default**, plus 37 `wasm_plugin_integration`, 13
+  `print_mode_e2e`, 6 `skills_integration`. **0 ignored, 0 warnings**
+  on both builds. Parallel runs re-checked 3/3 green on 2026-09-08.
+  (Was 836/716 and 11 `print_mode_e2e`; the +10 are the regression
+  tests for the six defects the manual pass found.)
   New tests should still prefer injecting paths over touching env;
   `paths::expand_against` is the pattern, and `TempNanopiHome` is for
   when the env genuinely has to move.
