@@ -144,3 +144,60 @@ until that is answered, because the answer determines whether blockers 1
 and 2 are worth solving at all.
 
 ---
+
+---
+
+## `settings.toml`'s `thinking_level` is written but never read back
+
+**What it is**: `/settings` shows a "Thinking level" row, cycles it, and
+persists the choice to `settings.toml` via `settings_toml::save`. Nothing
+ever reads it back. `App` is constructed with `thinking: None`
+unconditionally (`src/mode/tui.rs`), and `grep thinking_level src/` hits
+only `settings_toml.rs` (the struct + serializer) and the two
+`mode/tui.rs` sites that render and cycle the row. Neither `main.rs` nor
+`mode/print.rs` mentions it.
+
+Consequences:
+
+- Set a thinking level in `/settings`, quit, come back — it is off again.
+  The setting looks persistent (it *is* on disk) and behaves as though it
+  is not.
+- `-p` mode has **no way at all** to enable thinking: no CLI flag, and
+  this is the only config surface for it.
+
+This is a writer with no reader — the mirror image of
+`SessionEntry::ModelChange`, which had a reader with no writer for
+several releases (fixed in `483aec8`). Both are the failure mode
+`docs/claims-and-races.md` exists to catalogue.
+
+**Why deferred**: the patch is a few lines; the *decision* is not. Three
+questions have to be answered first, and answering them wrong is worse
+than the current honest-if-useless state:
+
+1. Should `settings.toml`'s level apply to `-p` mode, or only the TUI?
+   `-p` is scripted and non-interactive, so a persisted level silently
+   changing cost and latency for every scripted run is a real argument
+   against.
+2. After `Shift+Tab` changes the level mid-session, what wins on the next
+   launch — the file, or nothing? If the cycle key also writes the file,
+   the two stop being distinguishable.
+3. Does a resumed session restore the level in force when it was
+   suspended? `thinking_change` entries are in the transcript now
+   (`483aec8`), so replay *could* reconstruct it — which is a third
+   possible source of truth.
+
+**Trigger to pick it up**: anyone reporting that the thinking setting
+"does not stick", or wanting thinking in `-p`. Pick a precedence order
+(suggested: CLI flag > session replay > `settings.toml` > off), write it
+into the doc comment, then wire it.
+
+**Found**: 2026-09-08, while running T7.2 of
+`docs/v0.12-manual-test-plan.md` — the row needed reasoning output in
+`-p` mode and there was no way to ask for any.
+
+**Related, needs a separate yes/no rather than deferral**:
+`agent::thinking::supports_thinking_rejects_older_and_unknown` asserts
+`claude-haiku-4-5` does not support extended thinking. Probing the live
+API shows it returns a `thinking` content block. The assertion reads as
+deliberate, so it was left alone rather than flipped — but one of the two
+is wrong.
