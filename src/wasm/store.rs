@@ -64,15 +64,32 @@ impl PluginStore {
         }
     }
 
-    /// `~/.nanopi/extensions`, the production root. Falls back to a
-    /// relative path when `HOME` is unset, matching how
-    /// `crate::wasm::expand_path` degrades rather than panicking.
+    /// `$NANOPI_HOME/extensions`, or `~/.nanopi/extensions`.
+    ///
+    /// Goes through `paths::nanopi_home` because that function is the
+    /// single owner of what "nanopi's home" means, and this was the one
+    /// path in the program that reimplemented it. Reading `HOME`
+    /// directly got two things wrong:
+    ///
+    /// - **`NANOPI_HOME` was ignored.** It is the documented way to
+    ///   relocate nanopi's whole state, and the manual test plan leans
+    ///   on it specifically to avoid touching a real `~/.nanopi` — so
+    ///   plugin stores were the one thing that leaked into the user's
+    ///   real home during testing, and two different nanopi homes
+    ///   silently shared one store.
+    /// - **Windows fell through to a RELATIVE path.** cmd and
+    ///   PowerShell set `USERPROFILE`, never `HOME`, so the `None` arm
+    ///   was the normal case there and the store landed in
+    ///   `.\.nanopi\extensions` — wherever the user happened to be.
+    ///   `paths::nanopi_home` uses `dirs::home_dir`, which is the only
+    ///   thing that works there.
+    ///
+    /// The relative fallback is kept for the genuinely homeless case,
+    /// matching how `crate::wasm::expand_path` degrades rather than
+    /// panicking.
     pub fn default_root() -> PathBuf {
-        match std::env::var_os("HOME") {
-            Some(home) => PathBuf::new()
-                .join(home)
-                .join(".nanopi")
-                .join("extensions"),
+        match crate::paths::nanopi_home() {
+            Some(home) => home.join("extensions"),
             None => PathBuf::from(".nanopi").join("extensions"),
         }
     }
@@ -185,6 +202,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The production root must follow `NANOPI_HOME`.
+    ///
+    /// It did not: `default_root` read `HOME` directly, so the one thing
+    /// `NANOPI_HOME` could not relocate was plugin state — it leaked
+    /// into the user's real `~/.nanopi` even while the rest of nanopi
+    /// was pointed at a scratch directory, which is exactly what the
+    /// manual test plan sets `NANOPI_HOME` to prevent. Found by running
+    /// a store-using plugin under a scratch home and reading the
+    /// startup disclosure line, which named the real one.
+    #[test]
+    fn default_root_follows_nanopi_home() {
+        let _h = crate::TempNanopiHome::new();
+        let root = PluginStore::default_root();
+        let home = crate::paths::nanopi_home().expect("the guard sets one");
+        assert!(
+            root.starts_with(&home),
+            "plugin stores must live under NANOPI_HOME; got {root:?} for home {home:?}"
+        );
+        assert!(
+            root.ends_with("extensions"),
+            "and still in the extensions subdirectory: {root:?}"
+        );
+        // Relative would mean "wherever the process happens to be",
+        // which is the Windows failure mode this also fixes.
+        assert!(root.is_absolute(), "must not be relative: {root:?}");
     }
 
     #[test]
