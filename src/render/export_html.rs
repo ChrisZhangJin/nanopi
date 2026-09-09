@@ -94,6 +94,22 @@ pub fn build(header: &SessionHeader, entries: &[SessionEntry]) -> String {
                     Some(timestamp),
                 ));
             }
+            SessionEntry::ThinkingChange {
+                from,
+                to,
+                timestamp,
+            } => {
+                // `None` renders as "off" rather than as an empty
+                // cell: thinking off is a setting, and a blank would
+                // read as missing data.
+                let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "off".into());
+                body_html.push_str(&format_turn(
+                    "meta",
+                    "thinking",
+                    &html_escape(&format!("{} → {}", show(from), show(to))),
+                    Some(timestamp),
+                ));
+            }
             SessionEntry::Compaction {
                 summary,
                 replaced_count,

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::agent::context::Context;
 use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
 use crate::provider::sse::SseStream;
+use crate::provider::think_tags::{InlineThinkSplitter, Segment};
 
 #[derive(Debug, Error)]
 pub enum OpenAiError {
@@ -199,6 +200,15 @@ pub struct OpenAiProvider {
     /// v0.9.3: optional vendor for reasoning_effort / thinking-block
     /// emission. If `None`, request body omits reasoning params.
     pub vendor: Option<Box<dyn crate::vendor::Vendor>>,
+    /// Route `delta.content` through `InlineThinkSplitter`, reclassifying
+    /// a LEADING `<think>…</think>` span as `ThinkingDelta` instead of
+    /// `TextDelta` (see `provider::think_tags` for the position rule).
+    /// On by default for every vendor on the OpenAI wire — `<think>` is a
+    /// model-level convention, not a vendor-specific one, so there's no
+    /// vendor gate here anymore. Overridable via `with_inline_think` (the
+    /// `Config::inline_think_tags` escape hatch): `Some(false)` disables
+    /// splitting entirely, `Some(true)` is a no-op (already the default).
+    pub split_inline_think: bool,
 }
 
 impl OpenAiProvider {
@@ -215,12 +225,21 @@ impl OpenAiProvider {
                 .build()
                 .expect("build reqwest client"),
             vendor: None,
+            split_inline_think: true,
         }
     }
 
-    /// v0.9.3: attach a vendor.
+    /// v0.9.3: attach a vendor. `split_inline_think` is no longer set
+    /// from the vendor (see the position rule in `provider::think_tags`)
+    /// — it's already on by default from `new()`.
     pub fn with_vendor(mut self, vendor: Box<dyn crate::vendor::Vendor>) -> Self {
         self.vendor = Some(vendor);
+        self
+    }
+
+    /// Config escape hatch for `split_inline_think`: `Config::inline_think_tags`.
+    pub fn with_inline_think(mut self, on: bool) -> Self {
+        self.split_inline_think = on;
         self
     }
 }
@@ -493,7 +512,7 @@ impl OpenAiProvider {
                         }
                         let delay =
                             crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
                             attempt + 1,
                             retry.max_attempts,
@@ -526,7 +545,7 @@ impl OpenAiProvider {
                     }
                     let delay =
                         crate::provider::retry::compute_delay(attempt, &retry, hint, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -546,7 +565,7 @@ impl OpenAiProvider {
                     }
                     let delay =
                         crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -566,6 +585,7 @@ impl OpenAiProvider {
             let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
             let mut started = false;
             let mut usage_local = Usage::default();
+            let mut splitter = InlineThinkSplitter::new();
 
             let mut stream = Box::pin(sse);
             while let Some(event) = stream.next().await {
@@ -581,7 +601,7 @@ impl OpenAiProvider {
                     {
                         let delay =
                             crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: {}]",
                             attempt + 1,
                             retry.max_attempts,
@@ -603,12 +623,28 @@ impl OpenAiProvider {
                     let delta = &choice.delta;
                     if let Some(t) = &delta.content {
                         if !t.is_empty() {
-                            let _ = tx
-                                .send(AgentEvent::TextDelta {
-                                    content_index: choice.index,
-                                    text: t.clone(),
-                                })
-                                .await;
+                            if self.split_inline_think {
+                                for seg in splitter.push(t) {
+                                    let ev = match seg {
+                                        Segment::Text(text) => AgentEvent::TextDelta {
+                                            content_index: choice.index,
+                                            text,
+                                        },
+                                        Segment::Think(text) => AgentEvent::ThinkingDelta {
+                                            content_index: choice.index,
+                                            text,
+                                        },
+                                    };
+                                    let _ = tx.send(ev).await;
+                                }
+                            } else {
+                                let _ = tx
+                                    .send(AgentEvent::TextDelta {
+                                        content_index: choice.index,
+                                        text: t.clone(),
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     if let Some(t) = &delta.reasoning_content {
@@ -636,6 +672,26 @@ impl OpenAiProvider {
                             choice.index,
                         )
                         .await;
+                        // Drain any buffered splitter state BEFORE Done —
+                        // an event arriving after Done is a reordering
+                        // bug. finish() resets state, so a second drain
+                        // after the loop (stream closed without an
+                        // explicit finish_reason) is harmless.
+                        if self.split_inline_think {
+                            for seg in splitter.finish() {
+                                let ev = match seg {
+                                    Segment::Text(text) => AgentEvent::TextDelta {
+                                        content_index: choice.index,
+                                        text,
+                                    },
+                                    Segment::Think(text) => AgentEvent::ThinkingDelta {
+                                        content_index: choice.index,
+                                        text,
+                                    },
+                                };
+                                let _ = tx.send(ev).await;
+                            }
+                        }
                         let finish = match fr.as_str() {
                             "stop" => FinishReason::Stop,
                             "tool_calls" | "function_call" => FinishReason::ToolCalls,
@@ -671,6 +727,24 @@ impl OpenAiProvider {
 
             // Stream closed without an explicit finish_reason; emit Done with what we have.
             flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, 0).await;
+            // Drain any splitter state still buffered (unclosed <think>,
+            // partial delimiter prefix) so nothing is lost. Harmless if
+            // the finish_reason branch above already drained it.
+            if self.split_inline_think {
+                for seg in splitter.finish() {
+                    let ev = match seg {
+                        Segment::Text(text) => AgentEvent::TextDelta {
+                            content_index: 0,
+                            text,
+                        },
+                        Segment::Think(text) => AgentEvent::ThinkingDelta {
+                            content_index: 0,
+                            text,
+                        },
+                    };
+                    let _ = tx.send(ev).await;
+                }
+            }
             final_usage = usage_local;
             break 'retry;
         }
@@ -927,11 +1001,8 @@ mod tests {
         use crate::tool::ToolRegistry;
         use crate::util::{time, uuid};
 
-        let _g = crate::TEST_LOCK.lock().unwrap();
-        let prev_home = std::env::var_os("NANOPI_HOME");
-        let home = std::env::temp_dir().join(format!("nanopi-resume-tools-{}", uuid::v7()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = std::env::temp_dir().join(format!("nanopi-resume-cwd-{}", uuid::v7()));
         std::fs::create_dir_all(&cwd).unwrap();
@@ -993,6 +1064,7 @@ mod tests {
             SkillLoadPolicy::default(),
             true,
             crate::agent::prompt_override::PromptOverrides::default(),
+            &[],
         );
 
         // Wire body — serialize to JSON to actually exercise the
@@ -1015,11 +1087,6 @@ mod tests {
                 .is_some());
         }
 
-        if let Some(p) = prev_home {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }

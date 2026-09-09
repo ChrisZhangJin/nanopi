@@ -639,7 +639,7 @@ chmod +x /tmp/check-rm-rf.sh
 
 mkdir -p /tmp/nanopi-settings
 cat > /tmp/nanopi-settings/settings.toml <<EOF
-[[hooks.PreToolUse]]
+[[hooks.pre_tool_use]]
 matcher = "bash"
 type = "command"
 command = "/tmp/check-rm-rf.sh"

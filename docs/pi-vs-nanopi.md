@@ -305,6 +305,36 @@ interface extension-api {
 
 **可行性证据**：`Cargo.toml` 已经有 `lto = true` + `opt-level = "z"`，WASM runtime 只增加 ~2 MB（wasmtime 精简配置），仍在 5 MB 预算内。
 
+> **已实现（v0.11.0）—— 但形状和上面这份草图不同。**
+>
+> 实际接口见 `wit/nanopi-extension.wit`。三处关键差异，都不是随意改的：
+>
+> 1. **没有 `interface`，导出直接挂在 world 根上。** 宿主用
+>    `Instance::get_typed_func` 按裸名解析；放进 `interface` 会被命名空间化成
+>    `nanopi:extension/tool-api#list-tools`，宿主永远找不到。这个 bug 真的
+>    上线过一次。
+> 2. **没有回调，只有 `list-*` / `execute-*` 四个字符串进字符串出的函数。**
+>    canonical ABI 里传递函数引用需要 wit-bindgen 生成代码；把载荷统一压成
+>    JSON 字符串后，ABI 只剩一种原始类型，两侧都能手写。
+> 3. **`register-command` 变成了 `list-commands` + `execute-command`**，且
+>    放在第二个 world `extension-commands` 里 —— WIT 无法表达「可选导出」，
+>    扩宽原 world 会让所有已有插件的源码编译不过。
+>
+> **与 Pi 的三处有意分歧**（Pi 侧实现见
+> `packages/coding-agent/src/core/extensions/loader.ts:258` 和
+> `core/agent-session.ts:1270-1294`）：
+>
+> - Pi 的 handler 返回值被忽略，要改变状态得回调 `pi.sendUserMessage()` 等宿主
+>   API。nanopi 的插件在沙箱里，给它这些能力就得新增 host import；所以意图以
+>   **数据**形式返回：`{"print"|"send_user_message"|"error": "..."}`。import
+>   数量维持在三个。
+> - Pi 命令重名时把两边都改名成 `name:1` / `name:2`，裸名消失
+>   （`extensions/runner.ts:605-636`）；由于改名后的两个逃过了「内置命令遮蔽」
+>   过滤，撞两次反而比撞一次好用。nanopi 一律**大声拒绝**：撞内置则跳过，两个
+>   插件撞同名则两个都不注册。
+> - Pi 在流式输出中途排队扩展命令会直接抛异常；nanopi 走 steer / follow-up，
+>   和用户自己打字完全一致 —— 这套机制是 Pi 当年设计时还没有的。
+
 #### WASM 插件能否访问网络？
 
 **能**。WASI（WebAssembly System Interface）采用「能力化安全」模型——默认全禁，宿主显式授权哪些能力。

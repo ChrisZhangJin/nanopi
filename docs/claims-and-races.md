@@ -1,0 +1,473 @@
+# Claims and races
+
+This document specifies what nanopi is allowed to tell the user and the
+model about its own actions, and what must happen at each interleaving
+where a claim could outrun the action.
+
+It exists because of a pattern, not a theory. Manual acceptance of
+v0.12 turned up eight defects by hand; five of them were the same
+mistake in five places — **nanopi describing its own action more
+confidently than it performed it**:
+
+| Defect | The claim | What actually happened |
+|---|---|---|
+| `87a81b4` | `[compacted: 2158 → 2158 chars]` | no boundary was found; nothing was compacted |
+| `87a81b4` | a `session_before_compact` hook fired | no `session_compact` ever followed |
+| `b90b27f` | `[steer] who mai` | the message stayed in the channel, unseen by the model |
+| `af9f18b` | `To resume: --session <id>` | that was the session you started in, not the one you ended in |
+| `c0ce35c` | `[error: Input hook blocked…]` | the user's own policy, working, framed as a malfunction |
+
+None was caught by 682 passing tests. They are not logic bugs — every
+one of them computed the right thing and then said something else
+about it.
+
+The vocabulary here is borrowed from PI's durability work
+(`pi/packages/agent/docs/values.md`, `assistant-durability.md`,
+`tool-durability.md`), which states the same rule as an invariant
+rather than discovering it five times:
+
+> Unsafe synthetic results explicitly state that captured output is
+> incomplete and the external outcome is unknown.
+> — `tool-durability.md`, invariant 9
+
+> `entry_added` remains the only proof that the final assistant entry
+> committed. […] There is no claim that a `message_update` was durable.
+> — `assistant-durability.md`
+
+nanopi's storage is a single append-only JSONL file, not PI's
+transactional store with three backends and restart authority. The
+storage design does not transfer. The **discipline about claims** does,
+and costs nothing.
+
+## Goals
+
+1. For each thing nanopi reports, name the one signal that proves it.
+2. Make everything else explicitly an observation, in the code and in
+   the words shown to the user.
+3. Require an unknown outcome to be reported as unknown, never as
+   success and never as failure.
+4. Enumerate the interleavings where a claim can outrun its action, and
+   fix the required result for each.
+5. Give a reviewer a checklist short enough to actually apply when
+   adding a new status line or event.
+
+## Non-goals
+
+- Transactional storage, atomic multi-write commits, or a restart
+  authority. nanopi appends to JSONL; a torn tail is a truncated line,
+  handled where it is read.
+- Exactly-once side effects. Tools are at-least-once and always were.
+- A durable event log separate from the session file.
+- Reworking the `AgentEvent` stream into a proof-carrying protocol.
+  Events stay observations; that is the point.
+
+## 1. Proof and observation
+
+Two kinds of output, and the difference must be visible at the call
+site:
+
+**Proof.** A durable record whose presence means the thing happened.
+For nanopi this is exactly one mechanism: a committed
+`session::append_entry` line. Nothing else proves anything.
+
+**Observation.** Everything a human or the model sees: `AgentEvent`
+variants, TUI cards, `-p` markers, `crate::note!` lines, plugin event
+deliveries. These may be emitted before, after, or instead of the
+action. They are reports about intent or progress.
+
+### The rule
+
+An observation must not be phrased as an accomplished fact unless its
+proof has committed.
+
+This is a rule about **wording**, enforced by review, because the type
+system cannot express it. `[compacted: 2158 → 2158 chars]` is a
+well-typed string.
+
+### Proof for each claim
+
+| Claim | Proof | Note |
+|---|---|---|
+| the model said this | `SessionEntry::Message{role:"assistant"}` | text deltas are observation |
+| this tool ran | `SessionEntry::ToolResult` | `ToolCall` proves only that it was *about* to run — see §3 |
+| the context was compacted | `SessionEntry::Compaction` | `compact_now` returns `bool`; a caller may not infer from `estimate_chars()` |
+| this prompt reached the model | `SessionEntry::Message{role:"user"}` | a `[steer]` echo is observation |
+| this is the live session | `app.session_id` | NOT the `header` bound at startup |
+| a plugin observed this event | nothing | delivery is best-effort by design — see §4 |
+
+`SessionEntry::ToolCall` is deliberately not proof of execution. It is
+persisted before the tool runs, and that order is correct: for `bash`,
+the record of what was about to run outlives the process better than
+the result, because the side effects may have landed either way.
+
+### Unknown is a third outcome
+
+When nanopi cannot determine what happened, it says so. It does not
+pick the safer-sounding option.
+
+The live example is `repair_orphaned_tool_calls` (`agent/loop_.rs`):
+a session whose tail is a `tool_call` with no result gets a synthesized
+result stating the outcome is **UNKNOWN**, and telling the model
+explicitly not to assume failure. Reporting failure there would be a
+lie in the case that matters most — the command may well have finished,
+and a model that believes it failed will re-run a write.
+
+## 2. Naming a refusal
+
+A refusal by the user's own configuration is that configuration
+working. It is not an error, and must not borrow error vocabulary.
+
+Two audiences, two phrasings, both required:
+
+**To the model** — it cannot see the config, so a bare "blocked" leaves
+it to guess. It guessed a sandbox and spent a turn testing the theory
+(`363916b`). Say what refused and that it is policy:
+
+```
+blocked by a user-configured `tool_execution_start` hook — this is a
+policy refusal from the user's nanopi configuration, not a sandbox or
+environment failure. Hook's reason: {reason}
+```
+
+**To the user** — they wrote the hook, but a red `error:` still reads
+as a malfunction (`c0ce35c`):
+
+```
+your `input` hook refused this prompt (policy, not a failure) — {reason}
+```
+
+Corollaries:
+
+- A message must not bracket itself when its renderer adds framing.
+  Both renderers wrap `AgentEvent::Error` in `[error: …]`; a
+  self-bracketing message produced `[error: [ … ]]`.
+- A misconfigured hook must be loud. Exit 127/126 used to fail open in
+  silence, so a typo'd path looked like a hook that never matched.
+  Non-zero exits now print the code and a hint (`agent/hook.rs:470`).
+  **Untested** — it is a `note!` to stderr on a path with no return
+  value, so the hint could be deleted silently. Covered by
+  `docs/v0.12-manual-test-plan.md` T2.4 instead.
+- A rewritten tool call must be shown as rewritten. `-p` prints a
+  second `↻` marker (it already emitted the first); the TUI corrects
+  its stashed bar in place, since the card is only drawn on result.
+
+## 3. Races
+
+Required result for each interleaving.
+
+| Mark | Meaning |
+|---|---|
+| ✅ | a regression test pins it |
+| ⬜ | current behavior, nothing pinning it — could be deleted and the suite would stay green |
+| type | not testable and not needing a test: the signature makes the wrong thing unwritable |
+
+The ⬜ rows are the point of the table. Each one was found by asking
+"what does the test actually assert?" rather than "is there a test?",
+and several turned out to assert the in-memory half of a two-step
+write. Do not upgrade a mark without reading the assertions.
+
+### Steering
+
+| Race | Required result | |
+|---|---|---|
+| steer arrives mid-iteration | pumped at the next iteration top and pushed into context | ✅ |
+| — and persisted to the session | `append_entry` alongside the context push | ✅ `steer_message_injected_as_user_turn` |
+| steer arrives during a turn that ends without tool calls | demoted to a follow-up, which auto-starts the next turn — never dropped | ✅ `b90b27f` |
+| steer arrives after the receiver is dropped | `steer_or_queue` echoes `[queued]` and queues it in the TUI | ✅ |
+| steer arrives during cancellation | `drain_steer_to_follow_ups` keeps it as a follow-up | ✅ |
+| steer echoed but never delivered | forbidden — the echo is emitted only after the send succeeds | ✅ |
+| a plugin's `host-send-user-message` arrives with a turn running | steers it, same `Steering` variant a typed line takes — the plugin does not get a parallel path | ✅ |
+| — arrives with no live channel | queued in `plugin_send`'s overflow and started as the next turn; **last** of the three follow-up sources, behind the human's queued line | ✅ |
+| — accepted but the process/turn dies before the echo | the echo obligation and the routing decision are taken together under one lock, so the two cannot disagree: `echoes + queued == accepted sends`, exactly, as a partition | ✅ |
+| — refused (guard, cap, or no sink) | in-band `error: …` naming the reason; nothing routed, nothing echoed, nothing disclosed | ✅ |
+| a plugin traps after spending part of its session cap | the guard state is process-wide and survives the rebuild — trapping is not a way to reset the cap | ✅ |
+
+The persistence half is now pinned, and was worse than this table
+recorded: `steer_message_injected_as_user_turn` did not assert
+`ctx.messages` either — it asserted only the returned `final_text`. Both
+halves are asserted now, and deleting the `append_entry` reds it with
+`left: 0, right: 1`. The failure it guards would have surfaced only on
+`--continue`, as a resumed session missing a turn the user typed.
+
+The third and fourth rows cover a **dropped receiver**; the second
+covers a **live receiver nobody returns to**. Conflating them is what
+hid `b90b27f`: two of the three exits called
+`drain_steer_to_follow_ups` and the ordinary one did not.
+
+### Tool execution
+
+| Race | Required result | |
+|---|---|---|
+| process loss between `ToolCall` and `ToolResult` | replay synthesizes an unknown-outcome result so the session stays resumable | ✅ `f70e5cc` |
+| a hook rewrites arguments after the call was displayed | the rewrite is shown: `↻` line in `-p`, in-place correction in the TUI | ✅ |
+| a hook blocks | the tool does not run; the model is told it was policy; subscribers still receive the event | ✅ |
+| a WASM plugin traps | reported as a failed call; the plugin stays callable afterwards | ✅ |
+| user cancels mid-tool | the turn aborts; a directive-only marker enters context, and does NOT embed partial text | ✅ |
+| — and that marker is persisted | `append_entry` beside the context push | ✅ `run_turn_cancel_drops_stream_and_marks_context_aborted` |
+| a plugin's tool call fires an event back into the calling plugin | the delivery is dropped by `try_lock` and counted; the call proceeds | ✅ `a_busy_plugin_drops_the_event_and_counts_it` |
+| a plugin's tool call | no `SessionEntry`, no `AgentEvent` — the transcript is the conversation with the model | ✅ `a_plugin_initiated_call_leaves_the_session_file_byte_unchanged`, `a_plugin_origin_call_emits_no_agent_event` |
+| a plugin's tool call outruns its 30s deadline | reported as a failed call; the `tool_execution_start`/`end` pair stays balanced | ✅ `a_timed_out_call_still_fires_tool_execution_end` |
+| — and a process that call spawned | may outlive the deadline: the plugin is unblocked, the child is not killed | ⬜ known limit, not pinned |
+
+The cancel row's rationale is worth keeping: embedding the half-written
+response made the next turn's model continue it instead of answering
+the new question. Its test asserts on `agent.context`, not on the
+session file, so the persisted half is unpinned the same way the steer
+persistence is.
+
+### Compaction
+
+| Race | Required result | |
+|---|---|---|
+| `/compact` with no boundary | no hooks, no events, no session entry, and a line that says nothing was compacted | ✅ `87a81b4` |
+| auto-compact over threshold but no boundary | same — `maybe_compact` forwards the flag rather than hardcoding `true` | ✅ |
+| `session_before_compact` fires, compaction then no-ops | forbidden — the boundary is checked before any hook fires, so the pair is always balanced | ✅ |
+
+An unbalanced hook pair is indistinguishable, from a hook author's
+side, from nanopi dying mid-compaction. That is why it is forbidden
+rather than merely untidy.
+
+### Session identity
+
+| Race | Required result | |
+|---|---|---|
+| `/new`, `/resume`, `/fork`, `/import` then exit | the exit line names the session you ended in (`app.session_id`) | ⬜ T3.7 |
+| `/model` mid-session | a `ModelChange` entry is appended, so a resumed transcript shows the switch | ⬜ T3.9 — **run 2026-09-08, passed** |
+| thinking level cycled mid-session | a `ThinkingChange` entry is appended, with explicit `null` for off | ⬜ T3.9 — **run 2026-09-08, found 2 defects** |
+| in-session switch then a lifecycle hook | the hook payload carries the live session id | ✅ |
+| a compaction hook fires | `session_id` is the real id; the reason lives in `arguments.reason` | ✅ |
+
+The first row has no automated coverage on purpose: the two lines print
+at the tail of a several-hundred-line async fn with no seam to inject a
+fake `App`, and extracting a helper would pin the formatting rather
+than which variable the call site passes — which is the entire defect.
+`docs/v0.12-manual-test-plan.md` T3.7 covers it instead.
+
+The two `⬜ T3.9` rows are the same seam, and they are marked honestly
+rather than optimistically for a specific reason. `SessionEntry::ModelChange`
+had a serde definition, replay handling, `/export` rendering and a
+roundtrip test **since the session format existed, and no writer** — so
+`/model` mid-session left no trace and a resumed transcript read as
+though one model had answered throughout. It survived that long
+precisely because nothing pinned the CALL SITE: the roundtrip test
+asserted that the variant serializes, which it always did.
+
+Both writers now exist (`ModelChange` wired, `ThinkingChange` added with
+it) and both sit inside `handle_action`, which needs a live `Term` and
+agent slot. So the *writing* is again unpinned, and saying otherwise
+would repeat the mistake in the documentation instead of the code. What
+IS pinned: the entries roundtrip, and `ThinkingChange`'s `None` stays an
+explicit `null` (`a_thinking_change_to_or_from_off_keeps_its_nulls`) so
+"off" cannot be confused with "an entry predating the field".
+
+**T3.9 was executed on 2026-09-08 and this is exactly what it was for.**
+The `ModelChange` half passed as written: the entry lands on disk and
+`/export` renders it. The `ThinkingChange` half produced **no entries at
+all** — and the writer was fine. Two separate defects sat in front of it:
+
+1. **The default `Shift+Tab` binding was dead.** A terminal sends
+   `ESC [ Z`; crossterm 0.28 reports `BackTab` **with** SHIFT; the
+   default binding is `BackTab` with no modifier, and the equivalence
+   check beside it listed every spelling except that one. Isolated by
+   rebinding `thinking_cycle` to `ctrl+y`, which made the whole feature
+   work immediately — proving the writer was never the problem. Fixed in
+   `af2134d`; the existing test had covered only the two spellings the
+   code already handled.
+2. **Extended thinking was inert on the entire Claude 5 family.**
+   `supports_thinking` listed 3.7 and 4.x only, and
+   `provider/anthropic.rs` sends the `thinking` field only when it
+   returns true — so the level did nothing, while `/thinking`, the status
+   bar and the persisted `ThinkingChange` entry all reported it as on.
+   Fixed in `d9964fb`.
+
+Both are the failure this section predicts, one layer further out than
+expected: nothing pinned the call site, so nothing noticed that the call
+site was **unreachable**. After the fixes, the full seven-step cycle
+persists, with `{"from":null,"to":"minimal"}` … `{"from":"max","to":null}`
+— explicit nulls on both ends, as required.
+
+A third, still-open item came out of the same row and is written up in
+`docs/BACKLOG.md`: `settings.toml`'s `thinking_level` is persisted and
+never read back — a writer with no reader, this section's own pattern
+inverted.
+
+Worth noting how the old test failed: its assertions were bare
+`matches!(entry, Variant { .. });` STATEMENTS. The macro returns a bool,
+the `;` discarded it, and five lines asserted nothing at all — verified
+by rewriting one to the wrong variant and watching it still pass. They
+are `assert!(matches!(…))` now.
+
+### Plugin events
+
+| Race | Required result | |
+|---|---|---|
+| event arrives while the plugin is inside another guest call | dropped without waiting (`try_lock`, never a blocking lock) | ✅ |
+| a shell hook blocks the event's action | subscribers still receive the event | ✅ |
+| a plugin's handler panics or traps | delivery to the next subscriber continues | ✅ |
+| a plugin returns a value from `handle-event` | ignored | type |
+
+### Plugin hot reload (v0.12.0)
+
+| Race | Required result | |
+|---|---|---|
+| `/reload` lands while a tool call is inside the guest | the result is DISCARDED and the call refused in-band, naming the reload; the refusal says the side effects it already had stand | ✅ |
+| `/reload` lands before a queued call enters the guest | refused before the guest runs at all, so no side effects | ✅ |
+| a slash command runs against a replaced instance | same refusal as a tool call, both before and after | ✅ |
+| an event is emitted to a replaced instance | not delivered, and NOT counted in `dropped_events` — nothing was dropped from a live subscriber | ✅ |
+| a plugin's `.wasm` fails to load during `/reload` | the previously loaded instance stays live and callable, keeps its subscription and its grant row, and the failure is named in red | ✅ |
+| a plugin is removed from `[[extensions]]` and reloaded | its tools and commands are unregistered, its instance has no live generation left, and the count is reported | ✅ |
+| a plugin reloads to shed its spent per-session message budget | it does not: the budget and the loop guard are host-side and survive | ✅ |
+| a reloaded plugin re-registers a tool name it already owned | accepted, because unregister runs before register — `register_external` still refuses a name it does not own | ✅ |
+
+Two orderings are load-bearing and neither is arbitrary. Loading the
+new components happens BEFORE unregistering the old, so a load failure
+leaves the old instance intact rather than leaving the user with
+neither. And the generation table is published as the LAST statement of
+a successful load, so a plugin that fails halfway never marks its old
+instance stale — rollback is the absence of an action, not a
+compensating one.
+
+Delivery is explicitly **not** guaranteed, and that asymmetry is
+deliberate: a busy plugin must never be able to extend a turn. An
+audit plugin therefore cannot treat its own log as complete — which is
+exactly why a *blocked* action must still be delivered, since the
+refused requests are the ones such a plugin cares about most.
+
+### Terminal output
+
+| Race | Required result | |
+|---|---|---|
+| stderr written while the TUI owns the screen | `\r\n`, via `crate::note!` — a bare `\n` staircases in raw mode | ✅ `53bd497` |
+| stderr written before `setup_terminal()` | bare `\n` is correct; `note!` handles both via the raw-mode flag | ✅ |
+| a thinking delta lands after `Start`'s sticky color | each delta self-contained; `TextDelta` re-arms the color once per interruption | ✅ `d48f1aa` |
+| a `note!` line lands in ratatui's managed region | it does not: while the TUI owns the screen `note!` queues instead of writing to stderr, and the loop drains it into scrollback via `insert_before` | ✅ |
+| a `note!` is written with no drainer running (before the first tick, after the loop exits) | it is flushed to stderr at teardown, not dropped | ✅ |
+| a plugin `note!`s in a loop while the TUI is not ticking | the queue is capped at `MAX_PENDING`; the OLDEST are dropped, so the newest line survives | ✅ |
+| a `note!` is written to BOTH stderr and the queue | it cannot be: `note` matches one `Destination`. Not observable from a test — libtest does not capture an in-process stderr write, so the enum is the guard, not an assertion | ⬜ |
+
+## 4. Review checklist
+
+When adding a status line, an `AgentEvent`, or a `note!`:
+
+1. What proves this? Name the session entry. If none, it is an
+   observation — phrase it as intent or progress, not as done.
+2. Can the action fail or no-op after this is emitted? If so, either
+   emit after, or make the wording survive both outcomes.
+3. Is the audience the model? Then it cannot see the config, the hooks,
+   or the filesystem. Say which mechanism acted and whether it was
+   policy.
+4. Is there an unknown case? Report it as unknown. Not success, not
+   failure.
+5. Does the renderer add framing? Then do not add your own brackets.
+6. Which interleavings can this participate in? Add the row to §3, with
+   ✅ or ⬜ stated honestly.
+
+## Invariants
+
+1. A committed `session::append_entry` line is the only proof that an
+   action happened.
+2. No observation is phrased as an accomplished fact before its proof
+   commits.
+3. `SessionEntry::ToolCall` proves intent, never execution.
+4. An indeterminate outcome is reported as unknown, and never as
+   success or failure.
+5. A refusal by user configuration is named as policy, to both
+   audiences, and never borrows error vocabulary.
+6. A message does not bracket itself when its renderer adds framing.
+7. A hook pair (`*_before_*` / `*_*`) either both fire or neither does.
+8. A steer that is echoed to the user is delivered, or demoted to a
+   follow-up that runs. It is never silently dropped. Since v0.12 this
+   binds plugin-initiated messages too, as a biconditional rather than
+   an ordering: no send without an echo, and no echo without a send.
+   `b90b27f` is why the ordering the spec originally asked for
+   (echo-then-send) is the one that loses text.
+9. Every replayed `tool_use` id has a matching result after load.
+10. Plugin event delivery is best-effort and never extends a turn; a
+    blocked action still delivers its event.
+11. Session-identity output reads the live session, never the one bound
+    at startup.
+12. Anything written to stderr while raw mode is active terminates
+    lines with `\r\n`.
+13. A call held by a plugin instance that `/reload` replaced is refused,
+    never reported as a success — invariant 1's rule applied to
+    replacement: the result of code that is gone is not proof of
+    anything. `/reload` never leaves a plugin in a half-state: it
+    reloads, keeps the old instance, or says which, out loud.
+
+## Required tests
+
+Grouped by the invariant they defend. All present unless noted.
+
+### Claims
+
+- `compact_now` returns false and touches nothing when there is no
+  boundary; returns true and shrinks the context when there is;
+- a no-op compaction fires neither compaction hook;
+- an orphaned `tool_use` gets an unknown-outcome result, placed
+  directly after its assistant message;
+- a partially-answered batch fills only the gaps, in call order;
+- a healthy session and a text-only session replay byte-identical —
+  this runs on every resume, so a false positive would inject a
+  fabricated tool result into a working conversation;
+- a refused prompt does not bracket itself, names the `input` hook, and
+  says "policy".
+
+### Races
+
+- a steer that misses its turn becomes a follow-up — sent from inside
+  `stream_turn`, because enqueuing before `run_turn` exercises the pump
+  instead and passes against the unfixed code;
+- a cancelled turn keeps pending steers as follow-ups;
+- a blocking hook still delivers its event to subscribers;
+- a turn delivers every event it can reach (guards against a missing
+  `deliver_with` at any of the eleven sites, which is otherwise
+  completely silent);
+- a panicking handler does not stop delivery to the next subscriber;
+- a replaced plugin instance refuses a tool call and a slash command
+  rather than running them, and refuses a call that was ALREADY inside
+  the guest when the swap landed — the second is the one that closes
+  the window, and the first version of that test passed vacuously
+  (`done (255)`) because a real second `load` spends ~815ms in
+  Cranelift, longer than the call it was racing; it now publishes the
+  swap with the same `next_id` + `activate` pair `load` ends with, so
+  what is skipped is the compile, not the mechanism;
+- a replaced instance receives no further events;
+- a retired plugin has no live generation left;
+- a reload does not refund a plugin's spent session budget (this one
+  lives in the integration binary: `plugin_send`'s state is
+  process-wide and its own unit tests serialize on a private lock that
+  is not `crate::test_lock()`).
+
+### Rendering
+
+- every thinking delta renders with identical SGR state;
+- the reply is green again after reasoning and after a tool result;
+- the color is re-armed once per interruption, not once per delta;
+- a plain turn gains no extra escapes;
+- `note!` translates every newline to CRLF under raw mode and leaves
+  non-raw output in bare LF.
+
+### Not automated, by decision
+
+- T3.7 — the exit line names the live session (no seam; see §3);
+- T4.7 — `note!` output is legible while on screen (it is still wiped
+  on redraw);
+- T8.2b — `kill -9` mid-tool, then `--continue`.
+
+## What is not adopted from PI
+
+Recorded so the next reader does not re-litigate it:
+
+- **Transactional multi-write commits.** nanopi appends single JSONL
+  lines. Atomicity across an entry, a usage row, and a state value is a
+  property of PI's store; nanopi has no state values.
+- **Restart authority / `effect_pending` state machine.** nanopi has no
+  resumable operation state. A lost process loses the turn, and §3 says
+  what replay does about it.
+- **Typed durable addresses (`value<T>` / `list<T>`).** These serve a
+  keyed mutable store. nanopi's session is a transcript.
+- **Frame-level partial persistence.** PI persists provider frames so a
+  killed process can reduce the latest partial. nanopi streams to the
+  terminal and keeps the transcript's visual record only — a deliberate
+  trade, since the alternative reintroduces the "model continues its
+  own aborted response" bug.

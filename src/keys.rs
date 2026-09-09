@@ -201,8 +201,16 @@ impl KeyBindings {
         if spec.code == ev.code && spec.mods == ev.modifiers {
             return true;
         }
+        // `BackTab + SHIFT` is the case that matters in practice and was
+        // missing: a real terminal sends `ESC [ Z` for Shift+Tab, and
+        // crossterm 0.28's CSI parser turns that into BackTab *with*
+        // KeyModifiers::SHIFT — not NONE. The default ThinkingCycle
+        // binding is stored as BackTab + NONE, so neither the exact
+        // comparison above nor this equivalence matched, and Shift+Tab
+        // cycled nothing in any real terminal. Only a rebind reached the
+        // feature. All three spellings are the same chord; treat them so.
         let is_shift_tab = |c: KeyCode, m: KeyModifiers| {
-            (c == KeyCode::BackTab && m == KeyModifiers::NONE)
+            (c == KeyCode::BackTab && (m == KeyModifiers::NONE || m == KeyModifiers::SHIFT))
                 || (c == KeyCode::Tab && m == KeyModifiers::SHIFT)
         };
         is_shift_tab(spec.code, spec.mods) && is_shift_tab(ev.code, ev.modifiers)
@@ -281,6 +289,33 @@ mod tests {
         assert!(kb.matches(
             ActionId::ThinkingCycle,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        ));
+        // The spelling an actual terminal produces, and the one this
+        // test used to omit. `ESC [ Z` is what xterm & friends send for
+        // Shift+Tab; crossterm 0.28's `parse_csi` maps it to
+        // `BackTab + SHIFT` (see its `event/sys/unix/parse.rs`, arm
+        // `b'Z'`). With only the two spellings above covered, the
+        // default binding was unreachable in every real terminal while
+        // this test stayed green — Shift+Tab cycled nothing and only a
+        // manual rebind could reach the thinking level at all.
+        assert!(
+            kb.matches(
+                ActionId::ThinkingCycle,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            ),
+            "BackTab+SHIFT is what crossterm reports for a real Shift+Tab"
+        );
+    }
+
+    /// Shift+Tab equivalence must not swallow a plain Tab. Tab with no
+    /// modifiers is a different chord (and is bound elsewhere), so
+    /// widening the BackTab case must not make it match too.
+    #[test]
+    fn plain_tab_does_not_trigger_thinking_cycle() {
+        let kb = KeyBindings::default();
+        assert!(!kb.matches(
+            ActionId::ThinkingCycle,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
         ));
     }
 

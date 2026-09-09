@@ -1,0 +1,456 @@
+/// nanopi WASM extension interface (v0.11.0).
+///
+/// Plugins export `list-tools` and `execute-tool` at the world root;
+/// the host provides `host-log`. Structured payloads cross the
+/// boundary as JSON strings rather than WIT records — that keeps the
+/// ABI to one primitive type, which is what lets the host bind these
+/// by hand with `Instance::get_typed_func` instead of pulling in a
+/// wit-bindgen build step. If this interface grows, switch to
+/// wit-bindgen.
+///
+/// `extension-commands` adds two more string-in/string-out exports and
+/// no imports, so that budget still holds — it is not a reason to
+/// reach for wit-bindgen.
+///
+/// The exports are on the world directly, not inside an interface.
+/// An interface would namespace them as
+/// `nanopi:extension/tool-api#list-tools`, and the host resolves
+/// root exports by bare name.
+///
+/// A LINEAR LADDER, on purpose. WIT cannot express an optional export:
+/// `wasm-tools component new` fails if a declared export is missing.
+/// Adding the command exports to `extension` would therefore break
+/// every existing plugin *source* on upgrade, even though the host
+/// happily loads the old *binaries* (it resolves `list-commands`
+/// optionally). Keep tool-only plugins on `extension`; target
+/// `extension-commands` only when you actually register commands;
+/// target `extension-events` only when you also want to observe
+/// lifecycle events:
+///
+///   extension  ⊂  extension-commands  ⊂  extension-events
+///
+/// A lattice (tools, tools+commands, tools+events, tools+commands+events)
+/// was considered and refused: that shape is four worlds today and eight
+/// after the next feature. An events-but-no-commands plugin pays the
+/// accepted cost of stubbing `list-commands` / `execute-command` with
+/// two-line returns (see `docs/v0.12-events.md` §4.1).
+///
+/// Canonical ABI: WIT Component Model (wasmtime 19+).
+
+package nanopi:extension;
+
+world extension {
+    /// Log a message to nanopi's stderr.
+    /// Level: 0 = trace, 1 = info, 2 = warn, 3 = error.
+    import host-log: func(level: u8, message: string);
+
+    /// Read a UTF-8 text file, relative to the session's working
+    /// directory. Returns the file's contents, or an error string
+    /// prefixed with `error: `.
+    ///
+    /// Gated on `allow_fs = true` in the plugin's `[[extensions]]`
+    /// entry — without it every call returns an error, so a plugin
+    /// cannot read anything the user did not opt into.
+    ///
+    /// Even with the gate open, the resolved path must stay inside the
+    /// working directory. Paths are canonicalized before the check, so
+    /// `../` sequences and symlinks pointing outward are both refused.
+    import host-fs-read: func(path: string) -> string;
+
+    /// Fetch a URL over HTTP(S) and return the response body, or an
+    /// error string prefixed with `error: `.
+    ///
+    /// Gated on `allow_network = true` in the plugin's
+    /// `[[extensions]]` entry — without it every call is refused
+    /// before any request is made.
+    ///
+    /// Even with the gate open, the URL's host must appear in
+    /// `url_allowlist`. An empty allowlist denies everything: the
+    /// capability is opt-in twice over, once for the plugin and once
+    /// per host. Matching is on the parsed host, so an entry also
+    /// covers its subdomains and any port, but not a host that merely
+    /// contains or ends with the entry's text.
+    ///
+    /// Only `http` and `https` are accepted. Requests time out after
+    /// 10 seconds, so a plugin cannot hang a turn on a black-holed
+    /// connection. Redirects are NOT followed — a 3xx comes back as
+    /// `error: HTTP 30x` rather than walking the fetch onto a host the
+    /// allowlist never approved.
+    import host-http-get: func(url: string) -> string;
+
+    /// ─── Imports are additive; they need NO new world. ───
+    ///
+    /// The LINEAR LADDER note at the top of this file is about EXPORTS
+    /// only. `wasm-tools component new` fails on a *missing export*, so
+    /// adding an export to `extension` breaks every existing plugin
+    /// source. An import is the other direction: a guest compiled
+    /// against the older WIT simply never references these functions,
+    /// and a component that references no import needs nothing linked
+    /// for it. The host links them unconditionally and the old binaries
+    /// keep loading — the three committed fixtures predate every one of
+    /// these imports and prove it on every test run.
+    ///
+    /// So new capabilities go here, on `world extension`, and are
+    /// inherited by `extension-commands` / `extension-events` through
+    /// `include`. Do NOT add a fourth world for them.
+    ///
+    /// ─────────────────────────────────────────────────────────────
+
+    /// Read this plugin's stored value for `key`. Absent → `""`.
+    ///
+    /// Gated on `allow_store = true` in the plugin's `[[extensions]]`
+    /// entry — without it every call returns an `error: ` string, and
+    /// no store file is ever created. State that survives a restart is
+    /// a different capability from state in the instance's memory:
+    /// combined with `allow_network` it is a durable profile of the
+    /// user, which is why it is gated rather than free.
+    ///
+    /// KEYS, NOT PATHS. The plugin never names a filesystem location,
+    /// so the whole class of problems `host-fs-read` defends against —
+    /// `../`, symlinks pointing outward, non-regular files — does not
+    /// exist here. The host owns the mapping: one JSON object per
+    /// plugin at `~/.nanopi/extensions/<stem>/store.json`, where
+    /// `<stem>` is the `.wasm` file stem. Two plugins with the same
+    /// stem where either has `allow_store` is a LOAD ERROR, not a
+    /// silent share — the same policy as a command-name collision.
+    ///
+    /// Absent reads as `""` unambiguously, because `""` is not valid
+    /// JSON and a plugin should store JSON. The residual ambiguity — a
+    /// plugin storing a literal string that begins `error: ` — is
+    /// inherited from this ABI's in-band error convention and is
+    /// documented rather than papered over.
+    ///
+    /// A store value SURVIVES A GUEST TRAP. The store is host-side
+    /// precisely because a trap resets the instance and takes guest
+    /// memory with it.
+    import host-store-get: func(key: string) -> string;
+
+    /// Replace this plugin's value at `key`. Returns `""` on success,
+    /// or an `error: ` string.
+    ///
+    /// A return of `""` means THE BYTES REACHED THE FILESYSTEM, not a
+    /// buffer: the host commits by writing a temp file and renaming it
+    /// over `store.json` in the same directory, and returns only after
+    /// that rename. A same-directory rename is atomic, so a crash
+    /// mid-`set` leaves either the whole old file or the whole new one,
+    /// never a torn one. There is no `fsync` — this survives a process
+    /// crash, not a power cut.
+    ///
+    /// Bounds, checked BEFORE anything is written. A refusal stores
+    /// NOTHING, so a plugin is never told it failed while the value
+    /// went in anyway:
+    ///
+    ///   total serialized store   1 MiB   `error: store quota exceeded (1 MiB)`
+    ///   number of keys           1000    refused, naming the cap
+    ///   key length               128     refused, naming the cap (inclusive: 128 is fine)
+    ///
+    /// Replacing a key that already exists does not count against the
+    /// key cap, so a plugin at the cap can still update what it holds.
+    import host-store-set: func(key: string, value: string) -> string;
+
+    /// Put one line in the user's scrollback. Returns `""` when the
+    /// line was delivered whole, or an `error: ` string.
+    ///
+    /// UNGATED, because it is output rather than access: it reaches
+    /// nothing, reads nothing, and leaves nothing behind. What it can
+    /// do is flood the user's attention, so it is bounded by a RATE
+    /// LIMIT instead of a grant — N lines per plugin per turn, after
+    /// which further lines are dropped and one `… M more suppressed`
+    /// line reports how many. The truncation announces itself; the
+    /// suppressed calls also return an `error: ` string, so a plugin is
+    /// never told it spoke when it did not.
+    ///
+    /// THE HOST APPLIES THE PREFIX. Attribution is built from this
+    /// plugin's `.wasm` file stem and the payload is never parsed for
+    /// it, so a plugin cannot impersonate another: text of
+    /// `[other] rm -rf /` from a plugin named `memory` renders as
+    /// `[memory] [other] rm -rf /`. Newlines in the payload are
+    /// flattened to spaces for the same reason — the prefix covers the
+    /// first line only, so a second line could otherwise pose as
+    /// another plugin's notice. One call is one line.
+    ///
+    /// Payload capped at 64 KiB, the same `MAX_ACTION_PAYLOAD` the
+    /// command actions use. Over that the line is delivered truncated
+    /// and the return value says so, rather than `""`.
+    ///
+    /// DIFFERENT FROM `host-log`, and the difference matters. `host-log`
+    /// writes raw stderr, which lands inside ratatui's managed region
+    /// and is wiped by the next redraw (the known defect in
+    /// `docs/v0.12-manual-test-plan.md` T4.7) — fine for debugging,
+    /// useless for telling the user something. `host-notify` goes
+    /// through `insert_before`, so it scrolls into history and stays.
+    import host-notify: func(text: string) -> string;
+
+    /// Declare text this plugin wants present in the model's context.
+    /// Returns `""` on success, or an `error: ` string.
+    ///
+    /// Gated on `allow_context = true` in the plugin's `[[extensions]]`
+    /// entry. Without it every call returns an `error: ` string and
+    /// nothing enters the prompt. It is gated because this text is read
+    /// by the MODEL AS INSTRUCTION — it is the one import that changes
+    /// what the agent believes rather than what the plugin knows — and
+    /// combined with `allow_network = true` it lets a remote source
+    /// shape the agent's behaviour, which is why that combination gets
+    /// an escalated warning at load.
+    ///
+    /// REPLACES this plugin's previous contribution — it is STATE, not
+    /// an append. That is what makes it safe under a dropped delivery:
+    /// the value is idempotent, so a call the host never made simply
+    /// means the previous contribution stands for one more turn. An
+    /// append would grow without bound and would make a late arrival
+    /// observable. Passing `""` clears the contribution entirely.
+    ///
+    /// TAKES EFFECT AT THE NEXT TURN'S ASSEMBLY, not mid-turn. The host
+    /// folds contributions into the system prompt once per turn, before
+    /// the request is built; a call made while a turn is already in
+    /// flight lands on the following one. This is the same
+    /// idempotent-state framing as above — there is no partially
+    /// applied contribution.
+    ///
+    /// Bounded at 4 KiB per plugin, measured in BYTES, and each plugin
+    /// is capped separately. The bound is small because this text
+    /// enters EVERY request for the rest of the session: an unbounded
+    /// contribution silently multiplies the cost of every turn, which
+    /// is the opposite of what nanopi is for.
+    ///
+    /// A refusal is in-band and CHANGES NOTHING. An over-bound call
+    /// returns an `error: ` string and the PREVIOUS contribution still
+    /// stands — since this is replace-semantics, a refusal that also
+    /// cleared the existing value would turn being told "no" into
+    /// losing what you had.
+    ///
+    /// THE HOST APPLIES THE ATTRIBUTION. The text is rendered under a
+    /// `[context contributed by extension "<stem>"]` header built from
+    /// this plugin's `.wasm` file stem, so the model can tell a
+    /// plugin's injected instructions from the user's own. Unlike
+    /// `host-notify`, multi-line text is normal here and is kept as-is
+    /// — but a body containing a header-shaped line cannot open a block
+    /// attributed to another plugin; the host neutralizes the sequence.
+    ///
+    /// A contribution SURVIVES A GUEST TRAP, like the store and for the
+    /// same reason: it is host-side state, and a trap resets the
+    /// instance.
+    ///
+    /// The host also announces every CHANGE to the contribution in the
+    /// user's scrollback. A contribution is invisible by nature — the
+    /// user never sees the system prompt — so a plugin silently
+    /// rewriting the agent's instructions is exactly what nanopi
+    /// refuses to allow. The announcement is per change, not per turn
+    /// or per call, so re-declaring the same text is silent.
+    import host-set-context: func(text: string) -> string;
+
+    /// Run one of nanopi's BUILT-IN tools and get its result
+    /// (`docs/plugin-capabilities.md` §2.5).
+    ///
+    /// `name` is a built-in tool name (`bash`, `edit`, `find`, `grep`,
+    /// `ls`, `read`, `write`) and `args-json` is that tool's ordinary
+    /// JSON argument object.
+    ///
+    /// GATED PER TOOL, on `allow_tools` in this plugin's
+    /// `[[extensions]]` entry. Absent or `[]` refuses everything: the
+    /// grant is per tool rather than per plugin because
+    /// `host-call-tool("bash", …)` is arbitrary execution, which walks
+    /// straight past `allow_fs`'s cwd confinement and
+    /// `url_allowlist`'s per-host approval. `allow_tools =
+    /// ["find","read"]` says "may walk and read, may not write or
+    /// exec", which no per-plugin flag can express. A name in
+    /// `allow_tools` that is not a built-in is a LOAD ERROR, not a
+    /// silent no-op.
+    ///
+    /// BUILT-IN TOOLS ONLY. A target supplied by another extension is
+    /// refused, naming the extension. Two plugins each granted the
+    /// other's tool would deadlock — the tool path takes a blocking
+    /// lock on purpose, because the caller wants the result — so the
+    /// cycle is removed by construction rather than detected.
+    ///
+    /// RETURNS the tool result as JSON when a tool actually ran:
+    /// `{"content": "...", "is_error": false}`. A call that did NOT
+    /// run comes back as a bare `error: …` string instead, because a
+    /// refusal is not a tool result. Image attachments are dropped —
+    /// there is no channel here for them.
+    ///
+    /// BOUNDED at 30 seconds. Past that the call returns
+    /// `error: tool call exceeded the 30s plugin deadline`; note that a
+    /// process the tool spawned may outlive it.
+    ///
+    /// The user's `tool_execution_start` / `tool_execution_end` hooks
+    /// fire on these calls exactly as they do on the model's, and a
+    /// hook block returns `error: blocked by hook: <reason>` with the
+    /// tool not run. A plugin does not outrank the user's policy.
+    ///
+    /// The call writes NOTHING to the session transcript and emits no
+    /// agent event — the transcript is the conversation with the model.
+    /// The user is told about it by a one-line host disclosure instead.
+    import host-call-tool: func(name: string, args-json: string) -> string;
+
+    /// Start or steer a turn with `text`, as if the user had typed it
+    /// (`docs/plugin-capabilities.md` §2.4).
+    ///
+    /// Returns `""` on success, or `error: <reason>` — never traps.
+    ///
+    /// GATED on `allow_send_message = true` in this plugin's
+    /// `[[extensions]]` entry. This is the only capability that SPENDS
+    /// THE USER'S MONEY: it causes a billed turn against the provider.
+    /// Treat every call as one the user will be charged for.
+    ///
+    /// The text is always echoed to the user verbatim, attributed to
+    /// this plugin, and disclosed on the host's own budget. There is no
+    /// quiet path — a plugin can never believe it sent something the
+    /// user did not see.
+    ///
+    /// ROUTING. If a turn is running the text STEERS it, arriving as a
+    /// fresh user message at the next iteration boundary — the same
+    /// path a mid-stream typed line takes. If no turn is running, or
+    /// the one that was running has just ended, the text starts the
+    /// next turn instead. It is never dropped, and it never outranks a
+    /// line the human has already queued.
+    ///
+    /// GUARDED, three ways, all refusals in band:
+    ///
+    ///   * `error: a message from this plugin is already pending` — one
+    ///     unconsumed message per plugin. It clears when the text
+    ///     actually reaches a turn, not when this call returns.
+    ///   * `error: this plugin cannot send during a turn its own
+    ///     message started` — no replying to yourself. Per plugin, not
+    ///     global: another plugin may still speak during that turn.
+    ///   * `error: this plugin has started too many turns in this
+    ///     session (20)` — a per-session cap, because the first two
+    ///     rules do not bound a `turn_end` subscriber that sends once
+    ///     per turn forever.
+    ///
+    /// UNAVAILABLE in headless (`nanopi -p`), where there is no turn
+    /// loop to reach: `error: sending a message is not available right
+    /// now`. Refused, never silently discarded.
+    import host-send-user-message: func(text: string) -> string;
+
+    /// Return the tools this plugin provides, as a JSON array:
+    ///
+    ///   [
+    ///     {
+    ///       "name": "query",
+    ///       "description": "Run a read-only SQL query",
+    ///       "parameters": { "type": "object", "properties": { ... } }
+    ///     }
+    ///   ]
+    ///
+    /// `parameters` is a JSON Schema object, passed to the LLM
+    /// verbatim as the tool's parameter schema. Called once at load
+    /// time. A component that does not export this is rejected as
+    /// "not a nanopi extension".
+    export list-tools: func() -> string;
+
+    /// Execute one of the tools from `list-tools`.
+    ///
+    /// `args-json` is a JSON object matching that tool's `parameters`
+    /// schema. Returns a JSON object:
+    ///
+    ///   { "content": "...", "is_error": false }
+    ///
+    /// `is_error` is optional and defaults to false. A trap here is
+    /// reported to the model as a failed tool call; it does not take
+    /// down nanopi.
+    export execute-tool: func(name: string, args-json: string) -> string;
+}
+
+/// `extension` plus user-invocable slash commands.
+///
+/// A tool is something the *model* decides to call; a command is
+/// something the *user* types. Plugins that only provide tools should
+/// keep targeting `extension` — see the note at the top of this file.
+world extension-commands {
+    include extension;
+
+    /// Return the slash commands this plugin provides, as a JSON array:
+    ///
+    ///   [ { "name": "todo", "description": "Show the TODO list" } ]
+    ///
+    /// Called once at load time, and never again — a plugin cannot
+    /// change its command set mid-session.
+    ///
+    /// OPTIONAL from the host's side: a component that does not export
+    /// this loads normally and registers zero commands. That is what
+    /// keeps `extension`-targeted plugins working.
+    ///
+    /// Names may not contain whitespace, `:` or `/`, and are refused
+    /// rather than renamed on collision: a name already taken by a
+    /// built-in command does not register, and if two plugins claim the
+    /// same name then NEITHER registers. Both cases print a warning
+    /// naming the plugin(s). A refused command does not affect that
+    /// plugin's other commands or any of its tools.
+    ///
+    /// Commands are surfaced in interactive (TUI) mode only — `nanopi
+    /// -p` has no command palette. A plugin's tools still work there.
+    export list-commands: func() -> string;
+
+    /// Run one of the commands from `list-commands`.
+    ///
+    /// `args` is RAW TEXT: everything the user typed after the first
+    /// space, `""` if they typed none. Deliberately not `args-json` —
+    /// a slash command's argument is a line of prose, not a JSON
+    /// object, and pre-parsing it would be a lie. Note that leading and
+    /// trailing whitespace is trimmed, matching every built-in command.
+    ///
+    /// Returns a single-key JSON action object, exactly one of:
+    ///
+    ///   { "print":             "text for the user's scrollback" }
+    ///   { "send_user_message": "text to start a turn with" }
+    ///   { "error":             "what went wrong" }
+    ///
+    /// `print` and `error` never reach the model. `send_user_message`
+    /// is the sandbox-safe stand-in for PI's `pi.sendUserMessage()`:
+    /// PI ignores the handler's return value and lets the handler call
+    /// back into the host, which here would mean a new import. Returning
+    /// the intent as data instead keeps the import list at three. The
+    /// text is always echoed to the user verbatim before it is sent, so
+    /// nothing is said on their behalf invisibly. Invoked mid-stream it
+    /// steers the running turn, or queues as a follow-up if it arrives
+    /// too late — the same path a typed message takes.
+    ///
+    /// A trap, a malformed payload, or an `error` action is shown to
+    /// the user and NOT forwarded to the model — matching PI, where a
+    /// throwing command handler is swallowed rather than becoming a
+    /// prompt.
+    export execute-command: func(name: string, args: string) -> string;
+}
+
+/// `extension-commands` plus lifecycle event delivery.
+world extension-events {
+    include extension-commands;
+
+    /// Which events this plugin WANTS, as a JSON array of names:
+    ///   ["pre_tool_use", "turn_start"]
+    ///
+    /// Called once at load. Requesting an event is not the same as
+    /// receiving it — the config's `events` grant must ALSO name it.
+    /// Anything not in both this list and the config's `events` list is
+    /// never delivered (see `docs/v0.12-events.md` §4.2).
+    export list-events: func() -> string;
+
+    /// One event. `event` is PI's name for it — `tool_execution_start`,
+    /// not the shell layer's `pre_tool_use`.
+    ///
+    /// `payload-json` is byte-identical to what a shell hook receives on
+    /// stdin for the same event, so a plugin and a hook see exactly the
+    /// same thing.
+    ///
+    /// `message_end` carries the assistant's reply in
+    /// `arguments.response`, capped at 16 KiB. When the cap engages,
+    /// `arguments.response_truncated` is `true` AND the text itself ends
+    /// with `[nanopi: response truncated, N of M bytes]` —
+    /// `arguments.response_length` is always the whole reply's length,
+    /// never the truncated copy's. Do not conclude anything from a
+    /// `response` you have not checked for that marker.
+    ///
+    /// The return value is IGNORED. `handle-event` is observe-only —
+    /// return `"{}"`.
+    ///
+    /// A 2s epoch budget applies to GUEST code only: a handler that
+    /// calls `host-http-get` is bounded by that function's own 10s
+    /// timeout on top, so ~12s worst case. Do NOT fetch from an event
+    /// handler.
+    ///
+    /// Delivery is DROPPED WITHOUT WAITING if this plugin is already
+    /// inside another guest call (a tool execution, or another event
+    /// delivery) — the host uses `try_lock`, never a blocking lock.
+    export handle-event: func(event: string, payload-json: string) -> string;
+}

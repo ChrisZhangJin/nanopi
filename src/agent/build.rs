@@ -86,6 +86,231 @@ pub struct AgentBuildInputs {
     pub no_context_files: bool,
     /// `--system-prompt` / `--append-system-prompt` policy.
     pub prompt_overrides: PromptOverrides,
+    /// v0.11.0: optional injected follow-up message from a prior
+    /// turn's follow-up queue. None in `build_fresh`; set
+    /// for `hydrate_resumed` when the previous turn queued one.
+    pub initial_follow_up: Option<String>,
+    /// v0.11.0: tool execution mode (parallel or sequential).
+    pub tool_exec_mode: crate::config::ToolExecMode,
+    /// v0.12: per-tool `executionMode` overrides from
+    /// `[tool_exec_overrides]`, already validated against the registry
+    /// by `config::load_config`.
+    pub tool_exec_overrides:
+        std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
+    /// v0.11.0: `[[extensions]]` from config.toml. Each entry points at
+    /// a `.wasm` component (or a directory of them) whose exported
+    /// tools get registered alongside the built-ins. Ignored entirely
+    /// unless the binary was built with `--features wasm`.
+    pub extensions: Vec<crate::config::ExtensionConfig>,
+}
+
+/// Load `[[extensions]]` into the registry, returning the slash
+/// commands the plugins may register. Failures are reported on stderr
+/// and skipped — a broken plugin must not stop nanopi from starting
+/// with the rest of its tools.
+///
+/// Compiled out entirely without the `wasm` feature, so the default
+/// build carries neither wasmtime nor this code path.
+#[cfg(feature = "wasm")]
+fn load_extensions(
+    registry: &mut ToolRegistry,
+    extensions: &[crate::config::ExtensionConfig],
+    cwd: &std::path::Path,
+) -> (
+    Vec<crate::command::PluginCommand>,
+    crate::subscriber::EventSubscribers,
+    Vec<crate::plugin_grants::PluginGrants>,
+) {
+    if extensions.is_empty() {
+        return (Vec::new(), Default::default(), Vec::new());
+    }
+    use crate::render::notice::Notice;
+    use crate::tool::ToolSource;
+
+    let summary = crate::wasm::PluginHost::new().load_all(extensions, cwd);
+    // `load_all` collected its own notices; everything below appends to
+    // the same list so the user gets ONE block per startup rather than
+    // a warning block followed by loose lines.
+    let mut notices = summary.notices;
+    // Moved out before `summary.tools` is consumed below.
+    let grants = summary.grants;
+
+    for (path, err) in &summary.errors {
+        notices.push(Notice::error(
+            path.display().to_string(),
+            format!("failed to load: {err}"),
+        ));
+    }
+
+    // Group the per-tool lines by the plugin that supplied them:
+    // `registered extension tool "greet"` three times over says less
+    // than one `tools: events_seen, busy, greet` line, and buries any
+    // warning above it.
+    let mut registered: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for tool in summary.tools {
+        let name = tool.spec().name.clone();
+        let subject = match tool.source() {
+            ToolSource::Plugin { path, .. } => path,
+            // Unreachable — these all came from `load_all` — but a
+            // built-in here should still be reported, not dropped.
+            ToolSource::Builtin => String::new(),
+        };
+        if let Err(collision) = registry.register_external(tool) {
+            notices.push(Notice::warn(
+                subject,
+                format!(
+                    "extension tool {collision:?} collides with an existing \
+                     tool — skipping it (rename it in the plugin)"
+                ),
+            ));
+        } else {
+            registered.entry(subject).or_default().push(name);
+        }
+    }
+    for (subject, mut names) in registered {
+        names.sort();
+        notices.push(Notice::info(subject, format!("tools: {}", names.join(", "))));
+    }
+
+    // Commands are judged as a set, not one at a time: a name claimed
+    // by two plugins must register for neither, which is not decidable
+    // while looking at one plugin.
+    let resolved = crate::command::resolve_commands(summary.commands);
+    print_command_diagnostics(&resolved.diagnostics);
+    let mut by_plugin: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for cmd in &resolved.commands {
+        by_plugin
+            .entry(cmd.plugin_name.to_string())
+            .or_default()
+            .push(format!("/{}", cmd.spec.name));
+    }
+    for (plugin, mut cmds) in by_plugin {
+        cmds.sort();
+        notices.push(Notice::info(plugin, format!("commands: {}", cmds.join(", "))));
+    }
+
+    crate::render::notice::emit("Extensions", &notices);
+    let event_subscribers = crate::subscriber::EventSubscribers::from_subscribers(summary.subscribers);
+    (resolved.commands, event_subscribers, grants)
+}
+
+/// No-op stand-in for builds without the `wasm` feature. Warns once if
+/// the user configured extensions anyway, so a silently-ignored
+/// `[[extensions]]` block doesn't read as a nanopi bug.
+#[cfg(not(feature = "wasm"))]
+fn load_extensions(
+    _registry: &mut ToolRegistry,
+    extensions: &[crate::config::ExtensionConfig],
+    _cwd: &std::path::Path,
+) -> (
+    Vec<crate::command::PluginCommand>,
+    crate::subscriber::EventSubscribers,
+    Vec<crate::plugin_grants::PluginGrants>,
+) {
+    if !extensions.is_empty() {
+        crate::note!(
+            "nanopi: {} [[extensions]] entries ignored — this build has no \
+             WASM support (rebuild with `--features wasm`)",
+            extensions.len()
+        );
+    }
+    (Vec::new(), Default::default(), Vec::new())
+}
+
+/// What one `/reload` did to `[[extensions]]`.
+///
+/// Unconditionally compiled, like `plugin_grants` and `subscriber` and
+/// for the same reason: `mode::tui` is on the reading side of this seam,
+/// so the `/reload` handler stays free of `#[cfg(feature = "wasm")]`.
+/// Without the feature `supported` is false, every list is empty, and
+/// [`Self::line`] says so.
+///
+/// The notes are carried rather than printed. Loading normally reports
+/// through `render::notice` to stderr, which is correct at startup and
+/// wrong here — the TUI owns the screen by the time `/reload` runs, and
+/// a stderr write lands on top of it. The handler renders these into
+/// scrollback instead.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExtensionReloadReport {
+    /// Plugins that loaded fresh. These are the ones now live.
+    pub replaced: Vec<String>,
+    /// Plugins whose reload FAILED, with the reason. Their previously
+    /// loaded instance is still live — see `Agent::reload_extensions`.
+    pub failed: Vec<(String, String)>,
+    /// Plugins that vanished from `[[extensions]]` and are now gone:
+    /// unregistered, and their bridge retired so an in-flight call
+    /// refuses instead of running.
+    pub retired: Vec<String>,
+    /// Plugin tools registered after the reload.
+    pub tools: usize,
+    /// Plugin slash commands registered after the reload.
+    pub commands: usize,
+    /// Plugins whose context contribution was dropped, because they are
+    /// gone or no longer hold `allow_context`.
+    pub dropped_contributions: Vec<String>,
+    /// Warnings and errors worth putting in scrollback, already
+    /// rendered as single lines.
+    pub notes: Vec<String>,
+    /// False in a build without the `wasm` feature.
+    pub supported: bool,
+}
+
+impl ExtensionReloadReport {
+    /// The `/reload` report line's extensions clause.
+    ///
+    /// Never "extensions reloaded" on its own: the whole reason
+    /// `[[extensions]]` was skipped for two releases and SAID so is
+    /// that a reload claiming more than it did is worse than one that
+    /// admits a gap. So a failure is named in the line itself rather
+    /// than left to the notes below it.
+    pub fn line(&self) -> String {
+        if !self.supported {
+            return "extensions unchanged (this build has no WASM support)".to_string();
+        }
+        if self.replaced.is_empty()
+            && self.failed.is_empty()
+            && self.retired.is_empty()
+            && self.tools == 0
+        {
+            return "no extensions configured".to_string();
+        }
+        let mut parts = vec![format!(
+            "{} extension(s) reloaded ({} tool(s), {} command(s))",
+            self.replaced.len(),
+            self.tools,
+            self.commands
+        )];
+        if !self.retired.is_empty() {
+            parts.push(format!("{} removed", self.retired.len()));
+        }
+        if !self.failed.is_empty() {
+            parts.push(format!(
+                "{} FAILED, previous instance kept: {}",
+                self.failed.len(),
+                self.failed
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.dropped_contributions.is_empty() {
+            parts.push(format!(
+                "dropped context contribution from {}",
+                self.dropped_contributions.join(", ")
+            ));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Print command-registry diagnostics to stderr. Kept out of
+/// `resolve_commands` so tests can inspect them without noise —
+/// same split as `print_skill_diagnostics`.
+pub fn print_command_diagnostics(diags: &[crate::command::CommandDiagnostic]) {
+    for d in diags {
+        crate::note!("nanopi: {}", d.message);
+    }
 }
 
 impl Agent {
@@ -108,7 +333,19 @@ impl Agent {
             skill_load,
             no_context_files,
             prompt_overrides,
+            initial_follow_up,
+            tool_exec_mode,
+            tool_exec_overrides,
+            extensions,
         } = inputs;
+
+        // v0.11.0: load WASM extensions BEFORE reading `registry.names()`
+        // / `all_specs()` below — otherwise plugin tools would be absent
+        // from both the system prompt's tool list and the `tools` array
+        // sent to the model, i.e. registered but uncallable.
+        let mut registry = registry;
+        let (plugin_commands, event_subscribers, plugin_grants) =
+            load_extensions(&mut registry, &extensions, &cwd);
 
         let tool_names = registry.names();
         let LoadSkillsResult {
@@ -124,6 +361,13 @@ impl Agent {
         );
 
         let agent = Agent {
+            // Both fields, from the same compose. `system_base` is what
+            // every later turn re-derives `system` from once plugins
+            // start contributing; at construction they are equal
+            // because no plugin has contributed yet — which is exactly
+            // why injecting inside `compose_system_prompt` would
+            // capture nothing.
+            system_base: Some(prompt.clone()),
             context: Context {
                 system: Some(prompt),
                 messages: Vec::new(),
@@ -145,7 +389,20 @@ impl Agent {
             skills,
             no_context_files,
             prompt_overrides,
+            pending_follow_ups: initial_follow_up.into_iter().collect(),
+            tool_exec_mode,
+            tool_exec_overrides,
+            plugin_commands,
+            plugin_grants,
+            event_subscribers,
         };
+        // Published here as well as per turn, so a plugin that calls
+        // `host-call-tool` from a `session_start` handler — i.e. before
+        // any turn exists — gets a working dispatch rather than
+        // `error: tool calls are not available right now`. BOTH Agent
+        // construction paths do this; the stage-2 lesson is that a
+        // field set in one of them silently dies in the other.
+        agent.install_plugin_dispatch();
         (agent, diagnostics)
     }
 
@@ -172,6 +429,7 @@ impl Agent {
         skill_load: SkillLoadPolicy,
         no_context_files: bool,
         prompt_overrides: PromptOverrides,
+        extensions: &[crate::config::ExtensionConfig],
     ) -> Vec<SkillDiagnostic> {
         self.provider = provider;
         self.registry = registry;
@@ -182,6 +440,21 @@ impl Agent {
         self.api_key = api_key;
         self.no_context_files = no_context_files;
         self.prompt_overrides = prompt_overrides;
+
+        // Same ordering constraint as `build_fresh` above: extensions
+        // must register before `all_specs()` / `names()` are read, or
+        // plugin tools are registered but uncallable. Resumed sessions
+        // used to skip plugin loading entirely, so `--continue` and
+        // every TUI resume path silently lost every plugin tool.
+        let (plugin_commands, event_subscribers, plugin_grants) =
+            load_extensions(&mut self.registry, extensions, &self.cwd);
+        self.plugin_commands = plugin_commands;
+        // Set in BOTH build paths, the recurring stage-1/stage-2
+        // failure: a resumed session that showed no grant rows would
+        // read as "this plugin holds nothing", which is the exact
+        // opposite of the truth.
+        self.plugin_grants = plugin_grants;
+        self.event_subscribers = event_subscribers;
 
         // load_session rebuilds Context from JSONL messages only — it
         // never repopulates `tools`. Without this line, the first turn
@@ -194,24 +467,272 @@ impl Agent {
         // interactive/print `--continue` was not.
         self.context.tools = self.registry.all_specs();
 
+        // The second of the two Agent construction paths — see
+        // `build_fresh`. A dispatch installed in only one of them works
+        // until the first `--continue` and then silently does not.
+        self.install_plugin_dispatch();
+
         let LoadSkillsResult {
             skills,
             diagnostics,
         } = load_skills(skill_load.into_options());
         self.skills = skills;
 
-        if self.context.system.is_none() {
+        // The guard is on `system_base`, not `context.system`: the base
+        // is what a resumed session needs to have, and `context.system`
+        // is derived from it. Guarding on the derived field would
+        // recompose whenever the base existed but the derivation had
+        // not run yet.
+        if self.system_base.is_none() {
             let tool_names = self.registry.names();
-            self.context.system = Some(compose_system_prompt(
+            let prompt = compose_system_prompt(
                 &self.cwd,
                 &tool_names,
                 &self.skills,
                 self.no_context_files,
                 &self.prompt_overrides,
-            ));
+            );
+            self.set_system_base(prompt);
         }
 
         diagnostics
+    }
+
+    /// `/reload`'s `[[extensions]]` half: stand every configured plugin
+    /// back up from disk and swap it into the live Agent.
+    ///
+    /// The order is LOAD, then unregister, then register, and each step
+    /// is placed where it is for a reason that has a failure mode
+    /// attached:
+    ///
+    /// **Load first**, before anything is unregistered, so a plugin that
+    /// fails to compile or instantiate costs nothing: it never reached
+    /// `generation::activate`, so its PREVIOUS instance is still the
+    /// live one and its tools are still registered and callable. That is
+    /// the deliberate answer to "the old one is already unregistered, do
+    /// you keep it or end up with neither" — keep it, and say so in the
+    /// report line, which also names it. Ending up with neither is
+    /// defensible but strictly worse here: the user asked to pick up an
+    /// edit, and the edit not compiling should not also take away the
+    /// working plugin they had a second ago.
+    ///
+    /// **Unregister before register**, because `register_external`
+    /// refuses rather than overwrites — re-registering the same tool
+    /// names without clearing them first would report a collision for
+    /// every single one and reload nothing.
+    ///
+    /// **Unregister only the plugins that actually loaded**, plus the
+    /// ones that vanished from the config. A failed plugin's rows must
+    /// stay exactly as they were.
+    ///
+    /// Host-side plugin state (`docs/plugin-capabilities.md` invariant
+    /// 14) is decided per kind rather than wholesale, because "survives
+    /// a trap" does not settle it — a reload is a user action, not a
+    /// guest fault:
+    ///
+    /// - **`host-store` files survive.** They are the plugin's
+    ///   persistence across RESTARTS; a reload that wiped them would
+    ///   make `/reload` a destructive command by surprise. The fresh
+    ///   instance gets a `PluginStore` on the same stem, i.e. the same
+    ///   file.
+    /// - **`plugin_send`'s loop guard and spent session budget
+    ///   survive**, untouched by this function. Same argument as the
+    ///   trap, one step sharper: the cap exists so a plugin cannot spend
+    ///   the user's money in a loop, and if a reload reset it, the cap
+    ///   would be resettable by the very plugin that could ask the model
+    ///   to suggest a reload. It is keyed by plugin name in
+    ///   process-wide state, so this needs no code — only a test.
+    /// - **A `plugin_context` contribution survives a reload for a
+    ///   plugin that is still loaded WITH `allow_context`.** That is
+    ///   `/reload`'s existing claim and it stands.
+    /// - **…and is DROPPED otherwise**, which is the amendment: for a
+    ///   plugin that vanished from the config, and for one that reloaded
+    ///   without `allow_context`. The old doc comment argued survival on
+    ///   the grounds that dropping would "silently disable a loaded
+    ///   plugin's capability with no way to get it back short of a
+    ///   restart" — that argument is about a plugin that is still there
+    ///   and still holds the grant. In the other two cases keeping it
+    ///   inverts the same complaint: text attributed to an extension
+    ///   would stay in the model's system prompt with nothing able to
+    ///   retract it, again short of a restart. The report line names
+    ///   every contribution dropped, so it is never silent.
+    ///
+    /// Grants themselves are not migrated at all, and cannot be: the new
+    /// instance is built from the config now on disk, so
+    /// `allow_tools = ["read"]` becoming `["bash"]` simply IS the new
+    /// bridge's gate set, and `/tools`'s grant row is rebuilt from the
+    /// same load. A grant that disappears takes the capability with it
+    /// immediately; state accumulated under it (a store file, a
+    /// contribution) is handled by the two rules above.
+    #[cfg(feature = "wasm")]
+    pub fn reload_extensions(
+        &mut self,
+        extensions: &[crate::config::ExtensionConfig],
+    ) -> ExtensionReloadReport {
+        use crate::render::notice::Level;
+        use crate::tool::ToolSource;
+
+        let mut report = ExtensionReloadReport {
+            supported: true,
+            ..Default::default()
+        };
+        let previous = self.registry.plugin_names();
+
+        let summary = crate::wasm::PluginHost::new().load_all(extensions, &self.cwd);
+
+        // Info notices are dropped here, unlike at startup: `tools: a,
+        // b` per plugin is exactly what the report line already
+        // summarizes, and a reload is a keystroke the user may repeat.
+        // Warnings and errors are not — a grant warning that only
+        // appears at startup would go unseen by a user who edits the
+        // config and reloads.
+        report.notes = summary
+            .notices
+            .iter()
+            .filter(|n| n.level != Level::Info)
+            .map(|n| match &n.subject {
+                Some(s) => format!("{s}: {}", n.message),
+                None => n.message.clone(),
+            })
+            .collect();
+
+        let mut loaded: Vec<String> = summary
+            .grants
+            .iter()
+            .map(|g| g.plugin_name.clone())
+            .collect();
+        loaded.sort();
+        loaded.dedup();
+
+        report.failed = summary
+            .errors
+            .iter()
+            .map(|(path, e)| (crate::wasm::plugin_stem(path).to_string(), e.clone()))
+            .collect();
+        let failed_names: Vec<String> =
+            report.failed.iter().map(|(n, _)| n.clone()).collect();
+
+        report.retired = previous
+            .iter()
+            .filter(|n| !loaded.contains(n) && !failed_names.contains(n))
+            .cloned()
+            .collect();
+
+        for name in loaded.iter().chain(report.retired.iter()) {
+            self.registry.unregister_plugin(name);
+        }
+        // Only for the vanished. A replaced plugin's old bridge was
+        // already made stale by the new instance's `activate`; a FAILED
+        // plugin's bridge must stay live, which is why this loop is not
+        // over `previous`.
+        for name in &report.retired {
+            crate::wasm::generation::retire(name);
+        }
+
+        for tool in summary.tools {
+            let subject = match tool.source() {
+                ToolSource::Plugin { path, .. } => path,
+                ToolSource::Builtin => String::new(),
+            };
+            if let Err(collision) = self.registry.register_external(tool) {
+                report.notes.push(format!(
+                    "{subject}: extension tool {collision:?} collides with an \
+                     existing tool — skipping it (rename it in the plugin)"
+                ));
+            } else {
+                report.tools += 1;
+            }
+        }
+
+        // Commands are judged as a SET — a name claimed twice registers
+        // for neither — so the kept commands of a failed plugin go in as
+        // candidates alongside the fresh ones rather than being merged
+        // afterwards. Merging afterwards would let a new plugin quietly
+        // take a name the kept instance still answers to.
+        let mut candidates = summary.commands;
+        candidates.extend(
+            self.plugin_commands
+                .iter()
+                .filter(|c| failed_names.iter().any(|n| n.as_str() == &*c.plugin_name))
+                .cloned(),
+        );
+        let resolved = crate::command::resolve_commands(candidates);
+        for d in &resolved.diagnostics {
+            report.notes.push(d.message.clone());
+        }
+        report.commands = resolved.commands.len();
+        self.plugin_commands = resolved.commands;
+
+        // Same shape for subscriptions: the kept instance's `Arc` is
+        // folded back in as-is, because its handler holds the bridge
+        // that is still live and a rebuilt handler would point at a
+        // bridge that no longer exists.
+        let mut subs: Vec<std::sync::Arc<crate::subscriber::Subscriber>> = summary
+            .subscribers
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+        subs.extend(
+            self.event_subscribers
+                .shared()
+                .into_iter()
+                .filter(|s| failed_names.iter().any(|n| n.as_str() == &*s.plugin_name)),
+        );
+        self.event_subscribers = crate::subscriber::EventSubscribers::from_shared(subs);
+
+        // Grant rows follow the same rule, and for the sharpest version
+        // of the reason: a row describes what the RUNNING plugin holds,
+        // so a kept instance must keep its old row — rebuilding it from
+        // the config on disk would show grants nothing is running under.
+        let mut grants = summary.grants;
+        grants.extend(
+            self.plugin_grants
+                .iter()
+                .filter(|g| failed_names.contains(&g.plugin_name))
+                .cloned(),
+        );
+        grants.sort_by(|a, b| a.plugin_name.cmp(&b.plugin_name));
+        self.plugin_grants = grants;
+
+        for name in report.retired.iter().chain(
+            loaded
+                .iter()
+                .filter(|n| !summary.context_holders.contains(n)),
+        ) {
+            if crate::plugin_context::set(name, "").unwrap_or(false) {
+                report.dropped_contributions.push(name.clone());
+            }
+        }
+        report.dropped_contributions.sort();
+
+        report.replaced = loaded;
+
+        // The model's `tools` array is rebuilt from the registry, not
+        // patched: a renamed plugin tool would otherwise stay in the
+        // request forever, advertised and uncallable. The system prompt
+        // is the caller's job — it recomposes the base for skills in the
+        // same pass.
+        self.context.tools = self.registry.all_specs();
+        // And the dispatch, so a `host-call-tool` from a plugin sees the
+        // post-reload registry rather than the one that existed when the
+        // last turn started. Per-turn refresh would get there eventually
+        // (`run_turn`), but an event handler firing between now and the
+        // next turn would not.
+        self.install_plugin_dispatch();
+
+        report
+    }
+
+    /// No-op stand-in without the `wasm` feature, mirroring
+    /// `load_extensions`. Returns a report whose `supported` is false so
+    /// `/reload`'s line says "no WASM support" rather than claiming a
+    /// reload of nothing.
+    #[cfg(not(feature = "wasm"))]
+    pub fn reload_extensions(
+        &mut self,
+        _extensions: &[crate::config::ExtensionConfig],
+    ) -> ExtensionReloadReport {
+        ExtensionReloadReport::default()
     }
 }
 
@@ -286,7 +807,7 @@ pub fn print_skill_diagnostics(diags: &[SkillDiagnostic]) {
             DiagnosticLevel::Warning => "warning",
             DiagnosticLevel::Collision => "collision",
         };
-        eprintln!("skill {}: {} ({})", label, d.message, d.path.display());
+        crate::note!("skill {}: {} ({})", label, d.message, d.path.display());
     }
 }
 
@@ -307,15 +828,47 @@ mod tests {
         vec!["read".into(), "bash".into()]
     }
 
+    /// An empty `[[extensions]]` list must be a no-op in both feature
+    /// configurations — no warning, no registry mutation.
+    #[test]
+    fn load_extensions_empty_is_noop() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+        load_extensions(&mut r, &[], std::path::Path::new("/tmp"));
+        assert_eq!(r.names(), before);
+    }
+
+    /// Without the `wasm` feature, a configured extension is skipped
+    /// with a warning rather than panicking or silently pretending to
+    /// have loaded. With the feature on, a nonexistent path is
+    /// likewise reported and skipped. Either way the built-in tool set
+    /// is untouched — that's the invariant worth pinning.
+    #[test]
+    fn load_extensions_bad_path_leaves_registry_intact() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+        load_extensions(
+            &mut r,
+            &[crate::config::ExtensionConfig {
+                path: PathBuf::from("/nonexistent/plugin.wasm"),
+                ..Default::default()
+            }],
+            std::path::Path::new("/tmp"),
+        );
+        assert_eq!(
+            r.names(),
+            before,
+            "a broken extension must not add or remove tools"
+        );
+    }
+
     /// A cwd-level AGENTS.md is injected as a <project_context> block.
     /// NANOPI_HOME is pointed at an empty dir so the global scope stays
     /// clean and the test doesn't pick up the developer's real ~/.nanopi.
     #[test]
     fn compose_injects_cwd_context_file() {
-        let _g = crate::TEST_LOCK.lock().unwrap();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmpdir("cwd");
         std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES HERE").unwrap();
@@ -335,11 +888,6 @@ mod tests {
         assert!(!bare.contains("<project_context>"));
         assert!(!bare.contains("PROJECT RULES HERE"));
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -361,10 +909,8 @@ mod tests {
         use crate::agent::permission::PermissionGate;
         use crate::provider::openai::OpenAiProvider;
 
-        let _g = crate::TEST_LOCK.lock().unwrap();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmpdir("cwd");
         let (path, _hdr) =
@@ -388,6 +934,7 @@ mod tests {
             SkillLoadPolicy::default(),
             true,
             PromptOverrides::default(),
+            &[],
         );
 
         assert_eq!(
@@ -396,11 +943,73 @@ mod tests {
             "hydrate_resumed must repopulate ctx.tools from the registry"
         );
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Regression: `hydrate_resumed` used not to call `load_extensions`
+    /// at all, so `--continue` and every TUI resume path came back with
+    /// zero plugin tools while a fresh session had them. The plugin was
+    /// configured, loaded fine, and was simply absent — which reads as
+    /// "the plugin broke", not "resume drops plugins".
+    ///
+    /// Asserts the extension tool is present AND that `ctx.tools` was
+    /// populated after registration, which is the ordering constraint
+    /// that makes it callable rather than merely registered.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn hydrate_resumed_loads_extensions() {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
+
+        let cwd = tmpdir("cwd");
+        let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
+        let mut agent = Agent::load_session(&path, &cwd).expect("load");
+
+        let ext = crate::config::ExtensionConfig {
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/example-plugin.component.wasm"),
+            ..Default::default()
+        };
+        let baseline = ToolRegistry::standard().all_specs().len();
+        let _ = agent.hydrate_resumed(
+            Box::new(OpenAiProvider::new("", "", "")),
+            ToolRegistry::standard(),
+            PermissionGate::from_cli(false, None),
+            HooksConfig::default(),
+            "m".into(),
+            "http://x".into(),
+            "".into(),
+            SkillLoadPolicy::default(),
+            true,
+            PromptOverrides::default(),
+            std::slice::from_ref(&ext),
+        );
+
+        assert!(
+            agent.registry.names().iter().any(|n| n == "rot13"),
+            "resumed agent must carry the fixture plugin's tools; got {:?}",
+            agent.registry.names()
+        );
+        assert!(
+            agent.context.tools.len() > baseline,
+            "ctx.tools must be built AFTER extensions register, else the \
+             plugin tool is registered but uncallable"
+        );
+        // Commands ride the same path — a resumed session that lost
+        // them would show an empty palette while the tools worked.
+        let mut cmds: Vec<&str> = agent
+            .plugin_commands
+            .iter()
+            .map(|c| c.spec.name.as_str())
+            .collect();
+        cmds.sort();
+        assert_eq!(cmds, vec!["explain", "todo"]);
+
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -420,18 +1029,11 @@ mod tests {
     /// restoring the previous value afterward. Mirrors the pattern used
     /// throughout this module's existing tests.
     fn with_empty_global_home<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _g = crate::TEST_LOCK.lock().unwrap();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir("home");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let result = f(&home);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         result
     }
@@ -594,6 +1196,7 @@ mod tests {
                 SkillLoadPolicy::default(),
                 false,
                 overrides.clone(),
+                &[],
             );
 
             assert_eq!(
@@ -603,5 +1206,502 @@ mod tests {
 
             std::fs::remove_dir_all(&cwd).ok();
         });
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v0.12 turn assembly: `system_base` + plugin context
+    // contributions. The seam driven here is `Agent`'s prompt fields
+    // plus `refresh_system_prompt` — NOT the provider. `context.system`
+    // is exactly what `stream_turn` reads, so asserting on it after a
+    // refresh is asserting on what goes on the wire.
+    // ────────────────────────────────────────────────────────────────
+
+    /// A minimal Agent carrying only what turn assembly touches.
+    fn prompt_agent(cwd: &Path, base: &str) -> Agent {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+        let session_path = cwd.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let mut a = Agent {
+            context: crate::agent::context::Context::default(),
+            provider: Box::new(OpenAiProvider::new("", "", "")),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: crate::util::uuid::v7().to_string(),
+            cwd: cwd.to_path_buf(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Default::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: true,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: Default::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: PromptOverrides::default(),
+            system_base: None,
+        };
+        a.set_system_base(base.to_string());
+        a
+    }
+
+    /// The test that guarantees stage 2 costs a user with no plugins
+    /// nothing. Equality, not `contains`: a stray separator or trailing
+    /// newline would pass a `contains` and still change every request.
+    #[test]
+    fn with_no_contribution_the_prompt_is_byte_identical_to_the_base() {
+        let _g = crate::test_lock();
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("nocontrib");
+        let base = "BASE PROMPT";
+        let mut a = prompt_agent(&cwd, base);
+        a.refresh_system_prompt();
+        assert_eq!(
+            a.context.system.as_deref(),
+            Some(base),
+            "no plugin contributing must leave the prompt exactly as composed"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The whole point of the task: the contribution is made AFTER the
+    /// Agent is built, which is when a plugin actually calls
+    /// `host-set-context` — while handling an event, not at load. A
+    /// build-time-only injection cannot pass this.
+    #[test]
+    fn a_contribution_set_after_the_agent_is_built_reaches_the_prompt() {
+        let _g = crate::test_lock();
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("aftrbuild");
+        let mut a = prompt_agent(&cwd, "BASE PROMPT");
+        // Agent exists, prompt already composed — only NOW does the
+        // plugin contribute.
+        crate::plugin_context::set("memory", "User prefers Rust.").expect("accepted");
+        a.refresh_system_prompt();
+        let got = a.context.system.clone().unwrap_or_default();
+        assert!(got.starts_with("BASE PROMPT"), "{got:?}");
+        assert!(
+            got.contains("[context contributed by extension \"memory\"]"),
+            "the contribution must be present and attributed: {got:?}"
+        );
+        assert!(got.contains("User prefers Rust."), "{got:?}");
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The no-stacking test. This is the one that fails if anything
+    /// appends to `context.system` instead of deriving it from
+    /// `system_base` — ten turns with one contribution active must not
+    /// carry ten copies of it (invariant 10).
+    #[test]
+    fn ten_refreshes_leave_exactly_one_block() {
+        let _g = crate::test_lock();
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("tenrefresh");
+        let mut a = prompt_agent(&cwd, "BASE PROMPT");
+        crate::plugin_context::set("memory", "one contribution").expect("accepted");
+        for _ in 0..10 {
+            a.refresh_system_prompt();
+        }
+        let got = a.context.system.clone().unwrap_or_default();
+        assert_eq!(
+            got.matches("[context contributed by extension \"memory\"]").count(),
+            1,
+            "ten refreshes, one block: {got:?}"
+        );
+        assert_eq!(got.matches("one contribution").count(), 1, "{got:?}");
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Clearing leaves no residue — not a blank line, not a dangling
+    /// separator. Byte-equality with the base is the only assertion
+    /// that can see the difference.
+    #[test]
+    fn clearing_a_contribution_returns_the_prompt_to_the_base() {
+        let _g = crate::test_lock();
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("clearing");
+        let base = "BASE PROMPT";
+        let mut a = prompt_agent(&cwd, base);
+        crate::plugin_context::set("memory", "temporary").expect("accepted");
+        a.refresh_system_prompt();
+        assert_ne!(a.context.system.as_deref(), Some(base));
+        crate::plugin_context::set("memory", "").expect("clearing is not a refusal");
+        a.refresh_system_prompt();
+        assert_eq!(
+            a.context.system.as_deref(),
+            Some(base),
+            "a cleared contribution must leave the prompt byte-identical to \
+             the base, with no residue"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// `build.rs`'s two documented invariants, pinned against THIS
+    /// change specifically: (a) a custom `--system-prompt` replaces
+    /// only the identity/tools/guidelines section — context files,
+    /// skills and the cwd line still apply; (b) the base section still
+    /// ends with the "Current working directory:" line, so the
+    /// append/context/skills tail is byte-identical across both
+    /// branches. The contribution goes AFTER all of it, because it is
+    /// concatenated onto whatever `compose_system_prompt` returned,
+    /// once both branches have converged.
+    #[test]
+    fn a_custom_system_prompt_keeps_its_tail_with_a_contribution_active() {
+        let _h = crate::TempNanopiHome::new();
+        crate::plugin_context::clear_all();
+        let home = _h.path().to_path_buf();
+        let cwd = tmpdir("customprompt");
+        std::fs::write(cwd.join("AGENTS.md"), "PROJECT RULES HERE").unwrap();
+
+        let overrides =
+            PromptOverrides::from_cli(Some("MY CUSTOM IDENTITY".into()), Vec::new(), false);
+        let base = compose_system_prompt(&cwd, &tools(), &[], false, &overrides);
+
+        let mut a = prompt_agent(&cwd, &base);
+        crate::plugin_context::set("memory", "CONTRIBUTED TEXT").expect("accepted");
+        a.refresh_system_prompt();
+        let got = a.context.system.clone().unwrap_or_default();
+
+        // (a) the custom prompt is in, and the context-file tail still
+        // applies despite it.
+        assert!(got.contains("MY CUSTOM IDENTITY"), "{got:?}");
+        assert!(got.contains("PROJECT RULES HERE"), "{got:?}");
+        // (b) the base section still carries the cwd line.
+        let cwd_line = format!("Current working directory: {}", cwd.display());
+        assert!(got.contains(&cwd_line), "{got:?}");
+        // The base is untouched as a PREFIX — which is what proves the
+        // contribution was concatenated after both branches converged
+        // rather than spliced into the middle.
+        assert!(
+            got.starts_with(&base),
+            "the composed base must survive verbatim as a prefix: {got:?}"
+        );
+        // And the contribution comes after the whole tail.
+        let contributed = got.find("CONTRIBUTED TEXT").expect("contribution present");
+        let rules = got.find("PROJECT RULES HERE").expect("context file present");
+        assert!(
+            rules < contributed,
+            "the contribution belongs AFTER the context-files/skills tail: {got:?}"
+        );
+
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The resume guard, moved to the right field: `hydrate_resumed`
+    /// composes a base when there is none and leaves an existing one
+    /// alone.
+    #[test]
+    fn hydrate_resumed_sets_the_base_only_when_absent() {
+        use crate::agent::loop_::HooksConfig;
+        use crate::agent::permission::PermissionGate;
+        use crate::provider::openai::OpenAiProvider;
+
+        let _h = crate::TempNanopiHome::new();
+        crate::plugin_context::clear_all();
+        let home = _h.path().to_path_buf();
+        let cwd = tmpdir("hydratebase");
+
+        let hydrate = |agent: &mut Agent| {
+            let _ = agent.hydrate_resumed(
+                Box::new(OpenAiProvider::new("", "", "")),
+                ToolRegistry::standard(),
+                PermissionGate::from_cli(false, None),
+                HooksConfig::default(),
+                "m".into(),
+                "http://x".into(),
+                "".into(),
+                SkillLoadPolicy::default(),
+                true,
+                PromptOverrides::default(),
+                &[],
+            );
+        };
+
+        // Absent → composed.
+        let (path, _h) = crate::session::new_session(&cwd, "m", "http://x").expect("session");
+        let mut agent = Agent::load_session(&path, &cwd).expect("load");
+        assert!(agent.system_base.is_none(), "load_session persists no prompt");
+        hydrate(&mut agent);
+        let composed = agent.system_base.clone().expect("composed on resume");
+        assert!(!composed.is_empty());
+
+        // Present → untouched.
+        let (path2, _h2) = crate::session::new_session(&cwd, "m", "http://x").expect("session");
+        let mut agent2 = Agent::load_session(&path2, &cwd).expect("load");
+        agent2.set_system_base("PRESERVED BASE".into());
+        hydrate(&mut agent2);
+        assert_eq!(
+            agent2.system_base.as_deref(),
+            Some("PRESERVED BASE"),
+            "an existing base must not be recomposed over"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// `/reload` recomposes the BASE; an active contribution survives.
+    /// Driven through `set_system_base`, which is what the handler
+    /// calls — a contribution is not a skill, and `/reload` does not
+    /// reload `[[extensions]]`.
+    #[test]
+    fn reloading_the_base_leaves_an_active_contribution_standing() {
+        let _g = crate::test_lock();
+        crate::plugin_context::clear_all();
+        let cwd = tmpdir("reloadbase");
+        let mut a = prompt_agent(&cwd, "OLD BASE");
+        crate::plugin_context::set("memory", "SURVIVES RELOAD").expect("accepted");
+        a.refresh_system_prompt();
+
+        a.set_system_base("NEW BASE".into());
+        let got = a.context.system.clone().unwrap_or_default();
+        assert!(got.starts_with("NEW BASE"), "the base was replaced: {got:?}");
+        assert!(!got.contains("OLD BASE"), "{got:?}");
+        assert!(
+            got.contains("SURVIVES RELOAD"),
+            "a reload rebuilds the base, not the contributions: {got:?}"
+        );
+        crate::plugin_context::clear_all();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// A failure has to be in the LINE, not only in the notes below it.
+    /// The whole reason `[[extensions]]` went two releases unreloaded
+    /// and said so is that a reload claiming more than it did is worse
+    /// than one admitting a gap.
+    #[test]
+    fn the_report_line_names_a_failed_plugin_and_says_the_old_one_is_kept() {
+        let r = ExtensionReloadReport {
+            supported: true,
+            replaced: vec!["good".into()],
+            failed: vec![("broken".into(), "compile failed".into())],
+            tools: 3,
+            commands: 1,
+            ..Default::default()
+        };
+        let line = r.line();
+        assert!(line.contains("1 extension(s) reloaded"), "{line}");
+        assert!(
+            line.contains("FAILED, previous instance kept: broken"),
+            "the line must name the failure and what happened to it: {line}"
+        );
+    }
+
+    /// Without the feature the line must not read as "reloaded
+    /// nothing", which is indistinguishable from "you have no plugins".
+    #[test]
+    fn the_report_line_admits_a_build_without_wasm_support() {
+        let line = ExtensionReloadReport::default().line();
+        assert!(line.contains("no WASM support"), "{line}");
+    }
+
+    /// A dropped contribution is never silent — it is in the line.
+    #[test]
+    fn the_report_line_names_every_dropped_contribution() {
+        let r = ExtensionReloadReport {
+            supported: true,
+            replaced: vec!["p".into()],
+            tools: 1,
+            dropped_contributions: vec!["p".into()],
+            ..Default::default()
+        };
+        assert!(
+            r.line().contains("dropped context contribution from p"),
+            "{}",
+            r.line()
+        );
+    }
+
+    // ── hot reload (v0.12) ───────────────────────────────────────────
+    #[cfg(feature = "wasm")]
+    mod reload {
+        use super::*;
+        use crate::provider::openai::OpenAiProvider;
+
+        fn ext(path: &std::path::Path, allow_context: bool) -> crate::config::ExtensionConfig {
+            crate::config::ExtensionConfig {
+                path: path.to_path_buf(),
+                allow_context,
+                ..Default::default()
+            }
+        }
+
+        /// The committed example component, copied under a name this
+        /// test owns: the plugin STEM is the identity everything here
+        /// keys on, and two tests sharing one would collide in the
+        /// process-wide live-instance table.
+        fn plugin_copy(dir: &std::path::Path, stem: &str) -> PathBuf {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/example-plugin.component.wasm");
+            let dst = dir.join(format!("{stem}.wasm"));
+            std::fs::copy(src, &dst).expect("copy fixture");
+            dst
+        }
+
+        fn agent_with(cwd: &std::path::Path, exts: &[crate::config::ExtensionConfig]) -> Agent {
+            Agent::build_fresh(AgentBuildInputs {
+                cwd: cwd.to_path_buf(),
+                registry: ToolRegistry::standard(),
+                // The same stand-in the resume test above uses: no
+                // turn is ever run here.
+                provider: Box::new(OpenAiProvider::new("", "", "")),
+                session_path: cwd.join("session.jsonl"),
+                session_id: "test".into(),
+                permission: crate::agent::permission::PermissionGate::new(
+                    false,
+                    crate::agent::permission::TrustLevel::Distrusted,
+                ),
+                hooks: HooksConfig::default(),
+                model: "m".into(),
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                skill_load: SkillLoadPolicy {
+                    no_discovery: true,
+                    ..Default::default()
+                },
+                no_context_files: true,
+                prompt_overrides: PromptOverrides::default(),
+                initial_follow_up: None,
+                tool_exec_mode: Default::default(),
+                tool_exec_overrides: Default::default(),
+                extensions: exts.to_vec(),
+            })
+            .0
+        }
+
+        /// The plain case, and the one `register_external`'s refusal
+        /// makes non-obvious: reloading the SAME plugin re-registers the
+        /// SAME tool names. Without unregister-before-register every one
+        /// of them would collide and the reload would register nothing.
+        #[test]
+        fn reloading_the_same_plugin_re_registers_the_same_tool_names() {
+            let _h = crate::TempNanopiHome::new();
+            let dir = tmpdir("reload-same");
+            let p = plugin_copy(&dir, "reload-same");
+            let mut a = agent_with(&dir, &[ext(&p, false)]);
+
+            let before = a.registry.names();
+            assert!(before.iter().any(|n| n == "rot13"), "{before:?}");
+
+            let r = a.reload_extensions(&[ext(&p, false)]);
+            assert_eq!(r.replaced, vec!["reload-same".to_string()]);
+            assert!(r.failed.is_empty(), "{:?}", r.failed);
+            assert_eq!(r.tools, 4, "all four fixture tools must come back");
+            assert_eq!(
+                a.registry.names(),
+                before,
+                "the registry must end up exactly where it started"
+            );
+            assert!(
+                r.notes.is_empty(),
+                "a clean reload must produce no collision warnings: {:?}",
+                r.notes
+            );
+            // The model's tool array is rebuilt, not stale.
+            assert!(a.context.tools.iter().any(|t| t.name == "rot13"));
+        }
+
+        /// A plugin removed from `[[extensions]]` goes away: tools
+        /// unregistered, and reported as retired rather than silently
+        /// vanishing.
+        #[test]
+        fn a_plugin_dropped_from_the_config_is_unregistered_and_reported() {
+            let _h = crate::TempNanopiHome::new();
+            let dir = tmpdir("reload-gone");
+            let p = plugin_copy(&dir, "reload-gone");
+            let mut a = agent_with(&dir, &[ext(&p, false)]);
+            assert!(a.registry.names().iter().any(|n| n == "rot13"));
+
+            let r = a.reload_extensions(&[]);
+            assert_eq!(r.retired, vec!["reload-gone".to_string()]);
+            assert!(
+                !a.registry.names().iter().any(|n| n == "rot13"),
+                "a removed plugin's tools must not stay callable"
+            );
+            assert!(
+                a.registry.names().iter().any(|n| n == "bash"),
+                "built-ins are untouched"
+            );
+            assert!(a.plugin_grants.is_empty(), "and its grant row goes too");
+        }
+
+        /// The rollback decision. A plugin whose `.wasm` no longer loads
+        /// keeps the instance it had — tools, grant row and all — rather
+        /// than leaving the user with neither. The report names it, so
+        /// the state is never silent.
+        #[test]
+        fn a_plugin_that_fails_to_reload_keeps_its_previous_instance() {
+            let _h = crate::TempNanopiHome::new();
+            let dir = tmpdir("reload-broken");
+            let p = plugin_copy(&dir, "reload-broken");
+            let mut a = agent_with(&dir, &[ext(&p, false)]);
+            let before = a.registry.names();
+            let grants_before = a.plugin_grants.clone();
+
+            // Same path, same stem, no longer a component.
+            std::fs::write(&p, b"not wasm at all").unwrap();
+            let r = a.reload_extensions(&[ext(&p, false)]);
+
+            assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
+            assert_eq!(r.failed[0].0, "reload-broken");
+            assert!(r.replaced.is_empty());
+            assert!(
+                r.retired.is_empty(),
+                "a failure is not a removal — retiring it would kill the instance we are keeping"
+            );
+            assert_eq!(
+                a.registry.names(),
+                before,
+                "the previously loaded instance must still be registered"
+            );
+            assert_eq!(
+                a.plugin_grants, grants_before,
+                "its grant row describes what is RUNNING, so it must survive too"
+            );
+        }
+
+        /// The contribution rules, both halves in one test because they
+        /// are one decision: it SURVIVES for a plugin still loaded with
+        /// the grant, and is DROPPED when the grant is gone.
+        #[test]
+        fn a_contribution_survives_a_reload_with_the_grant_and_is_dropped_without_it() {
+            let _h = crate::TempNanopiHome::new();
+            let dir = tmpdir("reload-ctx");
+            let p = plugin_copy(&dir, "reload-ctx");
+            let mut a = agent_with(&dir, &[ext(&p, true)]);
+
+            crate::plugin_context::set("reload-ctx", "REMEMBER THIS").unwrap();
+
+            let r = a.reload_extensions(&[ext(&p, true)]);
+            assert!(
+                r.dropped_contributions.is_empty(),
+                "a plugin still loaded WITH allow_context keeps its contribution"
+            );
+            assert!(crate::plugin_context::render_blocks().contains("REMEMBER THIS"));
+
+            // Same plugin, grant removed from the config.
+            let r = a.reload_extensions(&[ext(&p, false)]);
+            assert_eq!(
+                r.dropped_contributions,
+                vec!["reload-ctx".to_string()],
+                "a plugin that can no longer retract its contribution must not keep it"
+            );
+            assert!(
+                !crate::plugin_context::render_blocks().contains("REMEMBER THIS"),
+                "the system prompt must not keep text nothing can take back"
+            );
+        }
+
     }
 }

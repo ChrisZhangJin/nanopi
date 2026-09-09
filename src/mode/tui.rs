@@ -54,7 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, SteerMessage};
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
@@ -106,6 +106,12 @@ enum SlashCmd {
     /// source · path). Doesn't take an arg. PI does this implicitly
     /// on startup; nanopi adds the on-demand relist.
     ListSkills,
+    /// List every tool the model can call, with its source (built-in
+    /// or the plugin `.wasm` that supplied it). The registry is the
+    /// same one handed to the provider, so this is ground truth —
+    /// asking the model to list its own tools is not: it will happily
+    /// present plugin tools as built-ins, or invent skills.
+    ListTools,
     /// Re-read config.toml + settings.toml + skills without exiting
     /// the session. Mirrors PI's `/reload` — new skills installed
     /// mid-session become visible to the model on the next turn.
@@ -114,6 +120,11 @@ enum SlashCmd {
     Settings,
     /// v0.9.3: print the keybindings submenu (list of ActionId + spec + toml key).
     Keybindings,
+    /// v0.11.0: a command registered by a WASM plugin. Payload is the
+    /// command name; the handler is looked up in `App::commands_cache`
+    /// at dispatch time rather than carried here, so `SlashCmd` stays
+    /// `PartialEq` and cheap for the palette's filter.
+    Plugin(String),
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -205,6 +216,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
         MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
         MenuItem::new(
+            "/tools",
+            "List all callable tools + their source",
+            SlashCmd::ListTools,
+        ),
+        MenuItem::new(
             "/reload",
             "Reload skills, config, settings",
             SlashCmd::Reload,
@@ -231,22 +247,134 @@ fn skill_menu_items(skills: &[crate::resources::Skill]) -> Vec<MenuItem<SlashCmd
     skills
         .iter()
         .map(|s| {
-            // Truncate the description so long ones don't blow out
-            // the palette row (matches PI's autocomplete label rules
-            // in interactive-mode.ts prefixAutocompleteDescription).
-            let desc: String = s.description.chars().take(80).collect();
-            let desc = if s.description.chars().count() > 80 {
-                format!("{desc}…")
-            } else {
-                desc
-            };
             MenuItem::new(
                 format!("/skill:{}", s.name),
-                desc,
+                palette_desc(&s.description),
                 SlashCmd::Skill(s.name.clone()),
             )
         })
         .collect()
+}
+
+/// Every row the palette can offer right now: built-ins, then skills,
+/// then plugin commands.
+///
+/// The ONE place the command vocabulary is assembled. `sync_palette`
+/// builds the menu from it and `submit_or_chat` asks it what exists —
+/// so "unknown" means unknown to the palette after plugins have
+/// registered, not unknown to a second hand-maintained list. A second
+/// list is exactly the bug that once routed fourteen commands to the
+/// model when the line had a leading space.
+fn palette_items(app: &App) -> Vec<MenuItem<SlashCmd>> {
+    // Built-ins first, then skills, then plugin commands: a built-in
+    // always sorts above a plugin row, so even if the reserved-name
+    // guard ever failed the built-in stays reachable.
+    let mut items = slash_items();
+    items.extend(skill_menu_items(&app.skills_cache));
+    items.extend(command_menu_items(&app.commands_cache));
+    items
+}
+
+/// The same vocabulary as bare names (no leading `/`), for the
+/// unknown-command check.
+fn known_command_names(app: &App) -> Vec<String> {
+    palette_items(app)
+        .into_iter()
+        .map(|i| i.label.trim_start_matches('/').to_string())
+        .collect()
+}
+
+/// Truncate a description so a long one doesn't blow out the palette
+/// row. Matches PI's autocomplete label rules
+/// (interactive-mode.ts prefixAutocompleteDescription).
+fn palette_desc(desc: &str) -> String {
+    const MAX: usize = 80;
+    if desc.chars().count() <= MAX {
+        return desc.to_string();
+    }
+    let mut out: String = desc.chars().take(MAX).collect();
+    out.push('…');
+    out
+}
+
+/// One palette row per plugin command. The `[plugin]` suffix costs a
+/// little width but earns it: the collision rules refuse rather than
+/// rename, so when something is missing or misbehaving the user needs
+/// to know which plugin to look at.
+fn command_menu_items(cmds: &[crate::command::PluginCommand]) -> Vec<MenuItem<SlashCmd>> {
+    cmds.iter()
+        .map(|c| {
+            MenuItem::new(
+                format!("/{}", c.spec.name),
+                palette_desc(&format!("{} [{}]", c.spec.description, c.plugin_name)),
+                SlashCmd::Plugin(c.spec.name.clone()),
+            )
+        })
+        .collect()
+}
+
+/// `/tools`'s "who's watching me" section (§5.1 / §9 of
+/// `docs/v0.12-events.md`): the callable-tools list only answers "what
+/// can the model call", not "what is observing every turn" — a plugin
+/// with no exported tools but a `list-events` subscription would
+/// otherwise be invisible from `/tools`. Returns an empty `Vec` when
+/// nothing is subscribed, so the section is omitted entirely rather than
+/// growing a permanently-empty heading.
+fn subscriptions_section(subs: &[(String, Vec<String>)]) -> Vec<Line<'static>> {
+    if subs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Watching events ({} plugins)", subs.len()),
+        Style::default()
+            .fg(Color::Indexed(108))
+            .add_modifier(Modifier::BOLD),
+    )])];
+    for (plugin, events) in subs {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {plugin:<20} "),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(events.join(", "), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
+}
+
+/// `/tools`'s "what can each plugin do to me" section. The callable
+/// tool list answers "what can the model call" and
+/// [`subscriptions_section`] answers "what is watching me"; neither
+/// answers "what was this plugin granted" — and `allow_tools` makes
+/// that the difference between a plugin that formats text and one that
+/// can run `bash`.
+///
+/// Empty slice → empty `Vec`, so the section is omitted rather than
+/// growing a permanently-empty heading in every non-`wasm` build. Same
+/// rule as [`subscriptions_section`]. Note this is NOT the same as a
+/// plugin with no grants: that plugin still gets a row, reading `no
+/// grants`, because "installed, powerless" and "not installed" must
+/// not look identical.
+fn grants_section(grants: &[crate::plugin_grants::PluginGrants]) -> Vec<Line<'static>> {
+    if grants.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Plugin grants ({} plugins)", grants.len()),
+        Style::default()
+            .fg(Color::Indexed(108))
+            .add_modifier(Modifier::BOLD),
+    )])];
+    for g in grants {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<20} ", g.plugin_name),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(g.summary(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
 }
 
 const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
@@ -283,6 +411,9 @@ pub async fn run_tui_mode(
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    // `config.inline_think_tags` — escape hatch for the inline
+    // `<think>` splitter (on by default). `None` leaves it on.
+    inline_think_tags: Option<bool>,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -326,15 +457,19 @@ pub async fn run_tui_mode(
             Some(base_url),
             model,
         )),
+        inline_think_tags,
     );
     let registry = ToolRegistry::standard();
-    let hooks = match settings::load_settings(&cwd) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("warning: failed to load settings: {e}");
-            HooksConfig::default()
-        }
-    };
+
+    // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
+    // config.toml, which isn't in this function's parameter list.
+    // Re-read it here; a parse failure already surfaced through
+    // load_settings, so fall back to defaults rather than re-report.
+    let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
+    // See the matching comment in `mode/print.rs`: a settings error is
+    // always a user-config mistake, and the old `HooksConfig::default()`
+    // fallback silently disarmed every hook in the file.
+    let hooks = settings::load_settings(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let skill_load_for_rebuilds = skill_load.clone();
@@ -353,6 +488,7 @@ pub async fn run_tui_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            &cfg_for_build.extensions,
         );
         print_skill_diagnostics(&diags);
         a
@@ -371,6 +507,10 @@ pub async fn run_tui_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            initial_follow_up: None,
+            tool_exec_mode: cfg_for_build.tool_exec_mode,
+            tool_exec_overrides: cfg_for_build.tool_exec_overrides.clone(),
+            extensions: cfg_for_build.extensions.clone(),
         });
         print_skill_diagnostics(&diags);
         a
@@ -382,7 +522,7 @@ pub async fn run_tui_mode(
     {
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
-            a.fire_session_start().await;
+            a.fire_session_start("startup").await;
         }
     }
 
@@ -395,6 +535,21 @@ pub async fn run_tui_mode(
     print_startup_banner(model, &header.id, &loaded_skills);
 
     let mut terminal = setup_terminal()?;
+    // From here on there IS a drain loop, so `host-notify` may queue
+    // instead of writing to stderr. Before this point (and in `-p`
+    // mode, which never gets here) it writes through `note!`, because a
+    // line queued for a drain that never runs is a line the user never
+    // sees.
+    #[cfg(feature = "wasm")]
+    crate::wasm::notify::install_sink();
+    // And from here on there is a turn loop, so `host-send-user-message`
+    // has somewhere to put a message. No `cfg`: `plugin_send` is
+    // non-gated on purpose, and without the feature nothing ever calls
+    // `send`. Installed with NO channel yet — that state means "queue
+    // it, a turn will pick it up", which is different from "not
+    // installed", which is `-p` mode and refuses. `-p` never reaches
+    // this line, which is the whole of Q4's implementation.
+    crate::plugin_send::install(crate::plugin_send::Sink { steer_tx: None });
     let mut app = App::new(
         header.id.to_string(),
         model.to_string(),
@@ -403,6 +558,7 @@ pub async fn run_tui_mode(
         skill_load_for_rebuilds,
         no_context_files,
         prompt_overrides_for_rebuilds,
+        cfg_for_build.extensions.clone(),
         session_path.with_extension("history.txt"),
     );
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
@@ -413,6 +569,7 @@ pub async fn run_tui_mode(
     // later pick_vendor() (model swap, /new, /fork) reads it from there,
     // and it used to sit at None forever, silently ignoring the field.
     app.cfg_provider = cfg_provider.clone();
+    app.inline_think_tags = inline_think_tags;
     let initial_vendor = crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), model);
     app.vendor_id = Some(initial_vendor.id().to_string());
     // Prime the skills cache from the just-built agent so the very
@@ -455,16 +612,29 @@ pub async fn run_tui_mode(
     {
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
-            a.fire_session_end().await;
+            a.fire_session_shutdown("quit").await;
         }
     }
 
-    // Closing lines: `✓ session saved` + resume hint so the user knows
-    // how to pick up where they left off.
-    let sid = header.id.to_string();
-    let sid_short = &sid[..8.min(sid.len())];
-    println!("\n\x1b[2m✓ session {sid_short} saved\x1b[0m");
-    println!("\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
+    // Closing line: the resume hint, and only that.
+    //
+    // A `✓ session <first 8 chars> saved` line used to sit above it.
+    // The abbreviation stops one character short of the first `-`, so
+    // `01a06af4-a1e9-…` printed as a bare `01a06af4` — which reads like
+    // a whole id rather than a prefix, next to the full one on the line
+    // below. And since v7 ids share their leading timestamp bits, two
+    // sessions from the same day differ only in those last digits, so
+    // the eye is being asked to do exactly the comparison it is worst
+    // at. The full id below already says everything the short one did.
+    //
+    // `app.session_id`, NOT the `header` bound at startup: `/new`,
+    // `/resume`, `/fork` and `/import` all switch the live session and
+    // update `app.session_id`, but that binding is never reassigned. So
+    // ending a run in a session you switched into printed the id of the
+    // one you STARTED in — and this line sent you back to a
+    // conversation you had abandoned.
+    let sid = app.session_id.clone();
+    println!("\n\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
 
     result
 }
@@ -529,6 +699,8 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
+    // From here until teardown, a bare `\n` on stderr staircases.
+    crate::render::raw_tty::set_raw_mode(true);
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
@@ -546,6 +718,10 @@ fn teardown_terminal(term: &mut Term) -> Result<()> {
     // lands on a clean line.
     let _ = term.clear();
     disable_raw_mode()?;
+    crate::render::raw_tty::set_raw_mode(false);
+    // Notices queued after the loop's last tick have no drainer left
+    // (T4.7). Raw mode is already off, so these go out as plain `\n`.
+    crate::render::raw_tty::flush_pending_to_stderr();
     crossterm::execute!(term.backend_mut(), DisableBracketedPaste)?;
     Ok(())
 }
@@ -620,6 +796,10 @@ struct App {
     /// v0.9.3: cached `config.provider` string used by every
     /// `pick_vendor()` call at Agent build. Populated at startup.
     cfg_provider: Option<String>,
+    /// `config.inline_think_tags` — escape hatch for the inline
+    /// `<think>` splitter (on by default), threaded to every follow-up
+    /// `provider::build()` call the same way `cfg_provider` is.
+    inline_think_tags: Option<bool>,
     /// v0.9.3: id from `pick_vendor` at last Agent build. `None`
     /// before first build; `Some("fallback")` when no signal matched.
     /// Footer suppresses the fallback string.
@@ -645,10 +825,19 @@ struct App {
     /// `expanded` bool that flips true on Ctrl+O so a second press
     /// doesn't duplicate the dump.
     last_tool_output: Option<LastTool>,
-    /// A tool_call event just arrived; its bar is not yet drawn. On the
-    /// matching tool-result marker we colour it green (success) or red
-    /// (failure) using the marker's separator (`→` vs `✗`).
-    pending_tool_call: Option<PendingBar>,
+    /// Tool calls whose bars are not yet drawn, keyed by call id and
+    /// kept in arrival order. On the matching tool-result marker we
+    /// colour a bar green (success) or red (failure) using the
+    /// marker's separator (`→` vs `✗`).
+    ///
+    /// A `Vec`, not an `Option`: with `tool_exec_mode = "parallel"`
+    /// (the default) every `ToolCall` in a batch arrives before the
+    /// first `ToolResult`, so a single slot meant the last call
+    /// overwrote its predecessors — the first card was then labelled
+    /// with the wrong tool and the rest rendered with no header line
+    /// at all. Order is preserved for the orphan flush, which has no
+    /// ids to match against.
+    pending_tool_calls: Vec<(String, PendingBar)>,
     /// When Some, a tool is currently executing — show a live BLUE
     /// "$ command  Elapsed X.Xs" strip inside the dock (PI-style
     /// working state, see img/PI_work_status.jpg). Cleared when
@@ -677,6 +866,12 @@ struct App {
     /// the Agent with the same prompt policy the user asked for on the
     /// command line.
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    /// `[[extensions]]` remembered from startup so `/new`, `/fork`,
+    /// `/resume`, and `/import` rebuild the Agent with the same plugin
+    /// set. Kept here rather than re-read per rebuild so a config edit
+    /// mid-session can't swap plugins under a live registry — plugin
+    /// reload needs an unregister path that doesn't exist yet.
+    extensions: Vec<crate::config::ExtensionConfig>,
     /// Most recent skill invocation, captured collapsed on scrollback.
     /// Ctrl-O expands it once. `None` outside a skill invocation.
     last_skill_block: Option<CollapsedSkill>,
@@ -684,6 +879,32 @@ struct App {
     /// entries without reaching into the agent (which is behind an
     /// async lock). Refreshed by `refresh_status` after every rebuild.
     skills_cache: Vec<crate::resources::Skill>,
+    /// Snapshot of agent.plugin_commands, refreshed by `refresh_status`
+    /// alongside `skills_cache` and for the same reason. Always empty
+    /// in a build without `--features wasm`.
+    commands_cache: Vec<crate::command::PluginCommand>,
+    /// Snapshot of agent.event_subscribers.subscriptions(), refreshed by
+    /// `refresh_status` alongside `commands_cache`. `(plugin_name, sorted
+    /// event names)` per plugin, non-gated (`src/subscriber.rs`), so this
+    /// field carries no WASM feature gate into `tui.rs`. Always empty in
+    /// a build without `--features wasm`.
+    subscriptions_cache: Vec<(String, Vec<String>)>,
+    /// Pre-rendered grant rows for `/tools`, refreshed in
+    /// `refresh_status` beside `subscriptions_cache`. Non-gated
+    /// (`src/plugin_grants.rs`); always empty without `--features
+    /// wasm`, which is why the section is omitted rather than empty.
+    plugin_grants_cache: Vec<crate::plugin_grants::PluginGrants>,
+    /// In-flight plugin command, run on the blocking pool.
+    ///
+    /// Not awaited inline: `handle_action` runs inside the `select!`
+    /// key arm, and a guest call there would freeze the ticker, the SSE
+    /// stream and key handling for up to the full epoch budget — longer
+    /// if a model-driven tool call already holds the plugin's mutex,
+    /// since epoch interruption cannot preempt a thread parked in
+    /// `lock()`. The main loop's tick polls this the same way it polls
+    /// `summarize_task`.
+    command_task:
+        Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
 }
 
 impl App {
@@ -695,6 +916,7 @@ impl App {
         skill_load: crate::agent::build::SkillLoadPolicy,
         no_context_files: bool,
         prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+        extensions: Vec<crate::config::ExtensionConfig>,
         history_path: PathBuf,
     ) -> Self {
         Self {
@@ -709,13 +931,14 @@ impl App {
             api_kind,
             bindings: crate::keys::KeyBindings::default(),
             cfg_provider: None,
+            inline_think_tags: None,
             vendor_id: None,
             usage: crate::event::Usage::default(),
             context_chars: 0,
             turn_count: 0,
             stream_buf: String::new(),
             thinking_buf: String::new(),
-            pending_tool_call: None,
+            pending_tool_calls: Vec::new(),
             tool_started_at: None,
             turn_started_at: None,
             status_note: None,
@@ -737,8 +960,13 @@ impl App {
             skill_load,
             no_context_files,
             prompt_overrides,
+            extensions,
             last_skill_block: None,
             skills_cache: Vec::new(),
+            commands_cache: Vec::new(),
+            subscriptions_cache: Vec::new(),
+            plugin_grants_cache: Vec::new(),
+            command_task: None,
         }
     }
 }
@@ -811,6 +1039,26 @@ struct PendingBar {
     body: String,
 }
 
+/// Remove and return the pending bar for `call_id`.
+///
+/// Falls back to the oldest pending entry when the id is unknown,
+/// which covers providers that renumber tool_call ids between the
+/// stream and the result. Dropping the bar instead would leave a
+/// headerless card, and an out-of-order label is still strictly more
+/// informative than none.
+fn take_pending_bar(app: &mut App, call_id: &str) -> Option<PendingBar> {
+    let idx = app
+        .pending_tool_calls
+        .iter()
+        .position(|(id, _)| id == call_id)
+        .or(if app.pending_tool_calls.is_empty() {
+            None
+        } else {
+            Some(0)
+        })?;
+    Some(app.pending_tool_calls.remove(idx).1)
+}
+
 #[derive(Debug, Clone)]
 struct LastTool {
     content: String,
@@ -841,6 +1089,22 @@ struct CollapsedSkill {
 enum KeyAction {
     Nothing,
     StartTurn(String),
+    /// v0.11.0: user typed + hit Enter WHILE the agent was streaming.
+    /// The text is routed into the running turn's steer channel as a
+    /// `SteerMessage::Steering` instead of starting a new turn.
+    /// Matches Pi's behavior (type mid-stream → steer the agent).
+    SteerTurn(String),
+    /// v0.11.0: the user picked a plugin command out of the palette.
+    RunPluginCommand {
+        name: String,
+        args: String,
+    },
+    /// v0.11.0: the blocking plugin-command task finished. Dispatched
+    /// by the main loop's tick, the same way `SummaryFinished` is.
+    PluginCommandFinished {
+        name: String,
+        outcome: Result<crate::command::CommandAction, String>,
+    },
     CancelTurn,
     Exit,
     Compact,
@@ -865,6 +1129,8 @@ enum KeyAction {
     ShowKeybindings,
     /// `/skills`: dump the loaded skill list into scrollback.
     ShowSkills,
+    /// `/tools`: dump the live tool registry into scrollback.
+    ShowTools,
     /// `/session`: dump usage / cost / model summary into scrollback.
     ShowSessionInfo,
     /// Bare `/name` — print the session's current name to scrollback.
@@ -906,6 +1172,14 @@ enum KeyAction {
     /// `/reload`: re-read config.toml / settings.toml / skills without
     /// exiting the session. New skills become visible on the next turn.
     Reload,
+    /// T4.6: the submission read as a command and the palette has no
+    /// such name. Scrollback only — it never reaches the model and
+    /// never enters the session transcript, the same rule
+    /// [`crate::command::CommandAction::Error`] follows.
+    UnknownCommand {
+        word: String,
+        suggestion: Option<String>,
+    },
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -1099,10 +1373,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     // /name can act immediately without a capture
                     // step (PI parity, see interactive-mode.ts:5701).
                     let full = app.input.as_string();
-                    let arg = full
-                        .lines()
-                        .next()
-                        .unwrap_or("")
+                    let arg = slash_line(&full)
                         .split_once(' ')
                         .map(|(_, rest)| rest.trim().to_string())
                         .unwrap_or_default();
@@ -1127,8 +1398,33 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     return KeyAction::Nothing;
                 }
                 // The palette's filter is driven externally by
-                // sync_palette, so it is never a free-text menu.
+                // sync_palette, so it is never a free-text menu and
+                // ChosenRaw never fires.
                 MenuAction::Nothing | MenuAction::ChosenRaw(_) => {
+                    // Enter on a filter that matches nothing means the
+                    // user is writing prose, not invoking a command —
+                    // "/etc/nginx/nginx.conf is misconfigured" is a
+                    // question, not a typo. Send it, matching PI, where
+                    // an unmatched `/word` falls through to the LLM as
+                    // an ordinary message and there is no
+                    // "unknown command" error anywhere
+                    // (`agent-session.ts:1122-1129` runs the extension
+                    // lookup, then lets unhandled text continue).
+                    //
+                    // Before slash_line() trimmed for the palette, a
+                    // leading space was the only way to send such a
+                    // line; that accident is gone, so this is the
+                    // replacement — and it also frees the user from
+                    // being stuck on "(no matches)" with text they
+                    // cannot submit.
+                    if k.code == KeyCode::Enter
+                        && app.palette.as_ref().is_some_and(|m| m.is_empty())
+                    {
+                        let text = app.input.as_string();
+                        app.palette = None;
+                        app.input.clear();
+                        return submit_or_chat(app, text);
+                    }
                     return KeyAction::Nothing;
                 }
             }
@@ -1171,39 +1467,233 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     out
 }
 
+/// Hand a mid-stream message to the running turn.
+///
+/// `Ok(msg)` means it reached the turn; `Err(msg)` hands the text back
+/// because there is no live turn to steer — the caller queues it as the
+/// next turn rather than dropping it. Both arms return the message so
+/// the caller can echo it either way.
+///
+/// Extracted from `handle_action` purely so this decision is reachable
+/// from a test: `handle_action` needs a live `Term` and agent slot,
+/// which is why the silent-drop bug survived in there in the first
+/// place.
+async fn try_steer(
+    steer_tx: Option<&mpsc::Sender<SteerMessage>>,
+    msg: String,
+) -> Result<String, String> {
+    let stx = match steer_tx {
+        Some(s) => s,
+        // No turn has ever run. Not reachable through the TUI today,
+        // since steering is only offered while streaming, but handled
+        // rather than assumed away.
+        None => return Err(msg),
+    };
+    // Cloned so the message survives a failed send. `SendError` does
+    // return the payload, but unwrapping it back out of the enum is
+    // more code than copying a line of user input.
+    match stx.send(SteerMessage::Steering { text: msg.clone() }).await {
+        Ok(()) => Ok(msg),
+        // The receiver is gone: `run_turn` returned between the
+        // keypress and now.
+        Err(_) => Err(msg),
+    }
+}
+
 /// Interpret a bare Enter submit (no capture mode active) as either
 /// exit, compact, or a chat turn. Extracted so the Submit path in
 /// interpret_key stays readable now that capture modes have their
 /// own branches.
-fn submit_or_chat(app: &App, text: String) -> KeyAction {
-    if app.status == Status::Streaming {
-        return KeyAction::Nothing;
+/// The scrollback block an unknown command produces.
+///
+/// Split from the handler so its wording is testable — `insert_line`
+/// needs a live `Term`. Three lines at most, and the last one is not
+/// optional: refusing input without saying how to send it anyway would
+/// trade a wasted turn for a stuck user.
+fn unknown_command_lines(word: &str, suggestion: Option<&str>) -> Vec<Line<'static>> {
+    let red = Style::default().fg(Color::Red);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Unknown command: /{word}"),
+        red,
+    )])];
+    if let Some(s) = suggestion {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  Did you mean /{s}?"),
+            dim,
+        )]));
     }
+    lines.push(Line::from(vec![Span::styled(
+        format!("  Type / to list commands, or //{word} to send it to the model as text."),
+        dim,
+    )]));
+    lines
+}
+
+/// What a submission starting with `/` actually is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashVerdict {
+    /// Send it. A leading `//` escape has had one slash removed, so
+    /// what the model sees is what the user meant to write.
+    Prose(String),
+    /// It reads as a command invocation and nothing in the palette
+    /// owns the name.
+    Unknown {
+        word: String,
+        suggestion: Option<String>,
+    },
+}
+
+/// Does `word` read as a command NAME, as opposed to the head of a
+/// path or a sentence?
+///
+/// This is the whole reason an unknown-command error is safe to add.
+/// PI never errors — an unmatched `/word` just goes to the model — and
+/// the case that justifies its silence is real: "/etc/nginx/nginx.conf
+/// is misconfigured" is a question, not a typo. So the refusal is
+/// narrowed to names a command could actually have, which is the same
+/// alphabet `command::name_problem` admits: no whitespace, no
+/// `/`, and here also no `.`, because every filesystem path a user
+/// pastes has one or the other.
+fn looks_like_command_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':'))
+}
+
+/// Edit distance, capped by the caller's threshold rather than by
+/// cleverness — the inputs are two command names, so the full matrix
+/// is a few hundred bytes.
+///
+/// In-tree on purpose: a typo hint is not worth a dependency, and the
+/// obvious twenty lines are easier to audit than a fuzzy matcher whose
+/// scoring nobody can predict.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The closest known command to `word`, if one is close enough to be
+/// worth naming.
+///
+/// Two edits, and never more than half the word — otherwise `/ab`
+/// "suggests" `/cd`, which is noise dressed as help. Case-insensitive,
+/// because `/Compact` is a typo the user would like fixed rather than
+/// a different command.
+fn closest_command(word: &str, known: &[&str]) -> Option<String> {
+    let lower = word.to_lowercase();
+    let budget = 2.min(lower.chars().count().div_ceil(2));
+    known
+        .iter()
+        .map(|k| (edit_distance(&lower, &k.to_lowercase()), *k))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k.to_string())
+}
+
+/// Classify one submission the palette declined.
+///
+/// `known` is the palette's vocabulary, bare names. Pure, so the whole
+/// T4.6 decision is testable without a `Term`.
+fn classify_submission(text: &str, known: &[&str]) -> SlashVerdict {
     let t = text.trim();
-    if t.is_empty() {
-        KeyAction::Nothing
-    } else if t == "/quit" || t == "/exit" {
-        KeyAction::Exit
-    } else if t == "/compact" {
-        KeyAction::Compact
-    } else {
-        KeyAction::StartTurn(t.to_string())
+    // A multi-line paste is prose whatever it starts with: the palette
+    // only ever looked at the first line, and refusing a wall of text
+    // over its first token would be a worse bug than the one being
+    // fixed.
+    if !t.starts_with('/') || t.contains('\n') {
+        return SlashVerdict::Prose(t.to_string());
+    }
+    // `//foo` is the escape hatch the error message advertises: one
+    // slash is eaten and the rest goes to the model verbatim. Needed
+    // because a leading space no longer works — `slash_line` trims it.
+    if let Some(rest) = t.strip_prefix("//") {
+        return SlashVerdict::Prose(format!("/{rest}"));
+    }
+    let word = t[1..].split_whitespace().next().unwrap_or("");
+    // Known, yet the palette declined it — only reachable if the two
+    // ever disagree. Send it rather than refuse: the old behaviour is
+    // the safer answer when the vocabulary is self-contradictory.
+    if known.contains(&word) || !looks_like_command_word(word) {
+        return SlashVerdict::Prose(t.to_string());
+    }
+    SlashVerdict::Unknown {
+        word: word.to_string(),
+        suggestion: closest_command(word, known),
     }
 }
 
-/// Sync palette state with the input buffer: open if first line
+/// Only ever sees text the palette declined, so it still does not
+/// RESOLVE command names — it used to carry its own list of three
+/// (`/quit`, `/exit`, `/compact`), a third source of truth beside
+/// `slash_items()` and `dispatch_slash`, and the reason a leading space
+/// routed the other fourteen commands to the model. The palette is
+/// still the only thing that resolves a command.
+///
+/// What it does do (T4.6) is REFUSE: text that reads as a command
+/// invocation and matches nothing in [`known_command_names`] is an
+/// error shown to the user, not a billed turn spent having the model
+/// explain that it has never heard of `/greet`. The vocabulary it
+/// checks against is the palette's own, built by [`palette_items`] —
+/// no second list, and plugin commands count because they are in it.
+fn submit_or_chat(app: &App, text: String) -> KeyAction {
+    let t = text.trim();
+    if t.is_empty() {
+        return KeyAction::Nothing;
+    }
+    let known = known_command_names(app);
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    let t = match classify_submission(t, &known) {
+        // Never reaches the agent, so it cannot enter the transcript.
+        SlashVerdict::Unknown { word, suggestion } => {
+            return KeyAction::UnknownCommand { word, suggestion };
+        }
+        SlashVerdict::Prose(s) => s,
+    };
+    let t = t.as_str();
+    if app.status == Status::Streaming {
+        // v0.11.0: mid-stream Enter steers the running turn instead of
+        // silently doing nothing.
+        return KeyAction::SteerTurn(t.to_string());
+    }
+    KeyAction::StartTurn(t.to_string())
+}
+
+/// The single line every slash path parses: the first line of the
+/// buffer, with leading whitespace removed.
+///
+/// Everything that inspects slash input MUST go through this.
+/// `sync_palette` used to test the raw line while `submit_or_chat`
+/// trimmed, so one leading space closed the palette and handed
+/// `" /session"` to `submit_or_chat` — which knew only three command
+/// names and forwarded the other fourteen to the model as chat text.
+fn slash_line(input: &str) -> &str {
+    input.lines().next().unwrap_or("").trim_start()
+}
+
+/// Sync palette state with the input buffer: open if the first line
 /// starts with `/`, else close. Also refreshes the filter query. When
 /// skills are loaded, their `/skill:<name>` entries are appended to
 /// the built-in list — mirrors PI's autocomplete provider
 /// (interactive-mode.ts:649-661).
 fn sync_palette(app: &mut App) {
     let full = app.input.as_string();
-    let first_line = full.lines().next().unwrap_or("");
+    let first_line = slash_line(&full);
     if first_line.starts_with('/') {
         if app.palette.is_none() {
-            let mut items = slash_items();
-            items.extend(skill_menu_items(&app.skills_cache));
-            app.palette = Some(MenuState::new(items));
+            app.palette = Some(MenuState::new(palette_items(app)));
         }
         if let Some(m) = app.palette.as_mut() {
             // Filter only on the command WORD (chars up to the first
@@ -1234,6 +1724,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Fork => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
         SlashCmd::ListSkills => KeyAction::ShowSkills,
+        SlashCmd::ListTools => KeyAction::ShowTools,
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
         // PI's /name: bare shows current, `/name X` sets it. See
         // packages/coding-agent/src/modes/interactive/interactive-
@@ -1269,6 +1760,12 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Reload => KeyAction::Reload,
         SlashCmd::Settings => KeyAction::ShowSettings,
         SlashCmd::Keybindings => KeyAction::ShowKeybindings,
+        // `arg` is already the trimmed remainder after the first space,
+        // computed by the caller. Reusing it rather than reimplementing
+        // PI's split keeps plugin commands consistent with `/name`,
+        // `/export` and `/import`; a plugin command that treated
+        // whitespace differently would be the odd one out.
+        SlashCmd::Plugin(name) => KeyAction::RunPluginCommand { name, args: arg },
     }
 }
 
@@ -1283,6 +1780,12 @@ async fn run_app(
 ) -> Result<i32> {
     let mut key_events = EventStream::new();
     let mut ag_rx: Option<mpsc::Receiver<AgentEvent>> = None;
+    let mut steer_tx_slot: Option<mpsc::Sender<SteerMessage>> = None;
+    // A queue, not a slot: two messages can land in the dead window
+    // between a turn ending and the completion handler running, and a
+    // single slot silently kept only the second — after echoing both.
+    let mut follow_up_slot: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
     let mut turn_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut cancel: Option<CancellationToken> = None;
     // 120ms ticker keeps the "Elapsed X.Xs" / spinner glyph moving
@@ -1315,7 +1818,7 @@ async fn run_app(
                                 handle_action(
                                     KeyAction::SummaryFinished(outcome),
                                     app, term, &agent_slot,
-                                    &mut ag_rx, &mut cancel, &mut turn_task,
+                                    &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
                                 ).await?;
                             }
                             Err(_join_err) => {
@@ -1333,6 +1836,99 @@ async fn run_app(
                         app.summarize_task = Some(task);
                     }
                 }
+                // Same shape for a finished plugin command. It runs on
+                // the blocking pool precisely so this arm keeps running
+                // — awaiting the guest call inline would freeze the
+                // ticker, the stream, and key handling at once.
+                if let Some(task) = app.command_task.take() {
+                    if task.is_finished() {
+                        match task.await {
+                            Ok((name, outcome)) => {
+                                handle_action(
+                                    KeyAction::PluginCommandFinished { name, outcome },
+                                    app, term, &agent_slot,
+                                    &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                                ).await?;
+                            }
+                            Err(_join_err) => {
+                                app.status_note = None;
+                                insert_line(term, Line::from(vec![
+                                    Span::styled(
+                                        "[plugin command panicked]",
+                                        Style::default().fg(Color::Red),
+                                    ),
+                                ]))?;
+                            }
+                        }
+                    } else {
+                        app.command_task = Some(task);
+                    }
+                }
+                // `note!` lines — plugin `host-log`, provider retry
+                // notices, hook diagnostics, `/new`'s config warnings.
+                // While the TUI is up `note!` queues instead of writing
+                // to stderr, because stderr lands in the region ratatui
+                // manages and the next redraw wipes it (T4.7). This is
+                // the drain that puts them in scrollback for good.
+                //
+                // Dim: these are diagnostics, and they must not read as
+                // the model's words or as a plugin addressing the user
+                // (`host-notify`, cyan, below).
+                for line in crate::render::raw_tty::drain() {
+                    insert_line(term, Line::from(vec![Span::styled(
+                        line,
+                        Style::default().fg(Color::DarkGray),
+                    )]))?;
+                }
+                // Plugin `host-notify` lines. Drained here rather than
+                // pushed from the host function because that function
+                // is a synchronous wasmtime closure with no `Term` and
+                // no channel to this loop (see `wasm::notify`).
+                //
+                // `insert_line` — NOT `note!`. Both now reach
+                // scrollback (T4.7), but they arrive differently
+                // styled and `host-notify` carries the plugin's
+                // attribution, which is the distinction between a
+                // plugin addressing the user and one logging.
+                #[cfg(feature = "wasm")]
+                for line in crate::wasm::notify::drain() {
+                    // Cyan, distinct from assistant text (green) and
+                    // from tool cards, so an attributed plugin line is
+                    // not mistaken for the model's own words.
+                    insert_line(term, Line::from(vec![Span::styled(
+                        line,
+                        Style::default().fg(Color::Cyan),
+                    )]))?;
+                }
+                // Verbatim echoes owed for plugin messages that reached
+                // a running turn (`host-send-user-message`). Drained
+                // here for the same reason `host-notify` is: the host
+                // function is a synchronous wasmtime closure with no
+                // `Term`. No `cfg` — `plugin_send` is non-gated, and
+                // without the feature this is always empty.
+                //
+                // `render_user_echo`, not `insert_line`: this text IS a
+                // user message as far as the model is concerned, so it
+                // must look like one. The attribution says whose.
+                for p in crate::plugin_send::take_echoes() {
+                    render_user_echo(term, &format!("[steer from {}] {}", p.plugin, p.text))?;
+                }
+                // A plugin message that arrived with no turn running
+                // starts one. Without this the overflow queue would
+                // only ever drain at the END of a turn, so a plugin
+                // that spoke at `session_start` — before any turn had
+                // ever run — would sit unheard until the user typed
+                // something, which is the silent-drop shape all over
+                // again.
+                if app.status != Status::Streaming && turn_task.is_none() {
+                    if let Some(text) = pick_follow_up(None, &mut follow_up_slot) {
+                        handle_action(
+                            KeyAction::StartTurn(text),
+                            app, term, &agent_slot,
+                            &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                        ).await?;
+                    }
+                }
                 // Redraw only when there's a live counter to update.
                 if app.turn_started_at.is_some()
                     || app.tool_started_at.is_some()
@@ -1346,7 +1942,8 @@ async fn run_app(
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                         let action = interpret_key(app, k);
                         handle_action(action, app, term, &agent_slot,
-                                      &mut ag_rx, &mut cancel, &mut turn_task).await?;
+                                      &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot,
+                                      &mut cancel, &mut turn_task).await?;
                     }
                     Some(Ok(Event::Paste(s))) => {
                         app.input.insert_str(&s);
@@ -1370,7 +1967,10 @@ async fn run_app(
                         // e.g. turn was cancelled).
                         flush_stream_buf(term, app)?;
                         flush_thinking_buf(term, app)?;
-                        if let Some(pending) = app.pending_tool_call.take() {
+                        // Every call still in flight is orphaned, not
+                        // just the newest one — a cancelled parallel
+                        // batch leaves several.
+                        for (_, pending) in std::mem::take(&mut app.pending_tool_calls) {
                             // Muted amber (Indexed 137 #af875f) for
                             // interrupted state — Morandi warm tone.
                             let bg = Color::Indexed(137);
@@ -1430,6 +2030,31 @@ async fn run_app(
                         // Blank separator between turns.
                         insert_line(term, Line::from(""))?;
                         term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+
+                        // v0.11.0: auto-start the next turn instead of
+                        // idling back to the prompt (Pi's
+                        // getFollowUpMessages semantic). Two sources
+                        // feed this, and they cannot both be one field:
+                        // a `SteerMessage::FollowUp` handled inside the
+                        // turn lands on `agent.pending_follow_ups`, but a
+                        // steer that missed its turn is noticed out here,
+                        // in a window where the agent has been taken out
+                        // of the slot and cannot be written to.
+                        //
+                        // v0.12 adds a THIRD source, last of the three:
+                        // see `pick_follow_up`.
+                        let from_agent = {
+                            let mut g = agent_slot.lock().await;
+                            g.as_mut().and_then(|a| a.pending_follow_ups.pop_front())
+                        };
+                        let follow_up = pick_follow_up(from_agent, &mut follow_up_slot);
+                        if let Some(text) = follow_up {
+                            handle_action(
+                                KeyAction::StartTurn(text),
+                                app, term, &agent_slot,
+                                &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                            ).await?;
+                        }
                     }
                 }
             }
@@ -1443,6 +2068,11 @@ async fn handle_action(
     term: &mut Term,
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     ag_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
+    steer_tx: &mut Option<mpsc::Sender<SteerMessage>>,
+    // Text the user typed mid-stream that arrived too late to steer.
+    // Drained by the turn-completion handler, which starts it as the
+    // next turn instead of letting it vanish.
+    follow_up: &mut std::collections::VecDeque<String>,
     cancel: &mut Option<CancellationToken>,
     turn_task: &mut Option<tokio::task::JoinHandle<Result<String, String>>>,
 ) -> Result<()> {
@@ -1540,6 +2170,21 @@ async fn handle_action(
             {
                 let mut g = agent_slot.lock().await;
                 if let Some(a) = g.as_mut() {
+                    // Persisted for the same reason as the model
+                    // switch above: how much the model was allowed to
+                    // think is part of why an answer looks the way it
+                    // does, and without this a session where the user
+                    // went to `max` halfway through replays as though
+                    // every answer was produced under the level in
+                    // force at the end.
+                    let _ = crate::session::append_entry(
+                        &a.session_path,
+                        &crate::session::SessionEntry::ThinkingChange {
+                            timestamp: crate::util::time::now_iso8601(),
+                            from: current.map(|l| l.to_string()),
+                            to: next.map(|l| l.to_string()),
+                        },
+                    );
                     a.context.thinking = next;
                 }
             }
@@ -1567,7 +2212,32 @@ async fn handle_action(
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let new_provider =
-                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&a.base_url), &new_model)));
+                    crate::provider::build(app.api_kind, &a.base_url, &a.api_key, &new_model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&a.base_url), &new_model)), app.inline_think_tags);
+                // Persist the switch. `SessionEntry::ModelChange` has
+                // existed since the session format did — replay skips
+                // it, `/export` renders it, and a roundtrip test covers
+                // it — but NOTHING EVER WROTE ONE. So a session where
+                // the user switched models mid-conversation replayed as
+                // though one model had answered throughout, and
+                // `/export` could never show the switch it knows how to
+                // render. Same shape as the two persistence gaps in
+                // `docs/claims-and-races.md`: a reader with no writer,
+                // and a test that asserted serialization rather than
+                // that anything produced it.
+                //
+                // Written BEFORE the swap takes effect so `from` is
+                // still the outgoing model. Best-effort like every
+                // other `append_entry` on this path: a session file
+                // that cannot be appended to must not cost the user
+                // their model switch.
+                let _ = crate::session::append_entry(
+                    &a.session_path,
+                    &crate::session::SessionEntry::ModelChange {
+                        timestamp: crate::util::time::now_iso8601(),
+                        from: a.model.clone(),
+                        to: new_model.clone(),
+                    },
+                );
                 a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();
@@ -1614,10 +2284,14 @@ async fn handle_action(
             };
             let _ = session::set_active_session(&cwd, &new_path);
             let registry = crate::tool::ToolRegistry::standard();
+            // `/new` rebuilds the agent from scratch, so re-read
+            // config for exec mode + extensions the same way startup
+            // does. Picks up an edited config.toml without a restart.
+            let cfg_now = crate::config::load_config(&cwd).unwrap_or_default();
             let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
                 cwd: cwd.clone(),
                 registry,
-                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model))),
+                provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags),
                 session_path: new_path,
                 session_id: new_header.id.clone(),
                 permission,
@@ -1628,12 +2302,13 @@ async fn handle_action(
                 skill_load: app.skill_load.clone(),
                 no_context_files: app.no_context_files,
                 prompt_overrides: app.prompt_overrides.clone(),
+                initial_follow_up: None,
+                tool_exec_mode: cfg_now.tool_exec_mode,
+                tool_exec_overrides: cfg_now.tool_exec_overrides.clone(),
+                extensions: cfg_now.extensions,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
+            swap_agent_with_reason(agent_slot, new_agent, "new").await;
             app.session_id = new_header.id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
@@ -1728,7 +2403,7 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
             let registry = crate::tool::ToolRegistry::standard();
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
@@ -1742,14 +2417,12 @@ async fn handle_action(
                 app.skill_load.clone(),
                 app.no_context_files,
                 app.prompt_overrides.clone(),
+                &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &path);
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
+            swap_agent_with_reason(agent_slot, new_agent, "resume").await;
             app.session_id = new_session_id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
@@ -2177,7 +2850,7 @@ async fn handle_action(
                     return Ok(());
                 }
             };
-            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+            let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
             let registry = crate::tool::ToolRegistry::standard();
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
@@ -2191,14 +2864,12 @@ async fn handle_action(
                 app.skill_load.clone(),
                 app.no_context_files,
                 app.prompt_overrides.clone(),
+                &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &dest);
-            {
-                let mut g = agent_slot.lock().await;
-                *g = Some(new_agent);
-            }
+            swap_agent_with_reason(agent_slot, new_agent, "import").await;
             app.session_id = new_session_id.clone();
             app.usage = crate::event::Usage::default();
             app.context_chars = 0;
@@ -2314,7 +2985,7 @@ async fn handle_action(
                         term,
                         Line::from(vec![
                             Span::styled(
-                                format!("  /skill:{:<24}", s.name),
+                                format!("  /skill:{:<24} ", s.name),
                                 Style::default().fg(Color::Cyan),
                             ),
                             Span::styled(
@@ -2334,6 +3005,109 @@ async fn handle_action(
                         )]),
                     )?;
                 }
+                insert_line(term, Line::from(""))?;
+            }
+        }
+        KeyAction::ShowTools => {
+            // Read the live registry rather than a cache: `/new`,
+            // `/resume` and `/fork` rebuild the Agent (and reload
+            // plugins), so a snapshot taken at startup would go stale
+            // in exactly the sessions where a user is most likely to
+            // ask what changed.
+            let entries = {
+                let g = agent_slot.lock().await;
+                g.as_ref().map(|a| a.registry.entries()).unwrap_or_default()
+            };
+            let plugin_count = entries
+                .iter()
+                .filter(|(_, src)| !matches!(src, crate::tool::ToolSource::Builtin))
+                .count();
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    format!(
+                        "Callable tools ({}, {} from plugins)",
+                        entries.len(),
+                        plugin_count
+                    ),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+            for (spec, src) in &entries {
+                let tag = match src {
+                    crate::tool::ToolSource::Builtin => "[builtin]".to_string(),
+                    crate::tool::ToolSource::Plugin { name, .. } => format!("[plugin:{name}]"),
+                };
+                insert_line(
+                    term,
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {:<20} ", spec.name),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("{tag} "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        // First line only: a plugin author's
+                        // description can be a paragraph, and the
+                        // point here is the inventory, not the docs.
+                        Span::styled(
+                            spec.description
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string(),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]),
+                )?;
+                if let crate::tool::ToolSource::Plugin { path, .. } = src {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("      {path}"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        )]),
+                    )?;
+                }
+            }
+            if plugin_count == 0 {
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
+                        "  No plugin tools. Declare [[extensions]] in config.toml \
+                         (needs a build with --features wasm)."
+                            .to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                )?;
+            }
+            insert_line(term, Line::from(""))?;
+
+            // §5.1: the inventory above answers "what can the model
+            // call" — this section answers "what is watching me", which
+            // is the other half of a plugin's blast radius and just as
+            // worth an operator's attention. Nothing printed when no
+            // plugin subscribed to any event.
+            // And this one answers "what was it allowed to do" —
+            // `allow_tools` in particular, which is what separates a
+            // plugin that formats text from one that can run `bash`.
+            for line in grants_section(&app.plugin_grants_cache) {
+                insert_line(term, line)?;
+            }
+            if !app.plugin_grants_cache.is_empty() {
+                insert_line(term, Line::from(""))?;
+            }
+
+            for line in subscriptions_section(&app.subscriptions_cache) {
+                insert_line(term, line)?;
+            }
+            if !app.subscriptions_cache.is_empty() {
                 insert_line(term, Line::from(""))?;
             }
         }
@@ -2527,12 +3301,28 @@ async fn handle_action(
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let before = a.context.estimate_chars();
-                a.compact_now(None, "manual").await;
+                let ran = a.compact_now(None, "manual").await;
                 let after = a.context.estimate_chars();
+                // `before → after` alone can't distinguish "compacted,
+                // same size" from "never ran", and on a short session
+                // it printed the former while doing the latter:
+                // `[compacted: 2158 → 2158 chars]`. The whole context
+                // already fit inside the verbatim tail budget, so there
+                // was no head to summarize — which is the right call,
+                // just not what the line said.
+                let msg = if ran {
+                    format!("[compacted: {before} → {after} chars]")
+                } else {
+                    format!(
+                        "[nothing to compact: {before} chars all fit in the \
+                         {} k-token tail kept verbatim]",
+                        crate::agent::compact::KEEP_RECENT_TOKENS / 1000
+                    )
+                };
                 insert_line(
                     term,
                     Line::from(vec![Span::styled(
-                        format!("[compacted: {before} → {after} chars]"),
+                        msg,
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
@@ -2551,6 +3341,7 @@ async fn handle_action(
             // Echo user message into scrollback, PI-style gray card.
             render_user_echo(term, &msg)?;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
+            let (steer_tx_inner, steer_rx) = mpsc::channel::<SteerMessage>(32);
             let ct = CancellationToken::new();
             let ct_task = ct.clone();
             let agent_task_slot = agent_slot.clone();
@@ -2558,16 +3349,215 @@ async fn handle_action(
                 let mut guard = agent_task_slot.lock().await;
                 let mut a = guard.take().ok_or_else(|| "agent slot empty".to_string())?;
                 drop(guard);
-                let result = a.run_turn(&msg, &tx, Some(ct_task)).await;
+                let result = a.run_turn(&msg, &tx, Some(ct_task), Some(steer_rx)).await;
                 let mut guard = agent_task_slot.lock().await;
                 *guard = Some(a);
                 result.map_err(|e| e.to_string())
             });
+            *steer_tx = Some(steer_tx_inner);
             *ag_rx = Some(rx);
             *cancel = Some(ct);
             *turn_task = Some(task);
             app.status = Status::Streaming;
             app.turn_started_at = Some(std::time::Instant::now());
+            // Re-arm each plugin's per-turn notify allowance. Done from
+            // the TUI's own turn-start path on purpose: the agent loop
+            // is off limits, and this is where the TUI already knows a
+            // turn is beginning.
+            #[cfg(feature = "wasm")]
+            crate::wasm::notify::reset_turn();
+            // The SAME boundary, deliberately not a second one. Two
+            // turn boundaries drift, and the drift would be a hole in
+            // §2.4's rule 2. `reset_turn` promotes whatever origin the
+            // follow-up drain staged: a plugin's queued message makes
+            // this the plugin's own turn, and anything else makes it a
+            // human's. No `cfg` — `plugin_send` is non-gated.
+            crate::plugin_send::reset_turn();
+            // Republished every turn, not once at startup. The steer
+            // sender is created fresh above, so a sink kept from the
+            // previous turn would hold one whose receiver is already
+            // gone and every plugin message would queue instead of
+            // steering.
+            crate::plugin_send::install(crate::plugin_send::Sink {
+                steer_tx: steer_tx.clone(),
+            });
+        }
+        KeyAction::SteerTurn(msg) => {
+            steer_or_queue(term, steer_tx.as_ref(), follow_up, msg).await?;
+        }
+        KeyAction::RunPluginCommand { name, args } => {
+            let Some(cmd) = app
+                .commands_cache
+                .iter()
+                .find(|c| c.spec.name == name)
+                .cloned()
+            else {
+                // Only reachable if the cache went stale between the
+                // palette opening and Enter — a rebuild in between.
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
+                        format!("[/{name} is no longer registered]"),
+                        Style::default().fg(Color::Red),
+                    )]),
+                )?;
+                return Ok(());
+            };
+            if app.command_task.is_some() {
+                // Serializing is not cosmetic: the plugin's own mutex
+                // would serialize them anyway, and queueing two
+                // 30-second commands behind each other with no visible
+                // reason is worse than refusing the second.
+                app.status_note = Some("a plugin command is already running…".into());
+                return Ok(());
+            }
+            app.status_note = Some(format!("running /{name}…"));
+            let handler = cmd.handler.clone();
+            let task_name = name.clone();
+            app.command_task = Some(tokio::task::spawn_blocking(move || {
+                let outcome = handler.run(&task_name, &args);
+                (task_name, outcome)
+            }));
+        }
+        KeyAction::UnknownCommand { word, suggestion } => {
+            for line in unknown_command_lines(&word, suggestion.as_deref()) {
+                insert_line(term, line)?;
+            }
+        }
+        KeyAction::PluginCommandFinished { name, outcome } => {
+            app.status_note = None;
+            match outcome {
+                Ok(crate::command::CommandAction::Print(text)) => {
+                    // Straight to scrollback: never enters the context
+                    // and never reaches the session JSONL. Works
+                    // identically mid-stream, since nothing here
+                    // touches the agent.
+                    for line in text.lines() {
+                        insert_line(term, Line::from(line.to_string()))?;
+                    }
+                }
+                Ok(crate::command::CommandAction::SendUserMessage(text)) => {
+                    if app.status == Status::Streaming {
+                        steer_or_queue(term, steer_tx.as_ref(), follow_up, text).await?;
+                    } else {
+                        // Echo first, always. The user must see verbatim
+                        // what a plugin said on their behalf — dropping
+                        // this is what would make the feature a
+                        // security problem rather than a convenience.
+                        Box::pin(handle_action(
+                            KeyAction::StartTurn(text),
+                            app,
+                            term,
+                            agent_slot,
+                            ag_rx,
+                            steer_tx,
+                            follow_up,
+                            cancel,
+                            turn_task,
+                        ))
+                        .await?;
+                    }
+                }
+                Ok(crate::command::CommandAction::Error(msg)) => {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("[/{name}] {msg}"),
+                            Style::default().fg(Color::Red),
+                        )]),
+                    )?;
+                }
+                Err(e) => {
+                    // A plugin-side failure — trap, malformed payload.
+                    // Shown to the user, never forwarded to the model,
+                    // matching PI, where a throwing command handler is
+                    // swallowed rather than becoming a prompt.
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("[/{name} failed] {e}"),
+                            Style::default().fg(Color::Red),
+                        )]),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Choose the next turn's text from the three follow-up sources, in
+/// order.
+///
+/// 1. `Agent::pending_follow_ups` — a `SteerMessage::FollowUp` handled
+///    inside the turn, or a steer `drain_steer_to_follow_ups` demoted.
+/// 2. `follow_up_slot` — a human's line that missed its turn, noticed
+///    out here in the window where the agent is out of the slot.
+/// 3. `plugin_send`'s overflow — a plugin message with no live channel.
+///
+/// **The plugin goes LAST, and that is a decision rather than an
+/// accident of writing order.** A human's queued line is something the
+/// user typed and watched land; a plugin's is something software
+/// decided to spend their money on. Putting the plugin first would let
+/// a plugin cut in front of the person at the keyboard.
+///
+/// Extracted purely so the ORDER is reachable from a test — the loop
+/// body it came from needs a live `Term` and agent slot.
+///
+/// **Caller obligation, and it is load-bearing.** This CONSUMES from
+/// all three sources: source 3 additionally clears §2.4's rule 1 and
+/// stages the turn origin. So whatever it returns must actually reach
+/// `KeyAction::StartTurn`, which early-returns when
+/// `app.status == Status::Streaming` — and a plugin message dropped in
+/// that early return would be one the guard had already counted as
+/// delivered, wedging the plugin and losing the text: `b90b27f`'s shape
+/// with a stuck flag on top. Both call sites establish the
+/// precondition — the ticker checks `status != Streaming && turn_task
+/// .is_none()` before calling, and the turn-completion site sets
+/// `status = Idle` well above. Do not add a third call site without it.
+fn pick_follow_up(
+    from_agent: Option<String>,
+    slot: &mut std::collections::VecDeque<String>,
+) -> Option<String> {
+    from_agent
+        .or_else(|| slot.pop_front())
+        // `take_pending` also stages the turn origin, which is what
+        // makes §2.4's rule 2 true for a turn a plugin STARTED (as
+        // opposed to one it steered). `KeyAction::StartTurn`'s
+        // `plugin_send::reset_turn()` promotes it a moment later.
+        .or_else(|| crate::plugin_send::take_pending().map(|p| p.text))
+}
+
+/// Route a mid-stream message into the running turn, or queue it as the
+/// next turn if the turn ended first.
+///
+/// Extracted so the plugin-command path can reach it: `handle_action`
+/// is `async`, so recursing into it would need boxing, and routing a
+/// plugin's `send_user_message` through `KeyAction::StartTurn` instead
+/// would hit its already-streaming early return and silently drop the
+/// text — the bug `SlashCmd::Skill` still has.
+///
+/// The send is attempted BEFORE the echo. It used to be the other way
+/// around, which meant the one case that can fail — the turn ending
+/// between the keypress and this dispatch, dropping the receiver —
+/// printed "[steer] ..." and then discarded the text. The user saw
+/// their message land and it was gone.
+async fn steer_or_queue(
+    term: &mut Term,
+    steer_tx: Option<&mpsc::Sender<SteerMessage>>,
+    follow_up: &mut std::collections::VecDeque<String>,
+    msg: String,
+) -> Result<()> {
+    match try_steer(steer_tx, msg).await {
+        // Marked so it reads differently from a normal turn.
+        Ok(landed) => render_user_echo(term, &format!("[steer] {landed}"))?,
+        Err(missed) => {
+            // Nothing left to steer. Queue it as the next turn rather
+            // than throwing away something the user typed — the
+            // turn-completion handler starts it. Echoed as queued, not
+            // as a steer, so the distinction is visible.
+            render_user_echo(term, &format!("[queued] {missed}"))?;
+            follow_up.push_back(missed);
         }
     }
     Ok(())
@@ -2577,6 +3567,34 @@ async fn recv_optional(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<Ag
     match rx.as_mut() {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Swap the live Agent for `new_agent`, firing the session-lifecycle
+/// hooks in between (spec §2.2c). Used at all four agent-swap sites
+/// (`/new`, `/resume`, `/import`, fork).
+///
+/// Order is load-bearing: `session_shutdown` MUST fire on the OUTGOING
+/// agent, still installed in the slot, before the slot is swapped —
+/// one line late (swap first, fire second) and the shutdown payload
+/// would carry the incoming session's id instead of the outgoing one,
+/// silently misattributing the teardown to the wrong session for any
+/// audit or cleanup hook. `session_start` then fires on the
+/// newly-installed incoming agent. Holding the mutex guard across both
+/// `await`s is correct here: this all runs on one task, and the hook
+/// subprocess has no path back into `agent_slot`.
+async fn swap_agent_with_reason(
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    incoming_agent: Agent,
+    reason: &str,
+) {
+    let mut g = agent_slot.lock().await;
+    if let Some(outgoing) = g.as_ref() {
+        outgoing.fire_session_shutdown(reason).await;
+    }
+    g.replace(incoming_agent);
+    if let Some(incoming) = g.as_ref() {
+        incoming.fire_session_start(reason).await;
     }
 }
 
@@ -2649,7 +3667,7 @@ async fn execute_fork(
             return Ok(());
         }
     };
-    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
     let registry = crate::tool::ToolRegistry::standard();
     new_agent.context.tools = registry.all_specs();
     let diags = new_agent.hydrate_resumed(
@@ -2663,14 +3681,12 @@ async fn execute_fork(
         app.skill_load.clone(),
         app.no_context_files,
         app.prompt_overrides.clone(),
+        &app.extensions,
     );
     crate::agent::build::print_skill_diagnostics(&diags);
     let new_session_id = new_header.id;
 
-    {
-        let mut g = agent_slot.lock().await;
-        *g = Some(new_agent);
-    }
+    swap_agent_with_reason(agent_slot, new_agent, "fork").await;
 
     app.session_id = new_session_id.to_string();
     app.usage = crate::event::Usage::default();
@@ -2720,7 +3736,7 @@ async fn spawn_summarize_task(
             None => return,
         }
     };
-    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)));
+    let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
     let cut_off = pending.cut_off.clone();
     let task = tokio::spawn(async move {
         match crate::agent::branch_summary::summarize_branch(
@@ -2753,21 +3769,90 @@ async fn refresh_status(app: &mut App, agent: &Arc<Mutex<Option<Agent>>>) {
         app.cwd = a.cwd.clone();
         app.thinking = a.context.thinking;
         app.skills_cache = a.skills.clone();
+        app.commands_cache = a.plugin_commands.clone();
+        app.subscriptions_cache = a.event_subscribers.subscriptions();
+        app.plugin_grants_cache = a.plugin_grants.clone();
     }
 }
 
-/// `/reload` handler: re-reads `config.toml`, `settings.toml`, and
-/// re-discovers skills, then updates the live Agent in place. Mirrors
-/// PI's `session.reload()` (`agent-session.ts:2602`) minus the
-/// extension system and provider swap — nanopi has no extensions, and
-/// mid-session provider swaps stay behind `/model` to avoid
+/// `/reload` handler: re-reads `config.toml`, `settings.toml`,
+/// re-discovers skills, and — since v0.12 — stands `[[extensions]]`
+/// back up from disk, then updates the live Agent in place. Mirrors
+/// PI's `session.reload()` (`agent-session.ts:2602`) minus the provider
+/// swap — mid-session provider swaps stay behind `/model` to avoid
 /// accidentally dropping an in-flight streaming connection.
 ///
-/// What it touches: `agent.skills`, `agent.hooks`, `agent.context.
-/// system` (rebuilt via `compose_system_prompt` so newly installed
-/// skills appear in `<available_skills>`). What it does NOT touch:
-/// `agent.provider`, `agent.model`, `agent.base_url`, `agent.api_key`,
-/// session state, or messages.
+/// What it touches: `agent.skills`, `agent.hooks`, `agent.
+/// system_base` (rebuilt via `compose_system_prompt` so newly
+/// installed skills appear in `<available_skills>`, then re-derived
+/// into `context.system`), and everything
+/// `Agent::reload_extensions` owns — the plugin half of the registry,
+/// the plugin command palette, the event subscriber table, and the
+/// grant rows. It rebuilds the system BASE only: an active plugin
+/// context contribution SURVIVES a reload for a plugin that is still
+/// loaded and still holds `allow_context`. A contribution is not a
+/// skill, and dropping one from under a working plugin would silently
+/// disable its capability with no way back short of a restart.
+/// `reload_extensions` DOES drop the contribution of a plugin that
+/// vanished from the config or that came back without the grant, and
+/// names it in the report line — see the decision list on that method.
+///
+/// What it does NOT touch: `agent.provider`, `agent.model`,
+/// `agent.base_url`, `agent.api_key`, session state, or messages. Nor
+/// any host-side plugin state: a plugin's `host-store` file, its
+/// `plugin_send` loop guard, and its spent session budget all survive,
+/// deliberately — see `Agent::reload_extensions`.
+///
+/// The three prerequisites the previous version of this comment named
+/// as missing are in place, which is what made the extension half
+/// possible: `ToolRegistry::unregister_plugin` (so a reload can remove
+/// as well as add, and re-registering the same names does not hit
+/// `register_external`'s collision refusal), `crate::wasm::generation`
+/// (so an `Arc<dyn Tool>` clone already handed out cannot keep calling
+/// the instance that was replaced — it refuses in-band instead), and
+/// load-before-unregister ordering (so nothing waits on the bridge
+/// mutex a turn may be holding: the reload never takes it). The
+/// wasmtime `Store` and its epoch ticker are not leaked per reload
+/// either — the ticker holds a `Weak<Engine>` and exits when the last
+/// bridge `Arc` drops.
+/// The `/reload` report line's extensions clause.
+///
+/// Pulled out as a pure function because it is where the only bug this
+/// line has had actually lived, and `handle_reload` itself has no test
+/// seam — `Term` is `Terminal<CrosstermBackend<Stdout>>`, not a
+/// `TestBackend`.
+///
+/// There are two distinct reasons `ext_report` can be `None`, and they
+/// need different words:
+///
+/// - **The agent is mid-turn.** It is MOVED OUT of the slot for the
+///   duration of a turn, so a `/reload` typed while the model is
+///   streaming finds it empty and reloads nothing at all — not skills,
+///   not hooks, not extensions. This used to fall through to the
+///   config-parse message below and report
+///   "extensions unchanged (config.toml did not parse)" against a
+///   perfectly valid config, sending the user to debug TOML when the
+///   real answer was "wait for the turn".
+/// - **`config.toml` genuinely failed to parse**, which the note
+///   underneath the line spells out.
+///
+/// Saying "unchanged" rather than nothing keeps the habit that made the
+/// extension reload possible in the first place: the line always states
+/// what it did NOT do. It just has to state it truthfully.
+fn reload_extensions_clause(
+    ext_report: Option<&crate::agent::build::ExtensionReloadReport>,
+    agent_busy: bool,
+) -> String {
+    match ext_report {
+        Some(r) => r.line(),
+        None if agent_busy => {
+            "nothing reloaded (a turn is in flight — run /reload again once it finishes)"
+                .to_string()
+        }
+        None => "extensions unchanged (config.toml did not parse)".to_string(),
+    }
+}
+
 async fn handle_reload(
     term: &mut Term,
     app: &mut App,
@@ -2777,13 +3862,20 @@ async fn handle_reload(
 
     // ── 1. config.toml (only skills.disabled is applied live; model /
     //       base_url / api_key changes need /model or restart) ──
-    let config_note: Option<String> = match crate::config::load_config(&app.cwd) {
-        Ok(cfg) => {
-            app.skill_load.disabled = cfg.skills.disabled.clone();
-            None
-        }
-        Err(e) => Some(format!("config.toml: {e}")),
-    };
+    // `extensions` is `None`, not an empty vec, when the config failed
+    // to parse. The distinction is the whole point: an empty vec means
+    // "the user configured no extensions", which would UNLOAD every
+    // running plugin. A config that failed to parse says nothing about
+    // what the user wants loaded, and acting on it would turn a typo in
+    // `[skills]` into the silent removal of every plugin.
+    let (extensions, config_note): (Option<Vec<crate::config::ExtensionConfig>>, Option<String>) =
+        match crate::config::load_config(&app.cwd) {
+            Ok(cfg) => {
+                app.skill_load.disabled = cfg.skills.disabled.clone();
+                (Some(cfg.extensions.clone()), None)
+            }
+            Err(e) => (None, Some(format!("config.toml: {e}"))),
+        };
 
     // ── 2. settings.toml → hooks ──
     let (hooks_new, settings_note): (Option<HooksConfig>, Option<String>) =
@@ -2798,6 +3890,16 @@ async fn handle_reload(
     let n_diagnostics = skill_result.diagnostics.len();
 
     // ── 4. apply to the live agent under the async lock ──
+    let mut ext_report: Option<crate::agent::build::ExtensionReloadReport> = None;
+    // The agent is MOVED OUT of the slot for the duration of a turn, so
+    // a `/reload` typed mid-stream finds it empty and every branch below
+    // is skipped. That used to be reported as
+    // "extensions unchanged (config.toml did not parse)" — the fallback
+    // arm for a `None` report — which is a plain untruth when the config
+    // parses fine, and it sends the user off to debug TOML while the
+    // real answer is "a turn is running". Skills and hooks are silently
+    // not applied either, so the honest line names the whole no-op.
+    let mut agent_busy = false;
     let n_hooks: usize = {
         let mut g = agent.lock().await;
         if let Some(a) = g.as_mut() {
@@ -2805,32 +3907,61 @@ async fn handle_reload(
             if let Some(ref h) = hooks_new {
                 a.hooks = h.clone();
             }
+            // BEFORE `registry.names()` below, the same ordering
+            // constraint both Agent construction paths carry: the
+            // system prompt's tool list has to describe the registry
+            // as it is after the reload, or a plugin tool added by this
+            // very reload would be registered and unmentioned.
+            if let Some(ref exts) = extensions {
+                ext_report = Some(a.reload_extensions(exts));
+            }
             let tool_names = a.registry.names();
-            a.context.system = Some(crate::agent::build::compose_system_prompt(
+            // Through `set_system_base`, not a direct assignment to
+            // `context.system`: this replaces the BASE, and an active
+            // plugin context contribution survives the reload (see the
+            // doc comment above — `[[extensions]]` is not reloaded
+            // either).
+            let base = crate::agent::build::compose_system_prompt(
                 &a.cwd,
                 &tool_names,
                 &a.skills,
                 a.no_context_files,
                 &a.prompt_overrides,
-            ));
+            );
+            a.set_system_base(base);
             let h = &a.hooks;
-            h.pre_tool_use.len()
-                + h.post_tool_use.len()
-                + h.user_prompt_submit.len()
+            h.tool_execution_start.len()
+                + h.tool_execution_end.len()
+                + h.input.len()
                 + h.session_start.len()
-                + h.session_end.len()
+                + h.session_shutdown.len()
         } else {
+            agent_busy = true;
             0
         }
     };
     app.skills_cache = skill_result.skills;
+    // The three plugin caches the TUI renders from — see
+    // `refresh_status`, which does the same for every other path. A
+    // reload that swapped the Agent's tables and left these stale would
+    // leave `/tools` and the command palette describing the plugins that
+    // used to be loaded.
+    {
+        let g = agent.lock().await;
+        if let Some(a) = g.as_ref() {
+            app.commands_cache = a.plugin_commands.clone();
+            app.subscriptions_cache = a.event_subscribers.subscriptions();
+            app.plugin_grants_cache = a.plugin_grants.clone();
+        }
+    }
 
     // ── 5. report to scrollback ──
     insert_line(
         term,
         L::from(vec![Span::styled(
             format!(
-                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s){}",
+                "[reloaded] {n_skills} skill(s), {n_hooks} hook(s) · {}{}",
+                reload_extensions_clause(ext_report.as_ref(), agent_busy),
                 if let Some(e) = &config_note {
                     format!(" · {e}")
                 } else {
@@ -2860,7 +3991,40 @@ async fn handle_reload(
             )]),
         )?;
     }
-    if n_diagnostics == 0 && settings_note.is_none() && config_note.is_none() {
+    // Warnings and errors from the extension load. Rendered HERE, into
+    // scrollback, rather than through `render::notice`: that writes to
+    // stderr, which is correct at startup and lands on top of the TUI
+    // once it owns the screen. `reload_extensions` carries them out for
+    // exactly this reason.
+    for note in ext_report.iter().flat_map(|r| r.notes.iter()) {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                format!("  extension: {note}"),
+                Style::default().fg(Color::Yellow),
+            )]),
+        )?;
+    }
+    // A failed plugin gets its own line, not just a name in the summary
+    // above: the reason it failed is the only thing the user can act
+    // on, and it is what tells them the previous instance is still the
+    // one running.
+    for (name, err) in ext_report.iter().flat_map(|r| r.failed.iter()) {
+        insert_line(
+            term,
+            L::from(vec![Span::styled(
+                format!(
+                    "  extension {name}: failed to reload ({err}) — the \
+                     previously loaded instance is still running"
+                ),
+                Style::default().fg(Color::Red),
+            )]),
+        )?;
+    }
+    let ext_quiet = ext_report
+        .as_ref()
+        .is_none_or(|r| r.notes.is_empty() && r.failed.is_empty());
+    if n_diagnostics == 0 && settings_note.is_none() && config_note.is_none() && ext_quiet {
         insert_line(
             term,
             L::from(vec![Span::styled(
@@ -2913,21 +4077,55 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
-            app.pending_tool_call = Some(PendingBar { leading, body });
+            app.pending_tool_calls
+                .push((call.id.clone(), PendingBar { leading, body }));
             // Start the live "Elapsed X.Xs" clock so the dock can
             // render a blue running-state strip until ToolResult.
             app.tool_started_at = Some(std::time::Instant::now());
         }
+        AgentEvent::ToolCallRewritten {
+            call_id,
+            tool_name,
+            arguments,
+        } => {
+            // The card is only drawn when the result arrives, so the
+            // stashed bar can still be corrected in place — the user
+            // ends up seeing what actually ran rather than what the
+            // model asked for. `↻` replaces the usual chip so the
+            // difference is visible rather than silently swapped.
+            let (_, body) = tool_call_bar_text(&tool_name, &arguments);
+            if let Some(slot) = app
+                .pending_tool_calls
+                .iter_mut()
+                .find(|(id, _)| *id == call_id)
+            {
+                slot.1.leading = format!(" ↻ {} ", tool_name.to_ascii_lowercase());
+                slot.1.body = body;
+            }
+        }
         AgentEvent::ToolResult {
+            call_id,
+            tool_name,
             content,
             is_error,
             elapsed_ms,
-            ..
         } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            render_tool_card(term, app, &content, is_error, elapsed_ms)?;
-            app.tool_started_at = None;
+            render_tool_card(
+                term,
+                app,
+                &call_id,
+                &tool_name,
+                &content,
+                is_error,
+                elapsed_ms,
+            )?;
+            // Only once every in-flight call has reported: with
+            // parallel execution the batch is still running.
+            if app.pending_tool_calls.is_empty() {
+                app.tool_started_at = None;
+            }
             // Stash full output so Ctrl+O can expand it later — with
             // the outcome flag so expansion uses matching bg.
             app.last_tool_output = Some(LastTool {
@@ -3118,6 +4316,8 @@ fn expand_tabs(s: &str) -> String {
 fn render_tool_card(
     term: &mut Term,
     app: &mut App,
+    call_id: &str,
+    tool_name: &str,
     content: &str,
     is_error: bool,
     elapsed_ms: u64,
@@ -3147,17 +4347,28 @@ fn render_tool_card(
     // Breathing room above.
     insert_line(term, Line::from(""))?;
 
-    // Row 1: command bar (from stashed pending_tool_call).
-    if let Some(pending) = app.pending_tool_call.take() {
-        insert_line_bg(
-            term,
-            Line::from(vec![
-                Span::styled(pending.leading, bar_style),
-                Span::styled(pending.body, bar_style),
-            ]),
-            Some(bar_style),
-        )?;
-    }
+    // Row 1: command bar — the stash left by this call's ToolCall
+    // event, matched on call id so a parallel batch can't mislabel a
+    // card. Missing stash falls back to the tool's name rather than
+    // dropping the row: a card with no header is unreadable, and the
+    // name is the one thing the result event always carries.
+    let pending = take_pending_bar(app, call_id).unwrap_or_else(|| PendingBar {
+        // Replayed history carries no tool name on the result entry,
+        // so the generic word beats an empty chip.
+        leading: match tool_name {
+            "" => " tool ".to_string(),
+            n => format!(" {} ", n.to_ascii_lowercase()),
+        },
+        body: String::new(),
+    });
+    insert_line_bg(
+        term,
+        Line::from(vec![
+            Span::styled(pending.leading, bar_style),
+            Span::styled(pending.body, bar_style),
+        ]),
+        Some(bar_style),
+    )?;
 
     // Output preview: last N lines. If more, show a truncation marker.
     let lines: Vec<&str> = content.lines().collect();
@@ -3306,7 +4517,7 @@ fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEnt
     app.md_state = crate::render::markdown::MdState::default();
     app.stream_buf.clear();
     app.thinking_buf.clear();
-    app.pending_tool_call = None;
+    app.pending_tool_calls.clear();
 
     for entry in entries {
         match entry {
@@ -3899,7 +5110,12 @@ fn draw_status_strip(buf: &mut Buffer, area: Rect, app: &App) {
         % BRAILLE.len();
 
     // Tool running has priority.
-    if let (Some(started), Some(bar)) = (app.tool_started_at, app.pending_tool_call.as_ref()) {
+    // Oldest in-flight call: with a parallel batch the strip can only
+    // show one, and the one that has been running longest is the one
+    // the elapsed clock actually belongs to.
+    if let (Some(started), Some((_, bar))) =
+        (app.tool_started_at, app.pending_tool_calls.first())
+    {
         let elapsed = started.elapsed().as_secs_f64();
         let blue_bg = Color::Indexed(24); // muted navy — matches Morandi
         let bar_style = Style::default()
@@ -4144,6 +5360,128 @@ fn draw_palette(buf: &mut Buffer, area: Rect, m: &MenuState<SlashCmd>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::hook::HookConfig;
+    use std::collections::VecDeque;
+
+    /// `plugin_send`'s state is process-wide, so the drain-order tests
+    /// must not interleave with each other.
+    fn send_guard() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = L.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plugin_send::install(crate::plugin_send::Sink { steer_tx: None });
+        while crate::plugin_send::take_pending().is_some() {}
+        let _ = crate::plugin_send::take_echoes();
+        // Clear rule 2's origin as well: the sibling test below leaves
+        // a turn attributed to `p`, and inheriting it would refuse the
+        // very send this test is set up to make.
+        crate::plugin_send::mark_turn_origin(None);
+        crate::plugin_send::reset_turn();
+        g
+    }
+
+    /// **The human outranks the plugin.** All three sources are loaded
+    /// at once and drained to exhaustion, so the assertion is about
+    /// ORDER and not merely about each source being reachable — a
+    /// version that reads the plugin first still returns all three
+    /// strings and would pass a weaker test.
+    ///
+    /// A human's queued line is something the user typed and watched
+    /// land; a plugin's is something software decided to spend their
+    /// money on.
+    #[test]
+    fn the_plugin_overflow_is_drained_last_of_the_three_sources() {
+        let _g = send_guard();
+        crate::plugin_send::send("p", "from the plugin").expect("queued, no live channel");
+
+        let mut slot: VecDeque<String> = VecDeque::new();
+        slot.push_back("from the human".to_string());
+
+        assert_eq!(
+            pick_follow_up(Some("from the agent".into()), &mut slot).as_deref(),
+            Some("from the agent"),
+            "1st: a FollowUp handled inside the turn, or a demoted steer"
+        );
+        assert_eq!(
+            pick_follow_up(None, &mut slot).as_deref(),
+            Some("from the human"),
+            "2nd: the human's queued line must beat the plugin's message"
+        );
+        assert_eq!(
+            pick_follow_up(None, &mut slot).as_deref(),
+            Some("from the plugin"),
+            "3rd, and only once the human has been served"
+        );
+        assert_eq!(pick_follow_up(None, &mut slot), None, "and then nothing");
+    }
+
+    /// **A structural test, and a test of last resort.** The reversion
+    /// it exists for — deleting the per-turn `plugin_send::install` from
+    /// `KeyAction::StartTurn` and relying on the one at startup — came
+    /// back GREEN against every behavioural test in this crate, because
+    /// the call site sits inside `handle_action`, which needs a live
+    /// `Term`, an agent slot and a spawned turn task to reach.
+    ///
+    /// The consequence of that deletion is not small: the steer sender
+    /// is created FRESH for every turn, so a sink kept from the first
+    /// turn holds one whose receiver died with it, and every plugin
+    /// message from the second turn onward would silently queue as a
+    /// follow-up instead of steering the running turn.
+    /// `plugin_send::installing_a_fresh_sink_replaces_the_previous_turns_sender`
+    /// pins `install`'s REPLACE semantics; nothing pinned that anyone
+    /// calls it.
+    ///
+    /// So this reads the source. It is brittle by construction — a
+    /// rename breaks it — and that is the accepted cost: a brittle test
+    /// that fails loudly on the right change beats a silent capability
+    /// that degrades after the first turn. If you are here because a
+    /// rename broke it, update the needle; if you are here because you
+    /// moved the call, move the needle with it and make sure the new
+    /// home still runs once per turn.
+    #[test]
+    fn the_send_sink_is_republished_on_every_turn_not_once_at_startup() {
+        let src = include_str!("tui.rs");
+        let arm = src
+            .split_once("KeyAction::StartTurn(msg) => {")
+            .expect("the turn-start arm must exist")
+            .1
+            .split_once("KeyAction::SteerTurn(")
+            .expect("…and end where the next arm begins")
+            .0;
+        assert!(
+            arm.contains("plugin_send::install"),
+            "KeyAction::StartTurn must REPUBLISH the send sink with this \
+             turn's steer sender. Installing only at startup leaves a \
+             sender whose receiver died with the first turn, and every \
+             later plugin message queues instead of steering — silently, \
+             and only from the second turn on."
+        );
+        assert!(
+            arm.contains("plugin_send::reset_turn"),
+            "…and it must promote the staged turn origin at the SAME \
+             boundary as `notify::reset_turn`. A second boundary drifts, \
+             and the drift is a hole in §2.4's rule 2."
+        );
+    }
+
+    /// The drain is also the only place that learns WHOSE turn is about
+    /// to start, which is what makes §2.4's rule 2 true for a turn a
+    /// plugin STARTED as opposed to one it steered. `StartTurn`'s
+    /// `plugin_send::reset_turn()` promotes it a moment later; this
+    /// test stands in for that call.
+    #[test]
+    fn draining_the_overflow_stages_the_turn_origin() {
+        let _g = send_guard();
+        crate::plugin_send::send("p", "x").expect("queued");
+        let mut slot: VecDeque<String> = VecDeque::new();
+        assert_eq!(pick_follow_up(None, &mut slot).as_deref(), Some("x"));
+        crate::plugin_send::reset_turn();
+        let err = crate::plugin_send::send("p", "again")
+            .expect_err("the turn that just started is this plugin's own");
+        assert_eq!(
+            err, "this plugin cannot send during a turn its own message started",
+            "{err}"
+        );
+    }
 
     /// Tabs must be expanded to spaces before we hand a line to
     /// ratatui. Otherwise the terminal's own tab expansion paints
@@ -4153,6 +5491,166 @@ mod tests {
         rows.iter()
             .map(|r| r.iter().map(|(c, _)| *c).collect::<String>())
             .collect()
+    }
+
+    /// One flattened string per rendered `Line`, for assertions that
+    /// don't care about per-span styling.
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// A `/reload` typed mid-turn must not be blamed on the config.
+    ///
+    /// The agent is moved out of its slot for the duration of a turn, so
+    /// the reload does nothing; the `None` report then fell through to
+    /// the config-parse arm and asserted a parse failure that had not
+    /// happened. Verified against the real binary before and after:
+    /// with one identical config, an idle `/reload` reported
+    /// "1 extension(s) reloaded" while a mid-turn one reported
+    /// "config.toml did not parse".
+    #[test]
+    fn a_midturn_reload_says_a_turn_is_in_flight_not_that_the_config_is_broken() {
+        let busy = reload_extensions_clause(None, true);
+        assert!(
+            busy.contains("turn is in flight"),
+            "must name the real reason: {busy:?}"
+        );
+        assert!(
+            !busy.contains("did not parse"),
+            "a busy agent is not a broken config: {busy:?}"
+        );
+    }
+
+    /// The other `None` case must keep its own, different message —
+    /// otherwise the fix above just relabels a real parse failure.
+    #[test]
+    fn an_unparseable_config_still_says_so() {
+        let broken = reload_extensions_clause(None, false);
+        assert!(
+            broken.contains("did not parse"),
+            "a genuine parse failure must still say so: {broken:?}"
+        );
+        assert!(!broken.contains("turn is in flight"), "{broken:?}");
+    }
+
+    /// And a report that exists always wins over both.
+    #[test]
+    fn a_present_report_is_used_verbatim_even_when_busy() {
+        let r = crate::agent::build::ExtensionReloadReport {
+            supported: true,
+            replaced: vec!["p".into()],
+            tools: 2,
+            ..Default::default()
+        };
+        let line = reload_extensions_clause(Some(&r), true);
+        assert_eq!(line, r.line());
+    }
+
+    #[test]
+    fn subscriptions_section_is_empty_when_nothing_subscribed() {
+        assert!(subscriptions_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn subscriptions_section_lists_header_and_one_line_per_plugin() {
+        let subs = vec![
+            ("watcher".to_string(), vec!["turn_end".to_string(), "turn_start".to_string()]),
+            ("logger".to_string(), vec!["input".to_string()]),
+        ];
+        let lines = subscriptions_section(&subs);
+        let texts = line_texts(&lines);
+        assert_eq!(texts.len(), 3, "header + one line per plugin");
+        assert!(texts[0].contains("Watching events"));
+        assert!(texts[0].contains("2"), "header should count the plugins");
+        assert!(texts[1].contains("watcher"));
+        assert!(texts[1].contains("turn_end, turn_start"));
+        assert!(texts[2].contains("logger"));
+        assert!(texts[2].contains("input"));
+    }
+
+    /// A plugin name at or past the pad width must still be separated
+    /// from the value beside it.
+    ///
+    /// `format!("  {plugin:<20}")` pads only up to 20 columns, so a
+    /// longer name consumed the whole field and the next span began
+    /// immediately — real output read
+    /// `nanopi-events-plugin.componentinput, turn_start`. Both example
+    /// plugins ship names past that width, so this was the normal case,
+    /// not an edge one. The tests above use "watcher" and "logger",
+    /// which fit, which is why they never saw it.
+    #[test]
+    fn a_long_plugin_name_stays_separated_from_its_event_list() {
+        let long = "nanopi-events-plugin.component".to_string();
+        assert!(long.len() > 20, "fixture must exceed the pad width");
+        let subs = vec![(long.clone(), vec!["input".to_string()])];
+        let texts = line_texts(&subscriptions_section(&subs));
+        assert!(
+            !texts[1].contains(&format!("{long}input")),
+            "name ran into the event list: {:?}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains(&format!("{long} ")),
+            "expected whitespace after the name: {:?}",
+            texts[1]
+        );
+    }
+
+    /// Same defect, the `Plugin grants` section. Observed as
+    /// `nanopi-events-plugin.componentno grants`.
+    #[test]
+    fn a_long_plugin_name_stays_separated_from_its_grant_summary() {
+        let long = "nanopi-events-plugin.component";
+        let grants = vec![crate::plugin_grants::PluginGrants {
+            plugin_name: long.to_string(),
+            path: "/tmp/events.wasm".into(),
+            grants: vec![],
+        }];
+        let texts = line_texts(&grants_section(&grants));
+        assert!(
+            !texts[1].contains(&format!("{long}no grants")),
+            "name ran into the summary: {:?}",
+            texts[1]
+        );
+    }
+
+    #[test]
+    fn grants_section_is_empty_when_no_plugin_loaded() {
+        // The non-`wasm` build takes this path on every `/tools`, so a
+        // heading here would be a permanent lie in the default binary.
+        assert!(grants_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn grants_section_gives_a_powerless_plugin_a_row_saying_so() {
+        let grants = vec![
+            crate::plugin_grants::PluginGrants {
+                plugin_name: "indexer".into(),
+                path: "/tmp/indexer.wasm".into(),
+                grants: vec!["allow_tools(find, read)".into()],
+            },
+            crate::plugin_grants::PluginGrants {
+                plugin_name: "formatter".into(),
+                path: "/tmp/formatter.wasm".into(),
+                grants: Vec::new(),
+            },
+        ];
+        let texts = line_texts(&grants_section(&grants));
+        assert_eq!(texts.len(), 3, "header + one row per plugin: {texts:?}");
+        assert!(texts[0].contains("Plugin grants"), "{texts:?}");
+        assert!(texts[0].contains('2'), "header counts the plugins: {texts:?}");
+        assert!(texts[1].contains("indexer"), "{texts:?}");
+        assert!(texts[1].contains("allow_tools(find, read)"), "{texts:?}");
+        assert!(texts[2].contains("formatter"), "{texts:?}");
+        assert!(
+            texts[2].contains("no grants"),
+            "an ungranted plugin must still get a row, and it must SAY \
+             it holds nothing — otherwise `installed, powerless` and \
+             `not installed` read the same: {texts:?}"
+        );
     }
 
     #[test]
@@ -4216,6 +5714,178 @@ mod tests {
         assert_eq!(input_scroll_window(0, 1, 0), (0, 1));
     }
 
+    // ─────── swap_agent_with_reason (Task 3, §2.2c) ───────
+
+    /// Test-only Provider — never called by these tests (they only
+    /// exercise `fire_session_shutdown` / `fire_session_start`, not
+    /// `run_turn`), so it can be a stub that panics if invoked.
+    struct DeadProvider;
+
+    #[async_trait::async_trait]
+    impl crate::agent::loop_::Provider for DeadProvider {
+        fn id(&self) -> &'static str {
+            "dead"
+        }
+        async fn stream_turn(
+            &self,
+            _ctx: &crate::agent::context::Context,
+            _tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<crate::event::Usage, String> {
+            panic!("swap_agent_with_reason tests must not drive a turn");
+        }
+    }
+
+    fn tmp_dir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nanopi-tui-swap-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn agent_with_id(dir: &std::path::Path, session_id: &str, hooks: HooksConfig) -> Agent {
+        let session_path = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &session_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":2,\"id\":\"{session_id}\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"m\",\"base_url\":\"\"}}\n"
+            ),
+        )
+        .unwrap();
+        Agent {
+            context: crate::agent::context::Context::default(),
+            provider: Box::new(DeadProvider),
+            registry: ToolRegistry::standard(),
+            plugin_grants: Vec::new(),
+            session_path,
+            session_id: session_id.to_string(),
+            cwd: dir.to_path_buf(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: crate::event::Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        }
+    }
+
+    /// The actual ordering assertion: `session_shutdown` fires against
+    /// the OUTGOING agent (session id A) BEFORE `session_start` fires
+    /// against the INCOMING one (session id B). A one-line-late
+    /// implementation (swap first, fire second) would still produce two
+    /// hook firings with the right event names and reason — only the
+    /// `session_id` on the first object catches the transposition.
+    #[tokio::test]
+    async fn swap_agent_with_reason_fires_shutdown_before_start_in_order() {
+        let dir = tmp_dir();
+        let transcript = dir.join("transcript.jsonl");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat >> {}\n", transcript.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let hooks = HooksConfig {
+            session_start: vec![hook_cfg.clone()],
+            session_shutdown: vec![hook_cfg],
+            ..Default::default()
+        };
+
+        let outgoing = agent_with_id(&dir, "session-A", hooks.clone());
+        let incoming = agent_with_id(&dir, "session-B", hooks);
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(outgoing)));
+
+        swap_agent_with_reason(&agent_slot, incoming, "new").await;
+
+        let text = std::fs::read_to_string(&transcript).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected exactly two hook firings, got:\n{text}");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+
+        // The load-bearing assertion: session_id on the FIRST firing is
+        // the OUTGOING agent's id, not the incoming one.
+        assert_eq!(first["event"], "session_shutdown");
+        assert_eq!(first["arguments"]["reason"], "new");
+        assert_eq!(first["session_id"], "session-A");
+
+        assert_eq!(second["event"], "session_start");
+        assert_eq!(second["arguments"]["reason"], "new");
+        assert_eq!(second["session_id"], "session-B");
+
+        let g = agent_slot.lock().await;
+        assert_eq!(g.as_ref().unwrap().session_id, "session-B");
+        drop(g);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--no-hooks` must still swap the agent but fire nothing.
+    #[tokio::test]
+    async fn swap_agent_with_reason_no_hooks_swaps_but_fires_nothing() {
+        let dir = tmp_dir();
+        let transcript = dir.join("transcript.jsonl");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat >> {}\n", transcript.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let hooks = HooksConfig {
+            session_start: vec![hook_cfg.clone()],
+            session_shutdown: vec![hook_cfg],
+            ..Default::default()
+        };
+
+        let mut outgoing = agent_with_id(&dir, "session-A", hooks.clone());
+        outgoing.permission = PermissionGate::from_cli(true /*no_hooks*/, None);
+        let mut incoming = agent_with_id(&dir, "session-B", hooks);
+        incoming.permission = PermissionGate::from_cli(true /*no_hooks*/, None);
+
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(outgoing)));
+
+        swap_agent_with_reason(&agent_slot, incoming, "new").await;
+
+        assert!(
+            !transcript.exists(),
+            "--no-hooks must suppress both session_shutdown and session_start"
+        );
+
+        let g = agent_slot.lock().await;
+        assert_eq!(g.as_ref().unwrap().session_id, "session-B");
+        drop(g);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn expand_tabs_replaces_all_tabs_with_four_spaces() {
         assert_eq!(expand_tabs("no tabs"), "no tabs");
@@ -4235,6 +5905,7 @@ mod tests {
             crate::agent::build::SkillLoadPolicy::default(),
             false,
             crate::agent::prompt_override::PromptOverrides::from_cli(None, Vec::new(), false),
+            Vec::new(),
             std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
         )
     }
@@ -4287,6 +5958,79 @@ mod tests {
         ));
     }
 
+    /// v0.11.0: typing + Enter WHILE the agent is streaming steers the
+    /// running turn instead of doing nothing (the pre-v0.11 behavior).
+    /// Mirrors Pi — mid-stream typing injects a steering message.
+    #[test]
+    fn enter_while_streaming_steers() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "also check the logs");
+        match interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            KeyAction::SteerTurn(s) => assert_eq!(s, "also check the logs"),
+            other => panic!("expected SteerTurn, got {other:?}"),
+        }
+    }
+
+    /// A steer that reaches a live turn arrives as a `Steering`
+    /// message, and the text comes back for the caller to echo.
+    #[tokio::test]
+    async fn steer_reaches_a_live_turn() {
+        let (tx, mut rx) = mpsc::channel::<SteerMessage>(4);
+        let got = try_steer(Some(&tx), "also check the logs".into()).await;
+        assert_eq!(got.as_deref(), Ok("also check the logs"));
+        match rx.recv().await {
+            Some(SteerMessage::Steering { text }) => assert_eq!(text, "also check the logs"),
+            other => panic!("expected a Steering message, got {other:?}"),
+        }
+    }
+
+    /// Regression: when the turn ended between the keypress and the
+    /// dispatch, the send failed and the text was dropped — after the
+    /// TUI had already echoed "[steer] ...", so the user believed it
+    /// had landed. It must come back to be queued instead.
+    #[tokio::test]
+    async fn steer_that_missed_its_turn_is_handed_back() {
+        let (tx, rx) = mpsc::channel::<SteerMessage>(4);
+        drop(rx); // the turn finished; run_turn dropped the receiver
+        let got = try_steer(Some(&tx), "also update the tests".into()).await;
+        assert_eq!(
+            got.as_deref().unwrap_err(),
+            "also update the tests",
+            "a steer with nowhere to go must be returned, not swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_with_no_channel_is_handed_back() {
+        let got = try_steer(None, "hello".into()).await;
+        assert_eq!(got.as_deref().unwrap_err(), "hello");
+    }
+
+    /// A slash command typed mid-stream resolves as a command rather
+    /// than being steered into the model as prose — "/compact" as a
+    /// user message would be nonsense.
+    ///
+    /// Pinned POSITIVELY to `Compact`. This used to assert only
+    /// `!matches!(got, SteerTurn(_))`, which is true of every other
+    /// variant too, so the test would have passed no matter which
+    /// command it dispatched — or if it silently did nothing. What
+    /// actually keeps `/compact` harmless here is downstream, not in
+    /// `interpret_key`: `StartTurn` takes the Agent out of its slot
+    /// while streaming, so the handler's `if let Some(a)` finds `None`
+    /// and no-ops.
+    #[test]
+    fn slash_command_while_streaming_resolves_as_a_command() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "/compact");
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(got, KeyAction::Compact),
+            "expected the palette to resolve /compact, got {got:?}"
+        );
+    }
+
     #[test]
     fn slash_quit_opens_palette_then_enter_exits() {
         let mut app = mkapp();
@@ -4326,6 +6070,440 @@ mod tests {
         seed_input(&mut app, "/co");
         let m = app.palette.as_ref().unwrap();
         assert!(m.visible().iter().any(|it| it.label == "/compact"));
+    }
+
+    /// A plugin command with no wasm behind it — proof that the TUI
+    /// side needs nothing feature-gated. These tests run in the DEFAULT
+    /// build.
+    fn fake_command(name: &str, plugin: &str) -> crate::command::PluginCommand {
+        struct H;
+        impl crate::command::CommandHandler for H {
+            fn run(&self, _n: &str, _a: &str) -> Result<crate::command::CommandAction, String> {
+                Ok(crate::command::CommandAction::Print("ok".into()))
+            }
+        }
+        crate::command::PluginCommand {
+            spec: crate::command::CommandSpec {
+                name: name.into(),
+                description: "does a thing".into(),
+            },
+            plugin_name: std::sync::Arc::from(plugin),
+            handler: std::sync::Arc::new(H),
+        }
+    }
+
+    #[test]
+    fn a_plugin_command_appears_in_the_palette_and_dispatches() {
+        let mut app = mkapp();
+        app.commands_cache = vec![fake_command("todo", "demo")];
+        seed_input(&mut app, "/todo buy milk");
+
+        let m = app.palette.as_ref().expect("palette opens");
+        let row = m
+            .visible()
+            .into_iter()
+            .find(|it| it.label == "/todo")
+            .expect("the plugin row is offered");
+        assert!(
+            row.description.contains("[demo]"),
+            "the row must name its plugin: {}",
+            row.description
+        );
+
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match got {
+            KeyAction::RunPluginCommand { name, args } => {
+                assert_eq!(name, "todo");
+                assert_eq!(args, "buy milk");
+            }
+            other => panic!("expected RunPluginCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_command_with_no_argument_gets_an_empty_string() {
+        let mut app = mkapp();
+        app.commands_cache = vec![fake_command("todo", "demo")];
+        seed_input(&mut app, "/todo");
+        match interpret_key(&mut app, KeyEvent::from(KeyCode::Enter)) {
+            KeyAction::RunPluginCommand { args, .. } => assert_eq!(args, ""),
+            other => panic!("expected RunPluginCommand, got {other:?}"),
+        }
+    }
+
+    /// PI runs extension commands immediately even mid-stream
+    /// (`agent-session.ts:1119-1129`, checked before the isStreaming
+    /// queue branch), so this must dispatch rather than no-op.
+    ///
+    /// Asserted POSITIVELY. The older sibling below asserts only
+    /// `!matches!(got, SteerTurn(_))`, which passes while receiving
+    /// `KeyAction::Compact` — that is why it never caught anything.
+    #[test]
+    fn a_plugin_command_dispatches_mid_stream() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        app.commands_cache = vec![fake_command("todo", "demo")];
+        seed_input(&mut app, "/todo now");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(got, KeyAction::RunPluginCommand { .. }),
+            "a plugin command must run mid-stream, got {got:?}"
+        );
+    }
+
+    /// A built-in must win: `resolve_commands` refuses the name, so a
+    /// plugin row with that name should never be in the cache — but if
+    /// one ever were, the built-in still sorts first and stays
+    /// reachable.
+    #[test]
+    fn a_builtin_outranks_a_same_named_plugin_row() {
+        let mut app = mkapp();
+        app.commands_cache = vec![fake_command("compact", "rogue")];
+        seed_input(&mut app, "/compact");
+        assert!(
+            matches!(
+                interpret_key(&mut app, KeyEvent::from(KeyCode::Enter)),
+                KeyAction::Compact
+            ),
+            "the built-in must stay reachable"
+        );
+    }
+
+    /// `command::RESERVED_COMMAND_NAMES` is hand-maintained, and it has
+    /// to be: plugin commands are registered inside `Agent::build_fresh`,
+    /// which knows nothing about the TUI and also runs in print mode.
+    /// This guard is what makes that safe. Without it the two lists drift
+    /// and a plugin silently shadows a built-in — exactly the bug PI has,
+    /// where `/debug` and friends are dispatched but missing from
+    /// `BUILTIN_SLASH_COMMANDS`, so they never autocomplete and never
+    /// participate in conflict warnings.
+    #[test]
+    fn reserved_command_names_match_the_builtin_palette() {
+        use std::collections::BTreeSet;
+
+        let from_palette: BTreeSet<String> = slash_items()
+            .iter()
+            .map(|it| it.label.trim_start_matches('/').to_string())
+            .collect();
+        let reserved: BTreeSet<String> = crate::command::RESERVED_COMMAND_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            from_palette, reserved,
+            "add/remove a built-in slash command and RESERVED_COMMAND_NAMES \
+             must move with it, or a plugin can claim the name"
+        );
+    }
+
+    /// Regression: `sync_palette` tested the untrimmed first line while
+    /// `submit_or_chat` trimmed, so one leading space closed the palette
+    /// and `" /session"` was sent to the model as chat text. `/compact`
+    /// happened to survive only because it was one of three names
+    /// `submit_or_chat` hardcoded; the other fourteen leaked.
+    #[test]
+    fn a_leading_space_still_resolves_the_command() {
+        for text in [" /session", "  /session", "\t/session"] {
+            let mut app = mkapp();
+            seed_input(&mut app, text);
+            assert!(
+                app.palette.is_some(),
+                "palette must open for {text:?} — leading whitespace is not meaningful"
+            );
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            assert!(
+                matches!(got, KeyAction::ShowSessionInfo),
+                "{text:?} must run /session, got {got:?}"
+            );
+        }
+    }
+
+    // ── T4.6: unknown slash commands ────────────────────────────────
+
+    /// The defect T4.6 recorded: `/greet Chris` (a TOOL, not a command)
+    /// was handed to the model, burning a turn to have it explain that
+    /// it does not know what `/greet` means. It must be refused, and
+    /// the refusal must come out of the palette's own vocabulary.
+    #[test]
+    fn an_unknown_command_is_refused_not_sent() {
+        for text in ["/greet Chris", "/greet", "/nosuchcommand", "  /greet x"] {
+            let mut app = mkapp();
+            seed_input(&mut app, text);
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            match got {
+                KeyAction::UnknownCommand { word, .. } => {
+                    assert!(
+                        text.contains(&word),
+                        "the refusal must name what the user typed: {word:?} vs {text:?}"
+                    );
+                }
+                other => panic!("expected {text:?} to be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// The refusal is the whole point only if it never becomes a turn:
+    /// no `StartTurn`, no `SteerTurn`, so nothing reaches the agent and
+    /// nothing is written to the transcript as if the user had said it.
+    #[test]
+    fn a_refusal_never_becomes_a_turn_even_mid_stream() {
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "/greet Chris");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(got, KeyAction::UnknownCommand { .. }),
+            "mid-stream a typo must not be steered into the running turn, got {got:?}"
+        );
+    }
+
+    /// A plugin command is in the palette, so it must not read as
+    /// unknown — "unknown" has to mean unknown AFTER registration, not
+    /// unknown to a hardcoded list.
+    #[test]
+    fn a_plugin_command_is_not_unknown() {
+        struct H;
+        impl crate::command::CommandHandler for H {
+            fn run(
+                &self,
+                _n: &str,
+                _a: &str,
+            ) -> Result<crate::command::CommandAction, String> {
+                Ok(crate::command::CommandAction::Print("ok".into()))
+            }
+        }
+        let mut app = mkapp();
+        app.commands_cache = vec![crate::command::PluginCommand {
+            spec: crate::command::CommandSpec {
+                name: "todo".into(),
+                description: "d".into(),
+            },
+            plugin_name: std::sync::Arc::from("p"),
+            handler: std::sync::Arc::new(H),
+        }];
+        let known = known_command_names(&app);
+        assert!(
+            known.iter().any(|n| n == "todo"),
+            "the plugin command must be in the vocabulary: {known:?}"
+        );
+        // …and it resolves through the palette as before.
+        seed_input(&mut app, "/todo buy milk");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(&got, KeyAction::RunPluginCommand { name, args }
+                if name == "todo" && args == "buy milk"),
+            "got {got:?}"
+        );
+    }
+
+    /// Skills are palette rows too, so `/skill:<name>` for a loaded
+    /// skill is known and a bare `/skill:typo` is not.
+    #[test]
+    fn a_loaded_skill_is_in_the_vocabulary() {
+        let mut app = mkapp();
+        app.skills_cache = vec![crate::resources::Skill {
+            name: "review".into(),
+            description: "d".into(),
+            file_path: std::path::PathBuf::from("/tmp/SKILL.md"),
+            base_dir: std::path::PathBuf::from("/tmp"),
+            source: crate::resources::SkillSource::Project,
+            disable_model_invocation: false,
+        }];
+        assert!(known_command_names(&app).iter().any(|n| n == "skill:review"));
+    }
+
+    /// The single-source-of-truth rule, asserted directly: everything
+    /// the palette offers is a name `submit_or_chat` considers known.
+    /// If these ever came from two lists this is what would catch it.
+    #[test]
+    fn the_vocabulary_is_exactly_the_palette() {
+        // Seeded with a skill and a plugin command, because with only
+        // built-ins the vocabulary matches a hardcoded list by accident
+        // and the test comes back green when the two are separated.
+        struct H;
+        impl crate::command::CommandHandler for H {
+            fn run(
+                &self,
+                _n: &str,
+                _a: &str,
+            ) -> Result<crate::command::CommandAction, String> {
+                Ok(crate::command::CommandAction::Print("ok".into()))
+            }
+        }
+        let mut app = mkapp();
+        app.skills_cache = vec![crate::resources::Skill {
+            name: "review".into(),
+            description: "d".into(),
+            file_path: std::path::PathBuf::from("/tmp/SKILL.md"),
+            base_dir: std::path::PathBuf::from("/tmp"),
+            source: crate::resources::SkillSource::Project,
+            disable_model_invocation: false,
+        }];
+        app.commands_cache = vec![crate::command::PluginCommand {
+            spec: crate::command::CommandSpec {
+                name: "todo".into(),
+                description: "d".into(),
+            },
+            plugin_name: std::sync::Arc::from("p"),
+            handler: std::sync::Arc::new(H),
+        }];
+        let app = app;
+        let labels: Vec<String> = palette_items(&app)
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        let known = known_command_names(&app);
+        assert_eq!(labels.len(), known.len());
+        for (label, name) in labels.iter().zip(&known) {
+            assert_eq!(label, &format!("/{name}"));
+            assert_eq!(
+                classify_submission(
+                    label,
+                    &known.iter().map(String::as_str).collect::<Vec<_>>()
+                ),
+                SlashVerdict::Prose(label.clone()),
+                "{label} must not read as unknown"
+            );
+        }
+    }
+
+    /// A typo of a real command is worth more than a bare refusal.
+    #[test]
+    fn a_near_miss_suggests_the_real_command() {
+        let known = crate::command::RESERVED_COMMAND_NAMES;
+        for (typed, want) in [
+            ("compct", "compact"),
+            ("sesion", "session"),
+            ("Model", "model"),
+            ("quti", "quit"),
+        ] {
+            match classify_submission(&format!("/{typed}"), &known) {
+                SlashVerdict::Unknown { suggestion, .. } => assert_eq!(
+                    suggestion.as_deref(),
+                    Some(want),
+                    "/{typed} should have suggested /{want}"
+                ),
+                other => panic!("expected /{typed} unknown, got {other:?}"),
+            }
+        }
+    }
+
+    /// …and something that resembles nothing gets no invented hint.
+    /// A bad suggestion is worse than none: it sends the user to a
+    /// command they did not want.
+    #[test]
+    fn a_distant_word_gets_no_suggestion() {
+        let known = crate::command::RESERVED_COMMAND_NAMES;
+        for typed in ["greet", "xyzzyfrobnicate", "ab"] {
+            match classify_submission(&format!("/{typed}"), &known) {
+                SlashVerdict::Unknown { suggestion, .. } => assert_eq!(
+                    suggestion, None,
+                    "/{typed} should not have suggested {suggestion:?}"
+                ),
+                other => panic!("expected /{typed} unknown, got {other:?}"),
+            }
+        }
+    }
+
+    /// The escape hatch the error message advertises has to work, or
+    /// the refusal leaves the user unable to say the thing at all.
+    #[test]
+    fn a_doubled_slash_sends_one_slash_to_the_model() {
+        let mut app = mkapp();
+        seed_input(&mut app, "//greet is not a command, right?");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match got {
+            KeyAction::StartTurn(sent) => {
+                assert_eq!(sent, "/greet is not a command, right?")
+            }
+            other => panic!("expected the escaped line to be sent, got {other:?}"),
+        }
+    }
+
+    /// A multi-line paste is prose whatever its first token looks like.
+    #[test]
+    fn a_multiline_submission_is_never_refused() {
+        let known = ["compact"];
+        assert!(matches!(
+            classify_submission("/greet\nand more", &known),
+            SlashVerdict::Prose(_)
+        ));
+    }
+
+    /// The refusal has to tell the user both how to find the real
+    /// command and how to send the line anyway.
+    #[test]
+    fn the_refusal_says_how_to_recover() {
+        let lines = unknown_command_lines("greet", Some("export"));
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(text[0], "Unknown command: /greet");
+        assert_eq!(text[1], "  Did you mean /export?");
+        assert!(text[2].contains("Type /"), "{}", text[2]);
+        assert!(text[2].contains("//greet"), "{}", text[2]);
+        // No suggestion → no empty second row.
+        assert_eq!(unknown_command_lines("greet", None).len(), 2);
+    }
+
+    /// The argument splitter has to trim the same way the palette does,
+    /// or `" /name x"` splits at the leading space and yields the whole
+    /// line as the argument.
+    #[test]
+    fn a_leading_space_does_not_corrupt_the_argument() {
+        let mut app = mkapp();
+        seed_input(&mut app, "  /name my-experiment");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        match got {
+            KeyAction::ApplyName(n) => assert_eq!(n, "my-experiment"),
+            other => panic!("expected ApplyName(\"my-experiment\"), got {other:?}"),
+        }
+    }
+
+    /// Trimming for the palette closed the accidental escape hatch that
+    /// a leading space used to provide, so an unmatched `/…` line must
+    /// fall through to the model instead of leaving the user stuck on
+    /// "(no matches)" with text they cannot submit.
+    ///
+    /// Narrowed by T4.6: a line that reads as a COMMAND is now refused
+    /// (see `an_unknown_command_is_refused_not_sent`), but a path or a
+    /// sentence still goes through, which is the case that justified
+    /// PI's blanket silence in the first place.
+    #[test]
+    fn an_unmatched_slash_line_is_sent_as_chat() {
+        for text in [
+            "/etc/nginx/nginx.conf is misconfigured",
+            " /usr/bin/env is missing",
+            "/3.5 is the version",
+        ] {
+            let mut app = mkapp();
+            seed_input(&mut app, text);
+            assert!(app.palette.is_some(), "palette opens for {text:?}");
+            assert!(
+                app.palette.as_ref().unwrap().is_empty(),
+                "{text:?} must match no command"
+            );
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            match got {
+                KeyAction::StartTurn(sent) => assert_eq!(sent, text.trim()),
+                other => panic!("expected {text:?} to be sent as chat, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fall-through must not hijack a line that *does* match — a
+    /// prefix like `/comp` still resolves rather than being chatted.
+    #[test]
+    fn a_partial_command_still_resolves_rather_than_chatting() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/comp");
+        let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(got, KeyAction::Compact),
+            "expected /comp to resolve to /compact, got {got:?}"
+        );
     }
 
     #[test]
@@ -4449,6 +6627,92 @@ mod tests {
         // The rows flanking the block are unstyled separators.
         assert!(rows.first().unwrap().1.is_none());
         assert!(rows.last().unwrap().1.is_none());
+    }
+
+/// A rewrite corrects the stashed bar in place.
+    ///
+    /// The card is only drawn when the result arrives, which is what
+    /// makes this possible: the user ends up seeing the command that
+    /// actually ran. Without it the card showed `echo hello` while
+    /// `echo REWRITTEN` executed — in manual testing the model saw its
+    /// own request answered differently and invented a sandbox to
+    /// explain it.
+    #[test]
+    fn a_rewrite_corrects_the_pending_bar() {
+        let mut app = mkapp();
+        app.pending_tool_calls.push((
+            "call_1".to_string(),
+            PendingBar {
+                leading: " $ ".into(),
+                body: "echo hello".into(),
+            },
+        ));
+
+        let (leading, body) =
+            tool_call_bar_text("bash", &serde_json::json!({"command": "echo REWRITTEN"}));
+        assert_eq!(body, "echo REWRITTEN", "sanity: {leading:?}");
+
+        // What the event handler does, asserted on the stash.
+        if let Some(slot) = app
+            .pending_tool_calls
+            .iter_mut()
+            .find(|(id, _)| id == "call_1")
+        {
+            slot.1.leading = " ↻ bash ".to_string();
+            slot.1.body = body;
+        }
+
+        let bar = take_pending_bar(&mut app, "call_1").expect("bar");
+        assert_eq!(bar.body, "echo REWRITTEN", "the card must show what ran");
+        assert!(
+            bar.leading.contains('↻'),
+            "the rewrite must be visible, not a silent swap: {:?}",
+            bar.leading
+        );
+    }
+
+    /// Regression: with `tool_exec_mode = "parallel"` (the default)
+    /// every ToolCall in a batch arrives before the first ToolResult.
+    /// A single-slot stash meant the last call overwrote the rest, so
+    /// the first card was labelled with the wrong tool and later cards
+    /// rendered with no header line at all — which is what made
+    /// plugin tools look like they printed nothing.
+    #[test]
+    fn parallel_tool_calls_each_keep_their_own_bar() {
+        let mut app = mkapp();
+        for (id, name) in [("call_a", "greet"), ("call_b", "fetch_head")] {
+            app.pending_tool_calls.push((
+                id.to_string(),
+                PendingBar {
+                    leading: format!(" {name} "),
+                    body: "{}".into(),
+                },
+            ));
+        }
+        // Results may come back in either order; each must find its own.
+        let second = take_pending_bar(&mut app, "call_b").expect("call_b bar");
+        assert_eq!(second.leading, " fetch_head ");
+        let first = take_pending_bar(&mut app, "call_a").expect("call_a bar");
+        assert_eq!(first.leading, " greet ");
+        assert!(app.pending_tool_calls.is_empty());
+    }
+
+    /// An unknown id must not silently drop the row. Providers do
+    /// renumber tool_call ids, and a card with no header at all is
+    /// worse than one labelled from the oldest pending call.
+    #[test]
+    fn an_unmatched_result_falls_back_to_the_oldest_bar() {
+        let mut app = mkapp();
+        app.pending_tool_calls.push((
+            "call_a".into(),
+            PendingBar {
+                leading: " greet ".into(),
+                body: String::new(),
+            },
+        ));
+        let bar = take_pending_bar(&mut app, "some-renumbered-id").expect("fallback bar");
+        assert_eq!(bar.leading, " greet ");
+        assert!(take_pending_bar(&mut app, "call_a").is_none());
     }
 
     /// Typing a command name in full must preselect that command.

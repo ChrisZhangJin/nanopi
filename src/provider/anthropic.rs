@@ -155,15 +155,41 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> serde_json::Value 
                     };
                     serde_json::Value::String(note)
                 };
-                messages.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": tool_result_content,
-                        "is_error": is_error,
-                    }]
-                }));
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": tool_result_content,
+                    "is_error": is_error,
+                });
+                // Every `tool_result` answering the SAME assistant turn
+                // must ride in ONE user message. Anthropic's shape is
+                // one user message whose content array holds a block per
+                // tool_use in the batch; emitting a separate user
+                // message per result instead makes the API merge the
+                // consecutive user turns and then reject the merge with
+                //
+                //   messages.N.content.M: each tool_use must have a
+                //   single result. Found multiple `tool_result` blocks
+                //   with id: toolu_...
+                //
+                // which killed EVERY parallel tool batch — the cards
+                // rendered and the tools ran, then the turn died before
+                // the model ever saw the results. A single tool call per
+                // turn never tripped it, so it only shows up once two
+                // tools land in one batch.
+                match messages.last_mut() {
+                    Some(prev)
+                        if prev["role"] == "user"
+                            && prev["content"].is_array()
+                            && prev["content"][0]["type"] == "tool_result" =>
+                    {
+                        prev["content"]
+                            .as_array_mut()
+                            .expect("checked is_array above")
+                            .push(block);
+                    }
+                    _ => messages.push(json!({"role": "user", "content": [block]})),
+                }
             }
         }
     }
@@ -393,7 +419,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                             return Err("send timeout: no response headers after 60s".into());
                         }
                         let delay = compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: send timeout after 60s]",
                             attempt + 1,
                             retry.max_attempts,
@@ -423,7 +449,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                         ));
                     }
                     let delay = compute_delay(attempt, &retry, hint, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: HTTP {} {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -442,7 +468,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                         return Err(msg);
                     }
                     let delay = compute_delay(attempt, &retry, None, rand01());
-                    eprintln!(
+                    crate::note!(
                         "[retrying ({}/{}) after {:.1}s: {}]",
                         attempt + 1,
                         retry.max_attempts,
@@ -474,7 +500,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                             && is_retryable_message(&msg)
                         {
                             let delay = compute_delay(attempt, &retry, None, rand01());
-                            eprintln!(
+                            crate::note!(
                                 "[retrying ({}/{}) after {:.1}s: {}]",
                                 attempt + 1,
                                 retry.max_attempts,
@@ -507,7 +533,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                                     && is_retryable_message(&msg)
                                 {
                                     let delay = compute_delay(attempt, &retry, None, rand01());
-                                    eprintln!(
+                                    crate::note!(
                                         "[retrying ({}/{}) after {:.1}s: {}]",
                                         attempt + 1,
                                         retry.max_attempts,
@@ -528,7 +554,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                     let msg = err.message.clone();
                     if !started && attempt < retry.max_attempts && is_retryable_message(&msg) {
                         let delay = compute_delay(attempt, &retry, None, rand01());
-                        eprintln!(
+                        crate::note!(
                             "[retrying ({}/{}) after {:.1}s: {}]",
                             attempt + 1,
                             retry.max_attempts,
@@ -925,5 +951,52 @@ mod tests {
         assert_eq!(tool_blocks[1]["tool_use_id"], "call_2");
         assert_eq!(tool_blocks[1]["is_error"], true);
         let _ = std::fs::remove_dir_all(&tmp()); // silence unused warning
+    }
+
+    /// A parallel batch's results must arrive as ONE user message
+    /// holding one `tool_result` block per call.
+    ///
+    /// The test above flattens content across every user message, so it
+    /// is satisfied by either shape and could not see this. Emitting a
+    /// user message per result made Anthropic merge the consecutive user
+    /// turns and then reject the merge —
+    /// "each tool_use must have a single result. Found multiple
+    /// `tool_result` blocks with id: ..." — so every batch of two or
+    /// more tools failed after the tools had already run. Assert the
+    /// message COUNT and the per-message block count, which is the part
+    /// that distinguishes the two shapes.
+    #[test]
+    fn a_parallel_batch_of_tool_results_rides_in_one_user_message() {
+        let mut ctx = Context::default();
+        ctx.push_tool_result("call_1", "first", false);
+        ctx.push_tool_result("call_2", "second", false);
+        let v = build_request(&ctx, "claude-3");
+        let msgs = v["messages"].as_array().unwrap();
+
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(
+            user_msgs.len(),
+            1,
+            "two results answering one turn must not become two user messages: {msgs:?}"
+        );
+        let blocks = user_msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "both results belong in one array: {blocks:?}");
+        assert_eq!(blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(blocks[1]["tool_use_id"], "call_2");
+    }
+
+    /// The coalescing must not glue a tool result onto an ordinary user
+    /// message. Only a run of tool results merges; a real user turn
+    /// stays its own message, or the model loses the turn boundary.
+    #[test]
+    fn a_tool_result_does_not_merge_into_a_plain_user_message() {
+        let mut ctx = Context::default();
+        ctx.push_user_text("hello");
+        ctx.push_tool_result("call_1", "ok", false);
+        let v = build_request(&ctx, "claude-3");
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "user text and tool result stay separate: {msgs:?}");
+        assert_eq!(msgs[0]["content"], "hello");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
     }
 }

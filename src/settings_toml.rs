@@ -72,7 +72,7 @@ pub fn load() -> SettingsFile {
             return SettingsFile::default();
         }
         Err(e) => {
-            eprintln!(
+            crate::note!(
                 "nanopi: settings.toml unreadable ({}): {}; using defaults",
                 path.display(),
                 e
@@ -83,7 +83,7 @@ pub fn load() -> SettingsFile {
     match toml::from_str::<SettingsFile>(&text) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
+            crate::note!(
                 "nanopi: settings.toml parse error ({}): {}; using defaults",
                 path.display(),
                 e
@@ -188,27 +188,18 @@ pub fn bindings_from(file: &SettingsFile) -> KeyBindings {
 mod tests {
     use super::*;
 
-    fn _lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     #[test]
     fn load_missing_file_returns_default() {
-        let _g = _lock();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("NANOPI_HOME", tmp.path());
+        let _tmp = crate::TempNanopiHome::new();
         let f = load();
         assert!(f.thinking_level.is_none());
         assert!(f.hide_thinking.is_none());
         assert!(f.keybindings.is_empty());
-        std::env::remove_var("NANOPI_HOME");
     }
 
     #[test]
     fn save_and_load_roundtrip_scalars() {
-        let _g = _lock();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("NANOPI_HOME", tmp.path());
+        let _tmp = crate::TempNanopiHome::new();
 
         let mut f = SettingsFile::default();
         f.thinking_level = Some(ThinkingLevel::High);
@@ -223,14 +214,11 @@ mod tests {
         assert_eq!(loaded.auto_compact, Some(false));
         assert_eq!(loaded.default_project_trust, Some(TrustLevelSer::Trusted));
 
-        std::env::remove_var("NANOPI_HOME");
     }
 
     #[test]
     fn save_preserves_user_comment_and_unknown_section() {
-        let _g = _lock();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("NANOPI_HOME", tmp.path());
+        let _tmp = crate::TempNanopiHome::new();
 
         // Pre-seed the file with a comment + legacy [hooks] block that
         // the interaction loader must NOT touch.
@@ -242,7 +230,7 @@ mod tests {
 # User's preferred defaults — DO NOT delete this comment.
 thinking_level = \"medium\"
 
-[[hooks.pre_tool_use]]
+[[hooks.tool_execution_start]]
 matcher = \"Bash\"
 command = \"echo hello\"
 ",
@@ -261,7 +249,7 @@ command = \"echo hello\"
             after
         );
         assert!(
-            after.contains("[[hooks.pre_tool_use]]"),
+            after.contains("[[hooks.tool_execution_start]]"),
             "hooks section lost:\n{}",
             after
         );
@@ -271,14 +259,11 @@ command = \"echo hello\"
             after
         );
 
-        std::env::remove_var("NANOPI_HOME");
     }
 
     #[test]
     fn keybindings_roundtrip() {
-        let _g = _lock();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("NANOPI_HOME", tmp.path());
+        let _tmp = crate::TempNanopiHome::new();
 
         let mut kb = HashMap::new();
         kb.insert(
@@ -305,7 +290,6 @@ command = \"echo hello\"
             "ctrl+,"
         );
 
-        std::env::remove_var("NANOPI_HOME");
     }
 
     #[test]

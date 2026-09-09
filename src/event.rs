@@ -26,6 +26,24 @@ pub enum AgentEvent {
     /// the call block is closed, then emit one `ToolCall` with parsed args.
     ToolCall { content_index: u32, call: ToolCall },
 
+    /// A `tool_execution_start` hook rewrote a call's arguments.
+    ///
+    /// `ToolCall` above is forwarded straight off the provider stream,
+    /// so it necessarily carries what the MODEL asked for — the hook
+    /// has not run yet. Without this event the card would keep showing
+    /// `echo hello` while `echo REWRITTEN` actually ran, which is
+    /// exactly what happened in manual testing: the model saw its own
+    /// request come back with a different answer and invented a
+    /// sandbox to explain it, then spent a turn investigating.
+    ///
+    /// Emitted only when the arguments actually changed, so the common
+    /// case costs nothing.
+    ToolCallRewritten {
+        call_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
+
     /// A tool call finished. Emitted by `Agent::execute_tool_calls`
     /// after the local tool ran, NOT by any provider. Carries the
     /// output content, error flag, and wall-clock duration so the
@@ -80,6 +98,30 @@ pub enum AgentEvent {
         /// Optional extra user text following the command.
         user_message: Option<String>,
     },
+}
+
+/// A message injected into the agent loop mid-turn (Pi parity:
+///
+/// - `SteeringMessages` get pushed into the conversation as a fresh
+///   user turn as soon as the current iteration ends, so the LLM sees
+///   them in its next call.
+/// - `FollowUpMessages` are queued and run AFTER the current turn
+///   returns — they don't interrupt the model mid-response, but they
+///   fire as a follow-on turn instead of letting the agent idle.
+///
+/// `tui.rs` owns the receiving end of these (`mpsc::Receiver`); the
+/// TUI's input handler sends `SteerMessage` whenever the user types
+/// while the agent is working. Non-interactive modes (`-p`, scripts)
+/// pass `None` and ignore this entirely — their loop is single-turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SteerMessage {
+    /// Push this text as a new user message at the next iteration
+    /// boundary. Matches Pi's `getSteeringMessages()`.
+    Steering { text: String },
+    /// Queue this text for execution AFTER the current turn ends.
+    /// Matches Pi's `getFollowUpMessages()`.
+    FollowUp { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

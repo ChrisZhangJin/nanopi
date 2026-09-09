@@ -1,0 +1,22 @@
+[package]
+name = "nanopi-example-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# `cdylib` is what the wasm32 target needs to emit a `.wasm`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The host hands us JSON strings and expects JSON back, so the only
+# real dependency is a JSON codec. Nothing nanopi-specific: a plugin
+# is a plain WASM component, not a crate that links against nanopi.
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

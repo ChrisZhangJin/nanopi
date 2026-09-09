@@ -4,14 +4,20 @@
 //! communicate back: exit code 2 = block, or `{"decision":"block"}` on
 //! stdout. See `docs/v0.5-research.md` §6 for the wire protocol.
 //!
-//! Example `~/.nanopi/settings.toml`:
+//! Example `~/.nanopi/config.toml`:
 //! ```toml
-//! [[hooks.PreToolUse]]
+//! [[hooks.tool_execution_start]]
 //! matcher = "bash"
 //! type = "command"
 //! command = "~/.nanopi/hooks/check-rm-rf.sh"
 //! timeout = 5000
 //! ```
+//!
+//! The table keys are snake_case (`tool_execution_start`,
+//! `tool_execution_end`, `session_start`, ...) — they are `HooksSection`'s
+//! field names, and there is no serde rename or alias. A CamelCase
+//! `[[hooks.ToolExecutionStart]]` parses as an unrelated key and silently
+//! registers nothing; this doc comment claimed otherwise until v0.11.0.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,7 +25,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -36,23 +44,337 @@ pub enum HookError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
-    PreToolUse,
-    PostToolUse,
-    UserPromptSubmit,
+    ToolExecutionStart,
+    ToolExecutionEnd,
+    Input,
     SessionStart,
-    SessionEnd,
+    SessionShutdown,
+    /// Fired once at the top of `run_turn`, BEFORE the user message is
+    /// pushed to context. The only new-hook variant that supports
+    /// Block (early return) and Transform (rewrite the prompt).
+    BeforeAgentStart,
+    /// Fired at the top of each agent-loop iteration (the `for` body
+    /// in `run_turn`). Advisory only — Block is logged, not enforced.
+    TurnStart,
+    /// Fired at the bottom of each agent-loop iteration, after tool
+    /// calls have been processed. Advisory only.
+    TurnEnd,
+    /// Fired once after the for-loop completes (all tool rounds done),
+    /// just before post-turn compaction. Advisory only.
+    MessageEnd,
+    /// Fired inside `compact_now` BEFORE compaction runs.
+    /// Mirrors Pi's `session_before_compact`. Advisory — can log or
+    /// observe; cannot cancel the compaction (since v0.11; future
+    /// versions may add a Cancel hook arm).
+    SessionBeforeCompact,
+    /// Fired after compaction runs successfully. Mirrors Pi's
+    /// `session_compact`. Advisory only.
+    SessionCompact,
 }
 
 impl HookEvent {
     pub fn env_var(self) -> &'static str {
         match self {
-            HookEvent::PreToolUse => "PreToolUse",
-            HookEvent::PostToolUse => "PostToolUse",
-            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::ToolExecutionStart => "ToolExecutionStart",
+            HookEvent::ToolExecutionEnd => "ToolExecutionEnd",
+            HookEvent::Input => "Input",
             HookEvent::SessionStart => "SessionStart",
-            HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::SessionShutdown => "SessionShutdown",
+            HookEvent::BeforeAgentStart => "BeforeAgentStart",
+            HookEvent::TurnStart => "TurnStart",
+            HookEvent::TurnEnd => "TurnEnd",
+            HookEvent::MessageEnd => "MessageEnd",
+            HookEvent::SessionBeforeCompact => "SessionBeforeCompact",
+            HookEvent::SessionCompact => "SessionCompact",
         }
     }
+
+    /// v0.12.0 §2.1: PI's name for this event — the WASM `events` grant,
+    /// `list-events`, and `handle-event`'s `event` argument all use this
+    /// string. It is, by construction, exactly what
+    /// `serde_json::to_string(&self)` produces minus the surrounding
+    /// quotes: Stage A (v0.12.0) made the config keys and `HookEvent`'s
+    /// serde names PI's names, so there is ONE vocabulary. The two-column
+    /// translation table an earlier draft of `docs/v0.12-events.md` §2.1
+    /// implied (Claude Code name on the shell side, PI name on the WASM
+    /// side) does not exist and is not needed — this accessor is just the
+    /// existing snake_case serialization, spelled out so callers don't
+    /// have to round-trip through `serde_json`.
+    pub fn pi_name(self) -> &'static str {
+        match self {
+            HookEvent::ToolExecutionStart => "tool_execution_start",
+            HookEvent::ToolExecutionEnd => "tool_execution_end",
+            HookEvent::Input => "input",
+            HookEvent::SessionStart => "session_start",
+            HookEvent::SessionShutdown => "session_shutdown",
+            HookEvent::BeforeAgentStart => "before_agent_start",
+            HookEvent::TurnStart => "turn_start",
+            HookEvent::TurnEnd => "turn_end",
+            HookEvent::MessageEnd => "message_end",
+            HookEvent::SessionBeforeCompact => "session_before_compact",
+            HookEvent::SessionCompact => "session_compact",
+        }
+    }
+}
+
+/// What an event's `matcher` is tested against.
+///
+/// One `matcher` field means four different things across the eleven
+/// events (`docs/v0.12-events.md` §7 calls this out as the price of the
+/// shell layer's uniform config shape) — and for one event it means
+/// nothing at all. This enum makes that fifth case a property of the
+/// event rather than a comment at the emit site, which is what lets
+/// `validate_hooks` refuse a matcher that cannot work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatcherSubject {
+    ToolName,
+    /// The turn counter, as a decimal string. Surprising but real:
+    /// `matcher = "^3$"` fires on turn 3.
+    TurnNumber,
+    SessionId,
+    /// `threshold` or `manual`.
+    CompactionReason,
+    /// **Nothing.** The emit site has no subject to offer, so the
+    /// matcher is tested against `""` and only `*` can ever match.
+    Nothing,
+}
+
+impl MatcherSubject {
+    /// Whether a real (non-`*`) matcher can ever fire against this
+    /// subject. The whole T2.7 rule in one line, expressed over the
+    /// subject rather than over the event, so a future event with no
+    /// matchable subject inherits it by declaring
+    /// [`MatcherSubject::Nothing`] and nothing else.
+    pub fn admits_a_matcher(self) -> bool {
+        match self {
+            MatcherSubject::ToolName
+            | MatcherSubject::TurnNumber
+            | MatcherSubject::SessionId
+            | MatcherSubject::CompactionReason => true,
+            MatcherSubject::Nothing => false,
+        }
+    }
+}
+
+impl HookEvent {
+    /// What this event's `matcher` is tested against at its emit site.
+    ///
+    /// Verified against `src/agent/loop_.rs`' `run_hooks` call sites and
+    /// `run_session_hooks`. Kept beside the events rather than derived
+    /// from the call sites because it is what `validate_hooks` needs at
+    /// config-load time, long before any emit site runs.
+    pub fn matcher_subject(self) -> MatcherSubject {
+        match self {
+            HookEvent::ToolExecutionStart | HookEvent::ToolExecutionEnd => {
+                MatcherSubject::ToolName
+            }
+            HookEvent::BeforeAgentStart
+            | HookEvent::TurnStart
+            | HookEvent::TurnEnd
+            | HookEvent::MessageEnd => MatcherSubject::TurnNumber,
+            HookEvent::SessionStart | HookEvent::SessionShutdown => MatcherSubject::SessionId,
+            HookEvent::SessionBeforeCompact | HookEvent::SessionCompact => {
+                MatcherSubject::CompactionReason
+            }
+            // `loop_.rs` passes `""` here: the user message is not a
+            // tool call and there is nothing else to match on.
+            HookEvent::Input => MatcherSubject::Nothing,
+        }
+    }
+}
+
+/// The eleven PI event names deliverable to WASM plugins, in
+/// `docs/v0.12-events.md` §7's table order. This is the vocabulary
+/// `parse_event_grants` validates config-supplied `events` entries
+/// against, and what a plugin's `list-events` intersects with.
+pub const EVENT_NAMES: [&str; 11] = [
+    "tool_execution_start",
+    "tool_execution_end",
+    "input",
+    "before_agent_start",
+    "turn_start",
+    "turn_end",
+    "message_end",
+    "session_start",
+    "session_shutdown",
+    "session_before_compact",
+    "session_compact",
+];
+
+/// v0.12.0 §5.2: these two PI events fire per streaming delta — hundreds
+/// of boundary crossings per turn — and are therefore PERMANENTLY
+/// undeliverable to WASM plugins. Neither has an emit site in nanopi
+/// yet (both are among the twenty PI events §2 lists as "no nanopi
+/// counterpart"), so this const IS the emit-site note §9 asks for: a
+/// future author wiring up `message_update` or `tool_execution_update`
+/// should find this list and keep the rule, not silently make either one
+/// deliverable to plugins.
+pub const PER_DELTA_EVENTS: [&str; 2] = ["message_update", "tool_execution_update"];
+
+/// The four hook keys retired in v0.12 in favor of PI's names, shared by
+/// `retired_hook_key_error` (config-key errors) and `parse_event_grants`
+/// (WASM `events` grant errors) so the two surfaces cannot drift apart.
+const RETIRED_EVENT_NAMES: [(&str, &str); 4] = [
+    ("pre_tool_use", "tool_execution_start"),
+    ("post_tool_use", "tool_execution_end"),
+    ("user_prompt_submit", "input"),
+    ("session_end", "session_shutdown"),
+];
+
+/// v0.12.0 §4.2 / §5.1: validate a plugin's config-granted `events` list
+/// against the PI vocabulary. Returns the accepted names (deduped, as
+/// `&'static str` drawn from [`EVENT_NAMES`]) plus a human-readable
+/// refusal report for every entry that was not granted, so a caller can
+/// print "requested but refused" diagnostics at plugin load.
+///
+/// This is where the grant is validated, deliberately NOT at
+/// `Config::load` — see plan decision D5: `[[extensions]]` (and now
+/// `events`) must stay ignored-with-a-warning in the stock binary, so an
+/// unknown `events` entry cannot be a config-load hard error. Living here
+/// in the non-gated `hook.rs` keeps it unit-testable in both builds; only
+/// the WASM layer calls it.
+pub fn parse_event_grants(granted: &[String]) -> (Vec<&'static str>, Vec<String>) {
+    let mut accepted: Vec<&'static str> = Vec::new();
+    let mut reports: Vec<String> = Vec::new();
+    for g in granted {
+        if let Some(&name) = EVENT_NAMES.iter().find(|&&n| n == g.as_str()) {
+            if !accepted.contains(&name) {
+                accepted.push(name);
+            }
+            continue;
+        }
+        if let Some((old, new)) = RETIRED_EVENT_NAMES.iter().find(|(old, _)| *old == g.as_str()) {
+            reports.push(format!(
+                "unknown event {old:?} — did you mean {new:?}? (see docs/v0.12-events.md §2.1)"
+            ));
+            continue;
+        }
+        if PER_DELTA_EVENTS.contains(&g.as_str()) {
+            reports.push(format!(
+                "event {g:?} fires per streaming delta and is permanently undeliverable to \
+                 plugins (see docs/v0.12-events.md §5.2)"
+            ));
+            continue;
+        }
+        reports.push(format!(
+            "unknown event {g:?} — valid names: {}",
+            EVENT_NAMES.join(", ")
+        ));
+    }
+    (accepted, reports)
+}
+
+/// Build the `HookInput` shared by both `run_hooks` and `run_session_hooks`
+/// and by [`event_payload_json`] — the single point that makes the WASM
+/// event payload structurally, not coincidentally, byte-identical to a
+/// shell hook's stdin.
+fn build_hook_input(
+    event: HookEvent,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    arguments: &Value,
+    cwd: &std::path::Path,
+    session_id: Option<&str>,
+) -> HookInput {
+    HookInput {
+        event,
+        tool_name: tool_name.map(|s| s.to_string()),
+        tool_call_id: tool_call_id.map(|s| s.to_string()),
+        arguments: arguments.clone(),
+        cwd: Some(cwd.display().to_string()),
+        session_id: session_id.map(|s| s.to_string()),
+    }
+}
+
+/// v0.12.0 §4.0 / §4.3: the payload handed to a WASM plugin's
+/// `handle-event`, serialized from the SAME `HookInput` a shell hook
+/// receives on stdin — see [`build_hook_input`]. Byte-identity is
+/// structural, not asserted: both `run_hooks` and `run_session_hooks`
+/// build their stdin JSON through this same path.
+pub fn event_payload_json(
+    event: HookEvent,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    arguments: &Value,
+    cwd: &std::path::Path,
+    session_id: Option<&str>,
+) -> String {
+    serde_json::to_string(&build_hook_input(
+        event,
+        tool_name,
+        tool_call_id,
+        arguments,
+        cwd,
+        session_id,
+    ))
+    .expect("serialize HookInput")
+}
+
+/// Stage 5 (`docs/plugin-capabilities.md` §5): the byte bound on the
+/// assistant text carried by `message_end`'s `arguments`.
+///
+/// The text crosses the process boundary twice per turn — once to every
+/// `[[hooks.message_end]]` command's stdin, once to every subscribed
+/// WASM plugin — so an unbounded reply is an unbounded copy on a tool
+/// that is meant to run on constrained hardware. 16 KiB holds a typical
+/// full reply (a 400-line code answer is ~12 KiB) while capping the
+/// pathological one.
+pub const MESSAGE_END_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+
+/// Build `message_end`'s `arguments`, carrying the assistant's text.
+///
+/// Stage 5 of `docs/plugin-capabilities.md` §5. Before this, the payload
+/// was `{turn_count, response_length}` — a number — so a plugin could
+/// see the user's words (`input`) and every tool result
+/// (`tool_execution_end`) but never what the model said.
+///
+/// Three fields, and the shape is deliberate on two counts:
+///
+/// - **`response_length` keeps its old meaning**: the length in bytes of
+///   the WHOLE reply, never of the truncated copy. A script reading it
+///   today keeps reading the same number after this change; and when
+///   truncation happens it is the field that says how much there was.
+/// - **Truncation announces itself three ways** — `response_truncated:
+///   true`, a `response_length` larger than `response`, and an in-band
+///   marker appended to the text itself. The in-band marker is the one
+///   that matters: a consumer that only looks at `response` (the obvious
+///   thing to do) must not be able to draw a conclusion from half a
+///   sentence without seeing that the sentence was cut. Invariant 9's
+///   rule — never let a subscriber believe something it should not —
+///   applied to a payload rather than to an import.
+pub fn message_end_arguments(turn_count: u32, final_text: &str) -> Value {
+    let full_len = final_text.len();
+    let (response, truncated) = truncate_response(final_text);
+    serde_json::json!({
+        "turn_count": turn_count,
+        "response_length": full_len,
+        "response": response,
+        "response_truncated": truncated,
+    })
+}
+
+/// Cut `text` to [`MESSAGE_END_RESPONSE_MAX_BYTES`] on a UTF-8 char
+/// boundary, appending a marker that says so. Returns `(text, was_cut)`.
+///
+/// The marker is counted OUTSIDE the bound: the bound exists to stop a
+/// 400 KiB reply, and a hundred-odd extra bytes on the rare truncated
+/// payload is not the cost worth optimizing. Cutting the marker itself
+/// to fit would be the one way to truncate silently.
+fn truncate_response(text: &str) -> (String, bool) {
+    if text.len() <= MESSAGE_END_RESPONSE_MAX_BYTES {
+        return (text.to_string(), false);
+    }
+    let mut cut = MESSAGE_END_RESPONSE_MAX_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + 64);
+    out.push_str(&text[..cut]);
+    out.push_str(&format!(
+        "\n[nanopi: response truncated, {cut} of {} bytes]",
+        text.len()
+    ));
+    (out, true)
 }
 
 /// One hook definition (parsed from settings.toml).
@@ -60,8 +382,13 @@ impl HookEvent {
 pub struct HookConfig {
     /// Regex matched against the tool name (or session_id for session_*).
     /// Empty or `*` = match all. Default when omitted is `"*"`, which is
-    /// the useful case for session_start / session_end where there's no
+    /// the useful case for session_start / session_shutdown where there's no
     /// tool name to match.
+    ///
+    /// What it is matched against depends on the event — see
+    /// [`HookEvent::matcher_subject`]. For an event whose subject is
+    /// [`MatcherSubject::Nothing`] (`input`), anything but `*` is a
+    /// load-time error rather than a hook that never fires.
     #[serde(default = "default_matcher")]
     pub matcher: String,
     /// Shell command. Supports `~`, `$HOME`, `${HOME}` expansion.
@@ -132,15 +459,66 @@ pub fn matcher_matches(matcher: &str, tool_name: &str) -> bool {
 }
 
 /// Validate all hook matchers at config-load time. Returns the first
-/// invalid matcher (line-agnostic).
-pub fn validate_hooks(hooks: &[HookConfig]) -> Result<(), String> {
+/// problem (line-agnostic).
+///
+/// Two rules, both load-time errors:
+///
+/// 1. **The matcher must be valid regex.** (Since v0.5.)
+/// 2. **The matcher must have something to match against.** An event
+///    whose [`HookEvent::matcher_subject`] is [`MatcherSubject::Nothing`]
+///    tests `matcher` against `""`, so anything but `*` can never fire.
+///    That was the defect `docs/v0.12-manual-test-plan.md` §T2.7
+///    reproduced for `[[hooks.input]]`: a config with
+///    `matcher = "hello"` parsed clean, started nothing, and said
+///    nothing. This project's rule for a config key that cannot do what
+///    it appears to do is a load-time error naming the problem — the
+///    same rule as a retired hook key (`retired_hook_key_error`) and as
+///    an `allow_tools` entry naming a tool that does not exist. Applied
+///    here, per event class rather than per event name, so a future
+///    event with no matchable subject inherits it without anyone
+///    remembering to.
+pub fn validate_hooks(event: HookEvent, hooks: &[HookConfig]) -> Result<(), String> {
     for (i, h) in hooks.iter().enumerate() {
-        if !h.matcher.is_empty() && h.matcher != "*" {
-            regex::Regex::new(&h.matcher)
-                .map_err(|e| format!("hook #{i} matcher {:?} is invalid regex: {e}", h.matcher))?;
+        if h.matcher.is_empty() || h.matcher == "*" {
+            continue;
         }
+        if !event.matcher_subject().admits_a_matcher() {
+            return Err(format!(
+                "[[hooks.{}]] #{i}: matcher {:?} can never match — the \"{}\" event carries no \
+                 tool name, so `matcher` is tested against an empty string. Use `matcher = \"*\"` \
+                 (or omit it) and filter inside your command. See \
+                 docs/v0.12-events.md §7.",
+                event.pi_name(),
+                h.matcher,
+                event.pi_name(),
+            ));
+        }
+        regex::Regex::new(&h.matcher)
+            .map_err(|e| format!("hook #{i} matcher {:?} is invalid regex: {e}", h.matcher))?;
     }
     Ok(())
+}
+
+/// v0.12.0 §2.3: the four hook keys retired in favor of PI's names have
+/// no alias and no dual-key parsing — a config using one of them is a
+/// hard load error. `HooksSection` carries `#[serde(deny_unknown_fields)]`
+/// so a retired (or simply misspelled) key surfaces as a
+/// `toml::de::Error` whose rendered text names the field. This function
+/// scans that rendered text for one of the four retired names and, if
+/// found, rewrites it into a message that names BOTH the retired key and
+/// its replacement, so the user does not have to cross-reference
+/// `docs/v0.12-events.md` §2.1 by hand. Any other unknown-field error
+/// (e.g. a genuine typo like `turn_startt`) returns `None` — the caller
+/// keeps serde's original message, which already lists the valid keys.
+pub fn retired_hook_key_error(err: &str) -> Option<String> {
+    for (old, new) in RETIRED_EVENT_NAMES {
+        if err.contains(&format!("`{old}`")) {
+            return Some(format!(
+                "unknown hook event \"{old}\" — renamed to \"{new}\" in v0.12 (see docs/v0.12-events.md §2.1)"
+            ));
+        }
+    }
+    None
 }
 
 fn extract_env(extra: &HashMap<String, String>) -> Vec<(String, String)> {
@@ -174,9 +552,30 @@ pub async fn run_hook(
 
     let mut child = cmd.spawn()?;
 
+    // A hook that never reads its stdin — `exit 0`, a bare `touch`,
+    // anything that just wants the NANOPI_* env vars — exits while we
+    // are still writing, and the write lands on a closed pipe. That is
+    // the hook working exactly as intended, so EPIPE is not an error
+    // here: swallow it and go on to collect the exit code, which is
+    // what actually decides allow vs block.
+    //
+    // Propagating it (the `?` this replaced) made every such hook a
+    // coin flip between running and "failing open" on a spawn error,
+    // depending on whether the child won the race. It reproduced as
+    // ~30% flake across the hook tests and would have been far worse
+    // in the field, where a blocking guard silently degrading to allow
+    // is the whole thing you installed it to prevent.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input_json.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
+        let wrote = async {
+            stdin.write_all(input_json.as_bytes()).await?;
+            stdin.write_all(b"\n").await
+        }
+        .await;
+        match wrote {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(HookError::Spawn(e)),
+        }
         let _ = stdin.shutdown().await;
     }
 
@@ -212,7 +611,47 @@ pub async fn run_hook(
         return Ok(decision);
     }
 
-    // exit 0 (or any other code) with no decision = allow.
+    // Any other non-zero exit with no decision: allow, but SAY SO.
+    //
+    // This is where a misconfigured hook goes to die quietly. nanopi
+    // runs hooks through `bash -c`, so a bad `command` does not fail
+    // the spawn — bash starts fine and exits 127. Neither 2 nor JSON,
+    // so it lands here, and before this warning existed the user got
+    // zero protection and zero signal:
+    //
+    //   127  path typo'd, or the file is not there
+    //   126  the file is there but not executable — no chmod +x
+    //     1  the script itself errored
+    //
+    // Someone installing a `check-rm-rf.sh` and forgetting `chmod +x`
+    // is the case that matters: a security hook silently doing
+    // nothing. Claude Code's protocol treats non-0/non-2 as an error
+    // too, so allowing without a word was not even protocol-faithful.
+    //
+    // Deliberately not a Block: turning a broken hook into a refusal
+    // would make a typo wedge every tool call, which is worse than
+    // failing open with a warning. Fail-open is the documented
+    // contract; being quiet about it was the defect.
+    if exit_code != 0 {
+        let hint = match exit_code {
+            127 => " (127 = command not found — check the path)",
+            126 => " (126 = not executable — chmod +x?)",
+            _ => "",
+        };
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            let head: String = detail.chars().take(200).collect();
+            format!(" stderr={head:?}")
+        };
+        crate::note!(
+            "nanopi: {} hook exited {exit_code}{hint} with no decision \
+             — allowing the call. command={:?}{detail}",
+            input.event.env_var(),
+            hook.command
+        );
+    }
     Ok(HookOutcome::Allow)
 }
 
@@ -260,10 +699,17 @@ fn parse_json_decision(stdout: &str) -> Option<HookOutcome> {
 
 /// Convenience: run all matching hooks for a given event. Stops on the
 /// first Block. Returns the final outcome (Allow if no hook blocks).
+///
+/// `tool_call_id` is the provider's id for the call in flight, and is
+/// `None` for the events that aren't about a tool. It was hardcoded to
+/// `None` at both call sites until v0.11.0, which made the payload
+/// field permanently null and left `tool_execution_end` hooks unable to
+/// correlate a result with the `tool_execution_start` that preceded it.
 pub async fn run_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
     tool_name: &str,
+    tool_call_id: Option<&str>,
     arguments: Value,
     cwd: &std::path::Path,
     session_id: Option<&str>,
@@ -276,18 +722,21 @@ pub async fn run_hooks(
         if !matcher_matches(&h.matcher, tool_name) {
             continue;
         }
-        let input = HookInput {
+        let input = build_hook_input(
             event,
-            tool_name: Some(tool_name.to_string()),
-            tool_call_id: None,
-            arguments: current_args.clone(),
-            cwd: Some(cwd.display().to_string()),
-            session_id: session_id.map(|s| s.to_string()),
-        };
+            Some(tool_name),
+            tool_call_id,
+            &current_args,
+            cwd,
+            session_id,
+        );
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
         env.insert("NANOPI_TOOL_NAME".into(), tool_name.into());
         env.insert("NANOPI_CWD".into(), cwd.display().to_string());
+        if let Some(id) = tool_call_id {
+            env.insert("NANOPI_TOOL_CALL_ID".into(), id.into());
+        }
         if let Some(s) = session_id {
             env.insert("NANOPI_SESSION_ID".into(), s.into());
         }
@@ -308,7 +757,7 @@ pub async fn run_hooks(
                 // This was a `tracing::warn!`, but nothing ever
                 // initialized a tracing subscriber, so the message the
                 // comment promises went nowhere for its whole life.
-                eprintln!(
+                crate::note!(
                     "nanopi: hook errored; failing open (allow) \
                      [tool={tool_name} matcher={} error={e}]",
                     h.matcher
@@ -319,42 +768,94 @@ pub async fn run_hooks(
     (HookOutcome::Allow, Some(current_args))
 }
 
-/// Run all `session_start` or `session_end` hooks. These don't have a
-/// tool_name and their outcome (allow/block) is advisory: a Block just
-/// gets logged, not enforced (a session start/end always proceeds).
-/// `matcher` on session hooks is applied against the session_id so users
-/// can scope by prefix; empty/"*" matches all.
+/// Run all session-lifecycle hooks. These don't have a tool_name and
+/// their outcome is advisory: a Block is reported on stderr, never
+/// enforced (a session start/shutdown/compaction always proceeds).
+///
+/// Three separate things went into one field before v0.12 (`subject`
+/// doubling as `session_id`); after v0.12 they are three separate
+/// parameters, so no payload field lies:
+///
+/// | field | value |
+/// |---|---|
+/// | `session_id` (param) → payload `session_id` + `NANOPI_SESSION_ID` | the real session id, always |
+/// | `arguments` (param) → payload `arguments` | `{"reason": ...}` for all four session events |
+/// | `subject` → what `matcher` is tested against | session id for `SessionStart` / `SessionShutdown`; compaction reason (`"threshold"`/`"manual"`) for `SessionBeforeCompact` / `SessionCompact` — deliberately still overloaded |
+///
+/// A hook that used to read `session_id` to get `"threshold"` /
+/// `"manual"` for the compaction events must now read
+/// `arguments.reason` instead — `session_id` carries the real id there
+/// too now.
 pub async fn run_session_hooks(
     hooks: &[HookConfig],
     event: HookEvent,
+    arguments: Value,
+    subject: &str,
     session_id: &str,
     cwd: &std::path::Path,
 ) {
+    // v0.11.0 added the compaction events, which route through here;
+    // the old assert covered only start/end and would have panicked a
+    // debug build the first time a `session_before_compact` hook fired.
     debug_assert!(matches!(
         event,
-        HookEvent::SessionStart | HookEvent::SessionEnd
+        HookEvent::SessionStart
+            | HookEvent::SessionShutdown
+            | HookEvent::SessionBeforeCompact
+            | HookEvent::SessionCompact
     ));
     for h in hooks {
         if h.kind != "command" {
             continue;
         }
-        if !matcher_matches(&h.matcher, session_id) {
+        if !matcher_matches(&h.matcher, subject) {
             continue;
         }
-        let input = HookInput {
-            event,
-            tool_name: None,
-            tool_call_id: None,
-            arguments: json!({}),
-            cwd: Some(cwd.display().to_string()),
-            session_id: Some(session_id.to_string()),
-        };
+        let input = build_hook_input(event, None, None, &arguments, cwd, Some(session_id));
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
         env.insert("NANOPI_SESSION_ID".into(), session_id.into());
         env.insert("NANOPI_CWD".into(), cwd.display().to_string());
-        // Fire and forget: outcome is advisory. Errors are swallowed.
-        let _ = run_hook(h, &input, &env).await;
+        report_advisory(event, &h.matcher, run_hook(h, &input, &env).await);
+    }
+}
+
+/// Say on stderr that an advisory hook wanted to block, or errored.
+///
+/// Advisory call sites used to drop the outcome on the floor while
+/// their comments promised "Block is logged, not enforced" — nothing
+/// logged it, so a hook that blocked (or timed out, which surfaces as
+/// Block) was indistinguishable from one that ran clean. Note that a
+/// timeout still costs its full `timeout` in wall clock before landing
+/// here.
+///
+/// `eprintln!` rather than `tracing::warn!` on purpose: nothing in this
+/// binary initializes a tracing subscriber, so a `warn!` would go
+/// nowhere — the same trap `run_hooks`'s error arm already documents.
+pub(crate) fn report_advisory(
+    event: HookEvent,
+    matcher: &str,
+    outcome: Result<HookOutcome, HookError>,
+) {
+    match outcome {
+        Ok(o) => report_advisory_outcome(event, o),
+        Err(e) => crate::note!(
+            "nanopi: {} hook errored [matcher={matcher} error={e}]",
+            event.env_var()
+        ),
+    }
+}
+
+/// `report_advisory` for the call sites that go through `run_hooks`,
+/// which folds errors into `Allow` itself and hands back one outcome
+/// for the whole chain.
+pub(crate) fn report_advisory_outcome(event: HookEvent, outcome: HookOutcome) {
+    if let HookOutcome::Block { reason } = outcome {
+        crate::note!(
+            "nanopi: {} hook asked to block; ignored (advisory event) \
+             [reason={reason}]",
+            event.env_var()
+        );
     }
 }
 
@@ -370,6 +871,33 @@ mod tests {
     }
 
     #[test]
+    fn retired_hook_key_error_maps_all_four_retired_keys() {
+        let cases = [
+            ("pre_tool_use", "tool_execution_start"),
+            ("post_tool_use", "tool_execution_end"),
+            ("user_prompt_submit", "input"),
+            ("session_end", "session_shutdown"),
+        ];
+        for (old, new) in cases {
+            let raw = format!("unknown field `{old}`, expected one of `tool_execution_start`, `tool_execution_end`, `input`, `session_start`, `session_shutdown`");
+            let mapped = retired_hook_key_error(&raw)
+                .unwrap_or_else(|| panic!("expected a mapping for {old}"));
+            assert!(mapped.contains(old), "message should name the retired key: {mapped}");
+            assert!(mapped.contains(new), "message should name the replacement: {mapped}");
+            assert!(
+                mapped.contains("v0.12-events.md"),
+                "message should point at the spec: {mapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_hook_key_error_ignores_unrelated_errors() {
+        let raw = "unknown field `turn_startt`, expected one of `tool_execution_start`, `turn_start`, `turn_end`";
+        assert_eq!(retired_hook_key_error(raw), None);
+    }
+
+    #[test]
     fn expand_command_home_var() {
         let p = expand_command("${HOME}/hooks/x.sh");
         assert!(p.to_string_lossy().contains("hooks/x.sh"));
@@ -379,6 +907,75 @@ mod tests {
     fn expand_command_absolute_passthrough() {
         let p = expand_command("/usr/local/bin/hook.sh");
         assert_eq!(p.to_string_lossy(), "/usr/local/bin/hook.sh");
+    }
+
+    /// A misconfigured hook must not fail silently.
+    ///
+    /// Found in manual testing: a hook whose `command` points at a
+    /// missing file allowed every call with no diagnostic. nanopi runs
+    /// hooks through `bash -c`, so the spawn succeeds and bash exits
+    /// 127 — neither 2 nor a JSON decision, so it fell into the plain
+    /// allow branch. The user believed a security hook was active when
+    /// it was doing nothing at all.
+    ///
+    /// Still allows (fail-open is the documented contract; a typo must
+    /// not wedge every tool call) — the fix is that it now says so.
+    #[tokio::test]
+    async fn a_hook_that_exits_nonzero_still_allows() {
+        for (command, label) in [
+            ("/nonexistent/path/to/hook.sh", "missing file → 127"),
+            ("exit 1", "script error → 1"),
+        ] {
+            let hook = HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: command.into(),
+                timeout: 4000,
+            };
+            let input = build_hook_input(
+                HookEvent::ToolExecutionStart,
+                Some("bash"),
+                None,
+                &json!({"command": "echo hi"}),
+                std::path::Path::new("/tmp"),
+                None,
+            );
+            let out = run_hook(&hook, &input, &HashMap::new())
+                .await
+                .unwrap_or_else(|e| panic!("{label}: should not be Err, got {e}"));
+            assert_eq!(
+                out,
+                HookOutcome::Allow,
+                "{label}: a broken hook must fail OPEN, not block every call"
+            );
+        }
+    }
+
+    /// exit 2 must still block — the warning path above must not have
+    /// swallowed the veto.
+    #[tokio::test]
+    async fn exit_two_still_blocks_after_the_nonzero_warning() {
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: "sh -c 'cat >/dev/null; echo nope >&2; exit 2'".into(),
+            timeout: 4000,
+        };
+        let input = build_hook_input(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            None,
+            &json!({"command": "echo hi"}),
+            std::path::Path::new("/tmp"),
+            None,
+        );
+        let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
+        assert_eq!(
+            out,
+            HookOutcome::Block {
+                reason: "nope".into()
+            }
+        );
     }
 
     #[test]
@@ -392,6 +989,83 @@ mod tests {
         assert!(matcher_matches("^(read|grep)$", "read"));
         assert!(matcher_matches("^(read|grep)$", "grep"));
         assert!(!matcher_matches("^(read|grep)$", "bash"));
+    }
+
+    /// Stage 5: the whole point — the assistant's text is IN the
+    /// payload, not summarized as a length.
+    #[test]
+    fn message_end_payload_carries_the_assistant_text() {
+        let args = message_end_arguments(3, "the answer is 42");
+        assert_eq!(args["response"], "the answer is 42");
+        assert_eq!(args["response_truncated"], false);
+        assert_eq!(args["turn_count"], 3);
+        assert_eq!(args["response_length"], 16);
+    }
+
+    /// Backward compatibility, stated as a test: a
+    /// `[[hooks.message_end]]` script reading `response_length` today
+    /// keeps reading the length of the WHOLE reply, even when the copy
+    /// it also now receives was cut. If `response_length` were quietly
+    /// redefined as "length of `response`" every existing script would
+    /// start reporting 16384 for every long turn.
+    #[test]
+    fn response_length_still_means_the_whole_reply_after_truncation() {
+        let long = "x".repeat(MESSAGE_END_RESPONSE_MAX_BYTES + 5_000);
+        let args = message_end_arguments(1, &long);
+        assert_eq!(
+            args["response_length"].as_u64().unwrap() as usize,
+            long.len(),
+            "response_length must be the full reply's length, not the truncated copy's"
+        );
+        assert!(
+            args["response"].as_str().unwrap().len() < long.len(),
+            "the copy must actually be bounded"
+        );
+    }
+
+    /// The spec's requirement: truncation ANNOUNCES itself rather than
+    /// silently cutting. In band, in the text a naive consumer reads —
+    /// not only in a sibling flag it may never look at.
+    #[test]
+    fn truncation_announces_itself_in_the_text_itself() {
+        let long = "y".repeat(MESSAGE_END_RESPONSE_MAX_BYTES * 2);
+        let args = message_end_arguments(1, &long);
+        assert_eq!(args["response_truncated"], true);
+        let text = args["response"].as_str().unwrap();
+        assert!(
+            text.contains("[nanopi: response truncated,"),
+            "a consumer reading only `response` must see that it was cut; got tail {:?}",
+            &text[text.len().saturating_sub(80)..]
+        );
+        assert!(
+            text.contains(&long.len().to_string()),
+            "the marker must say how much there was"
+        );
+        // Untruncated payloads carry no marker — the announcement must
+        // not be noise on every turn.
+        let short = message_end_arguments(1, "hi");
+        assert!(!short["response"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+    }
+
+    /// Cutting a byte count out of UTF-8 lands mid-codepoint on any
+    /// non-ASCII reply (this project's docs and prompts are half
+    /// Chinese), which panics `&str` slicing.
+    #[test]
+    fn truncation_lands_on_a_char_boundary() {
+        // 3 bytes per char, so the 16384-byte mark is mid-character.
+        let long = "中".repeat(MESSAGE_END_RESPONSE_MAX_BYTES);
+        let args = message_end_arguments(1, &long);
+        let text = args["response"].as_str().unwrap();
+        assert!(args["response_truncated"] == true);
+        let body = text.split("\n[nanopi:").next().unwrap();
+        assert!(
+            body.chars().all(|c| c == '中'),
+            "truncation must not emit a partial codepoint"
+        );
+        assert!(body.len() <= MESSAGE_END_RESPONSE_MAX_BYTES);
     }
 
     #[test]
@@ -415,7 +1089,7 @@ mod tests {
                 timeout: 1000,
             },
         ];
-        assert!(validate_hooks(&v).is_ok());
+        assert!(validate_hooks(HookEvent::ToolExecutionStart, &v).is_ok());
     }
 
     #[test]
@@ -426,7 +1100,145 @@ mod tests {
             command: "x".into(),
             timeout: 1000,
         }];
-        assert!(validate_hooks(&v).is_err());
+        assert!(validate_hooks(HookEvent::ToolExecutionStart, &v).is_err());
+    }
+
+    /// T2.7: `[[hooks.input]]` with `matcher = "hello"` used to parse
+    /// clean, register, and then never fire — the matcher was tested
+    /// against `""`. Silence was the defect; a load-time error naming
+    /// the problem is this project's rule for a config key that cannot
+    /// do what it appears to do.
+    #[test]
+    fn a_matcher_on_an_event_with_no_subject_is_a_load_error() {
+        let v = vec![HookConfig {
+            matcher: "hello".into(),
+            kind: "command".into(),
+            command: "cat >> /tmp/input.log".into(),
+            timeout: 1000,
+        }];
+        let err = validate_hooks(HookEvent::Input, &v)
+            .expect_err("a matcher that can never fire must not load silently");
+        // The message must name the key, the matcher, and WHY — an
+        // error that just says "invalid" sends the user back to §T2.7.
+        assert!(err.contains("hooks.input"), "{err}");
+        assert!(err.contains("\"hello\""), "{err}");
+        assert!(err.contains("can never match"), "{err}");
+        assert!(err.contains("no tool name"), "{err}");
+        assert!(err.contains("matcher = \"*\""), "{err}");
+    }
+
+    /// The two spellings that ARE meaningful for such an event still
+    /// load. Erroring on these would break every working `input` hook.
+    #[test]
+    fn star_and_omitted_matchers_still_load_for_input() {
+        for m in ["*", ""] {
+            let v = vec![HookConfig {
+                matcher: m.into(),
+                kind: "command".into(),
+                command: "x".into(),
+                timeout: 1000,
+            }];
+            assert!(
+                validate_hooks(HookEvent::Input, &v).is_ok(),
+                "matcher {m:?} must stay valid for input"
+            );
+        }
+    }
+
+    /// The rule is per event CLASS, not per event name. Every event
+    /// whose matcher has a real subject must keep accepting a real
+    /// matcher — including the turn-numbered ones, where `^3$` fires on
+    /// turn 3, and the session ones, which existing tests here rely on
+    /// (`^prod-`, `^threshold$`).
+    #[test]
+    fn events_with_a_real_matcher_subject_still_accept_matchers() {
+        for event in [
+            HookEvent::ToolExecutionStart,
+            HookEvent::ToolExecutionEnd,
+            HookEvent::BeforeAgentStart,
+            HookEvent::TurnStart,
+            HookEvent::TurnEnd,
+            HookEvent::MessageEnd,
+            HookEvent::SessionStart,
+            HookEvent::SessionShutdown,
+            HookEvent::SessionBeforeCompact,
+            HookEvent::SessionCompact,
+        ] {
+            assert_ne!(
+                event.matcher_subject(),
+                MatcherSubject::Nothing,
+                "{} has a documented matcher subject",
+                event.pi_name()
+            );
+            let v = vec![HookConfig {
+                matcher: "^something$".into(),
+                kind: "command".into(),
+                command: "x".into(),
+                timeout: 1000,
+            }];
+            assert!(
+                validate_hooks(event, &v).is_ok(),
+                "{} must still accept a real matcher",
+                event.pi_name()
+            );
+        }
+    }
+
+    /// Every *subject* must have decided whether it admits a matcher.
+    ///
+    /// The exhaustive `match` is the test: adding a sixth
+    /// `MatcherSubject` without deciding fails to compile here, which is
+    /// the only mechanism that reaches a future event nobody has written
+    /// yet. `every_event_declares_…` below cannot distinguish this rule
+    /// from a hardcoded `== Input`, because `input` is currently the only
+    /// member of the class — this is what covers that gap.
+    #[test]
+    fn every_matcher_subject_has_decided_whether_it_admits_a_matcher() {
+        for subject in [
+            MatcherSubject::ToolName,
+            MatcherSubject::TurnNumber,
+            MatcherSubject::SessionId,
+            MatcherSubject::CompactionReason,
+            MatcherSubject::Nothing,
+        ] {
+            let expected = match subject {
+                // A subject the matcher is tested against — a real
+                // matcher can fire.
+                MatcherSubject::ToolName
+                | MatcherSubject::TurnNumber
+                | MatcherSubject::SessionId
+                | MatcherSubject::CompactionReason => true,
+                // No subject: only `*` can ever match, so a real
+                // matcher is a config error, not a filter.
+                MatcherSubject::Nothing => false,
+            };
+            assert_eq!(subject.admits_a_matcher(), expected, "{subject:?}");
+        }
+    }
+
+    /// The class must be derived, not enumerated by hand: every one of
+    /// the eleven events has to declare what its matcher matches, and
+    /// exactly the ones declaring `Nothing` are the ones that refuse a
+    /// matcher. A future event added with no matchable subject then
+    /// inherits the error without anyone remembering to wire it up.
+    #[test]
+    fn every_event_declares_its_matcher_subject_and_the_class_decides() {
+        for name in EVENT_NAMES {
+            let event: HookEvent =
+                serde_json::from_value(json!(name)).expect("EVENT_NAMES must round-trip");
+            let v = vec![HookConfig {
+                matcher: "x".into(),
+                kind: "command".into(),
+                command: "c".into(),
+                timeout: 1000,
+            }];
+            let refused = validate_hooks(event, &v).is_err();
+            assert_eq!(
+                refused,
+                event.matcher_subject() == MatcherSubject::Nothing,
+                "{name}: refusal must follow from matcher_subject(), nothing else"
+            );
+        }
     }
 
     #[test]
@@ -540,7 +1352,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({"command": "ls"}),
@@ -560,7 +1372,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({}),
@@ -583,7 +1395,7 @@ mod tests {
             timeout: 2000,
         };
         let input = HookInput {
-            event: HookEvent::PreToolUse,
+            event: HookEvent::ToolExecutionStart,
             tool_name: Some("bash".into()),
             tool_call_id: None,
             arguments: json!({}),
@@ -600,18 +1412,47 @@ mod tests {
     #[test]
     fn session_events_env_var_names() {
         assert_eq!(HookEvent::SessionStart.env_var(), "SessionStart");
-        assert_eq!(HookEvent::SessionEnd.env_var(), "SessionEnd");
+        assert_eq!(HookEvent::SessionShutdown.env_var(), "SessionShutdown");
     }
 
     #[test]
     fn session_events_serialize_snake_case() {
         let s = serde_json::to_string(&HookEvent::SessionStart).unwrap();
         assert_eq!(s, "\"session_start\"");
-        let s = serde_json::to_string(&HookEvent::SessionEnd).unwrap();
-        assert_eq!(s, "\"session_end\"");
+        let s = serde_json::to_string(&HookEvent::SessionShutdown).unwrap();
+        assert_eq!(s, "\"session_shutdown\"");
         // Round-trip.
         let back: HookEvent = serde_json::from_str("\"session_start\"").unwrap();
         assert_eq!(back, HookEvent::SessionStart);
+    }
+
+    /// v0.11.0 lifecycle hook env_var names. These are exported as
+    /// process env vars (NANOPI_EVENT=<name>) so hook scripts can
+    /// branch on event without parsing stdin JSON.
+    #[test]
+    fn lifecycle_events_env_var_names() {
+        assert_eq!(HookEvent::BeforeAgentStart.env_var(), "BeforeAgentStart");
+        assert_eq!(HookEvent::TurnStart.env_var(), "TurnStart");
+        assert_eq!(HookEvent::TurnEnd.env_var(), "TurnEnd");
+        assert_eq!(HookEvent::MessageEnd.env_var(), "MessageEnd");
+    }
+
+    /// v0.11.0 lifecycle hooks serialize as snake_case (matching the
+    /// `serde(rename_all = "snake_case")` on the enum) and round-trip
+    /// through JSON.
+    #[test]
+    fn lifecycle_events_serialize_snake_case() {
+        for (v, expected) in [
+            (HookEvent::BeforeAgentStart, "before_agent_start"),
+            (HookEvent::TurnStart, "turn_start"),
+            (HookEvent::TurnEnd, "turn_end"),
+            (HookEvent::MessageEnd, "message_end"),
+        ] {
+            let s = serde_json::to_string(&v).unwrap();
+            assert_eq!(s, format!("\"{expected}\""));
+            let back: HookEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, v);
+        }
     }
 
     #[tokio::test]
@@ -628,12 +1469,53 @@ mod tests {
         run_session_hooks(
             &[hook],
             HookEvent::SessionStart,
+            json!({"reason": "startup"}),
+            "test-session-id",
             "test-session-id",
             std::path::Path::new("/tmp"),
         )
         .await;
         assert!(marker.exists(), "session_start hook should have run");
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// The compaction events route through `run_session_hooks` too, and
+    /// its `debug_assert!` originally listed only SessionStart/SessionShutdown
+    /// — so the first `session_before_compact` hook to fire would have
+    /// panicked any debug build. `matcher` here is tested against the
+    /// compaction reason, not a session id.
+    #[tokio::test]
+    async fn compaction_events_are_accepted_and_match_on_reason() {
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("nanopi-compact-hook-{}", crate::util::uuid::v7()));
+        let hook = HookConfig {
+            matcher: "^threshold$".into(),
+            kind: "command".into(),
+            command: format!("touch '{}'", marker.display()),
+            timeout: 2000,
+        };
+        run_session_hooks(
+            &[hook.clone()],
+            HookEvent::SessionBeforeCompact,
+            json!({"reason": "threshold"}),
+            "threshold",
+            "real-session-id",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(marker.exists(), "reason should have matched the matcher");
+        let _ = std::fs::remove_file(&marker);
+
+        run_session_hooks(
+            &[hook],
+            HookEvent::SessionCompact,
+            json!({"reason": "manual"}),
+            "manual",
+            "real-session-id",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(!marker.exists(), "a different reason must not match");
     }
 
     #[tokio::test]
@@ -652,7 +1534,9 @@ mod tests {
         };
         run_session_hooks(
             &[hook],
-            HookEvent::SessionEnd,
+            HookEvent::SessionShutdown,
+            json!({"reason": "quit"}),
+            "dev-1234",
             "dev-1234",
             std::path::Path::new("/tmp"),
         )
@@ -662,24 +1546,296 @@ mod tests {
             "hook should NOT fire for non-matching session id"
         );
     }
+
+    /// `pi_name()` must equal the serde snake_case serialization minus
+    /// quotes, for all eleven variants — this is what makes "one
+    /// vocabulary" (§2.1) a checked fact rather than an assertion.
+    #[test]
+    fn pi_name_matches_serde_snake_case_for_all_variants() {
+        let variants = [
+            HookEvent::ToolExecutionStart,
+            HookEvent::ToolExecutionEnd,
+            HookEvent::Input,
+            HookEvent::SessionStart,
+            HookEvent::SessionShutdown,
+            HookEvent::BeforeAgentStart,
+            HookEvent::TurnStart,
+            HookEvent::TurnEnd,
+            HookEvent::MessageEnd,
+            HookEvent::SessionBeforeCompact,
+            HookEvent::SessionCompact,
+        ];
+        for v in variants {
+            let serde_name = serde_json::to_string(&v).unwrap();
+            let expected = serde_name.trim_matches('"');
+            assert_eq!(v.pi_name(), expected, "{v:?}");
+        }
+        assert_eq!(variants.len(), EVENT_NAMES.len());
+    }
+
+    #[test]
+    fn parse_event_grants_accepts_a_valid_name() {
+        let (accepted, reports) =
+            parse_event_grants(&["tool_execution_start".to_string()]);
+        assert_eq!(accepted, vec!["tool_execution_start"]);
+        assert!(reports.is_empty(), "{reports:?}");
+    }
+
+    #[test]
+    fn parse_event_grants_refuses_a_retired_name() {
+        let (accepted, reports) = parse_event_grants(&["pre_tool_use".to_string()]);
+        assert!(accepted.is_empty());
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].contains("pre_tool_use"), "{}", reports[0]);
+        assert!(
+            reports[0].contains("tool_execution_start"),
+            "{}",
+            reports[0]
+        );
+        assert!(reports[0].contains("v0.12-events.md"), "{}", reports[0]);
+    }
+
+    #[test]
+    fn parse_event_grants_refuses_per_delta_events() {
+        for name in ["message_update", "tool_execution_update"] {
+            let (accepted, reports) = parse_event_grants(&[name.to_string()]);
+            assert!(accepted.is_empty(), "{name}");
+            assert_eq!(reports.len(), 1, "{name}");
+            assert!(
+                reports[0].contains("streaming delta") && reports[0].contains("undeliverable"),
+                "{}",
+                reports[0]
+            );
+        }
+    }
+
+    #[test]
+    fn parse_event_grants_refuses_nonsense_and_lists_valid_names() {
+        let (accepted, reports) = parse_event_grants(&["nonsense".to_string()]);
+        assert!(accepted.is_empty());
+        assert_eq!(reports.len(), 1);
+        for name in EVENT_NAMES {
+            assert!(reports[0].contains(name), "{}", reports[0]);
+        }
+    }
+
+    #[test]
+    fn parse_event_grants_empty_grants_nothing_and_reports_nothing() {
+        let (accepted, reports) = parse_event_grants(&[]);
+        assert!(accepted.is_empty());
+        assert!(reports.is_empty());
+    }
+
+    /// The WASM payload builder and a shell hook's stdin must be
+    /// structurally identical — `event_payload_json`'s output parses
+    /// back into the same `HookInput` fields.
+    #[test]
+    fn event_payload_json_round_trips_into_hook_input() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        let json = event_payload_json(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            Some("call-1"),
+            &json!({"command": "ls"}),
+            cwd,
+            Some("sess-1"),
+        );
+        let back: HookInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event, HookEvent::ToolExecutionStart);
+        assert_eq!(back.tool_name.as_deref(), Some("bash"));
+        assert_eq!(back.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(back.arguments, json!({"command": "ls"}));
+        assert_eq!(back.cwd.as_deref(), Some("/tmp/proj"));
+        assert_eq!(back.session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// §4.1's byte-identity promise, exercised end-to-end for
+    /// `run_hooks`: a shell hook that dumps its stdin to a file must see
+    /// EXACTLY what `event_payload_json` builds for the same inputs. This
+    /// is what a WASM subscriber receives (`src/subscriber.rs`'s
+    /// `deliver_with` calls `event_payload_json`) — if either side ever
+    /// drifts from `build_hook_input`, this test catches it.
+    /// Transforms accumulate: hook N sees hook N-1's rewrite.
+    ///
+    /// This is what makes a chain of hooks a pipeline rather than a
+    /// race, and nothing pinned it. The manual case that was supposed
+    /// to cover it could not: its inline `sh -c 'echo {"a":"b"}'`
+    /// had the inner shell strip the double quotes, so the hook
+    /// emitted `{a:b}`, the JSON parse failed, and BOTH hooks silently
+    /// degraded to plain allow — the test passed nothing and looked
+    /// like a product bug.
+    #[tokio::test]
+    async fn transforms_accumulate_across_hooks() {
+        let dir = std::env::temp_dir().join(format!("nanopi-xf-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Script files, not inline `sh -c` — quoting JSON through two
+        // levels of shell is exactly what broke the manual version.
+        let mut hooks = Vec::new();
+        for step in ["STEP1", "STEP2"] {
+            let path = dir.join(format!("{step}.sh"));
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncat > /dev/null\necho '{{\"decision\":\"allow\",\"updated_input\":{{\"command\":\"echo {step}\"}}}}'\n"
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            hooks.push(HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: path.display().to_string(),
+                timeout: 4000,
+            });
+        }
+
+        let (outcome, args) = run_hooks(
+            &hooks,
+            HookEvent::ToolExecutionStart,
+            "bash",
+            None,
+            json!({"command": "echo ORIGINAL"}),
+            &dir,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, HookOutcome::Allow);
+        let args = args.expect("a transform happened");
+        assert_eq!(
+            args.get("command").and_then(|v| v.as_str()),
+            Some("echo STEP2"),
+            "the LAST hook's rewrite must win, having seen the first's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_hooks_stdin_matches_event_payload_json_byte_for_byte() {
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("nanopi-byte-identity-{}", crate::util::uuid::v7()));
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: format!("cat > '{}'", marker.display()),
+            timeout: 2000,
+        };
+        let cwd = std::path::Path::new("/tmp");
+        let arguments = json!({"command": "ls -la", "cwd": "."});
+        let (_outcome, _transformed) = run_hooks(
+            &[hook],
+            HookEvent::ToolExecutionStart,
+            "bash",
+            Some("call-42"),
+            arguments.clone(),
+            cwd,
+            Some("sess-byte-identity"),
+        )
+        .await;
+        let dumped = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("hook did not write stdin to {}: {e}", marker.display()));
+        let _ = std::fs::remove_file(&marker);
+        let expected = event_payload_json(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            Some("call-42"),
+            &arguments,
+            cwd,
+            Some("sess-byte-identity"),
+        );
+        assert_eq!(
+            dumped.trim_end_matches('\n'),
+            expected,
+            "run_hooks's stdin must equal event_payload_json's output byte-for-byte"
+        );
+    }
+
+    /// Same promise, for the `run_session_hooks` path (session lifecycle
+    /// events never carry a tool_name / tool_call_id).
+    #[tokio::test]
+    async fn run_session_hooks_stdin_matches_event_payload_json_byte_for_byte() {
+        let mut marker = std::env::temp_dir();
+        marker.push(format!(
+            "nanopi-byte-identity-session-{}",
+            crate::util::uuid::v7()
+        ));
+        let hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: format!("cat > '{}'", marker.display()),
+            timeout: 2000,
+        };
+        let cwd = std::path::Path::new("/tmp");
+        let arguments = json!({"reason": "new"});
+        run_session_hooks(
+            &[hook],
+            HookEvent::SessionStart,
+            arguments.clone(),
+            "sess-byte-identity-2",
+            "sess-byte-identity-2",
+            cwd,
+        )
+        .await;
+        let dumped = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("hook did not write stdin to {}: {e}", marker.display()));
+        let _ = std::fs::remove_file(&marker);
+        let expected = event_payload_json(
+            HookEvent::SessionStart,
+            None,
+            None,
+            &arguments,
+            cwd,
+            Some("sess-byte-identity-2"),
+        );
+        assert_eq!(
+            dumped.trim_end_matches('\n'),
+            expected,
+            "run_session_hooks's stdin must equal event_payload_json's output byte-for-byte"
+        );
+    }
+
+    /// `--no-hooks` (`permission.hooks_active() == false`) must cut WASM
+    /// delivery too, not just shell hooks — the same leak v0.9.1 fixed
+    /// for session hooks. Every call site in `loop_.rs` wraps its
+    /// `deliver_with` call in the same `if self.permission.hooks_active()`
+    /// gate as the shell-hook call; this test asserts the gate condition
+    /// itself, at the seam reachable without a fake provider.
+    #[test]
+    fn no_hooks_gate_condition_prevents_delivery() {
+        use crate::agent::permission::{PermissionGate, TrustLevel};
+        let no_hooks_gate = PermissionGate::new(false, TrustLevel::Trusted);
+        assert!(
+            !no_hooks_gate.hooks_active(),
+            "a --no-hooks gate must report hooks_active() == false, \
+             which is the same condition every deliver_with call site checks"
+        );
+        let hooks_on_gate = PermissionGate::new(true, TrustLevel::Trusted);
+        assert!(hooks_on_gate.hooks_active());
+    }
 }
-/// `UserPromptSubmit` hook is supported alongside Pre/PostToolUse.
+/// `Input` hook is supported alongside ToolExecutionStart/ToolExecutionEnd.
 /// Round-trip its enum variant and env_var name.
 #[test]
-fn user_prompt_submit_event_round_trips() {
-    let v = HookEvent::UserPromptSubmit;
-    assert_eq!(v.env_var(), "UserPromptSubmit");
+fn input_event_round_trips() {
+    let v = HookEvent::Input;
+    assert_eq!(v.env_var(), "Input");
     let s = serde_json::to_string(&v).unwrap();
     let back: HookEvent = serde_json::from_str(&s).unwrap();
     assert_eq!(back, v);
 }
 
-/// `UserPromptSubmit` hooks don't have a tool_name, but the input
+/// `Input` hooks don't have a tool_name, but the input
 /// payload still has a `prompt` field carrying the user's text.
 #[test]
-fn user_prompt_submit_input_has_event_field() {
+fn input_hook_input_has_event_field() {
     let input = HookInput {
-        event: HookEvent::UserPromptSubmit,
+        event: HookEvent::Input,
         tool_name: None,
         tool_call_id: None,
         arguments: serde_json::Value::String("hi".into()),
@@ -687,6 +1843,6 @@ fn user_prompt_submit_input_has_event_field() {
         session_id: None,
     };
     let s = serde_json::to_string(&input).unwrap();
-    assert!(s.contains("\"event\":\"user_prompt_submit\""), "got {s}");
+    assert!(s.contains("\"event\":\"input\""), "got {s}");
     assert!(s.contains("\"hi\""), "got {s}");
 }

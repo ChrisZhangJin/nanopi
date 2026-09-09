@@ -18,9 +18,110 @@ Improve first-time and everyday console UX so nanopi is usable without hand-edit
 - First-run wizard for config bootstrap.
 - (future work — added as it comes up)
 
-### M2 · Backlog
+### M2 · Extensions (v0.11.0) — complete
 
-Nothing formally scoped yet — features land ad-hoc via `/gsd:quick`.
+Pi-parity extension capabilities. See `docs/pi-vs-nanopi.md` for the
+comparison that scoped this. All four phases shipped on `v0.11.0`.
+
+- **P0** ✅ Shell-hook event coverage extended to `before_agent_start`,
+  `turn_start`, `turn_end`, `message_end` (`410d12c`). Later joined by
+  `session_before_compact` / `session_compact` (`675cd02`).
+- **P1** ✅ `post_tool_use` can transform the tool result, not just
+  observe it (`a2e3994`) — enables redaction / scrubbing hooks.
+- **P2** ✅ WASM plugin system behind `--features wasm`
+  (`667bf30`, `d4aff4b`, `82d36d7`). Components declared in
+  `[[extensions]]` are compiled, instantiated, and their exported
+  tools registered alongside the built-ins.
+- **P3** ✅ `steer` / `follow-up` injection (`1767238`), wired to the
+  TUI so mid-stream typing steers the running turn (`d45bb42`) and
+  queued follow-ups auto-start the next one (`7064b10`).
+
+Also landed in this milestone:
+
+- `tool_exec_mode` (parallel vs sequential tool execution). Pi has a
+  per-tool override too, which is deferred.
+- **Capability-gated host functions** — `host-fs-read` (`788705c`,
+  read-only, cwd-confined, symlink-aware) and `host-http-get`
+  (`83bbe68`…`28c2e75`, gated on `allow_network` then a deny-by-default
+  host-matching `url_allowlist`; 10 s timeout, 1 MiB cap, redirects not
+  followed). Both return in-band `error: ` strings rather than
+  trapping. Declared at `wit/nanopi-extension.wit:36,57`, implemented
+  at `src/wasm/loader.rs:447,478`.
+  *(This was listed as deferred until 2026-09-01; it had in fact
+  shipped on 2026-08-28.)*
+- A hardening pass over the whole milestone — ~20 `fix(...)` commits
+  covering plugin epoch deadlines, trap isolation, allowlist bypass,
+  cwd-guard escapes, cancel-safety of parallel tool batches, and
+  session-file corruption on cancel.
+- VERSION centralization (`VERSION` + `make bump` + a tag-vs-VERSION
+  gate in `release.yml`), per `.planning/PLAN-VERSION.md` — that plan
+  is **done**, not pending.
+
+- **Plugin slash-command registration** (`4df493b`…`e9ce962`,
+  2026-09-02) — the last plugin capability. A component may export
+  `list-commands` / `execute-command` from a second WIT world,
+  `extension-commands`, which `include`s the first so tool-only
+  plugins keep building unchanged. A command returns an action rather
+  than calling back into the host, keeping the import list at three.
+  Pi's dispatch shape was followed
+  (`.planning/reference/pi-slash-commands.md`, since verified against
+  Pi's source); its collision rules deliberately were not — nanopi
+  refuses rather than renaming. Shipped alongside two adjacent fixes:
+  plugins now load on resumed sessions, and a leading space no longer
+  routes a slash command to the model as chat text.
+
+**Deferred to a later milestone** (from the parity review) — **all but
+one shipped in v0.12.0, 2026-09-07**:
+
+- ~~Per-tool `executionMode` override.~~ ✅ `003399f`. Not just
+  configurability: `bash` now declares itself Sequential, which fixed
+  the concurrent-bash data loss that had been sitting `#[ignore]`d as a
+  known bug. `[tool_exec_overrides]` takes the speed back.
+- ~~**Plugin hot reload.**~~ ✅ `34866aa`…`0a2f10c`. Both prerequisites
+  named here were built: `ToolRegistry::unregister_plugin` (keyed on the
+  plugin, never a tool name, so removing a built-in is unwritable) and
+  per-plugin instance ids. A call in flight when the swap lands is
+  refused in-band, with different wording depending on whether it had
+  already entered the guest — one says the result is discarded, the
+  other says side effects already stand.
+- ~~Richer session metadata.~~ ✅ `483aec8`, and it was three things:
+  **labels were already done** (`/name`); **`ModelChange` was a bug, not
+  a feature** — reader, replay, `/export` and a roundtrip test all
+  existed with NO WRITER since the session format did; **thinking-level
+  changes** were genuinely missing and are now `ThinkingChange`.
+  *Custom entries deliberately NOT built* — under-specified, and a
+  plugin-written entry runs into invariant 15. Needs a decision about
+  who writes and who reads.
+- **Provider registration from plugins** — still deferred, and moved to
+  `docs/BACKLOG.md` with the full argument. Short version: it is a new
+  ABI shape (streaming inverts the guest-calls-host flow every one of
+  the nine imports uses), it needs a `Provider` trait signature change,
+  and it requires deciding whether a plugin provider is exempt from
+  `url_allowlist`. **That last one is a decision for the project owner
+  and blocks the other two.**
+- Session-management hooks beyond compaction — untouched, no demand yet.
+
+### M3 · Bugfix Line (v0.10.1) — shipped 2026-09-01
+
+Patch line on top of v0.10.0. Lives on the `v0.10.1` branch; nothing
+new is developed there. **Released:** tag `v0.10.1` == `d19d3c2`, also
+fast-forwarded into `main`, four platform assets published.
+
+Contents:
+- `fix(config)` — the Windows first run died with `cannot read
+  api_key_file ~/.nanopi/api_key`. The wizard now writes an absolute
+  `api_key_file`, and `paths::expand_home` is the single expansion
+  point shared by `main` and `agent::hook` (falls back to
+  `dirs::home_dir()` when `$HOME` is unset, accepts `\`, honors
+  `NANOPI_HOME`).
+- `fix(vendor)` — MiniMax default base_url → `api.minimaxi.com`.
+- `fix(provider)` — gateway HTML error pages flattened to one line
+  (`retry::flatten_error_body`) instead of being shredded by the TUI
+  redraw.
+
+All three were cherry-picked onto `v0.11.0` on 2026-09-01
+(`e9425b8`, `777eb8a`, `642f696`) — different SHAs, same patches, so
+expect patch-id dedup when v0.11.0 eventually merges to `main`.
 
 ## Notes
 

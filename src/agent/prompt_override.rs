@@ -130,7 +130,7 @@ fn resolve_prompt_input(input: &str) -> String {
         match std::fs::read_to_string(path) {
             Ok(content) => return content,
             Err(e) => {
-                eprintln!(
+                crate::note!(
                     "warning: '{input}' exists but could not be read as text ({e}); \
                      using it as literal prompt text instead"
                 );
@@ -179,18 +179,10 @@ mod tests {
     /// concurrent tests don't race on the shared env var — mirrors
     /// `build.rs::compose_injects_cwd_context_file`.
     fn with_empty_global_home<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _g = crate::TEST_LOCK.lock().unwrap();
-        let prev = std::env::var_os("NANOPI_HOME");
-        let home = tmpdir();
-        std::env::set_var("NANOPI_HOME", &home);
+        let h = crate::TempNanopiHome::new();
+        let home = h.path().to_path_buf();
 
         let result = f(&home);
-
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         std::fs::remove_dir_all(&home).ok();
         result
     }

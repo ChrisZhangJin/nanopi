@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::agent::loop_::{Agent, HooksConfig};
+use crate::agent::loop_::Agent;
 use crate::agent::permission::PermissionGate;
 use crate::event::AgentEvent;
 use crate::render::stdout::StdoutRenderer;
@@ -57,6 +57,9 @@ pub async fn run_print_mode(
     skill_load: crate::agent::build::SkillLoadPolicy,
     no_context_files: bool,
     prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    // `config.inline_think_tags` — escape hatch for the inline
+    // `<think>` splitter (on by default). `None` leaves it on.
+    inline_think_tags: Option<bool>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
@@ -108,20 +111,29 @@ pub async fn run_print_mode(
             Some(base_url),
             model,
         )),
+        inline_think_tags,
     );
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
-    // For v0.5: no hooks loaded yet (settings.toml loader is a separate
-    // concern).
-    let hooks = match settings::load_settings(&cwd) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("warning: failed to load settings: {e}");
-            HooksConfig::default()
-        }
-    };
+    // Every `SettingsError` is a mistake in the user's own config —
+    // unparseable TOML, or a matcher that provably can never fire.
+    // Refusing to start is the only honest response: the fallback used
+    // to be `HooksConfig::default()`, which drops *every* hook in the
+    // file, not just the offending one. A `check-rm-rf.sh` veto hook
+    // then silently stops running while the warning scrolls away —
+    // zero protection with a one-line notice, the same failure shape
+    // T2.4 was written to eliminate. Same severity as an unknown hook
+    // event key, which has always been fatal.
+    let hooks = settings::load_settings(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let registry = ToolRegistry::standard();
+
+    // v0.11.0: `tool_exec_mode` + `[[extensions]]` live in config.toml,
+    // which isn't threaded through this function's parameter list.
+    // Re-read it here rather than widening the signature; a parse
+    // failure already surfaced above via load_settings, so fall back
+    // to defaults quietly instead of double-reporting.
+    let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
 
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
@@ -140,6 +152,7 @@ pub async fn run_print_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            &cfg_for_build.extensions,
         );
         print_skill_diagnostics(&diags);
         a
@@ -158,23 +171,27 @@ pub async fn run_print_mode(
             skill_load,
             no_context_files,
             prompt_overrides,
+            initial_follow_up: None,
+            tool_exec_mode: cfg_for_build.tool_exec_mode,
+            tool_exec_overrides: cfg_for_build.tool_exec_overrides.clone(),
+            extensions: cfg_for_build.extensions,
         });
         print_skill_diagnostics(&diags);
         a
     };
 
     // Fire session_start hooks before the first turn.
-    agent.fire_session_start().await;
+    agent.fire_session_start("startup").await;
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
     let message_owned = message.to_string();
     let agent_task = {
         let mut agent = agent; // move
         tokio::spawn(async move {
-            let r = agent.run_turn(message_owned.as_str(), &tx, None).await;
+            let r = agent.run_turn(message_owned.as_str(), &tx, None, None).await;
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
-            agent.fire_session_end().await;
+            agent.fire_session_shutdown("quit").await;
             r
         })
     };
@@ -190,12 +207,7 @@ pub async fn run_print_mode(
     while let Some(ev) = rx.recv().await {
         if output == OutputFormat::Text {
             if let Some(mut s) = spinner.take() {
-                if matches!(
-                    ev,
-                    AgentEvent::TextDelta { .. }
-                        | AgentEvent::ToolCall { .. }
-                        | AgentEvent::Error { .. }
-                ) {
+                if stops_spinner(&ev) {
                     s.stop().await;
                 } else {
                     spinner = Some(s);
@@ -281,3 +293,83 @@ fn collect_messages(session_path: &std::path::Path) -> Result<Vec<Value>> {
 // Arc import used by future extensions (TUI mode).
 
 // time import retained for future usage.
+
+/// Does this event mean the spinner has to go?
+///
+/// A predicate rather than an inline `matches!` so the decision is
+/// testable. It cannot be tested through the process's output: the
+/// spinner writes to **stderr** and everything else here goes to
+/// stdout, so a piped run separates them and sees nothing wrong. The
+/// damage only appears on a TTY, where both land on one screen.
+///
+/// The rule: anything that streams output of its own stops the
+/// spinner, because the spinner redraws with `\r\x1b[K` and shreds
+/// whatever shares the terminal with it.
+///
+/// `ThinkingDelta` belongs here and was missing. Reported from a real
+/// minimax session as reasoning interleaved with `⠼ thinking (1.7s)`
+/// and broken across lines at arbitrary points. Latent since thinking
+/// existed — the Anthropic wire always hit it — and invisible on the
+/// OpenAI wire until inline `<think>` began arriving as ThinkingDelta
+/// rather than as ordinary text.
+fn stops_spinner(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::Error { .. }
+    )
+}
+
+#[cfg(test)]
+mod spinner_tests {
+    use super::*;
+    use crate::event::{FinishReason, Usage};
+
+    #[test]
+    fn anything_that_streams_output_stops_the_spinner() {
+        for ev in [
+            AgentEvent::TextDelta {
+                content_index: 0,
+                text: "hi".into(),
+            },
+            AgentEvent::ThinkingDelta {
+                content_index: 0,
+                text: "musing".into(),
+            },
+            AgentEvent::ToolCall {
+                content_index: 0,
+                call: crate::event::ToolCall {
+                    id: "c".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+            AgentEvent::Error {
+                error: "boom".into(),
+            },
+        ] {
+            assert!(stops_spinner(&ev), "should stop the spinner: {ev:?}");
+        }
+    }
+
+    /// Events that print nothing leave it running — otherwise the
+    /// spinner would vanish at `Start` and the user would stare at a
+    /// blank screen for the whole first token latency, which is the
+    /// reason it exists.
+    #[test]
+    fn silent_events_leave_the_spinner_running() {
+        for ev in [
+            AgentEvent::Start {
+                message_id: "m".into(),
+            },
+            AgentEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ] {
+            assert!(!stops_spinner(&ev), "should NOT stop the spinner: {ev:?}");
+        }
+    }
+}

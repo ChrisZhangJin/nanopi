@@ -1,0 +1,1481 @@
+//! End-to-end WASM extension test.
+//!
+//! Loads a real component — the one built from `examples/wasm-plugin`,
+//! checked in at `tests/fixtures/` — and calls its tools through the
+//! same code path the agent uses.
+//!
+//! The unit tests in `src/wasm/` cover the pieces in isolation and all
+//! passed while three separate integration bugs were live: exports
+//! namespaced under a WIT `interface` so the host could never resolve
+//! them, `reference-types` left disabled so no component would
+//! compile, and an error chain flattened by `{}` so the cause was
+//! invisible. Only loading an actual `.wasm` catches that class of
+//! bug, which is why the fixture is committed rather than built on
+//! demand — the toolchain to produce it (`wasm32-wasip1` std plus
+//! `wasm-tools`) is a heavier ask than running the tests.
+//!
+//! To regenerate the fixture after changing `examples/wasm-plugin`:
+//!
+//! ```bash
+//! cargo build --manifest-path examples/wasm-plugin/Cargo.toml \
+//!   --target wasm32-wasip1 --release
+//! wasm-tools component embed wit/ \
+//!   examples/wasm-plugin/target/wasm32-wasip1/release/nanopi_example_plugin.wasm \
+//!   -o /tmp/embedded.wasm --world extension-commands
+//! wasm-tools component new /tmp/embedded.wasm \
+//!   -o tests/fixtures/example-plugin.component.wasm
+//! ```
+//!
+//! Note `--world extension-commands` — this fixture registers slash
+//! commands. `wit/` now declares two worlds, so `--world` is no longer
+//! optional here.
+//!
+//! A third fixture, `events-plugin.component.wasm`, is built from
+//! `examples/wasm-plugin-events` and targets `--world extension-events`
+//! — the top of the ladder, adding `list-events` / `handle-event` to
+//! everything `example-plugin.component.wasm` already exports. To
+//! regenerate it after changing `examples/wasm-plugin-events`:
+//!
+//! ```bash
+//! cargo build --manifest-path examples/wasm-plugin-events/Cargo.toml \
+//!   --target wasm32-wasip1 --release
+//! wasm-tools component embed wit/ \
+//!   examples/wasm-plugin-events/target/wasm32-wasip1/release/nanopi_events_plugin.wasm \
+//!   -o /tmp/embedded-events.wasm --world extension-events
+//! wasm-tools component new /tmp/embedded-events.wasm \
+//!   -o tests/fixtures/events-plugin.component.wasm
+//! ```
+//!
+//! (`make plugin-events` runs the same three steps and copies the
+//! result to `dist/`; `tests/fixtures/events-plugin.component.wasm` is
+//! that same output, committed.)
+//!
+//! THREE FIXTURES, THREE WORLDS, ON PURPOSE. `runaway-plugin` stays on
+//! `--world extension` and must keep doing so: besides being the
+//! hang-breaker fixture, it is the only committed component WITHOUT
+//! `list-commands`, and therefore the only end-to-end proof that the
+//! host resolves that export optionally. Retarget it and the
+//! backward-compatibility test below silently stops testing anything.
+//! `example-plugin.component.wasm` stays on `--world extension-commands`
+//! for the same reason in reverse: it is the only committed component
+//! WITHOUT `list-events` / `handle-event`, proving those two exports
+//! are equally optional. Retargeting it to `extension-events` would
+//! remove that proof.
+
+#![cfg(feature = "wasm")]
+
+use std::path::PathBuf;
+
+use nanopi::command::CommandAction;
+use nanopi::wasm::loader::PluginEngine;
+
+fn fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/example-plugin.component.wasm")
+}
+
+/// A plugin name no other load in this test binary will use.
+///
+/// Plugin identity became load-bearing at RUNTIME with hot reload:
+/// `wasm::generation` keys the live-instance table by plugin NAME, so
+/// two bridges loaded under one name make the earlier one stale and its
+/// calls refuse in-band. These tests run in parallel in one process, so
+/// the shared literal `"fixture"` this file used to pass was a race
+/// waiting for the feature that needed the table. Reality carries the
+/// same constraint from the other side: two `.wasm` files with the same
+/// stem are already a hard load error.
+fn unique_name() -> std::sync::Arc<str> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "fixture-{}",
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+    .into()
+}
+
+fn events_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/events-plugin.component.wasm")
+}
+
+/// The whole path: compile the component, read its tool list, call
+/// both tools, get correct answers back.
+#[test]
+fn loads_real_component_and_executes_its_tools() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, specs) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("example component must load");
+
+    // list-tools reached the host intact.
+    let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["fetch", "readfile", "rot13", "wordcount"]);
+
+    // Descriptions and schemas survive too — these are what the model
+    // sees, so an empty or mangled one is a silent quality failure.
+    let rot13 = specs.iter().find(|s| s.name == "rot13").unwrap();
+    assert!(rot13.description.contains("ROT13"), "{}", rot13.description);
+    assert_eq!(rot13.parameters["type"], "object");
+    assert_eq!(rot13.parameters["properties"]["text"]["type"], "string");
+
+    // execute-tool round-trips arguments and results.
+    let out = bridge
+        .execute_tool("rot13", r#"{"text":"Hello, World"}"#)
+        .expect("rot13 call");
+    assert_eq!(out.content, "Uryyb, Jbeyq");
+    assert!(!out.is_error);
+
+    let out = bridge
+        .execute_tool("wordcount", r#"{"text":"one two three"}"#)
+        .expect("wordcount call");
+    assert!(out.content.starts_with("3 words"), "{}", out.content);
+    assert!(!out.is_error);
+}
+
+/// The events fixture loads through the CURRENT loader unchanged, and
+/// its three tools are listed — proving the extra `list-events` /
+/// `handle-event` exports are invisible to a host that isn't yet
+/// looking for them. This is the backward-compatibility guarantee in
+/// reverse: `unknown_tool_name_is_rejected`'s fixture proves an old
+/// host tolerates a plugin missing new exports; this test proves a
+/// plugin WITH those new exports still works against the old host.
+#[test]
+fn events_fixture_loads_through_the_current_loader() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, specs) = engine
+        .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("events component must load");
+
+    let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["busy", "events_seen", "greet"]);
+
+    let out = bridge
+        .execute_tool("greet", r#"{"name":"nanopi"}"#)
+        .expect("greet call");
+    assert!(out.content.contains("nanopi"), "{}", out.content);
+    assert!(!out.is_error);
+}
+
+/// The grant-side of the two-list intersection: an event in BOTH the
+/// plugin's `list-events` (`tool_execution_start`, `turn_start`,
+/// `input`) and the config's `events` grant is actually delivered.
+#[test]
+fn an_event_in_both_lists_is_delivered() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            vec!["turn_start".to_string()],
+        )
+        .expect("events component must load");
+
+    assert_eq!(bridge.event_subscriptions(), vec!["turn_start".to_string()]);
+
+    bridge.handle_event("turn_start", "{}");
+
+    let out = bridge
+        .execute_tool("events_seen", "{}")
+        .expect("events_seen call");
+    assert!(
+        out.content.contains("\"turn_start\":1"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("\"total\":1"), "{}", out.content);
+}
+
+/// The refusal side: the plugin's `list-events` requests
+/// `tool_execution_start`, but the config's `events` grant does not
+/// name it — the event must not be delivered, and the plugin's tally
+/// must stay at zero.
+#[test]
+fn an_event_the_config_did_not_grant_is_not_delivered() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            // Grants only `input` — the plugin also requests
+            // `tool_execution_start` and `turn_start`, so those two
+            // must show up as unsatisfied and never be delivered.
+            vec!["input".to_string()],
+        )
+        .expect("events component must load");
+
+    assert_eq!(bridge.event_subscriptions(), vec!["input".to_string()]);
+    let mut unsatisfied = bridge.unsatisfied_event_requests();
+    unsatisfied.sort();
+    assert_eq!(
+        unsatisfied,
+        vec!["tool_execution_start".to_string(), "turn_start".to_string()]
+    );
+
+    // Not granted — must be a silent no-op, not a trap or error.
+    bridge.handle_event("tool_execution_start", "{}");
+    bridge.handle_event("turn_start", "{}");
+
+    let out = bridge
+        .execute_tool("events_seen", "{}")
+        .expect("events_seen call");
+    assert_eq!(out.content, "{\"total\":0,\"by_event\":{}}");
+}
+
+/// A plugin that exports neither `list-events` nor `handle-event`
+/// (`example-plugin.component.wasm`, the deliberately-fixed reference
+/// fixture — see the file header) still loads cleanly and delivering an
+/// event to it is a no-op, not an error.
+#[test]
+fn a_plugin_exporting_neither_event_function_still_loads_and_receives_nothing() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            vec!["turn_start".to_string()],
+        )
+        .expect("example component must load");
+
+    assert!(bridge.event_subscriptions().is_empty());
+    assert!(bridge.unsatisfied_event_requests().is_empty());
+
+    // Must not panic or trap the instance.
+    bridge.handle_event("turn_start", "{}");
+
+    let out = bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect("rot13 call after a no-op event delivery");
+    assert!(!out.is_error);
+}
+
+/// A trap inside `handle-event` (driven by the fixture's
+/// `TEST_TRAP_MARKER` substring) must not brick the plugin: its tools
+/// stay callable afterward, same recovery guarantee `execute_tool`
+/// already has for a trapping tool call.
+#[test]
+fn a_trap_in_handle_event_leaves_tools_callable() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            vec!["input".to_string()],
+        )
+        .expect("events component must load");
+
+    // Payload containing the trap marker — the fixture traps on this.
+    bridge.handle_event("input", "please nanopi-test-trap now");
+
+    // The instance must have recovered: an ordinary tool call still
+    // works.
+    let out = bridge
+        .execute_tool("greet", r#"{"name":"nanopi"}"#)
+        .expect("greet call after trap recovery");
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("nanopi"), "{}", out.content);
+}
+
+/// `handle-event`'s return value is discarded by the host — the fixture
+/// deliberately returns the non-JSON string `not-json`, which would be
+/// an error if anything tried to parse it. No panic, no error path
+/// triggered, is the only assertion.
+#[test]
+fn handle_event_return_value_is_ignored() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            vec!["input".to_string()],
+        )
+        .expect("events component must load");
+
+    // If the host parsed the return value as JSON, this call would
+    // have to fail or panic since `not-json` is not JSON. Neither
+    // happens — `handle_event` returns `()`.
+    bridge.handle_event("input", "{}");
+
+    let out = bridge
+        .execute_tool("events_seen", "{}")
+        .expect("events_seen call");
+    assert!(out.content.contains("\"input\":1"), "{}", out.content);
+}
+
+/// The `try_lock`-drops-rather-than-waits guarantee, made deterministic
+/// via `dropped_events()` rather than a sleep-timed race: hold the
+/// bridge lock with a long-running `busy` tool call on a background
+/// thread, then attempt event delivery while it is still running. The
+/// delivery must be dropped and counted, not queued behind the busy
+/// call.
+#[test]
+fn a_busy_plugin_drops_the_event_and_counts_it() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            vec!["turn_start".to_string()],
+        )
+        .expect("events component must load");
+
+    assert_eq!(bridge.dropped_events(), 0);
+
+    let busy_bridge = bridge.clone();
+    let busy_call = std::thread::spawn(move || {
+        // ~1s of guest time, well over the epoch-tick granularity, so
+        // the event delivery below reliably lands while this is still
+        // running.
+        busy_bridge.execute_tool("busy", "{}")
+    });
+
+    // Give the busy call a moment's head start so it has definitely
+    // taken the lock before the event delivery attempts `try_lock`.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    bridge.handle_event("turn_start", "{}");
+
+    busy_call.join().expect("busy call thread").expect("busy tool call");
+
+    assert_eq!(
+        bridge.dropped_events(),
+        1,
+        "the event delivered while the plugin was busy must be dropped and counted, not queued"
+    );
+
+    // The tally must NOT have counted the dropped delivery.
+    let out = bridge
+        .execute_tool("events_seen", "{}")
+        .expect("events_seen call");
+    assert_eq!(out.content, "{\"total\":0,\"by_event\":{}}");
+}
+
+/// Calling repeatedly must keep working — the plugin resets its arena
+/// per call, and a bug there would show up as garbage on call two
+/// rather than call one.
+#[test]
+fn repeated_calls_stay_correct() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()).expect("load");
+
+    for _ in 0..20 {
+        let out = bridge
+            .execute_tool("rot13", r#"{"text":"abc"}"#)
+            .expect("call");
+        assert_eq!(out.content, "nop");
+    }
+}
+
+/// A name the plugin never advertised is rejected by the host before
+/// it reaches the guest.
+#[test]
+fn unknown_tool_name_is_rejected() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()).expect("load");
+
+    let err = bridge
+        .execute_tool("definitely_not_a_tool", "{}")
+        .unwrap_err();
+    assert!(err.contains("does not export"), "{err}");
+}
+
+/// The plugin reports bad input as a failed tool call rather than
+/// trapping — the model gets something it can correct from.
+#[test]
+fn plugin_reports_bad_arguments_as_tool_error() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine.load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()).expect("load");
+
+    // `text` missing entirely.
+    let out = bridge.execute_tool("rot13", r#"{}"#).expect("no trap");
+    assert!(out.is_error, "missing field should be a tool error");
+    assert!(out.content.contains("text"), "{}", out.content);
+
+    // Not even JSON.
+    let out = bridge
+        .execute_tool("rot13", "this is not json")
+        .expect("no trap");
+    assert!(out.is_error);
+}
+
+/// A core module (not a component) must be refused with a message
+/// that says why, not a bare "translation error".
+#[test]
+fn core_module_is_rejected_with_a_useful_message() {
+    let engine = PluginEngine::new().expect("engine init");
+    let mut p = std::env::temp_dir();
+    p.push(format!("nanopi-core-mod-{}.wasm", std::process::id()));
+    // Smallest valid core module: magic + version.
+    std::fs::write(&p, [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]).unwrap();
+
+    match engine.load(&p, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new()) {
+        Ok(_) => panic!("a core module is not a component and must be refused"),
+        Err(e) => assert!(e.contains("compile") || e.contains("list-tools"), "{e}"),
+    }
+    let _ = std::fs::remove_file(&p);
+}
+
+// ── host-fs-read capability gate ────────────────────────────────────
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("nanopi-fs-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// With `allow_fs = false` (the default), the host refuses before it
+/// ever touches the filesystem — and says which knob to turn.
+#[test]
+fn fs_read_denied_without_allow_fs() {
+    let dir = scratch_dir("denied");
+    std::fs::write(dir.join("secret.txt"), "classified").unwrap();
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("readfile", r#"{"path":"secret.txt"}"#)
+        .expect("no trap");
+    assert!(out.is_error, "denied read must be a tool error");
+    assert!(out.content.contains("allow_fs"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With the gate open, a file inside cwd reads fine.
+#[test]
+fn fs_read_allowed_inside_cwd() {
+    let dir = scratch_dir("allowed");
+    std::fs::write(dir.join("notes.txt"), "line one\nline two\n").unwrap();
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("readfile", r#"{"path":"notes.txt"}"#)
+        .expect("no trap");
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("18 bytes"), "{}", out.content);
+    assert!(out.content.contains("2 lines"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Traversal out of cwd is refused even with the gate open. The guard
+/// canonicalizes first, so `../` cannot slip past a prefix check the
+/// way it does against a raw string comparison.
+#[test]
+fn fs_read_refuses_traversal_out_of_cwd() {
+    let dir = scratch_dir("traversal");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    for probe in [
+        r#"{"path":"../../../../etc/hostname"}"#,
+        r#"{"path":"/etc/hostname"}"#,
+    ] {
+        let out = bridge.execute_tool("readfile", probe).expect("no trap");
+        assert!(out.is_error, "{probe} should be refused, got {}", out.content);
+        // Either containment refused it, or the path didn't resolve —
+        // both are correct refusals; what matters is no contents leak.
+        assert!(
+            !out.content.contains("bytes,"),
+            "{probe} leaked file contents: {}",
+            out.content
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlink pointing outside cwd is refused too — canonicalization
+/// resolves it before the containment check, which a raw prefix test
+/// would miss.
+#[test]
+#[cfg(unix)]
+fn fs_read_refuses_symlink_escape() {
+    let dir = scratch_dir("symlink");
+    std::os::unix::fs::symlink("/etc/hostname", dir.join("sneaky")).unwrap();
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), dir.clone(), true, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("readfile", r#"{"path":"sneaky"}"#)
+        .expect("no trap");
+    assert!(out.is_error, "symlink escape must be refused: {}", out.content);
+    assert!(out.content.contains("escapes"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── host-http-get capability gate ───────────────────────────────────
+
+/// A throwaway HTTP server on an ephemeral loopback port.
+///
+/// The tests need a real socket — the gate is only meaningfully tested
+/// by watching a request either arrive or not — but they must not need
+/// the internet. A test that depends on `api.github.com` being
+/// reachable fails for reasons that have nothing to do with nanopi,
+/// and on a machine behind a filtering firewall it hangs rather than
+/// failing fast.
+///
+/// Accepts in a loop rather than once, so a retried or probing request
+/// does not leave a later one hanging on a dead listener. The thread
+/// is deliberately never joined: it dies with the test process, and
+/// shutdown plumbing would be more machinery than the fixture is
+/// worth.
+fn spawn_test_server(body: &'static str) -> u16 {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Drain the request head. Without this the client can see
+            // a reset instead of the response.
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                 Content-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    port
+}
+
+/// With `allow_network = false` (the default), the host refuses before
+/// it opens a socket — and names the knob to turn.
+///
+/// The allowlist is deliberately NON-empty and *would* permit this
+/// URL, so the refusal can only have come from the `allow_network`
+/// gate. With an empty allowlist this test would pass even if the
+/// first gate were deleted.
+#[test]
+fn http_get_denied_without_allow_network() {
+    let port = spawn_test_server("SERVED-BODY-DENIED-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["127.0.0.1".to_string()],
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            Vec::new(),
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(out.is_error, "denied fetch must be a tool error");
+    assert!(out.content.contains("allow_network"), "{}", out.content);
+    // Cheapest proof no request was made: the server's distinctive
+    // body never appears.
+    assert!(
+        !out.content.contains("SERVED-BODY-DENIED-CASE"),
+        "the request should never have been sent: {}",
+        out.content
+    );
+}
+
+/// Gate open, but the URL's host is not covered by the allowlist.
+#[test]
+fn http_get_denied_when_host_not_in_allowlist() {
+    let port = spawn_test_server("SERVED-BODY-ALLOWLIST-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["api.github.com".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            Vec::new(),
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(out.is_error, "unlisted host must be refused");
+    assert!(out.content.contains("url_allowlist"), "{}", out.content);
+    assert!(
+        !out.content.contains("SERVED-BODY-ALLOWLIST-CASE"),
+        "the request should never have been sent: {}",
+        out.content
+    );
+}
+
+/// An empty allowlist denies everything, even with the capability
+/// switched on. This is what `config.toml.example` promises, and it is
+/// what makes the capability opt-in per host rather than only per
+/// plugin — do not "fix" empty to mean allow-all.
+#[test]
+fn http_get_empty_allowlist_denies_everything() {
+    let port = spawn_test_server("SERVED-BODY-EMPTY-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, true, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(
+        out.is_error,
+        "empty allowlist must deny, got: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("SERVED-BODY-EMPTY-CASE"),
+        "the request should never have been sent: {}",
+        out.content
+    );
+}
+
+/// Both gates open: the body reaches the guest verbatim.
+///
+/// The allowlist entry is a bare `127.0.0.1` while the server is on an
+/// ephemeral port — matching is on the host, so the port is
+/// irrelevant, which is exactly why the entry can be written without
+/// knowing the port ahead of time.
+#[test]
+fn http_get_allowed_host_reaches_server() {
+    let port = spawn_test_server("SERVED-BODY-ALLOWED-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["127.0.0.1".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            Vec::new(),
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#))
+        .expect("no trap");
+    assert!(!out.is_error, "allowed fetch failed: {}", out.content);
+    assert!(
+        out.content.contains("SERVED-BODY-ALLOWED-CASE"),
+        "body did not reach the guest: {}",
+        out.content
+    );
+}
+
+/// `url_allowlist = ["*"]` reaches a host it never named.
+///
+/// The unit tests cover the matcher; this one covers the whole path —
+/// config value, `PluginState`, host function, real socket — because
+/// the failure mode users actually hit is a pattern that parses but
+/// never reaches the gate. `localhost` rather than `127.0.0.1` on
+/// purpose: a wildcard that only worked for entries resembling
+/// something in the list would still pass a same-string test.
+#[test]
+fn http_get_wildcard_allowlist_reaches_an_unnamed_host() {
+    let port = spawn_test_server("SERVED-BODY-WILDCARD-CASE");
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["*".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            Vec::new(),
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", &format!(r#"{{"url":"http://localhost:{port}/"}}"#))
+        .expect("no trap");
+    assert!(!out.is_error, "wildcard fetch failed: {}", out.content);
+    assert!(
+        out.content.contains("SERVED-BODY-WILDCARD-CASE"),
+        "body did not reach the guest: {}",
+        out.content
+    );
+}
+
+/// The wildcard widens hosts, not schemes. `file://` under `*` would
+/// hand the plugin the filesystem read that `allow_fs` exists to gate
+/// — a capability it was never granted here.
+#[test]
+fn wildcard_allowlist_still_refuses_non_http_schemes() {
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["*".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            Vec::new(),
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool("fetch", r#"{"url":"file:///etc/hostname"}"#)
+        .expect("no trap");
+    assert!(out.is_error, "file:// was allowed: {}", out.content);
+    assert!(out.content.contains("url_allowlist"), "{}", out.content);
+}
+
+/// Serve a single `302` pointing at `location`, forever. Same
+/// never-joined-thread shape as `spawn_test_server`.
+fn spawn_redirect_server(location: String) -> u16 {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    port
+}
+
+/// A `3xx` must not walk the fetch off the allowlist.
+///
+/// The allowlist covers `127.0.0.1`, which permits the *first* hop. That
+/// server then redirects to `localhost` — a different host string, and so
+/// NOT allowlisted, even though it resolves to the same loopback interface.
+/// That asymmetry is what makes this test both hermetic and sharp: the
+/// redirect target is a real, reachable, in-process server, so if
+/// `redirect::Policy::none()` were ever dropped the client would follow the
+/// hop, succeed, and hand the guest a body it was never allowed to see —
+/// failing this test immediately and by name rather than hanging on an
+/// unroutable address until the 10s timeout.
+///
+/// The allowlist is checked once, against the URL the guest supplied. Nothing
+/// re-checks the `Location` header, which is precisely why not following it is
+/// the control.
+#[test]
+fn http_get_does_not_follow_redirect_off_the_allowlist() {
+    let target_port = spawn_test_server("SERVED-BODY-REDIRECT-TARGET");
+    let redirect_port = spawn_redirect_server(format!("http://localhost:{target_port}/"));
+
+    let engine = PluginEngine::new().expect("engine");
+    let (bridge, _) = engine
+        .load(
+            &fixture(),
+            vec!["127.0.0.1".to_string()],
+            std::env::temp_dir(),
+            false,
+            true,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            Vec::new(),
+        )
+        .expect("load");
+
+    let out = bridge
+        .execute_tool(
+            "fetch",
+            &format!(r#"{{"url":"http://127.0.0.1:{redirect_port}/"}}"#),
+        )
+        .expect("no trap");
+
+    assert!(out.is_error, "an unfollowed 3xx must surface as an error");
+    assert!(
+        out.content.contains("302"),
+        "the redirect should be reported as its status: {}",
+        out.content
+    );
+    // The load-bearing assertion: the body behind the redirect must never
+    // reach the guest.
+    assert!(
+        !out.content.contains("SERVED-BODY-REDIRECT-TARGET"),
+        "redirect was followed off the allowlist: {}",
+        out.content
+    );
+}
+
+// ── Slash commands ──────────────────────────────────────────────────
+
+/// The whole command path against a real component: `list-commands`
+/// reaches the host, and each of the three action shapes round-trips.
+#[test]
+fn loads_and_executes_slash_commands() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _specs) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("example component must load");
+
+    let mut cmds: Vec<String> = bridge.command_specs().into_iter().map(|c| c.name).collect();
+    cmds.sort();
+    assert_eq!(cmds, vec!["explain", "todo"]);
+
+    // Descriptions are what the palette shows, so an empty one is a
+    // silent quality failure the same way a tool description is.
+    let todo = bridge
+        .command_specs()
+        .into_iter()
+        .find(|c| c.name == "todo")
+        .unwrap();
+    assert!(todo.description.contains("TODO"), "{}", todo.description);
+
+    match bridge.execute_command("todo", "").expect("todo call") {
+        CommandAction::Print(t) => assert!(t.contains("todo:"), "{t}"),
+        other => panic!("expected Print, got {other:?}"),
+    }
+    match bridge
+        .execute_command("explain", "lifetimes")
+        .expect("explain call")
+    {
+        CommandAction::SendUserMessage(t) => assert!(t.contains("lifetimes"), "{t}"),
+        other => panic!("expected SendUserMessage, got {other:?}"),
+    }
+    // A user-level failure is an in-band action, not an Err.
+    match bridge.execute_command("explain", "").expect("explain call") {
+        CommandAction::Error(t) => assert!(t.contains("usage"), "{t}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+/// `args` is raw text, deliberately not JSON. Interior runs of spaces
+/// must survive — proving the host hands the line through rather than
+/// tokenizing it.
+#[test]
+fn command_args_reach_the_guest_verbatim() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    match bridge
+        .execute_command("todo", "a b  c   d")
+        .expect("todo call")
+    {
+        CommandAction::Print(t) => assert!(t.ends_with("a b  c   d"), "{t}"),
+        other => panic!("expected Print, got {other:?}"),
+    }
+}
+
+/// An unknown name is refused host-side, without entering the guest —
+/// the command namespace is checked against `list-commands`, never
+/// against the tool list.
+#[test]
+fn an_unknown_command_is_refused_without_entering_the_guest() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    let err = bridge.execute_command("nope", "").unwrap_err();
+    assert!(err.contains("nope"), "{err}");
+
+    // A *tool* name must not be reachable as a command, or the two
+    // namespaces would leak into each other.
+    let err = bridge.execute_command("rot13", "").unwrap_err();
+    assert!(err.contains("rot13"), "{err}");
+}
+
+/// The backward-compatibility guarantee, end to end: `runaway-plugin`
+/// targets `--world extension` and exports no `list-commands`, so the
+/// host's optional resolution must let it load with zero commands
+/// rather than rejecting it. If this ever fails, check that the fixture
+/// was not regenerated against `extension-commands`.
+#[test]
+fn a_component_without_list_commands_still_loads() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runaway-plugin.component.wasm");
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, specs) = engine
+        .load(&path, Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("a command-less component must still load");
+
+    assert!(!specs.is_empty(), "its tools still register");
+    assert!(
+        bridge.command_specs().is_empty(),
+        "and it advertises no commands"
+    );
+}
+
+/// Tools and commands share one instance and one mutex, so a trap on
+/// either side must leave the other usable. Both directions, because
+/// only the tool→command direction catches a `PluginRebuild::build`
+/// that forgot to re-resolve `execute-command` — whose failure mode is
+/// silent: the palette keeps advertising a command that can no longer
+/// run.
+#[test]
+fn a_trap_on_either_side_leaves_the_other_callable() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    // Baseline.
+    assert!(bridge.execute_command("todo", "").is_ok());
+
+    // Blow the guest's 1 MiB arena from the tool side.
+    let huge = "x".repeat(3 * 1024 * 1024);
+    let err = bridge
+        .execute_tool("rot13", &format!(r#"{{"text":"{huge}"}}"#))
+        .unwrap_err();
+    assert!(err.contains("trapped"), "{err}");
+
+    // …a command still works, which only holds if the rebuild
+    // re-resolved `execute-command`.
+    match bridge.execute_command("todo", "after tool trap") {
+        Ok(CommandAction::Print(t)) => assert!(t.contains("after tool trap"), "{t}"),
+        other => panic!("command must survive a tool trap, got {other:?}"),
+    }
+
+    // Now the other direction: trap from the command side.
+    let err = bridge.execute_command("todo", &huge).unwrap_err();
+    assert!(err.contains("trapped"), "{err}");
+
+    let out = bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect("tool must survive a command trap");
+    assert_eq!(out.content, "nop");
+}
+
+/// The epoch deadline is consumed when reached, so every guest entry
+/// has to re-arm it. Calling a tool and then a command proves the
+/// command path does its own arming — without it, the second call
+/// enters a store whose deadline already elapsed and traps instantly.
+#[test]
+fn the_command_path_rearms_the_epoch_deadline() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), unique_name(), Vec::new())
+        .expect("load");
+
+    bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect("tool call");
+    bridge
+        .execute_command("todo", "")
+        .expect("a command after a tool must not trap on a stale deadline");
+}
+
+/// The event epoch budget must actually interrupt guest code.
+///
+/// Everything else about the budget was asserted structurally — a
+/// `const` assertion that 2 < 30. That proves the number is smaller,
+/// not that it is enforced, and "enforced" is the whole claim: an event
+/// fires on the critical path of every turn, so a handler that never
+/// returns would wedge every turn rather than one tool call.
+///
+/// The fixture spins on an unbounded volatile loop when the payload
+/// carries the spin sentinel. Only the deadline can end it, so if the
+/// budget were not wired this test would hang rather than fail — which
+/// is why the assertion is on elapsed time, with a ceiling far below
+/// the 30s tool budget so a wrongly-inherited tool budget also fails.
+#[test]
+fn a_runaway_event_handler_is_bounded_by_the_event_budget() {
+    let engine = PluginEngine::new().expect("engine init");
+    let (bridge, _) = engine
+        .load(
+            &events_fixture(),
+            Vec::new(),
+            std::env::temp_dir(),
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+            false,
+            std::env::temp_dir(),
+            unique_name(),
+            vec!["input".to_string()],
+        )
+        .expect("events component must load");
+
+    let started = std::time::Instant::now();
+    bridge.handle_event("input", "spin please nanopi-test-spin forever");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "handler ran {elapsed:?} — the event budget (2s) does not look enforced; \
+         15s is chosen to sit between it and the 30s tool budget, so inheriting \
+         the tool budget fails here too"
+    );
+
+    // A blown deadline is a trap, and a trap must leave the plugin
+    // usable — same contract as the trap test above.
+    let out = bridge
+        .execute_tool("greet", r#"{"name":"nanopi"}"#)
+        .expect("greet call after the deadline trap");
+    assert!(!out.is_error, "{}", out.content);
+}
+
+// ── hot reload (v0.12) ────────────────────────────────────────────────
+//
+// The hazard these pin is not "the old bridge is freed too early" — it
+// is that the old bridge still WORKS. `WasmTool`, `WasmCommandHandler`
+// and `WasmEventHandler` each hold an `Arc<dyn WasmExecuteBridge>`, so a
+// call in flight when `/reload` lands would otherwise run the replaced
+// instance and have its result read as the new plugin's.
+
+/// Load the same plugin NAME twice, as a reload does, and the first
+/// bridge must refuse rather than execute — naming the reload, in-band
+/// (`docs/plugin-capabilities.md` invariant 3).
+#[test]
+fn a_replaced_bridge_refuses_instead_of_running_the_old_instance() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("fixture must load")
+            .0
+    };
+
+    let old = load(name.clone());
+    // Works before the reload — otherwise the assertion below would
+    // pass for the wrong reason.
+    assert_eq!(
+        old.execute_tool("rot13", r#"{"text":"abc"}"#).unwrap().content,
+        "nop"
+    );
+
+    let new = load(name.clone());
+
+    let err = old
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect_err("the replaced instance must refuse");
+    assert!(
+        err.contains("/reload") && err.contains(&*name),
+        "the refusal must name the reload and the plugin: {err}"
+    );
+
+    // And the replacement is fully callable — a refusal mechanism that
+    // also broke the new instance would pass the assertion above.
+    assert_eq!(
+        new.execute_tool("rot13", r#"{"text":"abc"}"#).unwrap().content,
+        "nop"
+    );
+}
+
+/// The refusal happens BEFORE the guest runs, not after it.
+///
+/// Both checks produce the same `Err`, so the test above passes with
+/// the pre-call check deleted — verified by reverting it, which came
+/// back GREEN. The two are only distinguishable by whether the guest
+/// ran, and the only handle on that from outside is time: `busy` burns
+/// ~1s of guest time (that is what
+/// `a_busy_plugin_drops_the_event_and_counts_it` relies on), so a
+/// refusal that returns in a fraction of that cannot have executed it.
+/// This matters beyond tidiness — the guest of a replaced instance may
+/// write files or send HTTP requests, and side effects are the one part
+/// of a call a refusal cannot take back.
+#[test]
+fn a_refused_call_never_enters_the_guest() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("events fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+
+    // Establish the cost of actually running it, on this machine, so
+    // the bound below is not a guess about CPU speed.
+    let started = std::time::Instant::now();
+    old.execute_tool("busy", "{}").expect("busy must run while live");
+    let ran_for = started.elapsed();
+    assert!(
+        ran_for > std::time::Duration::from_millis(60),
+        "busy is the slow tool this test is built on; it took {ran_for:?}"
+    );
+
+    let _new = load(name.clone());
+
+    let started = std::time::Instant::now();
+    let err = old
+        .execute_tool("busy", "{}")
+        .expect_err("the replaced instance must refuse");
+    let refused_in = started.elapsed();
+    assert!(err.contains("/reload"), "{err}");
+    assert!(
+        refused_in < ran_for / 4,
+        "the refusal took {refused_in:?} against a {ran_for:?} run — the guest ran \
+         and was only refused afterwards"
+    );
+}
+
+/// The commands half, same shape. A plugin command is dispatched
+/// through the bridge too, and the palette can hand out a stale handler
+/// (a spawned command task holds it across the reload).
+#[test]
+fn a_replaced_bridge_refuses_commands_too() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    // The example fixture is the one with `list-commands`; the events
+    // fixture deliberately has none.
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+    let command = old
+        .command_specs()
+        .first()
+        .map(|s| s.name.clone())
+        .expect("the events fixture exports at least one command");
+    assert!(matches!(
+        old.execute_command(&command, ""),
+        Ok(CommandAction::Print(_)) | Ok(CommandAction::Error(_)) | Ok(CommandAction::SendUserMessage(_))
+    ));
+
+    let _new = load(name.clone());
+
+    let err = old
+        .execute_command(&command, "")
+        .expect_err("the replaced instance must refuse the command");
+    assert!(
+        err.contains("/reload"),
+        "the refusal must name the reload: {err}"
+    );
+}
+
+/// A reload that lands WHILE a tool call is inside the guest.
+///
+/// This is the case the pre-call check cannot cover: the bridge holds
+/// its mutex for the whole guest call, so the swap necessarily happened
+/// mid-call. The call is allowed to finish — there is no way to
+/// interrupt guest code that is already running, short of the epoch
+/// deadline killing it — and its RESULT is then refused rather than
+/// reported, because reporting it would attribute the replaced
+/// instance's work to the plugin now loaded. The wording says the call
+/// ran and its side effects stand.
+#[test]
+fn a_reload_landing_mid_call_refuses_the_result_rather_than_reporting_it() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, Vec::new())
+            .expect("events fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+
+    let busy_bridge = old.clone();
+    // ~1s of guest time, as `a_busy_plugin_drops_the_event_and_counts_it`
+    // uses it, so the reload below lands while this is still inside the
+    // guest.
+    let call = std::thread::spawn(move || busy_bridge.execute_tool("busy", "{}"));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // The swap is published directly rather than by standing a second
+    // instance up, and the first version of this test is why: a real
+    // `load` spends ~815ms in Cranelift, which is LONGER than the busy
+    // tool runs, so the reload landed after the call had already
+    // finished and the test passed vacuously
+    // (`Ok(ToolOutput { content: "done (255)" })`). This is the exact
+    // pair of calls `load` ends with, so what is being skipped is the
+    // compile, not the mechanism.
+    nanopi::wasm::generation::activate(&name, nanopi::wasm::generation::next_id());
+
+    let err = call
+        .join()
+        .expect("busy call thread")
+        .expect_err("a result from the replaced instance must not be reported as success");
+    assert!(
+        err.contains("WHILE this call was running"),
+        "the refusal must say the call ran, not that it was refused before starting: {err}"
+    );
+    assert!(
+        err.contains("side effects"),
+        "the user has to be told the call's side effects stand: {err}"
+    );
+}
+
+/// Event delivery to a replaced instance stops, and stops SILENTLY —
+/// `dropped_events` means "the plugin was busy" and is read as a
+/// tuning signal, so counting a reload there would misreport it.
+#[test]
+fn a_replaced_bridge_receives_no_more_events() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let load = |n: std::sync::Arc<str>| {
+        engine
+            .load(&events_fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), n, vec!["turn_start".to_string()])
+            .expect("events fixture must load")
+            .0
+    };
+    let old = load(name.clone());
+    // Read before anything else touches the instance, so the value put
+    // back on the live row below is the generation this bridge was
+    // loaded as, whatever the calls in between do.
+    let old_id = old.instance_id();
+
+    // One delivery before the reload, so the tally proves the plugin
+    // was receiving.
+    old.handle_event("turn_start", "{}");
+    let new = load(name.clone());
+    old.handle_event("turn_start", "{}");
+
+    let seen = new.execute_tool("events_seen", "{}").expect("events_seen");
+    assert_eq!(
+        seen.content, "{\"total\":0,\"by_event\":{}}",
+        "the fresh instance must not have seen the delivery aimed at the replaced one"
+    );
+
+    // The assertion above is necessary but NOT sufficient, and reverting
+    // the check proves it: the two instances share nothing but a name,
+    // so the fresh tally is zero whether or not the delivery reached the
+    // OLD guest. Ask the old guest directly, by putting it back on the
+    // live row so its own tools answer again. It must still be at 1 —
+    // the delivery after the reload must not have landed anywhere.
+    nanopi::wasm::generation::activate(&name, old_id);
+    let old_seen = old.execute_tool("events_seen", "{}").expect("events_seen");
+    assert_eq!(
+        old_seen.content, "{\"total\":1,\"by_event\":{\"turn_start\":1}}",
+        "the replaced instance received the event it was supposed to be past"
+    );
+    assert_eq!(
+        old.dropped_events(),
+        0,
+        "a reload is not the plugin being busy — dropped_events must not count it"
+    );
+}
+
+/// A plugin that vanishes from `[[extensions]]` is retired: nothing is
+/// live for it, so an in-flight call refuses rather than running code
+/// the user has removed from their config.
+#[test]
+fn a_retired_plugin_has_no_live_instance_left() {
+    let engine = PluginEngine::new().expect("engine init");
+    let name = unique_name();
+    let (bridge, _) = engine
+        .load(&fixture(), Vec::new(), std::env::temp_dir(), false, false, false, false, Vec::new(), false, std::env::temp_dir(), name.clone(), Vec::new())
+        .expect("fixture must load");
+    assert!(bridge.execute_tool("rot13", r#"{"text":"abc"}"#).is_ok());
+
+    nanopi::wasm::generation::retire(&name);
+
+    let err = bridge
+        .execute_tool("rot13", r#"{"text":"abc"}"#)
+        .expect_err("a retired plugin must not still be callable");
+    assert!(err.contains("/reload"), "{err}");
+}
+
+/// Host-side plugin state that a reload must NOT reset: the plugin's
+/// spent session budget.
+///
+/// Lives in THIS binary, not beside the other reload tests in
+/// `agent::build`, and the reason is a race rather than tidiness:
+/// `plugin_send`'s state is process-wide and its own unit tests
+/// serialize on a private lock that is NOT `crate::test_lock()`, so a
+/// new lib test touching that state would race them. A separate test
+/// process has the state to itself.
+///
+/// The claim being pinned is the trap argument one step sharper: the cap
+/// exists so a plugin cannot spend the user's money in a loop, and a
+/// reload that refunded it would make the cap resettable by the very
+/// plugin that could ask the model to suggest a reload.
+#[test]
+fn a_reload_does_not_refund_a_plugins_spent_session_budget() {
+    use nanopi::agent::build::{AgentBuildInputs, SkillLoadPolicy};
+    use nanopi::agent::loop_::{Agent, HooksConfig};
+    use nanopi::agent::permission::{PermissionGate, TrustLevel};
+    use nanopi::agent::prompt_override::PromptOverrides;
+    use nanopi::config::ExtensionConfig;
+    use nanopi::provider::openai::OpenAiProvider;
+    use nanopi::tool::ToolRegistry;
+
+    let dir = std::env::temp_dir().join(format!("nanopi-reload-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let plugin = dir.join("reload-budget.wasm");
+    std::fs::copy(fixture(), &plugin).unwrap();
+    let ext = || ExtensionConfig {
+        path: plugin.clone(),
+        allow_send_message: true,
+        ..Default::default()
+    };
+
+    let mut agent = Agent::build_fresh(AgentBuildInputs {
+        cwd: dir.clone(),
+        registry: ToolRegistry::standard(),
+        provider: Box::new(OpenAiProvider::new("", "", "")),
+        session_path: dir.join("session.jsonl"),
+        session_id: "test".into(),
+        permission: PermissionGate::new(false, TrustLevel::Distrusted),
+        hooks: HooksConfig::default(),
+        model: "m".into(),
+        base_url: "http://localhost".into(),
+        api_key: String::new(),
+        skill_load: SkillLoadPolicy {
+            no_discovery: true,
+            ..Default::default()
+        },
+        no_context_files: true,
+        prompt_overrides: PromptOverrides::default(),
+        initial_follow_up: None,
+        tool_exec_mode: Default::default(),
+        tool_exec_overrides: Default::default(),
+        extensions: vec![ext()],
+    })
+    .0;
+
+    nanopi::plugin_send::install(nanopi::plugin_send::Sink { steer_tx: None });
+    let cap = nanopi::plugin_send::MAX_PLUGIN_TURNS_PER_SESSION;
+    for i in 0..cap {
+        nanopi::plugin_send::send("reload-budget", "hi")
+            .unwrap_or_else(|e| panic!("send {i} of {cap} should be within the cap: {e}"));
+        nanopi::plugin_send::take_pending();
+        // In THIS order: rule 2 refuses a plugin sending during a turn
+        // its own message started, and `take_pending` stages exactly
+        // that origin for `reset_turn` to promote — so it has to be
+        // cleared before the promotion, not after.
+        nanopi::plugin_send::mark_turn_origin(None);
+        nanopi::plugin_send::reset_turn();
+    }
+    let spent = nanopi::plugin_send::send("reload-budget", "hi")
+        .expect_err("the cap must be reached");
+
+    let report = agent.reload_extensions(&[ext()]);
+    assert_eq!(report.replaced, vec!["reload-budget".to_string()]);
+
+    let after = nanopi::plugin_send::send("reload-budget", "hi")
+        .expect_err("a reload must not refund the cap");
+    assert_eq!(after, spent, "the same refusal, before and after the reload");
+}

@@ -52,6 +52,305 @@ base_url = "https://api.openai.com/v1"
 # MiMo ignores `cache_control` and `thinking.budget_tokens` on its
 # Anthropic surface, so thinking budgets there are advisory only.
 
+# ─── Tool execution (v0.11.0) ───────────────────────────────────────
+
+# How tool calls from a single LLM response are run.
+#   "parallel"   (default) all calls run concurrently
+#   "sequential" one at a time, in the order the model emitted them
+#
+# You do NOT need sequential to make same-file edits safe. In parallel
+# mode, `edit` and `write` calls targeting the same file are detected
+# (by resolved path, so `foo.txt` and `./foo.txt` count as one file)
+# and run one after another in the order the model emitted them.
+# Different files still run concurrently.
+#
+# What sequential is actually for:
+#
+#   1. Concurrent `bash` data loss. `bash` is NOT serialized — a
+#      command string cannot be analyzed to know which files it
+#      touches, so nanopi does not try. Two same-batch `bash` calls
+#      doing a read-modify-write of one file (`sed -i`, a formatter, a
+#      codemod) can each snapshot the file before the other writes, and
+#      whichever finishes last silently reverts the other. Both report
+#      success; nothing surfaces the loss. Sequential is the mitigation:
+#      the first command is awaited to completion before the second is
+#      spawned at all.
+#   2. Stateful chains where order matters across different tools —
+#      e.g. a `write` whose result the next `bash` must see.
+#
+# The cost is real: sequential serializes the *entire* batch, including
+# reads and greps that had no reason to wait. Reach for it if the model
+# is driving shell-based rewrites of the same files, or if you hit an
+# ordering bug; otherwise leave the default.
+# tool_exec_mode = "sequential"
+
+# ─── Per-tool execution mode (v0.12) ────────────────────────────────
+#
+# A tool can declare that it is unsafe to run alongside anything else,
+# and one such tool anywhere in a batch serializes the whole batch.
+# Today exactly one built-in declares it: `bash`.
+#
+# Why bash: its `command` is an opaque shell string, so nothing can
+# infer which files it will open. `edit` and `write` name their `path`,
+# so same-file calls are serialized per path and different files still
+# run concurrently. bash gets neither. Two concurrent bash calls doing
+# read-modify-write on one file — any `sed -i`, formatter or codemod —
+# used to race, and BOTH reported success while one silently reverted
+# the other.
+#
+# This table overrides that, in both directions. It is yours to set and
+# yours to own:
+#
+#   [tool_exec_overrides]
+#   bash = "parallel"     # give me the speed back; I know what my
+#                         # commands touch
+#   read = "sequential"   # or force something to serialize
+#
+# A key naming a tool that does not exist is a startup error, not a
+# silent no-op — a misspelled `bahs` would otherwise leave you thinking
+# concurrent bash is simply still broken. Plugin tools are governed by
+# their own executionMode and cannot be listed here.
+
+# ─── WASM extensions (v0.11.0) ──────────────────────────────────────
+#
+# Requires a build with `--features wasm`. The stock release binary
+# does NOT include the runtime — entries here are ignored with a
+# warning on stderr.
+#
+# Each entry points at a `.wasm` component, or a directory of them
+# (scanned one level deep, non-recursive). Tools the component
+# exports are registered alongside the built-ins and offered to the
+# model like any other tool. A plugin may not shadow an existing tool
+# name; collisions are reported and skipped.
+#
+# A component may also export slash commands (`list-commands` /
+# `execute-command`), which appear in the `/` palette tagged with the
+# plugin's name. Those are interactive-mode only — `nanopi -p` has no
+# palette, though the plugin's tools still work there. Command
+# collisions are refused rather than renamed: a name belonging to a
+# built-in is skipped, and a name claimed by two plugins registers
+# for neither.
+#
+# Plugins load at startup and on /new, /resume, /fork, /import —
+# and on `/reload`, which re-reads this section and hot-swaps the
+# live registry (v0.12.0). Editing a grant here and running
+# `/reload` takes effect immediately. A plugin whose .wasm stops
+# loading keeps the instance already running, and /reload says so;
+# a tool call in flight when the swap lands is refused in-band
+# rather than run against replaced code.
+#
+# An UNKNOWN KEY inside [[extensions]] is a config LOAD ERROR as of
+# v0.12.0, not a silently-ignored line. A misspelled grant
+# (allow_stroe = true) used to read as a capability the user believed
+# they had granted and had not, with nothing anywhere saying so.
+#
+# Fields:
+#   path            .wasm file or directory. Supports ~ and $HOME.
+#   max_files       Cap when path is a directory. Default 64.
+#   allow_fs        Let the plugin call host-fs-read. Default false.
+#                   Even when true, reads are confined to the working
+#                   directory: paths are canonicalized first, so `../`
+#                   and outward-pointing symlinks are refused.
+#   allow_store     Let the plugin call host-store-get / host-store-set
+#                   (v0.12.0). Default false. Gives the plugin its own
+#                   keyed store that SURVIVES A RESTART, at
+#                   ~/.nanopi/extensions/<stem>/store.json — one JSON
+#                   object per plugin, where <stem> is the .wasm file
+#                   name without its extension.
+#                   KEYS, NOT PATHS: the plugin supplies a map key and
+#                   the host decides which file that lands in, so this
+#                   grants no filesystem reach — nothing here needs the
+#                   confinement rules allow_fs has.
+#                   Bounds, all reported in-band and all refusing
+#                   WITHOUT storing anything: 1 MiB total, 1000 keys,
+#                   keys up to 128 chars. A key that was already there
+#                   can always be replaced, even at the key cap.
+#                   Two plugins whose .wasm files share a file stem
+#                   where either sets allow_store is a LOAD ERROR for
+#                   BOTH — they would share one store.json, and one
+#                   silently overwriting the other's memory is worse
+#                   than refusing to start either. Rename one file.
+#                   Combining allow_store with allow_network = true is
+#                   warned about at startup: a durable profile built up
+#                   across restarts, plus a way off the machine.
+#   allow_context   Let the plugin call host-set-context (v0.12.0).
+#                   Default false. The plugin declares text and the
+#                   host folds it into the system prompt at the start
+#                   of each turn, under a header naming the plugin:
+#                     [context contributed by extension "memory"]
+#                   That attribution is not decoration — without it the
+#                   model cannot tell a plugin's instructions from
+#                   yours.
+#                   REPLACES, never appends: each call supersedes the
+#                   plugin's previous contribution, so ten turns cannot
+#                   accumulate ten copies. Passing "" clears it.
+#                   Bounded at 4 KiB per plugin, measured in bytes,
+#                   each plugin capped separately. Small on purpose:
+#                   this text enters EVERY request for the rest of the
+#                   session, so an unbounded contribution multiplies
+#                   the cost of every turn. Over the bound the call is
+#                   refused in-band and the PREVIOUS contribution still
+#                   stands.
+#                   Every CHANGE is announced in your scrollback, naming
+#                   the plugin — a contribution is invisible otherwise,
+#                   since you never see the system prompt. Re-declaring
+#                   the same text says nothing.
+#                   Combining allow_context with allow_network = true is
+#                   warned about at startup, and it is the sharpest of
+#                   these combinations: a remote source it controls can
+#                   then shape how the agent behaves.
+#   allow_network   Let the plugin call host-http-get. Default false.
+#                   Only http/https; requests time out after 10s, and
+#                   redirects are not followed, so a 3xx cannot walk a
+#                   fetch onto a host you did not approve.
+#   url_allowlist   Hosts host-http-get may reach. EMPTY DENIES
+#                   EVERYTHING — allow_network alone reaches nothing.
+#                   Matching is on the URL's host, never a substring.
+#                   Three spellings:
+#                     "github.com"    the host AND its subdomains, any
+#                                     port (api.github.com:8443 passes;
+#                                     evilgithub.com does not)
+#                     "*.github.com"  subdomains ONLY — the apex
+#                                     github.com is refused
+#                     "*"             any http/https host. For plugins
+#                                     whose hosts aren't knowable up
+#                                     front. This turns the second gate
+#                                     off: allow_network becomes the
+#                                     only check, link-local metadata
+#                                     endpoints (169.254.169.254)
+#                                     included. nanopi warns at startup
+#                                     when it sees this.
+#                   A star anywhere else ("api.*.com") is refused
+#                   rather than widened. Effective only when
+#                   allow_network = true.
+#   allow_tools     Built-in tools this plugin may CALL, by name
+#                   (v0.12.0), via host-call-tool. Absent or empty
+#                   DENIES EVERY TOOL, like url_allowlist and events.
+#                   Per tool, not per plugin, because the tools are not
+#                   equivalent: allow_tools = ["bash"] is arbitrary
+#                   command execution, and it walks straight past
+#                   allow_fs's cwd confinement and url_allowlist's
+#                   per-host approval. nanopi prints the escalated
+#                   [Extensions] warning when it sees bash here.
+#                   Built-ins ONLY — bash, edit, find, grep, ls, read,
+#                   write. A plugin may not call another plugin's tool
+#                   (that would deadlock: the tool path takes a
+#                   blocking lock, unlike event delivery). A name that
+#                   is not a built-in is a LOAD ERROR naming the valid
+#                   ones, not a silent no-op.
+#   allow_send_message
+#                   Let the plugin call host-send-user-message
+#                   (v0.12.0): it may start or steer a turn with text
+#                   of its own. Default false.
+#                   THIS IS THE ONE GRANT THAT SPENDS YOUR MONEY. Every
+#                   other capability lets a plugin learn something,
+#                   change what the agent believes, or run a tool you
+#                   could have run yourself; this one causes billed
+#                   turns against your provider. nanopi prints the
+#                   escalated [Extensions] warning whenever it is set,
+#                   alone, without needing a second grant to pair with.
+#                   The text is ALWAYS echoed to you verbatim and
+#                   attributed to the plugin — there is no quiet path.
+#                   Three bounds, all announced, none silent: one
+#                   unconsumed message per plugin; no message during a
+#                   turn that plugin's own message started; and at most
+#                   20 turns per plugin per session, which is a backstop
+#                   against a runaway subscriber, not a budget.
+#                   Unavailable in headless mode (nanopi -p), where the
+#                   call is REFUSED rather than quietly dropped.
+#                   A call that RAN comes back as
+#                     {"content": "...", "is_error": false}
+#                   and anything that did NOT run comes back as a bare
+#                   `error: ...` string. Nothing traps.
+#                   Bounded at 30s per call, and each call that ran is
+#                   announced in your scrollback naming the plugin and
+#                   the tool — a plugin acts with nothing on screen, and
+#                   its calls are deliberately NOT in the session
+#                   transcript, so `--continue` will not show them.
+#                   Your [[hooks.*]] still run: a plugin does not
+#                   outrank your own policy, and a block comes back as
+#                   `error: blocked by hook: <reason>`.
+#                   `/tools` lists what every loaded plugin holds, under
+#                   "Plugin grants".
+#   events          Lifecycle events this plugin may OBSERVE (v0.12.0).
+#                   Absent or empty grants NOTHING — a plugin exporting
+#                   `list-events` still receives no deliveries until its
+#                   requests appear here too. Delivery needs the event
+#                   in BOTH this list AND the plugin's own `list-events`
+#                   export; either alone is not enough. PI's eleven
+#                   event names (same vocabulary as [[hooks.*]] below):
+#                     tool_execution_start, tool_execution_end, input,
+#                     before_agent_start, turn_start, turn_end,
+#                     message_end, session_start, session_shutdown,
+#                     session_before_compact, session_compact
+#                   A subscriber is OBSERVE-ONLY — it cannot block or
+#                   transform, unlike a shell hook. But the grant is
+#                   real: a `tool_execution_start` subscriber sees every
+#                   tool call's arguments, and an `input` subscriber
+#                   sees every prompt verbatim — a bigger surface than
+#                   `allow_fs`. Combining `events` with
+#                   `allow_network = true` on the same plugin is warned
+#                   about at startup: it can exfiltrate whatever those
+#                   events carry. `/tools` lists every plugin currently
+#                   watching, under "Watching events".
+#
+# See docs/pi-vs-nanopi.md §4.3 and wit/nanopi-extension.wit for the
+# guest interface a plugin must export.
+
+# [[extensions]]
+# path = "~/.nanopi/extensions/my-tool.wasm"
+
+# A plugin that fetches arbitrary URLs — no finite host list to
+# enumerate, so the wildcard is the honest way to say so.
+# [[extensions]]
+# path = "~/.nanopi/extensions/fetcher.wasm"
+# allow_network = true
+# url_allowlist = ["*"]
+
+# [[extensions]]
+# path = "~/.nanopi/extensions/"
+# max_files = 16
+
+# A memory plugin: watches what you type, remembers it across restarts,
+# and puts what it learned in front of the model. No network, so what it
+# accumulates stays on this machine.
+# [[extensions]]
+# path = "~/.nanopi/extensions/memory.wasm"
+# allow_store = true
+# allow_context = true
+# events = ["input", "message_end"]
+
+# A codebase indexer: walks the tree and reads files through nanopi's
+# own tools, so it needs no filesystem grant of its own. It cannot
+# write, and it cannot exec.
+# [[extensions]]
+# path = "~/.nanopi/extensions/indexer.wasm"
+# allow_tools = ["find", "read"]
+# allow_store = true
+
+# A remote executor needs a shell. nanopi warns at startup when it sees
+# bash here, and the warning is correct: this grant makes every other
+# grant on this plugin decorative.
+# [[extensions]]
+# path = "~/.nanopi/extensions/remote-exec.wasm"
+# allow_tools = ["bash"]
+
+# A plugin that only watches lifecycle events (e.g. an audit logger) —
+# no tools, no commands, just `events`.
+# [[extensions]]
+# path = "~/.nanopi/extensions/audit-watcher.wasm"
+# events = ["tool_execution_start", "session_start", "session_shutdown"]
+
+# A plugin that drives the agent: it watches for a failing build and
+# asks nanopi to fix it, unprompted. Grant this only to a plugin you
+# want spending your provider budget on your behalf — nanopi warns
+# about it at startup, and every message it sends appears in your
+# scrollback attributed to it.
+# [[extensions]]
+# path = "~/.nanopi/extensions/autofix.wasm"
+# events = ["tool_execution_end"]
+# allow_send_message = true
+
 # ─── API key: pick ONE of the two below ─────────────────────────────
 
 # Option A — file (recommended). Path to a chmod-600 file containing
@@ -76,9 +375,16 @@ base_url = "https://api.openai.com/v1"
 #
 # Each hook is a bash command run at a lifecycle event.
 # Fields:
-#   matcher  regex against tool_name (or session_id for session_*).
+#   matcher  regex against tool_name (or session_id for session_*,
+#            the turn number for the four lifecycle events, and the
+#            compaction reason for session_*_compact).
 #            Defaults to "*" (match all) — required-looking blocks
 #            that omit it work fine.
+#            `input` has NOTHING to match against (a user message is
+#            not a tool call), so `matcher` there must be "*": any
+#            other value is a startup error naming the problem, rather
+#            than a hook that loads and never fires. Filter inside the
+#            command instead — the prompt is in arguments.prompt.
 #   type     "command" (only value in v0.6+); optional.
 #   command  Path/expression run via `bash -c "..."`. Supports ~,
 #            $HOME, ${HOME}.
@@ -90,27 +396,93 @@ base_url = "https://api.openai.com/v1"
 #
 # All hook vectors are cumulative — multiple hooks of the same type
 # fire in declaration order.
+#
+# ── Renamed in v0.12 — the old keys are errors, not warnings ────────
+# nanopi used to borrow Claude Code's event names for four of these
+# hooks. v0.12 renames them to PI's names, with no alias and no
+# deprecation period: a config using one of the left-hand keys below
+# fails to load, and the error names the right-hand replacement.
+#
+#   old key               | new key
+#   -----------------------|------------------------
+#   pre_tool_use           | tool_execution_start
+#   post_tool_use          | tool_execution_end
+#   user_prompt_submit     | input
+#   session_end            | session_shutdown
+#
+# ── Session payload contract (all four session-lifecycle events) ────
+# session_start / session_shutdown / session_before_compact /
+# session_compact all send a JSON payload whose `arguments.reason`
+# names why the event fired (e.g. "startup", "quit", "new", "resume",
+# "fork", "import", "threshold", "manual") and whose `session_id` is
+# ALWAYS the real session id — never the reason. A hook that used to
+# read `session_id` to distinguish a compaction's cause must now read
+# `arguments.reason` instead.
+
+# Working versions of every script referenced below live in
+# `examples/hooks/` — copy them to ~/.nanopi/hooks/ and see that
+# directory's README.md for the payload shape and the three decision
+# forms (refuse / rewrite / allow).
 
 # Ex 1: veto dangerous rm invocations before bash runs them.
-# [[hooks.pre_tool_use]]
+# [[hooks.tool_execution_start]]
 # matcher = "^bash$"
 # command = "~/.nanopi/hooks/check-rm-rf.sh"
 # timeout = 5000
 
 # Ex 2: log every tool result to a file for later audit.
-# [[hooks.post_tool_use]]
+# [[hooks.tool_execution_end]]
 # matcher = "*"
 # command = "cat >> ~/.nanopi/tool-audit.log"
 
 # Ex 3: refuse prompts that contain a specific secret pattern.
-# [[hooks.user_prompt_submit]]
+# [[hooks.input]]
 # command = "~/.nanopi/hooks/redact-secrets.sh"
 
 # Ex 4: notify on session start (matcher defaults to "*"; session_id
-# is what the matcher runs against for session_* events).
+# is what the matcher runs against for session_* events — the
+# "reason" for the event, e.g. "startup" or "new", lives in
+# arguments.reason on the JSON payload, not in the matcher subject).
 # [[hooks.session_start]]
 # command = "echo \"[nanopi] session started at $(date)\" >> ~/.nanopi/sessions.log"
 
-# Ex 5: run cleanup on session exit.
-# [[hooks.session_end]]
-# command = "~/.nanopi/hooks/cleanup.sh"
+# Ex 5: run cleanup on session exit (also fires on /new, /resume,
+# /fork, /import — check arguments.reason if you only want the final
+# quit). `examples/hooks/session-log.sh` shows that check.
+# [[hooks.session_shutdown]]
+# command = "~/.nanopi/hooks/session-log.sh"
+
+# ── v0.11.0 lifecycle hooks ─────────────────────────────────────────
+# These map to PI's before_agent_start / turn_start / turn_end /
+# message_end. See docs/pi-vs-nanopi.md §4.3 for the full list.
+
+# Ex 6: log every turn start for debugging.
+# [[hooks.before_agent_start]]
+# matcher = "*"
+# command = "echo \"turn $TURN_COUNT started\" >> ~/.nanopi/turns.log"
+# timeout = 2000
+
+# Ex 7: audit each agent-loop iteration.
+# [[hooks.turn_start]]
+# matcher = "*"
+# command = "echo \"[turn_start] iter=$ITERATION\" >> ~/.nanopi/agent.log"
+# timeout = 2000
+
+# Ex 8: track tool usage across iterations.
+# [[hooks.turn_end]]
+# matcher = "*"
+# command = "echo \"[turn_end] had_tools=$HAD_TOOL_CALLS\" >> ~/.nanopi/agent.log"
+# timeout = 2000
+
+# Ex 9: fire a notification when a turn completes.
+#
+# The payload's `arguments` carries the assistant's reply itself in
+# `response` (since v0.12), alongside `response_length` — which is, as
+# before, the length of the WHOLE reply. A reply over 16 KiB arrives
+# cut, with `response_truncated = true` and a trailing
+# `[nanopi: response truncated, N of M bytes]` marker in the text, so a
+# script that reads only `response` can still tell.
+# [[hooks.message_end]]
+# matcher = "*"
+# command = "notify-send \"nanopi turn done\""
+# timeout = 2000

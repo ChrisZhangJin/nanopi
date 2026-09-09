@@ -54,10 +54,10 @@ impl PermissionGate {
         Self::new(!no_hooks, trust)
     }
 
-    /// Decide whether a PreToolUse block decision should be honored.
-    /// Always true now that per-call yolo bypass is gone; `--no-hooks`
-    /// is the way to opt out of hook enforcement entirely.
-    pub fn should_honor_pretooluse_block(&self) -> bool {
+    /// Decide whether a ToolExecutionStart block decision should be
+    /// honored. Always true now that per-call yolo bypass is gone;
+    /// `--no-hooks` is the way to opt out of hook enforcement entirely.
+    pub fn should_honor_tool_execution_start_block(&self) -> bool {
         true
     }
 
@@ -140,9 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn pretooluse_block_always_honored() {
+    fn tool_execution_start_block_always_honored() {
         let p = PermissionGate::from_cli(false, None);
-        assert!(p.should_honor_pretooluse_block());
+        assert!(p.should_honor_tool_execution_start_block());
     }
 
     #[test]
@@ -156,10 +156,10 @@ mod tests {
 
     #[test]
     fn persist_and_session_only_is_noop() {
-        let dir = std::env::temp_dir().join(format!("nanopi-trust-{}", crate::util::uuid::v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &dir);
+        // Was entirely unlocked before: it mutated NANOPI_HOME while
+        // every other env test ran concurrently.
+        let _h = crate::TempNanopiHome::new();
+        let dir = _h.path().to_path_buf();
 
         let cwd = Path::new("/tmp/test/cwd");
         let r = persist_trust_choice(cwd, TrustChoice::SessionOnly);
@@ -168,11 +168,6 @@ mod tests {
         let trust_dir = dir.join("trust");
         assert!(!trust_dir.exists() || std::fs::read_dir(&trust_dir).unwrap().count() == 0);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

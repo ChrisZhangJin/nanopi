@@ -11,6 +11,9 @@ pub struct ZaiVendor;
 impl Vendor for ZaiVendor {
     fn id(&self) -> &'static str { "zai" }
     fn transport(&self) -> ApiKind { ApiKind::Openai }
+    /// `api.z.ai/api/paas/v4` (OpenAI-compat) and
+    /// `api.z.ai/api/anthropic` (Anthropic-native).
+    fn dual_surface(&self) -> bool { true }
     fn default_base_url(&self) -> Option<&'static str> { Some("https://api.z.ai/api/paas/v4") }
     fn supports_thinking(&self, model: &str) -> bool {
         let m = model.to_ascii_lowercase();

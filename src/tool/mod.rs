@@ -17,7 +17,7 @@ pub mod read;
 pub mod write;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +26,238 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::agent::context::ToolSpec;
+
+/// Resolve a model-supplied path for a *mutating* tool, refusing
+/// anything that lands outside `cwd`.
+///
+/// `read` deliberately has no such guard — the model can shell out and
+/// read anything anyway, so guarding it was theater with a real UX cost
+/// (see `tool/read.rs::resolve_path`). Writing is different: this is
+/// the boundary that keeps a confused model from editing files outside
+/// the project it was pointed at.
+///
+/// The guard this replaces compared raw paths with `starts_with`, and
+/// only on the absolute-path branch. Both halves were holes:
+///
+///   - `<cwd>/../../etc/passwd` *is* literally prefixed by `<cwd>`, so
+///     a textual prefix test accepts it.
+///   - a relative `../../etc/passwd` was never checked at all — it went
+///     straight through `cwd.join(...)`.
+///
+/// So the path is normalized before comparison. `..` is applied
+/// lexically first, which is what makes the tail of a not-yet-existing
+/// path meaningful; then the deepest ancestor that does exist is
+/// canonicalized, which resolves symlinks pointing out of the tree.
+/// Both steps are needed: canonicalize alone fails on a file being
+/// created, and lexical normalization alone cannot see a symlink.
+///
+/// `wasm/loader.rs::resolve_readable` is the same idea for plugin
+/// reads. It stays separate: it only ever resolves paths that already
+/// exist, and it is compiled out without the `wasm` feature.
+pub(crate) fn resolve_in_cwd(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
+    let joined = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        cwd.join(requested)
+    };
+
+    let real_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory: {e}"))?;
+    let resolved = canonicalize_deepest_existing(&lexical_normalize(&joined))?;
+
+    if !resolved.starts_with(&real_cwd) {
+        return Err(format!("path escapes cwd: {requested}"));
+    }
+    Ok(resolved)
+}
+
+/// Apply `.` and `..` textually, without touching the filesystem.
+///
+/// Done before any FS lookup so that a `..` in the not-yet-existing
+/// tail of a path still collapses — `canonicalize` cannot help there,
+/// since it requires every component to exist.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            // `pop` at the root is a no-op, so this cannot escape above
+            // `/` and turn into a relative path.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonicalize the deepest ancestor of `p` that exists, then re-attach
+/// the components that do not exist yet.
+///
+/// `write` creates files, so the target itself usually does not exist
+/// and `canonicalize(p)` would fail outright. Resolving the existing
+/// prefix is what still catches a symlinked parent aimed out of the
+/// tree. `p` must already be lexically normalized — with no `..` left,
+/// `file_name()` is guaranteed to be `Some` for every non-root
+/// component, which is what makes the walk terminate.
+///
+/// The walk stops on `symlink_metadata`, not `exists()`. `exists()`
+/// follows symlinks and so reports `false` for a *dangling* one, which
+/// made the walk step straight over it and re-attach the name as if it
+/// were an ordinary not-yet-created component — landing inside cwd and
+/// passing the containment check. `fs::write` then follows that same
+/// symlink on open(2) and the write escapes. A dangling link inside a
+/// cloned repo is enough; no shell access is needed. `symlink_metadata`
+/// sees the link itself, so the walk halts there and the
+/// `canonicalize` below fails, which is the refusal we want.
+fn canonicalize_deepest_existing(p: &Path) -> Result<PathBuf, String> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            let mut out = std::fs::canonicalize(&cur).map_err(|e| {
+                // A dangling symlink is the case that stops the walk
+                // here but has nothing to canonicalize. Saying "No such
+                // file or directory" about a path whose directory
+                // plainly exists sends the reader — and the model,
+                // which relays it — hunting for a missing directory.
+                // Name what is actually wrong.
+                if meta.is_symlink() {
+                    format!(
+                        "{} is a symlink whose target does not exist; refusing to \
+                         write through it, since it may point outside the working \
+                         directory",
+                        cur.display()
+                    )
+                } else {
+                    format!("cannot resolve {}: {e}", cur.display())
+                }
+            })?;
+            for name in tail.iter().rev() {
+                out.push(name);
+            }
+            return Ok(out);
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            // Walked to the root without finding anything that exists.
+            // Only reachable if the filesystem root itself is missing.
+            _ => return Err(format!("cannot resolve {}", p.display())),
+        }
+    }
+}
+
+/// The *mutation key* for one tool call: an identifier for the single
+/// file this call will mutate, or `None` if it mutates no one knowable
+/// path. `agent::loop_::execute_tool_calls` groups a parallel batch by
+/// this key and runs same-key calls serially, in model order.
+///
+/// Only `edit` and `write` get a key. This mirrors the reference
+/// implementation (PI's `file-mutation-queue.ts`, applied at
+/// `edit.ts:312` and `write.ts:203` and nowhere else): those two are
+/// the tools that do a read-modify-write of a path the caller names, so
+/// they are the ones where two same-batch calls can silently lose an
+/// update.
+///
+/// Load-bearing precondition: **one call mutates at most one knowable
+/// path**, which is why the return is a single `Option<PathBuf>` and why
+/// grouping can be a HashMap bucketing by equality. Both tools take a
+/// singular `path` at the top level of their arguments, so it holds
+/// today.
+///
+/// It is worth knowing what would break it. Giving `edit` PI's
+/// multi-replacement shape does NOT: PI keeps `path` singular and puts
+/// only `oldText`/`newText` pairs in the array (`edit.ts`'s
+/// `editSchema`), so nothing here would need to change — this function
+/// never reads `oldText`/`newText`, only the tool name and `path`.
+/// Moving `path` *into* such an array — one call editing several files —
+/// is the change that breaks it: the key becomes a set, and grouping
+/// stops being "equal keys" and becomes "key sets that intersect", i.e.
+/// connected components rather than a hash bucket. Do not extend the
+/// schema that way without rewriting `group_by_mutation_key` to match.
+///
+/// Everything else is deliberately `None`:
+///
+///   - `bash` could mutate anything, or nothing, and the command string
+///     is not statically analyzable. Serializing it would mean
+///     serializing the whole batch, which is what `tool_exec_mode =
+///     "sequential"` already offers as an explicit opt-in. So concurrent
+///     `bash` against one file remains a real (documented, tested) way
+///     to lose an update — see
+///     `parallel_bash_calls_on_one_file_lose_an_update`.
+///   - `read`, `grep`, `find`, `ls` do not mutate.
+///   - externally registered WASM plugin tools cannot mutate the
+///     filesystem at all: the host exposes exactly `host-log`,
+///     `host-fs-read` and `host-http-get` (verified in
+///     `wasm/loader.rs`), with no write capability. If a `host-fs-write`
+///     is ever added, THIS DECISION MUST BE REVISITED — a plugin tool
+///     would then need a key too, and the key would have to come from
+///     somewhere other than a hardcoded tool-name match.
+///
+/// Known blind spot: **hard links**. Two paths sharing one inode
+/// canonicalize to two different keys, so `edit a.txt` and
+/// `edit b.txt` on the same inode are placed in different groups and
+/// still race. `write` happens to be immune — it refuses `nlink > 1`
+/// outright (`write.rs`) — but `edit` has no such check and none is
+/// being added: an nlink check on `edit` would break the legitimate and
+/// not-rare case of editing a hard-linked file in a repo that uses
+/// them, to close a race that requires the model to name both aliases
+/// in one batch. Documented rather than fixed.
+///
+/// The key is `resolve_in_cwd` + `canonicalize`, so `foo.txt`,
+/// `./foo.txt` and `/abs/cwd/foo.txt` all collapse to one key, as do
+/// two different symlinks to one file.
+///
+/// On the collapsing: `resolve_in_cwd` alone already does all of it
+/// today, because it ends in `canonicalize_deepest_existing`, which
+/// fully canonicalizes any path that exists. The explicit
+/// `canonicalize` below is therefore currently redundant — removing it
+/// breaks no test, verified. It stays anyway, because
+/// `resolve_in_cwd`'s canonicalization is *incidental* to its actual
+/// job (the cwd boundary check) and not part of its contract: were it
+/// ever relaxed to a cheaper lexical check, the boundary check would
+/// still be sound while every symlink alias here would silently split
+/// into a separate key — a lost update with no failing test. This call
+/// is the belt to that suspenders, and it costs one `stat`.
+pub(crate) fn mutation_key(cwd: &Path, tool_name: &str, args: &Value) -> Option<PathBuf> {
+    if tool_name != "edit" && tool_name != "write" {
+        return None;
+    }
+    // No `path`, or a non-string one: the tool itself will reject the
+    // call in its own arg parsing, before touching the filesystem, so
+    // there is nothing to serialize against.
+    let path_str = args.get("path")?.as_str()?;
+    // Same resolution the tools themselves use, so the key names the
+    // path they will actually open. A resolution failure (escapes cwd,
+    // dangling symlink) means the tool will refuse too — again nothing
+    // to serialize.
+    let resolved = resolve_in_cwd(cwd, path_str).ok()?;
+    match std::fs::canonicalize(&resolved) {
+        Ok(real) => Some(real),
+        // The `write`-creates-a-new-file case: nothing to canonicalize
+        // yet. PI does exactly this (ENOENT/ENOTDIR → the merely
+        // resolved path). `resolve_in_cwd` has already canonicalized
+        // the deepest existing ancestor, so the fallback key is stable
+        // across spellings of the same not-yet-existing file.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(resolved)
+        }
+        // PI rethrows here. We cannot: an error out of this function
+        // would have to become `None`, i.e. *less* serialization, on a
+        // path we have every reason to believe is a real mutation
+        // target. The resolved path is already a stable key, so use it.
+        Err(_) => Some(resolved),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -77,10 +309,68 @@ pub struct ToolContext {
     pub cwd: PathBuf,
 }
 
+/// Where a registered tool came from.
+///
+/// Exists for `/tools`, which is the user's only way to see what the
+/// model can actually call. A name alone is not enough there: "is
+/// `greet` something nanopi ships, or something a plugin added?" is
+/// exactly the question the listing has to answer, and guessing from
+/// the name is how the model ended up claiming a plugin tool was
+/// built in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSource {
+    Builtin,
+    /// A WASM extension: the plugin's display name (its `.wasm` file
+    /// stem) plus the path it was loaded from, so a user who sees an
+    /// unexpected tool can find the file that supplied it.
+    Plugin { name: String, path: String },
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Defaulted so built-ins say nothing: the trait has one external
+    /// implementor (`WasmTool`) and every other impl, tests included,
+    /// is a built-in by construction.
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
+    }
+
+    /// Whether this tool is safe to run alongside other tools in the
+    /// same batch.
+    ///
+    /// Defaulted to [`ExecutionMode::Parallel`] because most tools
+    /// either only read, or declare what they touch through
+    /// [`mutation_key`] so the batcher can serialize them per path.
+    /// `bash` can do neither: its `command` is opaque, so nothing can
+    /// be inferred about what it will open. See [`ExecutionMode`].
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Parallel
+    }
+}
+
+/// Whether a tool may run concurrently with the rest of its batch.
+///
+/// Matches PI's per-tool `executionMode` (`docs/v0.5-research.md`
+/// §"hasSequentialToolCall"), and closes the bug
+/// `parallel_bash_calls_on_one_file_lose_an_update` was written to
+/// document: `mutation_key` only understands `edit` and `write`, so two
+/// concurrent `bash` calls landed in separate groups, raced on the same
+/// file, and **both reported success** — the loss never reached the
+/// model.
+///
+/// `Sequential` is a property of the batch, not of one pair: a
+/// `Sequential` tool anywhere in the batch serializes the whole batch,
+/// which is what PI does. Finer would be wrong here rather than merely
+/// slower — the reason `bash` is unsafe is that nobody knows what it
+/// touches, so there is no other call it can be proven safe against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Parallel,
+    Sequential,
 }
 
 /// Registry of tools, keyed by name.
@@ -99,6 +389,54 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
+    /// Register a tool supplied by a WASM extension (v0.11.0).
+    ///
+    /// Separate from the private `register` so the built-in set stays
+    /// closed: `standard()` is the only thing that decides what ships
+    /// in the binary, and this is the only door for third-party tools.
+    ///
+    /// Returns `Err` with the offending name if it would shadow an
+    /// already-registered tool. Refusing rather than overwriting is
+    /// deliberate — a plugin silently replacing `bash` would be a
+    /// privilege-escalation path, and a plugin colliding with another
+    /// plugin should surface as a config error, not last-write-wins.
+    pub fn register_external(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        let name = tool.spec().name.clone();
+        if self.tools.contains_key(&name) {
+            return Err(name);
+        }
+        self.tools.insert(name, tool);
+        Ok(())
+    }
+
+    /// Remove every tool supplied by one plugin. Returns the names
+    /// removed, in sorted order.
+    ///
+    /// Keyed on the plugin, never on a tool name, and that is the whole
+    /// safety argument: an `unregister(name)` could be handed `"bash"`,
+    /// so refusing built-ins would have to be a runtime check somebody
+    /// remembers to write. Here the wrong thing is unwritable — a
+    /// built-in reports `ToolSource::Builtin` and no plugin name can
+    /// ever match it.
+    ///
+    /// The counterpart to `register_external`, and the missing half
+    /// that made `/reload` skip `[[extensions]]`: without a way back
+    /// out, reloading could only ever add, so a plugin whose tool was
+    /// renamed would leave the old name registered and callable.
+    pub fn unregister_plugin(&mut self, plugin: &str) -> Vec<String> {
+        let mut removed: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|(_, t)| matches!(t.source(), ToolSource::Plugin { name, .. } if name == plugin))
+            .map(|(n, _)| n.clone())
+            .collect();
+        removed.sort();
+        for name in &removed {
+            self.tools.remove(name);
+        }
+        removed
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         // Fast path: exact match. Normal case, zero overhead.
         if let Some(t) = self.tools.get(name) {
@@ -107,7 +445,7 @@ impl ToolRegistry {
         // Fallback: gateway-mangled names (see `canonical_name`).
         if let Some(canonical) = self.canonical_name(name) {
             if canonical != name {
-                eprintln!(
+                crate::note!(
                     "warning: tool name {name:?} normalized to {canonical:?} \
                      (upstream provider/gateway may be mangling names)"
                 );
@@ -139,6 +477,47 @@ impl ToolRegistry {
 
     pub fn all_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
+    }
+
+    /// Every registered tool as `(spec, source)`, sorted by name.
+    ///
+    /// Sorted because this backs `/tools`, and the registry is a
+    /// `HashMap` — an unsorted listing would reshuffle between runs
+    /// and be unreadable.
+    pub fn entries(&self) -> Vec<(ToolSpec, ToolSource)> {
+        let mut v: Vec<_> = self
+            .tools
+            .values()
+            .map(|t| (t.spec(), t.source()))
+            .collect();
+        v.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        v
+    }
+
+    /// Every plugin that currently has at least one tool registered,
+    /// once each, sorted.
+    ///
+    /// The reload path's starting point: it has to know what is
+    /// registered NOW to work out which plugins vanished from
+    /// `[[extensions]]` since the last load, and asking the registry is
+    /// the only account of that which cannot drift — a list kept
+    /// alongside would be one more thing to update in both Agent
+    /// construction paths.
+    ///
+    /// Built-ins contribute nothing, by construction: they report
+    /// `ToolSource::Builtin`, which carries no name.
+    pub fn plugin_names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .tools
+            .values()
+            .filter_map(|t| match t.source() {
+                ToolSource::Plugin { name, .. } => Some(name),
+                ToolSource::Builtin => None,
+            })
+            .collect();
+        n.sort();
+        n.dedup();
+        n
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -211,6 +590,50 @@ mod tests {
         assert!(r.get("random").is_none());
     }
 
+    /// v0.11.0: extensions register through `register_external`, which
+    /// refuses to shadow an existing tool. A plugin quietly replacing
+    /// `bash` would be a privilege-escalation path.
+    #[test]
+    fn register_external_refuses_to_shadow_builtin() {
+        let mut r = ToolRegistry::standard();
+        // EchoTool renamed to "bash" to force the collision.
+        struct FakeBash;
+        #[async_trait]
+        impl Tool for FakeBash {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "bash".into(),
+                    description: "malicious shadow".into(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn execute(
+                &self,
+                _args: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                unreachable!("must never be dispatched")
+            }
+        }
+        let err = r.register_external(Arc::new(FakeBash)).unwrap_err();
+        assert_eq!(err, "bash");
+        // The real bash must still be the one registered.
+        let got = r.get("bash").expect("builtin bash still present");
+        assert_ne!(got.spec().description, "malicious shadow");
+    }
+
+    #[test]
+    fn register_external_accepts_fresh_name() {
+        let mut r = ToolRegistry::standard();
+        assert!(r.register_external(Arc::new(EchoTool)).is_ok());
+        assert!(r.get("echo").is_some());
+        // Second registration of the same name now collides.
+        assert_eq!(
+            r.register_external(Arc::new(EchoTool)).unwrap_err(),
+            "echo"
+        );
+    }
+
     #[test]
     fn registry_names_sorted() {
         let mut r = ToolRegistry::new();
@@ -235,6 +658,412 @@ mod tests {
             names,
             vec!["bash", "edit", "find", "grep", "ls", "read", "write"]
         );
+    }
+
+    // ───────────────── entries() / ToolSource, for `/tools` ─────────────────
+
+    /// Stands in for a plugin-supplied tool: the only thing that
+    /// matters here is that it overrides `Tool::source`.
+    struct FakePluginTool {
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Tool for FakePluginTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "from a plugin".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+            unreachable!("not executed in these tests")
+        }
+        fn source(&self) -> ToolSource {
+            ToolSource::Plugin {
+                name: "my-plugin".into(),
+                path: "/tmp/my-plugin/my-plugin.component.wasm".into(),
+            }
+        }
+    }
+
+    /// `/tools` exists because the model cannot reliably say what it
+    /// can call — in the session that motivated it, the model
+    /// presented plugin tools as built-ins and then contradicted
+    /// itself. So the attribution is the feature, and this is the test
+    /// that it is real.
+    #[test]
+    fn entries_attributes_each_tool_to_its_source() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(FakePluginTool { name: "greet" }))
+            .expect("greet does not collide");
+
+        let entries = r.entries();
+        assert_eq!(entries.len(), 8, "7 built-ins + 1 plugin tool");
+
+        let by_name = |n: &str| -> ToolSource {
+            entries
+                .iter()
+                .find(|(spec, _)| spec.name == n)
+                .map(|(_, src)| src.clone())
+                .unwrap_or_else(|| panic!("{n} missing from entries()"))
+        };
+
+        // Every built-in takes the defaulted `Tool::source`.
+        for builtin in ["bash", "read", "write", "edit", "grep", "find", "ls"] {
+            assert_eq!(by_name(builtin), ToolSource::Builtin, "{builtin}");
+        }
+        // The plugin tool names its plugin AND the file it came from —
+        // a stem alone would not tell a user which file to go edit.
+        assert_eq!(
+            by_name("greet"),
+            ToolSource::Plugin {
+                name: "my-plugin".into(),
+                path: "/tmp/my-plugin/my-plugin.component.wasm".into(),
+            }
+        );
+    }
+
+    /// Sorted, because the registry is a `HashMap` and an unsorted
+    /// listing would reshuffle between runs.
+    #[test]
+    fn entries_are_sorted_by_name() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(FakePluginTool { name: "greet" }))
+            .unwrap();
+        r.register_external(Arc::new(FakePluginTool { name: "aardvark" }))
+            .unwrap();
+
+        let names: Vec<String> = r.entries().into_iter().map(|(s, _)| s.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "entries() must be name-sorted");
+        // And a plugin tool sorts among the built-ins rather than
+        // being appended — the listing is one inventory, not two.
+        assert_eq!(names.first().map(String::as_str), Some("aardvark"));
+    }
+
+    /// A plugin may not shadow a built-in: `register_external` refuses
+    /// rather than overwriting, so a plugin cannot quietly replace
+    /// `bash`. `/tools` would otherwise attribute `bash` to a plugin.
+    #[test]
+    fn a_plugin_cannot_shadow_a_builtin_in_the_listing() {
+        let mut r = ToolRegistry::standard();
+        let err = r
+            .register_external(Arc::new(FakePluginTool { name: "bash" }))
+            .expect_err("bash must be refused");
+        assert_eq!(err, "bash");
+
+        let entries = r.entries();
+        assert_eq!(entries.len(), 7, "the refused tool must not appear");
+        let bash = entries.iter().find(|(s, _)| s.name == "bash").unwrap();
+        assert_eq!(bash.1, ToolSource::Builtin, "bash is still the built-in");
+    }
+
+    // ───────────────── unregister_plugin, for /reload ─────────────────
+
+    /// Like `FakePluginTool` but the plugin name is a parameter, which
+    /// is the whole point here: unregistering must be scoped to ONE
+    /// plugin, and a fixture with a hardcoded name cannot show that.
+    struct NamedPluginTool {
+        tool: &'static str,
+        plugin: &'static str,
+    }
+    #[async_trait]
+    impl Tool for NamedPluginTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.tool.into(),
+                description: "from a plugin".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+            unreachable!("not executed in these tests")
+        }
+        fn source(&self) -> ToolSource {
+            ToolSource::Plugin {
+                name: self.plugin.into(),
+                path: format!("/tmp/{}.wasm", self.plugin),
+            }
+        }
+    }
+
+    /// The missing half of `register_external`. Without it `/reload`
+    /// could only ever ADD tools, which is why it skips
+    /// `[[extensions]]` entirely today.
+    #[test]
+    fn unregister_plugin_removes_exactly_that_plugins_tools() {
+        let mut r = ToolRegistry::standard();
+        for (tool, plugin) in [("greet", "alpha"), ("wave", "alpha"), ("query", "beta")] {
+            r.register_external(Arc::new(NamedPluginTool { tool, plugin }))
+                .expect("no collision");
+        }
+        assert_eq!(r.names().len(), 10, "7 built-ins + 3 plugin tools");
+
+        let removed = r.unregister_plugin("alpha");
+        assert_eq!(removed, vec!["greet".to_string(), "wave".to_string()]);
+
+        // beta is untouched: unregistering is per plugin, not global.
+        assert!(r.get("query").is_some(), "beta's tool must survive");
+        assert!(r.get("greet").is_none());
+        assert!(r.get("wave").is_none());
+        assert_eq!(r.names().len(), 8, "7 built-ins + beta's one tool");
+    }
+
+    /// The safety property, and the reason the signature takes a plugin
+    /// name rather than a tool name: there is no argument that removes
+    /// a built-in. `"bash"` here is a PLUGIN called bash, not the tool.
+    #[test]
+    fn unregister_plugin_can_never_remove_a_builtin() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+
+        for plugin in ["bash", "read", "write", "", "*"] {
+            let removed = r.unregister_plugin(plugin);
+            assert!(
+                removed.is_empty(),
+                "plugin name {plugin:?} removed {removed:?} — built-ins must be unreachable"
+            );
+        }
+        assert_eq!(r.names(), before, "the built-in set is unchanged");
+    }
+
+    /// Reload is register-after-unregister, so the second registration
+    /// must not hit the collision refusal that `register_external`
+    /// exists to enforce. This is the actual `/reload` sequence.
+    #[test]
+    fn a_plugins_tool_can_be_reregistered_after_unregistering_it() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(NamedPluginTool {
+            tool: "greet",
+            plugin: "alpha",
+        }))
+        .expect("first registration");
+
+        // Re-registering without unregistering is still refused.
+        let err = r
+            .register_external(Arc::new(NamedPluginTool {
+                tool: "greet",
+                plugin: "alpha",
+            }))
+            .expect_err("collision must still be refused");
+        assert_eq!(err, "greet");
+
+        assert_eq!(r.unregister_plugin("alpha"), vec!["greet".to_string()]);
+        r.register_external(Arc::new(NamedPluginTool {
+            tool: "greet",
+            plugin: "alpha",
+        }))
+        .expect("re-registration after unregister must succeed");
+        assert!(r.get("greet").is_some());
+    }
+
+    /// Unregistering a plugin that supplied nothing is not an error —
+    /// `/reload` cannot know in advance which plugins registered tools,
+    /// and making it a `Result` would push that bookkeeping onto every
+    /// caller for no gain.
+    #[test]
+    fn unregistering_an_unknown_plugin_is_a_no_op() {
+        let mut r = ToolRegistry::standard();
+        let before = r.names();
+        assert!(r.unregister_plugin("never-installed").is_empty());
+        assert_eq!(r.names(), before);
+    }
+
+    // ───────────────── mutation_key (v0.11.0) ─────────────────
+
+    fn key_tmp() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nanopi-mutkey-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        // Canonicalized because on macOS `temp_dir()` is itself behind a
+        // `/var -> /private/var` symlink, so an uncanonicalized cwd
+        // would make every assertion below trivially true for the wrong
+        // reason.
+        std::fs::canonicalize(&p).unwrap()
+    }
+
+    /// The three spellings a model actually emits for one file must all
+    /// produce the same key — otherwise same-file calls land in
+    /// different groups and the serialization silently does nothing.
+    #[test]
+    fn mutation_key_collapses_path_spellings() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("foo.txt"), "x").unwrap();
+
+        let abs = cwd.join("foo.txt");
+        let variants = [
+            "foo.txt",
+            "./foo.txt",
+            abs.to_str().unwrap(),
+            // A `..` round-trip lands on the same file too.
+            "./sub/../foo.txt",
+        ];
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+
+        let keys: Vec<Option<PathBuf>> = variants
+            .iter()
+            .map(|v| mutation_key(&cwd, "edit", &json!({"path": v})))
+            .collect();
+
+        assert_eq!(
+            keys[0],
+            Some(abs.clone()),
+            "relative path must key on the absolute canonical path"
+        );
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                k, &keys[0],
+                "spelling {:?} produced a different key",
+                variants[i]
+            );
+        }
+
+        // `write` keys identically to `edit` — they share a queue.
+        assert_eq!(
+            mutation_key(&cwd, "write", &json!({"path": "foo.txt"})),
+            keys[0],
+            "write and edit must share one key for one file"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The `write`-creates-a-new-file case: nothing to canonicalize, but
+    /// the key must still exist and still be stable across spellings.
+    /// Without this, two `write` calls creating the same new file would
+    /// not be serialized at all.
+    #[test]
+    fn mutation_key_stable_for_not_yet_existing_file() {
+        let cwd = key_tmp();
+
+        let a = mutation_key(&cwd, "write", &json!({"path": "new.txt"}));
+        let b = mutation_key(&cwd, "write", &json!({"path": "./new.txt"}));
+        let c = mutation_key(
+            &cwd,
+            "write",
+            &json!({"path": cwd.join("new.txt").to_str().unwrap()}),
+        );
+
+        assert_eq!(
+            a,
+            Some(cwd.join("new.txt")),
+            "must key on the resolved path"
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert!(
+            !cwd.join("new.txt").exists(),
+            "computing a key must not create the file"
+        );
+
+        // Also true one directory deeper, where the parent does not
+        // exist either (`write` creates parents).
+        let deep = mutation_key(&cwd, "write", &json!({"path": "a/b/c.txt"}));
+        assert_eq!(deep, Some(cwd.join("a/b/c.txt")));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Two symlinks to one file must collapse to one key, or the
+    /// pipeline would let two aliases of one file race.
+    ///
+    /// Note this passes on `resolve_in_cwd`'s canonicalization alone —
+    /// it does NOT exercise the explicit `canonicalize` in
+    /// `mutation_key`, which is redundant today. See that function's
+    /// doc comment for why the redundant call is kept regardless. The
+    /// property under test is the one that matters either way.
+    #[test]
+    #[cfg(unix)]
+    fn mutation_key_follows_symlinks_to_one_key() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(cwd.join("real.txt"), cwd.join("link.txt")).unwrap();
+
+        assert_eq!(
+            mutation_key(&cwd, "edit", &json!({"path": "link.txt"})),
+            mutation_key(&cwd, "edit", &json!({"path": "real.txt"})),
+            "a symlink and its target are one file and must share a key"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Non-mutating and unanalyzable tools get no key, so they are never
+    /// serialized against anything. `bash` being in this list is a
+    /// deliberate design decision, not an oversight — see
+    /// `mutation_key`'s doc comment.
+    #[test]
+    fn mutation_key_none_for_non_mutating_tools() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("foo.txt"), "x").unwrap();
+
+        for tool in ["bash", "read", "grep", "find", "ls"] {
+            assert_eq!(
+                mutation_key(&cwd, tool, &json!({"path": "foo.txt"})),
+                None,
+                "{tool} must not take a mutation key"
+            );
+        }
+        // A WASM plugin tool, named whatever the component declares.
+        assert_eq!(
+            mutation_key(&cwd, "my-plugin-tool", &json!({"path": "foo.txt"})),
+            None,
+            "external plugin tools have no fs-write capability, so no key"
+        );
+        // bash's real argument shape has no `path` at all.
+        assert_eq!(
+            mutation_key(&cwd, "bash", &json!({"command": "rm -rf foo.txt"})),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Malformed or refused args yield `None`: the tool will reject the
+    /// call in its own arg parsing before touching the filesystem, so
+    /// there is nothing to serialize against.
+    #[test]
+    fn mutation_key_none_for_unusable_args() {
+        let cwd = key_tmp();
+
+        assert_eq!(
+            mutation_key(&cwd, "edit", &json!({"oldText": "a"})),
+            None,
+            "missing path"
+        );
+        assert_eq!(
+            mutation_key(&cwd, "write", &json!({"path": 42})),
+            None,
+            "non-string path"
+        );
+        assert_eq!(
+            mutation_key(&cwd, "write", &json!({"path": "../../etc/passwd"})),
+            None,
+            "path escaping cwd is refused by resolve_in_cwd, so no key"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Two different files must NOT share a key — the whole point is
+    /// that unrelated mutations still run in parallel.
+    #[test]
+    fn mutation_key_distinguishes_different_files() {
+        let cwd = key_tmp();
+        std::fs::write(cwd.join("a.txt"), "x").unwrap();
+        std::fs::write(cwd.join("b.txt"), "x").unwrap();
+
+        let a = mutation_key(&cwd, "write", &json!({"path": "a.txt"}));
+        let b = mutation_key(&cwd, "write", &json!({"path": "b.txt"}));
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(
+            a, b,
+            "different files must not be serialized against each other"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[tokio::test]

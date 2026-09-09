@@ -12,9 +12,11 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::agent::context::Context;
-use crate::agent::hook::{run_hooks, run_session_hooks, HookConfig, HookEvent, HookOutcome};
+use crate::agent::hook::{
+    event_payload_json, run_hooks, run_session_hooks, HookConfig, HookEvent, HookOutcome,
+};
 use crate::agent::permission::PermissionGate;
-use crate::event::{AgentEvent, FinishReason, ToolCall, Usage};
+use crate::event::{AgentEvent, FinishReason, SteerMessage, ToolCall, Usage};
 use crate::provider::openai::OpenAiProvider;
 use crate::session::{self, SessionEntry};
 
@@ -52,11 +54,22 @@ impl From<session::SessionError> for AgentError {
 /// Hook configuration for an Agent.
 #[derive(Debug, Clone, Default)]
 pub struct HooksConfig {
-    pub pre_tool_use: Vec<HookConfig>,
-    pub post_tool_use: Vec<HookConfig>,
-    pub user_prompt_submit: Vec<HookConfig>,
+    pub tool_execution_start: Vec<HookConfig>,
+    pub tool_execution_end: Vec<HookConfig>,
+    pub input: Vec<HookConfig>,
     pub session_start: Vec<HookConfig>,
-    pub session_end: Vec<HookConfig>,
+    pub session_shutdown: Vec<HookConfig>,
+    /// NEW v0.11.0 lifecycle hooks (see docs/pi-vs-nanopi.md §4.3).
+    /// BeforeAgentStart is the only new variant that supports Block /
+    /// Transform; the other three are advisory only.
+    pub before_agent_start: Vec<HookConfig>,
+    pub turn_start: Vec<HookConfig>,
+    pub turn_end: Vec<HookConfig>,
+    pub message_end: Vec<HookConfig>,
+    /// v0.11.0: compaction lifecycle hooks (mirrors Pi's
+    /// `session_before_compact` / `session_compact`).
+    pub session_before_compact: Vec<HookConfig>,
+    pub session_compact: Vec<HookConfig>,
 }
 
 /// The agent — owns context, provider, tool registry, session, permissions.
@@ -93,6 +106,43 @@ pub struct Agent {
     /// in `run_turn`. Empty when discovery is disabled and no --skill
     /// paths were passed.
     pub skills: Vec<crate::resources::Skill>,
+    /// v0.11.0: messages waiting to become their own turn. The TUI's
+    /// turn-completed handler pops the front and auto-starts a turn
+    /// with it (Pi's `getFollowUpMessages()` semantic).
+    ///
+    /// A queue rather than one slot: a `SteerMessage::FollowUp` can
+    /// arrive more than once per turn, and cancelling a turn converts
+    /// every still-pending steer into a follow-up at once. Keeping only
+    /// the first silently dropped the rest.
+    pub pending_follow_ups: std::collections::VecDeque<String>,
+    /// v0.11.0: tool execution mode (parallel by default; user can
+    /// configure sequential via `tool_exec_mode` in config.toml).
+    /// Set at build time and reused on every turn.
+    pub tool_exec_mode: crate::config::ToolExecMode,
+    /// v0.12: per-tool `executionMode` overrides from
+    /// `[tool_exec_overrides]`. Outranks the tool's own
+    /// `Tool::execution_mode` in both directions, so a user who wants
+    /// concurrent `bash` back can have it. Empty by default, in which
+    /// case every tool's own declaration stands.
+    pub tool_exec_overrides: std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
+    /// v0.11.0: slash commands registered by WASM plugins, already
+    /// filtered for collisions. Held here for the same reason `skills`
+    /// is: the TUI snapshots it after every rebuild rather than
+    /// reaching into the plugin layer, which keeps `mode::tui` free of
+    /// any `cfg(feature = "wasm")`. Empty in a build without the
+    /// feature, and in print mode, which has no command palette.
+    pub plugin_commands: Vec<crate::command::PluginCommand>,
+    /// What each loaded plugin was granted, pre-rendered at load for
+    /// `/tools`. Non-gated for the same reason as `plugin_commands`:
+    /// the TUI reads it and must compile without the `wasm` feature,
+    /// where it simply stays empty.
+    pub plugin_grants: Vec<crate::plugin_grants::PluginGrants>,
+    /// Lifecycle-event subscribers registered by WASM plugins — the
+    /// granted ∩ requested intersection computed at load time. Held
+    /// here for the same non-gated reason as `plugin_commands`: keeps
+    /// `mode::tui` free of `cfg(feature = "wasm")`. Empty in a build
+    /// without the feature.
+    pub event_subscribers: crate::subscriber::EventSubscribers,
     /// When true, AGENTS.md / CLAUDE.md discovery is skipped entirely
     /// (CLI `--no-context-files` / `-nc`). Stashed here so `/reload` can
     /// rebuild the system prompt with the same policy. Mirrors PI's
@@ -106,7 +156,143 @@ pub struct Agent {
     /// `/reload` re-read an edited `SYSTEM.md` from disk, which is the
     /// whole point of `/reload`.
     pub prompt_overrides: crate::agent::prompt_override::PromptOverrides,
+    /// v0.12: exactly what `compose_system_prompt` returned, held apart
+    /// from `context.system`.
+    ///
+    /// `context.system` is a DERIVED value — this base plus
+    /// `plugin_context::render_blocks()` — and nothing ever appends to
+    /// it. That is the whole design, and the alternatives are both
+    /// worse:
+    ///
+    /// Injecting inside `compose_system_prompt` captures nothing. It
+    /// runs ONCE, at Agent construction; a plugin calls
+    /// `host-set-context` LATER, while handling an event, when no
+    /// plugin has contributed yet.
+    ///
+    /// Appending to `context.system` per turn stacks — turn ten would
+    /// carry ten copies — and re-deriving the base by stripping the
+    /// suffix back off is rejected outright: it breaks the moment a
+    /// plugin's own text happens to contain the header, which makes
+    /// correctness depend on a string search over attacker-controlled
+    /// text. Keeping the base in its own field costs one `String` and
+    /// removes the question.
+    ///
+    /// `compose_system_prompt` is deliberately NOT re-run per turn: it
+    /// reads AGENTS.md / CLAUDE.md and the skills tree from disk, which
+    /// is real I/O on the critical path of a tool whose whole point is
+    /// running on constrained hardware. The per-turn cost here is one
+    /// string concatenation and one lock over a small map.
+    pub system_base: Option<String>,
 }
+
+/// Give every replayed tool call a result, synthesizing one where the
+/// session has none.
+///
+/// The session records a `tool_call` entry BEFORE running the tool
+/// (`execute_one_call`), which is the right order — for `bash` the
+/// record of what was about to run is worth more than the result, since
+/// the side effects may have happened either way. But it leaves a
+/// window: lose the process while a long command runs (Ctrl-C twice, a
+/// closed terminal, OOM, a laptop lid) and the file ends with a
+/// `tool_call` and no `tool_result`.
+///
+/// Replayed verbatim that becomes an assistant message carrying a
+/// `tool_use` block with nothing answering it, which both wire
+/// protocols reject. The session was then **permanently unresumable**:
+/// every `--continue` and `/resume` failed with a provider 400 that
+/// names none of this. And it happened at the likeliest possible
+/// moment, since interrupting a long command is exactly when people
+/// press Ctrl-C.
+///
+/// So synthesize a result that says the outcome is unknown, rather than
+/// inventing a plausible one or dropping the call. PI states the same
+/// rule as an invariant — "unsafe synthetic results explicitly state
+/// that captured output is incomplete and the external outcome is
+/// unknown" (`pi/packages/agent/docs/tool-durability.md`, invariant 9).
+/// Claiming the command failed would be a lie in the case that matters
+/// most: it may well have finished.
+fn repair_orphaned_tool_calls(context: &mut Context) {
+    use crate::agent::context::{AssistantBlock, ContextMessage};
+
+    // Every id that already has an answer, anywhere in the context.
+    // Answers sit in their own `Tool` messages, so a scan is simpler
+    // and more robust than pairing by position.
+    let answered: std::collections::HashSet<String> = context
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Collect insertions first: mutating while walking would
+    // invalidate the indices.
+    let mut insertions: Vec<(usize, Vec<ContextMessage>)> = Vec::new();
+    for (idx, msg) in context.messages.iter().enumerate() {
+        let ContextMessage::Assistant { content } = msg else {
+            continue;
+        };
+        let missing: Vec<String> = content
+            .iter()
+            .filter_map(|b| match b {
+                AssistantBlock::ToolCall { call } if !answered.contains(&call.id) => {
+                    Some(call.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let synthetic = missing
+            .into_iter()
+            .map(|id| ContextMessage::Tool {
+                tool_call_id: id,
+                content: ORPHANED_TOOL_CALL_RESULT.to_string(),
+                // `is_error` true: the call did not complete as far as
+                // this session can prove, and the model should not
+                // treat the text below as output. It is NOT a claim
+                // that the command itself failed — the text says so.
+                is_error: true,
+                images: Vec::new(),
+            })
+            .collect();
+        // Immediately after its assistant message: the Anthropic wire
+        // requires the results to follow the `tool_use` that asked for
+        // them, with nothing in between.
+        insertions.push((idx + 1, synthetic));
+    }
+
+    if insertions.is_empty() {
+        return;
+    }
+    let repaired: usize = insertions.iter().map(|(_, v)| v.len()).sum();
+    // Back to front so earlier indices stay valid.
+    for (at, msgs) in insertions.into_iter().rev() {
+        for (offset, m) in msgs.into_iter().enumerate() {
+            context.messages.insert(at + offset, m);
+        }
+    }
+    crate::note!(
+        "nanopi: this session had {repaired} tool call(s) with no recorded \
+         result — nanopi most likely exited while they were running. \
+         Synthesized unknown-outcome results so the session can be \
+         resumed; the model is told the outcome is unknown rather than \
+         being given a made-up one."
+    );
+}
+
+/// Stand-in result for a tool call the session never recorded an answer
+/// for. Addressed to the model, and deliberately does not claim the
+/// call failed — the whole point is that nobody knows.
+const ORPHANED_TOOL_CALL_RESULT: &str = "\
+nanopi exited while this tool call was running, so its result was never \
+recorded. The outcome is UNKNOWN: the command may have completed, \
+partially completed, or not run at all, and any side effects it has \
+already had are still in place. Do not assume it failed. If the answer \
+matters, verify the current state before acting — and prefer a \
+read-only check over re-running anything that writes.";
 
 impl Agent {
     /// Reconstruct an Agent from an existing session JSONL file.
@@ -216,6 +402,7 @@ impl Agent {
             }
         }
         flush(&mut pending, &mut context);
+        repair_orphaned_tool_calls(&mut context);
         Ok(Self {
             context,
             provider: Box::new(OpenAiProvider::new("", "", "")),
@@ -232,43 +419,103 @@ impl Agent {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            // Populated by `hydrate_resumed`, which is what loads the
+            // plugins — `load_session` only replays JSONL and knows
+            // nothing about config.
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            // `None`, and `hydrate_resumed` composes it. The session
+            // file records messages and tool calls only, never the
+            // system prompt, so there is nothing to restore here — and
+            // that absence is precisely what makes deriving
+            // `context.system` safe: a plugin's contribution cannot
+            // reach the transcript and bake itself into every later
+            // `--continue`.
+            system_base: None,
         })
     }
 
     /// Fire all `session_start` hooks. Advisory — outcome is not enforced.
     /// Call once, after Agent construction, before the first turn.
     ///
+    /// `reason` is the session-start vocabulary: `startup|new|resume|fork|
+    /// import`. Diverges from PI (which has no `import`) because nanopi
+    /// supports importing a session from an external source; matches PI's
+    /// `startup|new|resume|fork` otherwise.
+    ///
     /// v0.9.1 fix: honors `--no-hooks` — previously session lifecycle
     /// hooks leaked through the emergency switch because only the
     /// tool-facing sites gated on `hooks_active()`.
-    pub async fn fire_session_start(&self) {
+    pub async fn fire_session_start(&self, reason: &str) {
         if !self.permission.hooks_active() {
             return;
         }
+        let arguments = serde_json::json!({"reason": reason});
         run_session_hooks(
             &self.hooks.session_start,
             HookEvent::SessionStart,
+            arguments.clone(),
+            &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
         .await;
+        let session_id = self.session_id.to_string();
+        let cwd = self.cwd.clone();
+        self.event_subscribers.deliver_with(HookEvent::SessionStart, || {
+                event_payload_json(
+                    HookEvent::SessionStart,
+                    None,
+                    None,
+                    &arguments,
+                    &cwd,
+                    Some(&session_id),
+                )
+            })
+            .await;
     }
 
-    /// Fire all `session_end` hooks. Advisory. Call before the process
+    /// Fire all `session_shutdown` hooks. Advisory. Call before the process
     /// exits (or before Agent is dropped in the interactive loop).
+    ///
+    /// `reason` is the session-shutdown vocabulary: `quit|new|resume|fork|
+    /// import`. Diverges from PI (which has no `reload` and no `import`)
+    /// — nanopi has no `reload` reason, and adds `import` for the same
+    /// reason as `fire_session_start`.
+    ///
     /// See `fire_session_start` for the `--no-hooks` note.
-    pub async fn fire_session_end(&self) {
+    pub async fn fire_session_shutdown(&self, reason: &str) {
         if !self.permission.hooks_active() {
             return;
         }
+        let arguments = serde_json::json!({"reason": reason});
         run_session_hooks(
-            &self.hooks.session_end,
-            HookEvent::SessionEnd,
+            &self.hooks.session_shutdown,
+            HookEvent::SessionShutdown,
+            arguments.clone(),
+            &self.session_id.to_string(),
             &self.session_id.to_string(),
             &self.cwd,
         )
         .await;
+        let session_id = self.session_id.to_string();
+        let cwd = self.cwd.clone();
+        self.event_subscribers.deliver_with(HookEvent::SessionShutdown, || {
+                event_payload_json(
+                    HookEvent::SessionShutdown,
+                    None,
+                    None,
+                    &arguments,
+                    &cwd,
+                    Some(&session_id),
+                )
+            })
+            .await;
     }
 
     /// Force a compaction pass regardless of threshold. Bound to `/compact`
@@ -280,8 +527,74 @@ impl Agent {
     /// events so the UI can draw a scrollback marker. The manual
     /// `/compact` path passes None and drives its own feedback via
     /// the palette; the auto-trigger passes Some(&turn_tx).
-    pub async fn compact_now(&mut self, tx: Option<&mpsc::Sender<AgentEvent>>, reason: &str) {
+    /// Returns true if a pass actually ran. False means
+    /// `find_compact_boundary` found nothing to do — the whole context
+    /// already fits inside the verbatim tail budget — and the context is
+    /// byte-for-byte unchanged.
+    ///
+    /// The caller needs this to describe what happened: measuring
+    /// `estimate_chars()` either side can't tell "compacted, and the
+    /// summary happened to be the same length" from "never ran", and
+    /// `/compact` on a short session reported the first while doing the
+    /// second.
+    pub async fn compact_now(
+        &mut self,
+        tx: Option<&mpsc::Sender<AgentEvent>>,
+        reason: &str,
+    ) -> bool {
         use crate::agent::compact::compact;
+
+        // Decide whether there is anything to do BEFORE announcing
+        // anything. `compact()` makes this same call internally and
+        // returns None when it comes back empty, but by then the
+        // `session_before_compact` hook has already fired — leaving a
+        // `before` with no matching `after` in every hook log, and no
+        // way for a hook author to tell that pair apart from a crash
+        // mid-compaction. The duplicated boundary scan is a walk over
+        // the message list; the honesty is worth it.
+        if crate::agent::compact::find_compact_boundary(
+            &self.context.messages,
+            crate::agent::compact::KEEP_RECENT_TOKENS,
+        )
+        .is_none()
+        {
+            return false;
+        }
+
+        // ── SessionBeforeCompact hook (v0.11.0) ──────────────────
+        // Advisory only — fires before compaction runs. `subject`
+        // (matcher target) is still the compaction reason string
+        // ("threshold" or "manual"); `session_id` is the real session
+        // id, carried honestly in the payload (v0.12.0 fix — this used
+        // to be the reason string, not the actual session id).
+        if self.permission.hooks_active() {
+            let arguments = serde_json::json!({"reason": reason});
+            if !self.hooks.session_before_compact.is_empty() {
+                run_session_hooks(
+                    &self.hooks.session_before_compact,
+                    HookEvent::SessionBeforeCompact,
+                    arguments.clone(),
+                    reason,
+                    &self.session_id.to_string(),
+                    &self.cwd,
+                )
+                .await;
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::SessionBeforeCompact, || {
+                    event_payload_json(
+                        HookEvent::SessionBeforeCompact,
+                        None,
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
+        }
+
         if let Some(tx) = tx {
             let _ = tx
                 .send(AgentEvent::CompactionStart {
@@ -289,9 +602,12 @@ impl Agent {
                 })
                 .await;
         }
+        // The boundary was there a moment ago and nothing has touched
+        // the context since, so this is not expected to be None.
         let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
-            return;
+            return false;
         };
+
         if let Some(tx) = tx {
             let _ = tx
                 .send(AgentEvent::CompactionEnd {
@@ -300,6 +616,39 @@ impl Agent {
                 })
                 .await;
         }
+
+        // ── SessionCompact hook (v0.11.0) ──────────────────────────
+        // Fires after compaction completes. `subject` (matcher target)
+        // is the compaction reason; `session_id` is the real session
+        // id, carried honestly in the payload.
+        if self.permission.hooks_active() {
+            let arguments = serde_json::json!({"reason": reason});
+            if !self.hooks.session_compact.is_empty() {
+                run_session_hooks(
+                    &self.hooks.session_compact,
+                    HookEvent::SessionCompact,
+                    arguments.clone(),
+                    reason,
+                    &self.session_id.to_string(),
+                    &self.cwd,
+                )
+                .await;
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::SessionCompact, || {
+                    event_payload_json(
+                        HookEvent::SessionCompact,
+                        None,
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
+        }
+
         let _ = session::append_entry(
             &self.session_path,
             &SessionEntry::Compaction {
@@ -308,6 +657,7 @@ impl Agent {
                 replaced_count: result.replaced_count,
             },
         );
+        true
     }
 
     /// Threshold-gated version of `compact_now`. Called at the top of
@@ -321,8 +671,10 @@ impl Agent {
         if !should_auto_compact(est_chars, window) {
             return false;
         }
-        self.compact_now(Some(tx), "threshold").await;
-        true
+        // Over threshold but no boundary (a single message larger than
+        // the tail budget) means no pass ran — say so rather than
+        // reporting one.
+        self.compact_now(Some(tx), "threshold").await
     }
 
     /// Run a single user turn to completion. Streams events to `tx` and
@@ -335,65 +687,316 @@ impl Agent {
     /// with whatever was streamed so far. The session file is left in a
     /// consistent state (last completed turns persisted; the cancelled
     /// turn's partial assistant text is dropped).
+    /// Move anything still sitting in the steer channel onto the
+    /// follow-up queue.
+    ///
+    /// Called on every early return from `run_turn`. A steer that the
+    /// channel accepted but the pump never reached has already been
+    /// echoed to the user as landed; letting it die with the receiver
+    /// makes their text vanish without a trace — the same failure
+    /// c15c8a9 fixed on the send side and missed here. On cancellation
+    /// a `Steering` message becomes a follow-up, since there is no
+    /// longer a turn for it to steer.
+    fn drain_steer_to_follow_ups(
+        &mut self,
+        steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
+        queue: &mut Vec<String>,
+    ) {
+        if let Some(rx) = steer_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(SteerMessage::Steering { text })
+                    | Ok(SteerMessage::FollowUp { text }) => queue.push(text),
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        self.pending_follow_ups.extend(queue.drain(..));
+    }
+
+    /// Set the composed system-prompt base and re-derive
+    /// `context.system` from it.
+    ///
+    /// The single door through which a base is written, so the two
+    /// fields cannot drift. Every caller that used to assign
+    /// `context.system = Some(compose_system_prompt(…))` goes through
+    /// here instead.
+    pub fn set_system_base(&mut self, base: String) {
+        self.system_base = Some(base);
+        self.refresh_system_prompt();
+    }
+
+    /// Re-derive `context.system` as base + plugin contributions.
+    ///
+    /// Unconditionally compiled, no `cfg`: without the `wasm` feature
+    /// `render_blocks()` returns `""` and this is a clone of the base,
+    /// so a build without plugins produces a byte-identical prompt.
+    /// That `""` contract is exactly what makes the `cfg` unnecessary.
+    ///
+    /// Assignment, never append — see the `system_base` doc comment for
+    /// why the base lives in its own field.
+    pub fn refresh_system_prompt(&mut self) {
+        if let Some(base) = &self.system_base {
+            let blocks = crate::plugin_context::render_blocks();
+            self.context.system = Some(if blocks.is_empty() {
+                base.clone()
+            } else {
+                format!("{base}{blocks}")
+            });
+        }
+    }
+
+    /// Publish everything `host-call-tool` needs to drive
+    /// `run_one_tool` (`crate::plugin_tools`).
+    ///
+    /// Unconditionally compiled, no `cfg`, for the same reason
+    /// `refresh_system_prompt` is: without the `wasm` feature nothing
+    /// ever calls the dispatch, so installing one is a few clones and
+    /// no behaviour.
+    ///
+    /// Called at Agent construction AND once per `run_turn`. The
+    /// per-turn refresh is the load-bearing half: `session_id` and
+    /// `session_path` change under `/new`, `/resume` and `/fork`, and a
+    /// dispatch that bound one at startup would hand every
+    /// `tool_execution_start` hook a stale session id for the rest of
+    /// the process — `docs/claims-and-races.md` §3's session-identity
+    /// row. It is also why the dispatch carries the id rather than
+    /// looking one up.
+    pub fn install_plugin_dispatch(&self) {
+        crate::plugin_tools::install(crate::plugin_tools::Dispatch {
+            registry: self.registry.clone(),
+            cwd: self.cwd.clone(),
+            permission: self.permission.clone(),
+            hooks: self.hooks.clone(),
+            subscribers: self.event_subscribers.clone(),
+            session_path: self.session_path.clone(),
+            session_id: self.session_id.clone(),
+        });
+    }
+
     pub async fn run_turn(
         &mut self,
         user_msg: &str,
         tx: &mpsc::Sender<AgentEvent>,
         cancel: Option<tokio_util::sync::CancellationToken>,
+        steer_rx: Option<mpsc::Receiver<SteerMessage>>,
     ) -> Result<String, AgentError> {
+        // v0.12: fold in any plugin context contributions, BEFORE
+        // compaction. Two reasons for that order and that grain:
+        //
+        // Before `maybe_compact`, because the contribution enters every
+        // request and `estimate_chars` has to count it — a compaction
+        // decision that pretended it were free would understate the
+        // context by up to 4 KiB per plugin.
+        //
+        // Once per turn rather than per provider iteration, because
+        // §2.2 frames the contribution as idempotent state: a call the
+        // host never made simply means the previous contribution stands
+        // for one more turn, and a contribution set mid-turn lands on
+        // the next one. The WIT doc says so, so a plugin author is not
+        // surprised.
+        self.refresh_system_prompt();
+        // Same site, same reason: a per-turn refresh keeps the
+        // dispatch's session identity live across `/new`, `/resume` and
+        // `/fork`. See `install_plugin_dispatch`.
+        self.install_plugin_dispatch();
         // If the accumulated context is too big, compact it before adding
         // the new user message so the new message survives intact.
         self.maybe_compact(tx).await;
         self.turn_count = self.turn_count.saturating_add(1);
 
-        // ── UserPromptSubmit hook (mirrors PI's beforeUserMessage) ────
-        // Allow user hooks to inspect / transform the raw prompt before
-        // any skill-command expansion, and to block outright. Same
-        // Allow/Block/Transform semantics as pre_tool_use hooks; Block
-        // aborts the turn with a synthetic assistant marker so the user
-        // sees why. Transform mutates the prompt in place.
-        let mut effective_msg = user_msg.to_string();
-        if self.permission.hooks_active() && !self.hooks.user_prompt_submit.is_empty() {
-            let (outcome, new_args) = run_hooks(
-                &self.hooks.user_prompt_submit,
-                HookEvent::UserPromptSubmit,
-                "", // no tool name for prompt submit
-                serde_json::json!({ "prompt": effective_msg }),
-                &self.cwd,
-                Some(&self.session_id.to_string()),
-            )
-            .await;
-            match outcome {
-                HookOutcome::Block { reason } => {
-                    let marker = format!("[UserPromptSubmit hook blocked the prompt: {reason}]");
-                    let _ = tx
-                        .send(AgentEvent::Error {
-                            error: marker.clone(),
-                        })
-                        .await;
-                    return Ok(marker);
-                }
-                HookOutcome::Transform { new_arguments } => {
-                    if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
-                        effective_msg = v.to_string();
+        // ── BeforeAgentStart hook (v0.11.0; mirrors PI's before_agent_start) ─
+        // Fires once per turn, after compaction + turn-count bump but
+        // BEFORE the user message enters context. The only new lifecycle
+        // hook that supports Block (early return) and Transform (rewrite
+        // the prompt); the others are advisory.
+        // matcher applies to the turn_count string so users can scope
+        // audit hooks (e.g. "^1$" to log only the first turn).
+        //
+        // A rewritten prompt lands in `pre_start_msg` rather than being
+        // applied directly: `effective_msg` is only born below, and
+        // seeding it from here is what makes the two prompt hooks chain
+        // — BeforeAgentStart's output is Input's input.
+        let mut pre_start_msg: Option<String> = None;
+        if self.permission.hooks_active() {
+            let turn_label = self.turn_count.to_string();
+            let arguments = serde_json::json!({
+                "turn_count": self.turn_count,
+                "prompt": user_msg,
+            });
+            // A Block is stashed rather than returned from inside the
+            // match, so the WASM delivery below still runs. Observe-only
+            // subscribers must not have a blind spot exactly where a
+            // shell hook refuses something — an audit plugin cares most
+            // about the refused turns. Matches what the
+            // ToolExecutionStart site does with its own block.
+            let mut blocked: Option<String> = None;
+            if !self.hooks.before_agent_start.is_empty() {
+                let (outcome, new_args) = run_hooks(
+                    &self.hooks.before_agent_start,
+                    HookEvent::BeforeAgentStart,
+                    &turn_label,
+                    None,
+                    arguments.clone(),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+                match outcome {
+                    HookOutcome::Block { reason } => {
+                        blocked = Some(reason);
                     }
-                }
-                HookOutcome::Allow => {
-                    if let Some(v) = new_args
-                        .as_ref()
-                        .and_then(|a| a.get("prompt"))
-                        .and_then(|v| v.as_str())
-                    {
-                        if v != effective_msg {
-                            effective_msg = v.to_string();
+                    HookOutcome::Transform { new_arguments } => {
+                        // Only the `prompt` key is honored — the payload
+                        // also carries `turn_count`, which is ours, not the
+                        // hook's, to rewrite.
+                        if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
+                            pre_start_msg = Some(v.to_string());
+                        }
+                    }
+                    HookOutcome::Allow => {
+                        // `run_hooks` folds transforms into its accumulated
+                        // args and still reports Allow when no hook blocked,
+                        // so a rewrite usually arrives here rather than in
+                        // the Transform arm. Same fallback the Input hook
+                        // uses; compare against `user_msg` so an unchanged
+                        // echo doesn't count as a rewrite.
+                        if let Some(v) = new_args
+                            .as_ref()
+                            .and_then(|a| a.get("prompt"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if v != user_msg {
+                                pre_start_msg = Some(v.to_string());
+                            }
                         }
                     }
                 }
             }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::BeforeAgentStart, || {
+                    event_payload_json(
+                        HookEvent::BeforeAgentStart,
+                        Some(&turn_label),
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
+            if let Some(reason) = blocked {
+                let marker = format!("[BeforeAgentStart hook blocked the turn: {reason}]");
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        error: marker.clone(),
+                    })
+                    .await;
+                return Ok(marker);
+            }
+        }
+
+        // ── Input hook (mirrors PI's beforeUserMessage) ────
+        // Allow user hooks to inspect / transform the raw prompt before
+        // any skill-command expansion, and to block outright. Same
+        // Allow/Block/Transform semantics as tool_execution_start hooks;
+        // Block aborts the turn with a synthetic assistant marker so the
+        // user sees why. Transform mutates the prompt in place.
+        let mut effective_msg = pre_start_msg.unwrap_or_else(|| user_msg.to_string());
+        if self.permission.hooks_active() {
+            // Pre-transform arguments — shared byte-for-byte by the
+            // shell-hook call and the WASM delivery below, per §4.1.
+            let arguments = serde_json::json!({ "prompt": effective_msg });
+            // Stashed, not returned from inside the match — same
+            // reasoning as the BeforeAgentStart site above: an
+            // observe-only subscriber must still see a prompt that a
+            // shell hook refused.
+            let mut blocked: Option<String> = None;
+            if !self.hooks.input.is_empty() {
+                let (outcome, new_args) = run_hooks(
+                    &self.hooks.input,
+                    HookEvent::Input,
+                    // No tool name here, so `matcher` is tested against ""
+                    // — only `*` (or an omitted matcher) can ever match.
+                    // This is `MatcherSubject::Nothing`, and since T2.7 a
+                    // config that puts a real regex here is a load-time
+                    // error rather than a hook that silently never fires
+                    // (`hook::validate_hooks`). Anything reaching here
+                    // therefore has `*`.
+                    "",
+                    None,
+                    arguments.clone(),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+                match outcome {
+                    HookOutcome::Block { reason } => {
+                        blocked = Some(reason);
+                    }
+                    HookOutcome::Transform { new_arguments } => {
+                        if let Some(v) = new_arguments.get("prompt").and_then(|v| v.as_str()) {
+                            effective_msg = v.to_string();
+                        }
+                    }
+                    HookOutcome::Allow => {
+                        if let Some(v) = new_args
+                            .as_ref()
+                            .and_then(|a| a.get("prompt"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if v != effective_msg {
+                                effective_msg = v.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::Input, || {
+                    event_payload_json(
+                        HookEvent::Input,
+                        Some(""),
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
+            if let Some(reason) = blocked {
+                // NOT bracketed: both renderers wrap `AgentEvent::Error`
+                // in `[error: …]` themselves, so a self-bracketing
+                // message came out as
+                // `[error: [Input hook blocked the prompt: …]]`.
+                //
+                // And it says whose decision this was. A prompt refused
+                // by the user's own `[[hooks.input]]` entry is a policy
+                // outcome, not a malfunction — the bare
+                // `Input hook blocked the prompt` under a red `error:`
+                // reads like nanopi broke, which is the same confusion
+                // the tool-block message was reworded to avoid.
+                let notice = format!(
+                    "your `input` hook refused this prompt (policy, not a \
+                     failure) — {reason}"
+                );
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        error: notice.clone(),
+                    })
+                    .await;
+                // The returned text stands alone in `--output json` and
+                // in the session record, so it carries the same prose
+                // rather than a bracketed marker.
+                return Ok(notice);
+            }
         }
 
         // ── /skill:name expansion (mirrors PI's _expandSkillCommand) ──
-        // Runs AFTER the UserPromptSubmit hook so a hook that rewrites
+        // Runs AFTER the Input hook so a hook that rewrites
         // the prompt into a /skill: call still triggers expansion.
         // Emits SkillInvocation so the TUI can render its own card.
         if let Some(expansion) =
@@ -466,13 +1069,100 @@ impl Agent {
         let mut stuck_streak: u32 = 0;
         let mut last_error_sig: Option<Vec<(String, String)>> = None;
 
-        for _ in 0..MAX_ITERATIONS {
+        // ── Steer / follow-up (v0.11.0) ────────────────────────────────
+        // Mutably held so the loop body can `try_recv()` at each
+        // iteration boundary. `take()` happens once; after that the
+        // Option is `None` (the receiver is moved into the loop
+        // scope).
+        let mut steer_rx = steer_rx;
+        let mut follow_up_queue: Vec<String> = Vec::new();
+
+        for iteration_idx in 0..MAX_ITERATIONS {
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
                 if ct.is_cancelled() {
+                    self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
                     return Ok(final_text);
                 }
+            }
+
+            // ── Steer pump (v0.11.0) ───────────────────────────────
+            // Drain any pending `SteerMessage::Steering` messages
+            // from the channel and push them as fresh user messages
+            // into context so the next LLM call sees them. `FollowUp`
+            // messages are queued — they fire after the turn ends.
+            // `try_recv` is non-blocking so the agent loop never
+            // stalls waiting for user input.
+            if let Some(rx) = steer_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(SteerMessage::Steering { text }) => {
+                            self.context.push_user_text(text.clone());
+                            let _ = session::append_entry(
+                                &self.session_path,
+                                &SessionEntry::Message {
+                                    id: uuid::v7().to_string(),
+                                    timestamp: time::now_iso8601(),
+                                    role: "user".into(),
+                                    content: text,
+                                },
+                            );
+                        }
+                        Ok(SteerMessage::FollowUp { text }) => {
+                            follow_up_queue.push(text);
+                        }
+                        // Empty or disconnected — nothing pending.
+                        // Spelled out rather than `_` so adding a
+                        // `SteerMessage` variant is a compile error
+                        // here instead of silently falling into this
+                        // arm and aborting the drain with the rest of
+                        // the queue still buffered.
+                        Err(mpsc::error::TryRecvError::Empty)
+                        | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+
+            // ── TurnStart hook (v0.11.0) ────────────────────────────────
+            // Advisory only — a Block is reported on stderr but does not
+            // abort the iteration. matcher applied to turn_count (as
+            // string).
+            if self.permission.hooks_active() {
+                let turn_label = self.turn_count.to_string();
+                let arguments = serde_json::json!({
+                    "turn_count": self.turn_count,
+                    "iteration": iteration_idx,
+                });
+                if !self.hooks.turn_start.is_empty() {
+                    let (outcome, _) = run_hooks(
+                        &self.hooks.turn_start,
+                        HookEvent::TurnStart,
+                        &turn_label,
+                        None,
+                        arguments.clone(),
+                        &self.cwd,
+                        Some(&self.session_id.to_string()),
+                    )
+                    .await;
+                    crate::agent::hook::report_advisory_outcome(
+                        HookEvent::TurnStart,
+                        outcome,
+                    );
+                }
+                let session_id = self.session_id.to_string();
+                let cwd = self.cwd.clone();
+                self.event_subscribers.deliver_with(HookEvent::TurnStart, || {
+                        event_payload_json(
+                            HookEvent::TurnStart,
+                            Some(&turn_label),
+                            None,
+                            &arguments,
+                            &cwd,
+                            Some(&session_id),
+                        )
+                    })
+                    .await;
             }
 
             // Set up a forward channel: provider pushes to `forward_tx`,
@@ -543,7 +1233,6 @@ impl Agent {
             let (mut calls, done, assistant_text) = collect_task
                 .await
                 .map_err(|e| AgentError::Provider(format!("collect task: {e}")))?;
-
             if cancelled {
                 // Push a short directive-only marker so the NEXT
                 // turn's LLM sees the turn was aborted and answers
@@ -582,6 +1271,7 @@ impl Agent {
                     },
                 )?;
                 self.context.push_assistant_text(marker);
+                self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
                 return Ok(final_text);
             }
 
@@ -712,6 +1402,11 @@ impl Agent {
                 .cache_write_tokens
                 .saturating_add(usage.cache_write_tokens);
 
+            // Snapshot had_tool_calls before the match — `calls` is moved
+            // inside the ToolCalls arm, so the TurnEnd hook below needs
+            // a value captured before the move.
+            let had_tool_calls = !calls.is_empty();
+
             match finish_reason {
                 FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
                     break;
@@ -766,12 +1461,116 @@ impl Agent {
                     break;
                 }
             }
+
+            // ── TurnEnd hook (v0.11.0) ──────────────────────────────────
+            // Advisory only — fired at the bottom of each iteration. A
+            // Block is reported on stderr and otherwise ignored.
+            if self.permission.hooks_active() {
+                let turn_label = self.turn_count.to_string();
+                let arguments = serde_json::json!({
+                    "turn_count": self.turn_count,
+                    "iteration": iteration_idx,
+                    "had_tool_calls": had_tool_calls,
+                });
+                if !self.hooks.turn_end.is_empty() {
+                    let (outcome, _) = run_hooks(
+                        &self.hooks.turn_end,
+                        HookEvent::TurnEnd,
+                        &turn_label,
+                        None,
+                        arguments.clone(),
+                        &self.cwd,
+                        Some(&self.session_id.to_string()),
+                    )
+                    .await;
+                    crate::agent::hook::report_advisory_outcome(
+                        HookEvent::TurnEnd,
+                        outcome,
+                    );
+                }
+                let session_id = self.session_id.to_string();
+                let cwd = self.cwd.clone();
+                self.event_subscribers.deliver_with(HookEvent::TurnEnd, || {
+                        event_payload_json(
+                            HookEvent::TurnEnd,
+                            Some(&turn_label),
+                            None,
+                            &arguments,
+                            &cwd,
+                            Some(&session_id),
+                        )
+                    })
+                    .await;
+            }
+        }
+        // ── MessageEnd hook (v0.11.0) ───────────────────────────────────
+        // Fires once after the for-loop completes (all tool rounds done),
+        // just before post-turn compaction. Advisory only — a Block is
+        // reported on stderr but does not abort the turn (which has
+        // already ended anyway).
+        if self.permission.hooks_active() {
+            let turn_label = self.turn_count.to_string();
+            // Stage 5 (`docs/plugin-capabilities.md` §5): the payload
+            // carries the assistant's text, not just its length. Built
+            // in `hook.rs` so the truncation bound and its self-
+            // announcement live next to the payload type and stay
+            // unit-testable in both builds.
+            let arguments =
+                crate::agent::hook::message_end_arguments(self.turn_count, &final_text);
+            if !self.hooks.message_end.is_empty() {
+                let (outcome, _) = run_hooks(
+                    &self.hooks.message_end,
+                    HookEvent::MessageEnd,
+                    &turn_label,
+                    None,
+                    arguments.clone(),
+                    &self.cwd,
+                    Some(&self.session_id.to_string()),
+                )
+                .await;
+                crate::agent::hook::report_advisory_outcome(
+                    HookEvent::MessageEnd,
+                    outcome,
+                );
+            }
+            let session_id = self.session_id.to_string();
+            let cwd = self.cwd.clone();
+            self.event_subscribers.deliver_with(HookEvent::MessageEnd, || {
+                    event_payload_json(
+                        HookEvent::MessageEnd,
+                        Some(&turn_label),
+                        None,
+                        &arguments,
+                        &cwd,
+                        Some(&session_id),
+                    )
+                })
+                .await;
         }
         // Post-turn compaction check. Matches PI (`agent-session.ts`
         // `_handlePostAgentRun`). Firing here means the user sees the
         // compaction event bundled with the just-finished response
         // instead of at the start of the next turn.
         self.maybe_compact(tx).await;
+
+        // Anything still sitting in the steer channel arrived too late
+        // for the steer pump, which only runs at the top of an
+        // iteration. A turn that ends without tool calls — the common
+        // case — has no next iteration, so a message typed during the
+        // stream was left in the channel: never pushed into context,
+        // never persisted, never seen by the model. The TUI had already
+        // drawn its `[steer]` bar, so the user was told it landed.
+        //
+        // Demote them to follow-ups, same as the cancel and
+        // interrupted-marker paths already do, and the same contract
+        // the WIT docs state for `send_user_message`: steer the running
+        // turn, or queue as a follow-up if it arrives too late.
+        self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
+
+        // v0.11.0: surface the first `FollowUp` message (if any)
+        // onto the Agent so the caller can auto-trigger another
+        // turn. Matches Pi's `getFollowUpMessages()` semantic.
+        self.pending_follow_ups.extend(follow_up_queue.drain(..));
         Ok(final_text)
     }
 
@@ -784,15 +1583,20 @@ impl Agent {
         tx: &mpsc::Sender<AgentEvent>,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<bool>, AgentError> {
-        // Phase 1: Run all tool executions CONCURRENTLY via join_all.
-        // Each future resolves to (ToolCall, Result<ToolOutput, ToolError>).
-        // Hooks, persistence, and context mutation happen in phase 2.
+        // Phase 1: Run tool executions per `tool_exec_mode`.
+        // - Parallel (default): `tokio::join_all` — all calls concurrently.
+        // - Sequential: each call awaited in order.
+        //
+        // In sequential mode we still wrap cancel race around the whole
+        // batch so Esc can short-circuit. Cancellation drops in-flight
+        // bash children via `kill_on_drop`.
         let cwd = self.cwd.clone();
         let registry = self.registry.clone();
         let session_path = self.session_path.clone();
         let session_id = self.session_id.clone();
         let permission = self.permission.clone();
         let hooks = self.hooks.clone();
+        let subscribers = self.event_subscribers.clone();
 
         // Keep id/name copies so we can synthesize cancelled results if
         // the whole batch gets dropped mid-flight (the calls Vec itself
@@ -802,29 +1606,83 @@ impl Agent {
             .map(|c| (c.id.clone(), c.name.clone()))
             .collect();
 
-        let futs: Vec<_> = calls
+        // Outcomes land here as each tool finishes, so a cancel that
+        // interrupts the batch still sees what already completed. Plain
+        // `std::sync::Mutex`: the lock is taken and released inside one
+        // statement, never across an await.
+        let completed: std::sync::Arc<std::sync::Mutex<Vec<ToolCallOutcome>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Per-path serialization. The batch is split into groups; the
+        // groups run concurrently, the calls inside one group run one
+        // after another in the order the model emitted them. A group is
+        // "the calls that mutate the same file" (see
+        // `tool::mutation_key`); every non-mutating call is its own
+        // one-element group, so it still runs fully in parallel.
+        //
+        // Sequential mode is NOT grouped, and that is load-bearing
+        // rather than an optimization: grouping reorders a batch (all
+        // calls for one key move to the position of the first of them),
+        // and Sequential's contract is "one at a time, in the order the
+        // model emitted them". One call per group reproduces today's
+        // behaviour exactly — including the per-call cancel checks
+        // below, which straddle group boundaries.
+        let groups: Vec<Vec<ToolCall>> = match self.tool_exec_mode {
+            crate::config::ToolExecMode::Sequential => calls.into_iter().map(|c| vec![c]).collect(),
+            crate::config::ToolExecMode::Parallel => {
+                group_batch(&registry, &cwd, calls, &self.tool_exec_overrides)
+            }
+        };
+
+        let futs: Vec<_> = groups
             .into_iter()
-            .map(|call| {
+            .map(|group| {
                 let cwd = cwd.clone();
                 let registry = registry.clone();
                 let session_path = session_path.clone();
                 let session_id = session_id.clone();
                 let permission = permission.clone();
                 let hooks = hooks.clone();
+                let subscribers = subscribers.clone();
                 let tx = tx.clone();
+                let done = completed.clone();
                 async move {
-                    let outcome = run_one_tool(
-                        call,
-                        registry,
-                        session_path,
-                        session_id,
-                        cwd,
-                        permission,
-                        hooks,
-                        tx,
-                    )
-                    .await;
-                    outcome
+                    // Serial within the group. Awaiting each call before
+                    // starting the next is the whole guarantee: the
+                    // second `edit` of a file cannot snapshot it until
+                    // the first has written.
+                    for call in group {
+                        let outcome = run_one_tool(
+                            call,
+                            registry.clone(),
+                            session_path.clone(),
+                            session_id.clone(),
+                            cwd.clone(),
+                            permission.clone(),
+                            hooks.clone(),
+                            subscribers.clone(),
+                            tx.clone(),
+                            ToolCallOrigin::Model,
+                        )
+                        .await;
+                        // Recorded through a shared handle rather than
+                        // only returned, because `join_all`'s output is
+                        // all-or-nothing: when cancel wins the race
+                        // below, its `Vec` is empty even for tools that
+                        // already finished — and already wrote their
+                        // real ToolResult to the session file. Losing
+                        // them there is what made the cancel path append
+                        // a SECOND, contradictory entry for the same
+                        // tool_call_id.
+                        //
+                        // Pushing per call (not per group) keeps that
+                        // true at group granularity too: a cancel that
+                        // drops a group mid-way still leaves the calls
+                        // it already finished recorded here, so the
+                        // synthesis pass below only invents results for
+                        // calls that genuinely never ran.
+                        done.lock().unwrap_or_else(|e| e.into_inner()).push(outcome);
+                    }
                 }
             })
             .collect();
@@ -838,18 +1696,104 @@ impl Agent {
         // tool_result entries so the assistant's tool_use blocks stay
         // paired with tool_result blocks — otherwise the next request
         // to Anthropic would 400 on unmatched tool_use ids.
-        let (results, cancelled) = match cancel.as_ref() {
-            Some(ct) => tokio::select! {
-                biased;
-                _ = ct.cancelled() => (Vec::new(), true),
-                r = join_all(futs) => (r, false),
+        let cancelled = match self.tool_exec_mode {
+            crate::config::ToolExecMode::Parallel => match cancel.as_ref() {
+                Some(ct) => tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => true,
+                    _ = join_all(futs) => false,
+                },
+                None => {
+                    join_all(futs).await;
+                    false
+                }
             },
-            None => (join_all(futs).await, false),
+            crate::config::ToolExecMode::Sequential => {
+                // Sequentially await each tool. Cancel is raced against
+                // the *in-flight* future, not just checked between
+                // tools: a between-tools-only check meant a 30s bash
+                // ran to completion after Esc, since nothing was
+                // polling the token while it was awaited. Dropping the
+                // future here has the same effect as the Parallel arm —
+                // kill_on_drop SIGKILLs any live bash child.
+                //
+                // The returned `Vec<ToolCallOutcome>` has the same
+                // shape as `join_all` for the post-phase, except it may
+                // be short when cancel won.
+                let mut cancelled = false;
+                let mut iter = futs.into_iter();
+                loop {
+                    // Pre-check so an already-cancelled token doesn't
+                    // pay for spawning the next tool at all.
+                    if let Some(ct) = cancel.as_ref() {
+                        if ct.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
+                    }
+                    match iter.next() {
+                        Some(fut) => match cancel.as_ref() {
+                            // `biased` matches the Parallel arm: cancel
+                            // is polled first so a fast Esc can't lose
+                            // the race to a fast-finishing tool.
+                            Some(ct) => tokio::select! {
+                                biased;
+                                _ = ct.cancelled() => {
+                                    cancelled = true;
+                                    break;
+                                }
+                                _ = fut => {}
+                            },
+                            None => fut.await,
+                        },
+                        None => break,
+                    }
+                }
+                cancelled
+            }
         };
 
+        // Both arms record into `completed`; neither returns outcomes
+        // directly any more, so the two modes now behave identically
+        // under cancellation.
+        let results = std::sync::Arc::try_unwrap(completed)
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or_else(|arc| {
+                // A future still holds a reference — only reachable if
+                // cancel dropped the batch mid-poll. Clone what landed.
+                arc.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            });
+
         let results = if cancelled {
+            // Cancel can land mid-batch in either mode, so some tools
+            // already ran — and already appended their real ToolResult
+            // to the session JSONL from inside `run_one_tool`. Keeping
+            // those and synthesizing only for the calls that never ran
+            // is what stops a second, contradictory entry being written
+            // for the same tool_call_id.
+            //
+            // That duplicate was live in Parallel until `completed`
+            // existed: `join_all` returns an empty Vec when cancel wins
+            // the race, so finished-and-persisted tools looked un-run
+            // here and got a cancel marker appended on top of their real
+            // result. On resume `load_session` replayed both, and two
+            // tool_result blocks sharing one tool_use_id is a permanent
+            // 400 from Anthropic — the session could never be resumed
+            // again.
+            //
+            // Iterating `call_meta` rather than `results` keeps
+            // tool_result order matching tool_use order; Anthropic also
+            // 400s on an unmatched or misordered pair.
+            let mut done: std::collections::HashMap<String, ToolCallOutcome> = results
+                .into_iter()
+                .map(|o| (o.call_id.clone(), o))
+                .collect();
             let mut synth = Vec::with_capacity(call_meta.len());
             for (id, _name) in call_meta {
+                if let Some(finished) = done.remove(&id) {
+                    synth.push(finished);
+                    continue;
+                }
                 let content = "[cancelled by user before tool completed]".to_string();
                 let _ = session::append_entry(
                     &self.session_path,
@@ -895,20 +1839,185 @@ impl Agent {
 /// caller's join_all. Only what the caller actually needs to push a
 /// tool result into context; persistence already happened inside
 /// `run_one_tool`.
-struct ToolCallOutcome {
-    call_id: String,
-    content: String,
-    is_error: bool,
+#[derive(Clone)]
+pub(crate) struct ToolCallOutcome {
+    #[allow(dead_code)]
+    pub(crate) call_id: String,
+    pub(crate) content: String,
+    pub(crate) is_error: bool,
     /// Multimodal image attachments from the tool (empty for text-only
     /// tools). Forwarded into context so the next request to a vision
     /// model can carry the image blocks.
-    images: Vec<crate::tool::ImageAttachment>,
+    pub(crate) images: Vec<crate::tool::ImageAttachment>,
+}
+
+/// Who asked for this tool call.
+///
+/// `docs/plugin-capabilities.md` §"One code path, an origin flag" is
+/// the design: `host-call-tool` must NOT get a second, narrower
+/// execution path, because a second path is a second place for the
+/// hook contract, the cwd guard and the result shape to drift. So
+/// `run_one_tool` stays the only one and this flag decides what a
+/// plugin-initiated call does differently.
+///
+/// It decides exactly THREE things — the spec said two, and the spec
+/// was amended in this stage rather than left disagreeing with the
+/// code:
+///
+/// 1. whether a [`SessionEntry`] is written. The session file is the
+///    transcript of the conversation with the MODEL. A plugin's call
+///    was not part of that conversation, and replaying it on `--continue`
+///    would put a `tool_use` block in the model's history that it never
+///    emitted (invariant 15).
+/// 2. whether an [`AgentEvent`] is sent. The events drive the model's
+///    view and the TUI's tool cards; a plugin's call belongs in neither.
+///    The user learns about it through `notify::disclose` instead, which
+///    is a one-line disclosure on the host budget rather than a card.
+/// 3. the execution deadline. §"It needs its own timeout" requires a
+///    bound, and the origin is the only thing that knows whether one
+///    applies: a model-initiated call is user-visible and user-awaited,
+///    so it is effectively unbounded, while a plugin's runs with nothing
+///    on screen.
+pub(crate) enum ToolCallOrigin {
+    /// The provider asked for it. Byte-identical behaviour to before
+    /// this enum existed.
+    Model,
+    /// A plugin asked for it through `host-call-tool`.
+    Plugin {
+        /// Wall-clock bound on `tool.execute` only — see the comment at
+        /// the execution site for why not the whole function.
+        deadline: std::time::Duration,
+    },
+}
+
+impl ToolCallOrigin {
+    /// Whether this call belongs in the session transcript.
+    fn records_session(&self) -> bool {
+        matches!(self, ToolCallOrigin::Model)
+    }
+    /// Whether this call may emit `AgentEvent`s.
+    fn emits_events(&self) -> bool {
+        matches!(self, ToolCallOrigin::Model)
+    }
+    /// Whether the result text will be read by the MODEL rather than by
+    /// a plugin. Only the hook-refusal wording depends on this, and it
+    /// is a separate question from the two gates above even though the
+    /// answer happens to coincide: the refusal is a message, not a side
+    /// effect.
+    fn audience_is_the_model(&self) -> bool {
+        matches!(self, ToolCallOrigin::Model)
+    }
+    fn deadline(&self) -> Option<std::time::Duration> {
+        match self {
+            ToolCallOrigin::Model => None,
+            ToolCallOrigin::Plugin { deadline } => Some(*deadline),
+        }
+    }
+}
+
+/// The exact prefix a plugin-initiated call's content carries when a
+/// `tool_execution_start` hook blocked it.
+///
+/// A shared constant rather than a field on [`ToolCallOutcome`]: the
+/// struct is built in several places and only this one distinction is
+/// needed, and `plugin_tools` matching on a constant this module owns
+/// is a contract, not string surgery over a message someone else
+/// composed. §2.5 fixes the plugin-visible form as
+/// `error: blocked by hook: <reason>`, so the `error: ` prefix is added
+/// exactly once, by `plugin_tools::call_blocking`.
+pub(crate) const PLUGIN_BLOCKED_PREFIX: &str = "blocked by hook: ";
+
+/// Split a parallel batch into groups that must not run concurrently
+/// with each other.
+///
+/// Calls sharing a `tool::mutation_key` land in one group and are run
+/// serially by the caller; calls with no key (`bash`, `read`, `grep`,
+/// `find`, `ls`, WASM plugin tools — see `tool::mutation_key` for why)
+/// each get their own group and stay fully parallel.
+///
+/// Two ordering properties the caller depends on:
+///
+///   - within a group, model order is preserved (calls are pushed in
+///     iteration order);
+///   - groups appear in order of their first member, so the batch's
+///     overall shape stays as close to model order as grouping allows.
+///
+/// Names are canonicalized first. `run_turn` already normalizes
+/// gateway-mangled names (`Edit_tool` → `edit`) before calling
+/// `execute_tool_calls`, but `execute_tool_calls` is `pub` and reachable
+/// with raw names, and a missed normalization here would silently
+/// degrade to "no serialization" rather than fail loudly.
+/// Batch a set of calls into groups that may run concurrently, where
+/// each group runs serially inside itself.
+///
+/// Two rules, checked in this order:
+///
+/// 1. **A `Sequential` tool anywhere serializes the whole batch.** Its
+///    unsafety is that nothing can be inferred about what it touches,
+///    so there is no call it can be proven safe against. See
+///    [`crate::tool::ExecutionMode`].
+/// 2. Otherwise group by [`crate::tool::mutation_key`] as before, so
+///    two writes to one path serialize and writes to different paths
+///    do not.
+///
+/// `overrides` is the user's `[tool_exec_overrides]` and outranks the
+/// tool's own declaration in both directions — including making `bash`
+/// parallel again, which is theirs to choose and theirs to own.
+fn group_batch(
+    registry: &ToolRegistry,
+    cwd: &Path,
+    calls: Vec<ToolCall>,
+    overrides: &std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
+) -> Vec<Vec<ToolCall>> {
+    let mode_of = |call: &ToolCall| -> crate::tool::ExecutionMode {
+        let name = registry
+            .canonical_name(&call.name)
+            .unwrap_or_else(|| call.name.clone());
+        if let Some(m) = overrides.get(&name) {
+            return *m;
+        }
+        registry
+            .get(&name)
+            .map(|t| t.execution_mode())
+            .unwrap_or(crate::tool::ExecutionMode::Parallel)
+    };
+
+    if calls
+        .iter()
+        .any(|c| mode_of(c) == crate::tool::ExecutionMode::Sequential)
+    {
+        // One group, so the existing per-group serialization runs the
+        // whole batch in the order the model emitted it. Deliberately
+        // NOT `calls.into_iter().map(|c| vec![c])` — that is the
+        // opposite, N groups running concurrently.
+        return vec![calls];
+    }
+
+    let mut groups: Vec<Vec<ToolCall>> = Vec::new();
+    let mut index: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    for call in calls {
+        let name = registry
+            .canonical_name(&call.name)
+            .unwrap_or_else(|| call.name.clone());
+        match crate::tool::mutation_key(cwd, &name, &call.arguments) {
+            Some(key) => match index.get(&key) {
+                Some(&i) => groups[i].push(call),
+                None => {
+                    index.insert(key, groups.len());
+                    groups.push(vec![call]);
+                }
+            },
+            None => groups.push(vec![call]),
+        }
+    }
+    groups
 }
 
 /// Run a single tool call: hooks → execute → persist → render. Pure
 /// function over its arguments; safe to call concurrently from
 /// `execute_tool_calls`.
-async fn run_one_tool(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_one_tool(
     call: ToolCall,
     registry: ToolRegistry,
     session_path: PathBuf,
@@ -916,24 +2025,92 @@ async fn run_one_tool(
     cwd: PathBuf,
     permission: PermissionGate,
     hooks: HooksConfig,
+    subscribers: crate::subscriber::EventSubscribers,
     tx: mpsc::Sender<AgentEvent>,
+    origin: ToolCallOrigin,
 ) -> ToolCallOutcome {
-    // PreToolUse hooks.
+    // ToolExecutionStart hooks. `hook::PER_DELTA_EVENTS` (message_update,
+    // tool_execution_update) are the two per-delta events that will never
+    // be plugin-deliverable (§5.2) — this is the nearest per-tool-call
+    // site to anchor that comment against.
     let mut effective_args = call.arguments.clone();
-    if permission.hooks_active() && !hooks.pre_tool_use.is_empty() {
-        let (outcome, transformed) = run_hooks(
-            &hooks.pre_tool_use,
-            HookEvent::PreToolUse,
-            &call.name,
-            call.arguments.clone(),
-            &cwd,
-            Some(&session_id.to_string()),
-        )
-        .await;
-        effective_args = transformed.unwrap_or(call.arguments.clone());
-        if let HookOutcome::Block { reason } = outcome {
-            if permission.should_honor_pretooluse_block() {
-                let result_text = format!("blocked by hook: {reason}");
+    if permission.hooks_active() {
+        let mut block: Option<String> = None;
+        if !hooks.tool_execution_start.is_empty() {
+            let (outcome, transformed) = run_hooks(
+                &hooks.tool_execution_start,
+                HookEvent::ToolExecutionStart,
+                &call.name,
+                Some(call.id.as_str()),
+                call.arguments.clone(),
+                &cwd,
+                Some(&session_id.to_string()),
+            )
+            .await;
+            effective_args = transformed.unwrap_or(call.arguments.clone());
+            if let HookOutcome::Block { reason } = outcome {
+                if permission.should_honor_tool_execution_start_block() {
+                    block = Some(reason);
+                }
+            }
+        }
+        // Tell the renderers (and, below, the model) that the call
+        // that actually runs is not the one the model asked for.
+        // `AgentEvent::ToolCall` was forwarded off the provider stream
+        // before this hook ran, so without this the card shows the
+        // pre-transform command forever.
+        if effective_args != call.arguments && origin.emits_events() {
+            let _ = tx
+                .send(AgentEvent::ToolCallRewritten {
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments: effective_args.clone(),
+                })
+                .await;
+        }
+        let session_id_str = session_id.to_string();
+        subscribers.deliver_with(HookEvent::ToolExecutionStart, || {
+                event_payload_json(
+                    HookEvent::ToolExecutionStart,
+                    Some(&call.name),
+                    Some(call.id.as_str()),
+                    &call.arguments,
+                    &cwd,
+                    Some(&session_id_str),
+                )
+            })
+            .await;
+        if let Some(reason) = block {
+            // Self-explanatory on purpose. The system prompt never
+            // mentions that hooks exist, so `blocked by hook: X` left
+            // the model guessing what a "hook" was — in manual testing
+            // it twice concluded a sandbox was intercepting bash, and
+            // once went looking for `.claude/settings.json`, i.e. a
+            // different product's config. Naming the mechanism and
+            // ruling out the wrong hypothesis costs one line and saves
+            // a turn of investigation.
+            //
+            // The hook's own reason is preserved verbatim and last, so
+            // a hook author's message stays the most visible part.
+            //
+            // A PLUGIN gets the short form instead, and gets it here
+            // rather than by trimming the paragraph afterwards. §2.5
+            // fixes the plugin-visible string as
+            // `error: blocked by hook: <reason>`, and the paragraph
+            // above exists for the model's benefit specifically — a
+            // plugin author reading `blocked by hook:` has the
+            // mechanism named already and does not need the sandbox
+            // hypothesis ruled out.
+            let result_text = if origin.audience_is_the_model() {
+                format!(
+                    "blocked by a user-configured `tool_execution_start` hook — this is a \
+                     policy refusal from the user's nanopi configuration, not a sandbox or \
+                     environment failure. Hook's reason: {reason}"
+                )
+            } else {
+                format!("{PLUGIN_BLOCKED_PREFIX}{reason}")
+            };
+            if origin.records_session() {
                 let _ = session::append_entry(
                     &session_path,
                     &SessionEntry::ToolResult {
@@ -944,41 +2121,98 @@ async fn run_one_tool(
                         images: Vec::new(),
                     },
                 );
+            }
+            if origin.emits_events() {
                 let _ = tx
                     .send(AgentEvent::TextDelta {
                         content_index: 0,
                         text: format!("\n[{} blocked: {}]\n", call.name, reason),
                     })
                     .await;
-                return ToolCallOutcome {
-                    call_id: call.id,
-                    content: result_text,
-                    is_error: true,
-                    images: Vec::new(),
-                };
             }
+            return ToolCallOutcome {
+                call_id: call.id,
+                content: result_text,
+                is_error: true,
+                images: Vec::new(),
+            };
         }
     }
 
-    // Persist tool call.
-    let _ = session::append_entry(
-        &session_path,
-        &SessionEntry::ToolCall {
-            id: call.id.clone(),
-            timestamp: time::now_iso8601(),
-            tool_name: call.name.clone(),
-            arguments: effective_args.clone(),
-        },
-    );
+    // Persist tool call. Model origin only — see `ToolCallOrigin`.
+    if origin.records_session() {
+        let _ = session::append_entry(
+            &session_path,
+            &SessionEntry::ToolCall {
+                id: call.id.clone(),
+                timestamp: time::now_iso8601(),
+                tool_name: call.name.clone(),
+                arguments: effective_args.clone(),
+            },
+        );
+    }
 
     // Resolve and execute. Wall-clock timed so the TUI can show
     // "Took 0.3s" next to the marker.
+    //
+    // THE DEADLINE GOES AROUND `tool.execute` AND NOTHING ELSE.
+    //
+    // Wrapping the whole of `run_one_tool` instead would drop the
+    // future wherever it happened to be — including between
+    // `tool_execution_start` firing and `tool_execution_end` — leaving
+    // the hook pair unbalanced. That is exactly the defect `87a81b4`
+    // fixed for `/compact`, and it is the first row of
+    // `docs/claims-and-races.md`'s opening table. Manufacturing a
+    // second instance of it in order to bound a timeout would be a bad
+    // trade, so the timeout is local and the function still runs to its
+    // end, hooks included.
+    //
+    // 30 SECONDS, and the number is not arbitrary. `host-http-get`
+    // carries 10s, which is too tight for a legitimate `find` over a
+    // large tree or a `cargo`-shaped `bash`. A model-initiated call is
+    // effectively unbounded because it is user-visible and
+    // user-awaited; a plugin's runs with nothing on screen, so it needs
+    // a bound, and 30s sits deliberately above the network bound and
+    // far below "unbounded". The engine's epoch interruption cannot
+    // substitute for this: it bounds GUEST code and cannot preempt a
+    // host function that is already executing.
+    //
+    // KNOWN LIMIT, not a claim: a process the timed-out tool spawned (a
+    // `bash` child) may outlive the deadline. The elapse unblocks the
+    // PLUGIN; the child is not killed. `tool.execute`'s own future is
+    // dropped, which is what `kill_on_drop` acts on for the bash tool,
+    // but anything already detached from it is out of reach here.
     let started = std::time::Instant::now();
-    let (content, is_error, images) = match registry.get(&call.name) {
+    let (mut content, mut is_error, images) = match registry.get(&call.name) {
         Some(tool) => {
             let ctx = ToolContext { cwd: cwd.clone() };
-            match tool.execute(effective_args.clone(), &ctx).await {
-                Ok(o) => (o.content, o.is_error, o.images),
+            let executed = match origin.deadline() {
+                None => tool.execute(effective_args.clone(), &ctx).await.map(Some),
+                Some(d) => {
+                    match tokio::time::timeout(d, tool.execute(effective_args.clone(), &ctx))
+                        .await
+                    {
+                        Ok(r) => r.map(Some),
+                        // Elapsed. Fall through as a failed call so the
+                        // rest of the function — `tool_execution_end`
+                        // included — still runs.
+                        Err(_) => Ok(None),
+                    }
+                }
+            };
+            match executed {
+                Ok(Some(o)) => (o.content, o.is_error, o.images),
+                Ok(None) => (
+                    format!(
+                        "tool call exceeded the {}s plugin deadline",
+                        origin
+                            .deadline()
+                            .map(|d| d.as_secs())
+                            .unwrap_or_default()
+                    ),
+                    true,
+                    Vec::new(),
+                ),
                 Err(e) => (format!("tool error: {e}"), true, Vec::new()),
             }
         }
@@ -986,35 +2220,49 @@ async fn run_one_tool(
     };
     let elapsed = started.elapsed();
 
-    // Persist result.
-    let _ = session::append_entry(
-        &session_path,
-        &SessionEntry::ToolResult {
-            tool_call_id: call.id.clone(),
-            timestamp: time::now_iso8601(),
-            content: content.clone(),
-            is_error,
-            images: images.clone(),
-        },
-    );
+    // Tell the model a hook rewrote its arguments.
+    //
+    // Not cosmetic: without it the model gets an answer to a question
+    // it did not ask, with no way to find out why. In manual testing
+    // it concluded a sandbox was replacing bash output with a
+    // constant, then spent a turn devising an experiment to confirm
+    // that theory. Hiding the rewrite by silently replacing the
+    // model's own recorded arguments would remove the contradiction
+    // but also the information — and a coding agent whose commands are
+    // being normalized should know, so it can stop re-sending the form
+    // that gets rewritten.
+    //
+    // Only on an actual rewrite, so no ordinary tool result changes
+    // shape. Prefixed rather than appended: a long result would push a
+    // trailing note out of the model's attention, and out of the
+    // 6-line card preview entirely.
+    if effective_args != call.arguments {
+        let args_line = serde_json::to_string(&effective_args)
+            .unwrap_or_else(|_| effective_args.to_string());
+        content = format!(
+            "[note: a tool_execution_start hook rewrote the arguments of this \
+             call to {args_line} — the output below is from those arguments, \
+             not the ones you sent]\n{content}"
+        );
+    }
 
-    // Stream a structured ToolResult so the TUI can render one green
-    // (or red) card containing command + output preview + timing.
-    // Rustyline mode picks the same event apart and prints a compact
-    // marker line instead.
-    let _ = tx
-        .send(AgentEvent::ToolResult {
-            call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: content.clone(),
-            is_error,
-            elapsed_ms: elapsed.as_millis() as u64,
-        })
-        .await;
+    // Persist result. Model origin only — see `ToolCallOrigin`.
+    if origin.records_session() {
+        let _ = session::append_entry(
+            &session_path,
+            &SessionEntry::ToolResult {
+                tool_call_id: call.id.clone(),
+                timestamp: time::now_iso8601(),
+                content: content.clone(),
+                is_error,
+                images: images.clone(),
+            },
+        );
+    }
 
-    // PostToolUse hooks. Payload mirrors Claude Code's PostToolUse
+    // ToolExecutionEnd hooks. Payload mirrors Claude Code's post-tool-use
     // wire schema so hooks can inspect what actually happened —
-    // `tool_input` (final args after any PreToolUse transform) and
+    // `tool_input` (final args after any ToolExecutionStart transform) and
     // `tool_response` (content + is_error + duration_ms).
     //
     // v0.9.1 fix: previously passed `Value::Object(Default::default())`
@@ -1022,7 +2270,11 @@ async fn run_one_tool(
     // nothing about the call itself — no way to log outputs, react
     // to failures, or scrape secrets from stdout. Everything the
     // hook actually needs to be useful was missing.
-    if permission.hooks_active() && !hooks.post_tool_use.is_empty() {
+    //
+    // P1 ordering: hooks fire BEFORE the ToolResult event is emitted,
+    // so the post-hook content/is_error is what the renderer sees
+    // (and what the next LLM turn sees in the context).
+    if permission.hooks_active() {
         let post_payload = serde_json::json!({
             "tool_input": effective_args,
             "tool_response": {
@@ -1031,15 +2283,68 @@ async fn run_one_tool(
                 "duration_ms": elapsed.as_millis() as u64,
             },
         });
-        let _ = run_hooks(
-            &hooks.post_tool_use,
-            HookEvent::PostToolUse,
-            &call.name,
-            post_payload,
-            &cwd,
-            Some(&session_id.to_string()),
-        )
-        .await;
+        if !hooks.tool_execution_end.is_empty() {
+            let (_outcome, new_args) = run_hooks(
+                &hooks.tool_execution_end,
+                HookEvent::ToolExecutionEnd,
+                &call.name,
+                Some(call.id.as_str()),
+                post_payload.clone(),
+                &cwd,
+                Some(&session_id.to_string()),
+            )
+            .await;
+            // P1: tool_execution_end Transform replaces the tool result content.
+            //
+            // `run_hooks` always returns `HookOutcome::Allow` — transforms
+            // are accumulated into `current_args` which becomes `new_args`.
+            // So we just look at whether `new_args` was rewritten, not at
+            // the outcome enum.
+            //
+            // Hook emits
+            //   {"decision":"allow","updated_input":{"content":"...","is_error":true}}
+            // → `run_hooks` replaces the whole `current_args` with
+            //   `{"content":"...","is_error":true}` → `new_args` holds that.
+            if let Some(v) = new_args.as_ref() {
+                // Only apply if the rewrite is structurally different from
+                // the original payload — it must have a `content` key at
+                // the top level (not nested under `tool_response`).
+                if let Some(new_content) = v.get("content").and_then(|v| v.as_str()) {
+                    content = new_content.to_string();
+                }
+                if let Some(new_is_error) = v.get("is_error").and_then(|v| v.as_bool()) {
+                    is_error = new_is_error;
+                }
+            }
+        }
+        let session_id_str = session_id.to_string();
+        subscribers.deliver_with(HookEvent::ToolExecutionEnd, || {
+                event_payload_json(
+                    HookEvent::ToolExecutionEnd,
+                    Some(&call.name),
+                    Some(call.id.as_str()),
+                    &post_payload,
+                    &cwd,
+                    Some(&session_id_str),
+                )
+            })
+            .await;
+    }
+
+    // Stream a structured ToolResult so the TUI can render one green
+    // (or red) card containing command + output preview + timing.
+    // Rustyline mode picks the same event apart and prints a compact
+    // marker line instead.
+    if origin.emits_events() {
+        let _ = tx
+            .send(AgentEvent::ToolResult {
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: content.clone(),
+                is_error,
+                elapsed_ms: elapsed.as_millis() as u64,
+            })
+            .await;
     }
 
     ToolCallOutcome {
@@ -1053,7 +2358,7 @@ async fn run_one_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::context::{ContextMessage, ToolSpec};
+    use crate::agent::context::{ContentBlock, ContextMessage, ToolSpec};
     use serde_json::json;
 
     fn tmp() -> PathBuf {
@@ -1082,11 +2387,8 @@ mod tests {
             timeout: 2000,
         };
         let hooks = HooksConfig {
-            pre_tool_use: vec![pre_hook],
-            post_tool_use: vec![],
-            user_prompt_submit: vec![],
-            session_start: vec![],
-            session_end: vec![],
+            tool_execution_start: vec![pre_hook],
+            ..Default::default()
         };
         let mut agent = Agent {
             context: Context::default(),
@@ -1104,7 +2406,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1143,14 +2452,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression: v0.9.1 PostToolUse used to be called with
+    /// Regression: v0.9.1 ToolExecutionEnd used to be called with
     /// `Value::Object(Default::default())` (empty `{}`) — hooks
     /// couldn't see what the tool actually did. Fix populates the
     /// payload with `tool_input` (final args) and `tool_response`
     /// (content / is_error / duration_ms). This test writes the
     /// hook stdin JSON to disk and asserts every field is present.
     #[tokio::test]
-    async fn post_tool_use_hook_receives_input_and_response() {
+    async fn tool_execution_end_hook_receives_input_and_response() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tmp();
@@ -1177,11 +2486,8 @@ mod tests {
             timeout: 3000,
         };
         let hooks = HooksConfig {
-            pre_tool_use: vec![],
-            post_tool_use: vec![post_hook],
-            user_prompt_submit: vec![],
-            session_start: vec![],
-            session_end: vec![],
+            tool_execution_end: vec![post_hook],
+            ..Default::default()
         };
         let mut agent = Agent {
             context: Context::default(),
@@ -1199,7 +2505,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1222,7 +2535,7 @@ mod tests {
             std::fs::read_to_string(&stdin_dump).expect("hook must have written its stdin JSON");
         let v: serde_json::Value = serde_json::from_str(&dumped).expect("stdin was JSON");
 
-        assert_eq!(v["event"], "post_tool_use");
+        assert_eq!(v["event"], "tool_execution_end");
         assert_eq!(v["tool_name"], "bash");
         // tool_input carries the (post-transform) tool arguments.
         assert_eq!(v["arguments"]["tool_input"]["command"], "echo hi");
@@ -1237,6 +2550,1220 @@ mod tests {
         );
         assert_eq!(v["arguments"]["tool_response"]["is_error"], false);
         assert!(v["arguments"]["tool_response"]["duration_ms"].is_u64());
+        // v0.11.0: was hardcoded `None` at every call site, so this
+        // field was permanently null and a tool_execution_end hook had no
+        // way to pair a result with its tool_execution_start.
+        assert_eq!(v["tool_call_id"], "call_pt");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1 regression: tool_execution_end hook can rewrite the tool's output
+    /// content via `{"updated_input":{"content":"..."}}`. Previously
+    /// the hook's return was discarded (`let _ = run_hooks(...)`),
+    /// so redact / log-scrubbing / result-truncation plugins were
+    /// inert. Fix: capture the outcome and apply Transform to the
+    /// result `content` and `is_error` (image attachments keep their
+    /// original handling).
+    #[tokio::test]
+    async fn tool_execution_end_hook_can_transform_result() {
+        let dir = tmp();
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let post_hook = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            // Replace content with a redacted marker. Mirror Claude
+            // Code's protocol — `decision:"allow"` + `updated_input`.
+            command: r#"echo '{"decision":"allow","updated_input":{"content":"[REDACTED]","is_error":true}}'"#.into(),
+            timeout: 2000,
+        };
+        let hooks = HooksConfig {
+            tool_execution_end: vec![post_hook],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .execute_tool_calls(
+                vec![ToolCall {
+                    id: "call_xform".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "echo SECRET=abc123"}),
+                }],
+                &tx,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(tx);
+
+        let last = agent.context.messages.last().expect("message in context");
+        match last {
+            crate::agent::context::ContextMessage::Tool {
+                content,
+                is_error,
+                ..
+            } => {
+                assert!(
+                    content.contains("[REDACTED]"),
+                    "expected hook to rewrite content, got {content:?}"
+                );
+                assert!(
+                    !content.contains("SECRET"),
+                    "raw tool output leaked into context: {content:?}"
+                );
+                assert!(
+                    *is_error,
+                    "hook should be able to flip is_error via updated_input"
+                );
+            }
+            other => panic!("expected Tool message, got {other:?}"),
+        }
+
+        // Drain channel — the renderer also gets the rewritten content.
+        let mut found_redacted = false;
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::ToolResult { content, is_error, .. } = &ev {
+                if content.contains("[REDACTED]") {
+                    found_redacted = true;
+                    assert!(is_error, "renderer event should reflect is_error flip");
+                }
+            }
+        }
+        assert!(
+            found_redacted,
+            "renderer must receive the post-hook rewritten content"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the BeforeAgentStart `Transform` arm was empty and
+    /// `run_hooks`' rewritten args were dropped on the floor, so a hook
+    /// returning `updated_input.prompt` was silently inert even though
+    /// the payload ships `prompt` specifically for it. Fix mirrors
+    /// Input and seeds `effective_msg` from the result.
+    /// A shell hook that BLOCKS must still deliver the event to
+    /// observe-only WASM subscribers.
+    ///
+    /// Regression guard for an inconsistency: `tool_execution_start`
+    /// stashed its block and delivered first, while
+    /// `before_agent_start` and `input` returned from inside the match
+    /// and skipped delivery. Two behaviours for one situation, and the
+    /// missing half is the security-relevant one — an audit plugin
+    /// cares most about the turns something refused, and a dropped
+    /// event is invisible to it.
+    ///
+    /// Delivery cannot change the outcome (observe-only is in the
+    /// `EventHandler` signature), so delivering costs nothing but a
+    /// blind spot is real.
+    /// Every emit site must actually deliver.
+    ///
+    /// The `deliver_with` mechanism is unit-tested in `subscriber`, and
+    /// two sites are pinned by the blocking-hook test below — but
+    /// nothing asserted that each of the eleven `run_hooks` sites has a
+    /// matching delivery. A missing `deliver_with` at one site is
+    /// completely silent: the plugin just never hears about that event
+    /// and there is no error anywhere to notice.
+    ///
+    /// So run a real turn that goes through a tool round and assert the
+    /// exact set of events a turn CAN produce. The two compaction
+    /// events are not reachable from `run_turn` without crossing the
+    /// threshold, so they are asserted separately below.
+    #[tokio::test]
+    async fn a_turn_delivers_every_event_it_can_reach() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: &str, _payload: &str) {
+                self.seen.lock().unwrap().push(event.to_string());
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+            plugin_name: Arc::from("watcher"),
+            events: crate::agent::hook::EVENT_NAMES.to_vec(),
+            handler: recorder.clone(),
+        }]);
+
+        let dir = tmp();
+        let session_path = dir.join("all-events.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProviderForEvents {
+                step: Arc::new(AtomicUsize::new(0)),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: subs,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.fire_session_start("startup").await;
+        agent.run_turn("go", &tx, None, None).await.unwrap();
+        agent.fire_session_shutdown("quit").await;
+
+        let seen = recorder.seen.lock().unwrap().clone();
+        for expected in [
+            "session_start",
+            "before_agent_start",
+            "input",
+            "turn_start",
+            "tool_execution_start",
+            "tool_execution_end",
+            "turn_end",
+            "message_end",
+            "session_shutdown",
+        ] {
+            assert!(
+                seen.iter().any(|e| e == expected),
+                "{expected} was never delivered; a turn produced {seen:?}"
+            );
+        }
+
+        // Ordering that a subscriber can rely on: the turn is bracketed,
+        // and a tool's start precedes its end.
+        let pos = |name: &str| seen.iter().position(|e| e == name).unwrap();
+        assert!(pos("session_start") < pos("before_agent_start"));
+        assert!(pos("before_agent_start") < pos("input"));
+        assert!(pos("input") < pos("turn_start"));
+        assert!(pos("tool_execution_start") < pos("tool_execution_end"));
+        assert!(pos("message_end") < pos("session_shutdown"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two events the turn test cannot reach. Together with it,
+    /// all eleven are covered.
+    #[tokio::test]
+    async fn compaction_delivers_both_of_its_events() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: &str, payload: &str) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(format!("{event}:{payload}"));
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+            plugin_name: Arc::from("watcher"),
+            events: crate::agent::hook::EVENT_NAMES.to_vec(),
+            handler: recorder.clone(),
+        }]);
+
+        let dir = tmp();
+        let session_path = dir.join("compaction-events.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "summary".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: subs,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+        // Enough tail that find_compact_boundary actually cuts —
+        // otherwise `compact` returns None, the function returns before
+        // the SessionCompact site, and the test would be asserting the
+        // wrong thing. Same sizing as compact_now_emits_start_and_end.
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.compact_now(Some(&tx), "manual").await;
+
+        let seen = recorder.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|e| e.starts_with("session_before_compact:")),
+            "session_before_compact not delivered; got {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| e.starts_with("session_compact:")),
+            "session_compact not delivered; got {seen:?}"
+        );
+        // The reason rides in arguments, and session_id is the real id —
+        // the payload-honesty fix, asserted through the plugin surface
+        // rather than only the shell one.
+        assert!(
+            seen.iter().any(|e| e.contains(r#""reason":"manual""#)),
+            "reason missing from the compaction payload: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| e.contains(r#""session_id":"manual""#)),
+            "session_id is carrying the reason again: {seen:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two-step provider for `a_turn_delivers_every_event_it_can_reach`:
+    /// a tool round, then a plain answer.
+    struct SteppedProviderForEvents {
+        step: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for SteppedProviderForEvents {
+        fn id(&self) -> &'static str {
+            "stepped-events"
+        }
+        async fn stream_turn(
+            &self,
+            _ctx: &Context,
+            tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<Usage, String> {
+            let step = self
+                .step
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx
+                .send(AgentEvent::Start {
+                    message_id: "m".into(),
+                })
+                .await;
+            if step == 0 {
+                let _ = tx
+                    .send(AgentEvent::ToolCall {
+                        content_index: 0,
+                        call: ToolCall {
+                            id: "c1".into(),
+                            name: "ls".into(),
+                            arguments: json!({}),
+                        },
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Usage::default(),
+                    })
+                    .await;
+            } else {
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: "done".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::Stop,
+                        usage: Usage::default(),
+                    })
+                    .await;
+            }
+            Ok(Usage::default())
+        }
+    }
+
+    /// Stage 5 end to end: the assistant's text reaches a subscriber.
+    ///
+    /// `hook.rs` unit-tests the payload builder, but a builder nobody
+    /// calls is exactly the failure mode `message_end` already had —
+    /// the field was there and carried a number. This runs a real turn
+    /// and reads what the subscriber was handed.
+    #[tokio::test]
+    async fn message_end_delivers_the_assistant_text_to_subscribers() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Capture {
+            payload: std::sync::Mutex<Option<String>>,
+        }
+        impl EventHandler for Capture {
+            fn handle_event(&self, event: &str, payload: &str) {
+                if event == "message_end" {
+                    *self.payload.lock().unwrap() = Some(payload.to_string());
+                }
+            }
+        }
+
+        let cap = Arc::new(Capture::default());
+        let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+            plugin_name: Arc::from("watcher"),
+            events: crate::agent::hook::EVENT_NAMES.to_vec(),
+            handler: cap.clone(),
+        }]);
+
+        let dir = tmp();
+        let session_path = dir.join("message-end-text.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProviderForEvents {
+                step: Arc::new(AtomicUsize::new(0)),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: subs,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.run_turn("go", &tx, None, None).await.unwrap();
+
+        let raw = cap
+            .payload
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("message_end was never delivered");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["arguments"]["response"], "done",
+            "the assistant's text must be in the payload; got {raw}"
+        );
+        assert_eq!(v["arguments"]["response_truncated"], false);
+        assert_eq!(v["arguments"]["response_length"], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blocked tool call must tell the model WHAT blocked it.
+    ///
+    /// The system prompt never mentions hooks, so `blocked by hook: X`
+    /// left the model to guess. In manual testing it twice decided a
+    /// sandbox was intercepting bash, and once went hunting for
+    /// `.claude/settings.json` — another product's config file. The
+    /// message now names the mechanism and rules out the environment
+    /// hypothesis, while keeping the hook author's own reason last and
+    /// verbatim.
+    #[tokio::test]
+    async fn a_blocked_call_explains_itself_to_the_model() {
+        let dir = tmp();
+        let session_path = dir.join("blocked-msg.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let hooks = HooksConfig {
+            tool_execution_start: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: "sh -c 'cat >/dev/null; echo policy-says-no >&2; exit 2'".into(),
+                timeout: 4000,
+            }],
+            ..Default::default()
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        let outcome = run_one_tool(
+            ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+            },
+            ToolRegistry::standard(),
+            session_path,
+            uuid::v7().to_string(),
+            dir.clone(),
+            PermissionGate::from_cli(false, None),
+            hooks,
+            Default::default(),
+            tx,
+            ToolCallOrigin::Model,
+        )
+        .await;
+
+        assert!(outcome.is_error, "a blocked call is an error result");
+        let c = &outcome.content;
+        // The hook's own words survive, and stay the tail of the line.
+        assert!(c.contains("policy-says-no"), "{c}");
+        // The mechanism is named, so "hook" is not an unexplained noun.
+        assert!(c.contains("tool_execution_start"), "{c}");
+        assert!(c.contains("user-configured"), "{c}");
+        // And the wrong hypothesis is pre-empted.
+        assert!(
+            c.contains("not a sandbox or environment failure"),
+            "the message must rule out the environment theory: {c}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_blocking_hook_still_delivers_the_event_to_subscribers() {
+        use crate::subscriber::{EventHandler, EventSubscribers, Subscriber};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Recorder {
+            events: std::sync::Mutex<Vec<String>>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: &str, _payload_json: &str) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.events.lock().unwrap().push(event.to_string());
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorder = Arc::new(Recorder {
+            events: std::sync::Mutex::new(Vec::new()),
+            calls: calls.clone(),
+        });
+
+        let dir = tmp();
+        let session_path = dir.join("blocked.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        // exit 2 is the hook protocol's "block".
+        let blocking = |event: &str| HooksConfig {
+            before_agent_start: if event == "before_agent_start" {
+                vec![HookConfig {
+                    matcher: "*".into(),
+                    kind: "command".into(),
+                    command: "exit 2".into(),
+                    timeout: 2000,
+                }]
+            } else {
+                Vec::new()
+            },
+            input: if event == "input" {
+                vec![HookConfig {
+                    matcher: "*".into(),
+                    kind: "command".into(),
+                    command: "exit 2".into(),
+                    timeout: 2000,
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+
+        for event in ["before_agent_start", "input"] {
+            calls.store(0, Ordering::SeqCst);
+            recorder.events.lock().unwrap().clear();
+
+            let subs = EventSubscribers::from_subscribers(vec![Subscriber {
+                plugin_name: Arc::from("test-watcher"),
+                events: crate::agent::hook::EVENT_NAMES.to_vec(),
+                handler: recorder.clone(),
+            }]);
+
+            let mut agent = Agent {
+                context: Context::default(),
+                provider: Box::new(FakeProvider {
+                    response: "ok".into(),
+                }),
+                registry: ToolRegistry::standard(),
+                session_path: session_path.clone(),
+                session_id: uuid::v7().to_string(),
+                cwd: dir.clone(),
+                permission: PermissionGate::from_cli(false, None),
+                hooks: blocking(event),
+                model: String::new(),
+                base_url: String::new(),
+                api_key: String::new(),
+                usage_total: Usage::default(),
+                turn_count: 0,
+                skills: Vec::new(),
+                no_context_files: false,
+                pending_follow_ups: Default::default(),
+                tool_exec_mode: crate::config::ToolExecMode::default(),
+                tool_exec_overrides: Default::default(),
+                plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+                event_subscribers: subs,
+                prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+                system_base: None,
+            };
+
+            let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+            let out = agent.run_turn("a prompt", &tx, None, None).await.unwrap();
+
+            // The block still takes effect — this is not a regression
+            // in the veto, only in what observers see.
+            assert!(
+                out.contains("blocked"),
+                "{event}: the hook should still have blocked the turn, got {out:?}"
+            );
+            let seen = recorder.events.lock().unwrap().clone();
+            assert!(
+                seen.iter().any(|e| e == event),
+                "{event}: subscriber never saw it, only saw {seen:?}"
+            );
+        }
+    }
+
+    /// A refused prompt must not be double-bracketed, and must say
+    /// whose decision it was.
+    ///
+    /// Both renderers wrap `AgentEvent::Error` in `[error: …]`
+    /// themselves, so a message that bracketed itself produced
+    /// `[error: [Input hook blocked the prompt: …]]` on screen. And the
+    /// old wording under a red `error:` read like nanopi had
+    /// malfunctioned, when it was the user's own `[[hooks.input]]`
+    /// entry doing exactly what they configured.
+    #[tokio::test]
+    async fn a_refused_prompt_is_not_double_bracketed() {
+        let dir = tmp();
+        let session_path = dir.join("refused.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let script = dir.join("veto.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat > /dev/null\necho 'policy: no prompts today' >&2\nexit 2\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hooks = HooksConfig {
+            input: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: script.display().to_string(),
+                timeout: 3000,
+            }],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "unreachable".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let out = agent.run_turn("hi", &tx, None, None).await.unwrap();
+        drop(tx);
+
+        let mut errors = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::Error { error } = ev {
+                errors.push(error);
+            }
+        }
+        assert_eq!(errors.len(), 1, "expected exactly one Error event");
+        let err = &errors[0];
+
+        // The renderers add `[error: …]`. A leading `[` here means the
+        // user sees `[error: [ … ]]`.
+        assert!(
+            !err.starts_with('['),
+            "the message must not bracket itself — renderers already do: {err:?}"
+        );
+        // It names the mechanism and says this was policy, so a red
+        // line doesn't read as a malfunction.
+        assert!(err.contains("`input` hook"), "{err:?}");
+        assert!(err.contains("policy"), "{err:?}");
+        // The hook's own reason survives — without it the user cannot
+        // tell which of several hooks refused.
+        assert!(err.contains("policy: no prompts today"), "{err:?}");
+        // The returned text stands alone in `--output json`, so it
+        // carries the same prose rather than a bare marker.
+        assert_eq!(&out, err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_hook_can_transform_prompt() {
+        let dir = tmp();
+        let session_path = dir.join("bas.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let hooks = HooksConfig {
+            before_agent_start: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command:
+                    r#"echo '{"decision":"allow","updated_input":{"prompt":"REWRITTEN BY HOOK"}}'"#
+                        .into(),
+                timeout: 2000,
+            }],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.run_turn("original prompt", &tx, None, None).await.unwrap();
+
+        let user_text = agent
+            .context
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                ContextMessage::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("user message in context");
+        assert_eq!(
+            user_text, "REWRITTEN BY HOOK",
+            "BeforeAgentStart transform must reach context, got {user_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two prompt hooks must chain: BeforeAgentStart runs first and
+    /// its rewritten text is what Input receives. The second
+    /// hook here only emits a rewrite when it sees the first hook's
+    /// output, so a passing assert proves the ordering, not just that
+    /// each hook fired.
+    #[tokio::test]
+    async fn before_agent_start_output_feeds_input() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let session_path = dir.join("chain.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let ups_script = dir.join("ups.sh");
+        std::fs::write(
+            &ups_script,
+            "#!/usr/bin/env bash\n\
+             payload=$(cat)\n\
+             if grep -q FROM_BAS <<< \"$payload\"; then\n\
+             \x20 echo '{\"decision\":\"allow\",\"updated_input\":{\"prompt\":\"CHAINED\"}}'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ups_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hooks = HooksConfig {
+            before_agent_start: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: r#"echo '{"decision":"allow","updated_input":{"prompt":"FROM_BAS"}}'"#
+                    .into(),
+                timeout: 2000,
+            }],
+            input: vec![HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: ups_script.display().to_string(),
+                timeout: 3000,
+            }],
+            ..Default::default()
+        };
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks,
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        agent.run_turn("original", &tx, None, None).await.unwrap();
+
+        let user_text = agent
+            .context
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                ContextMessage::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("user message in context");
+        assert_eq!(
+            user_text, "CHAINED",
+            "Input must see BeforeAgentStart's rewrite, got {user_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: in Sequential mode cancel was only checked *between*
+    /// tools, so Esc during a long-running bash waited for it to finish;
+    /// and the cancel path then replaced every result — including tools
+    /// that had already run and already written their real ToolResult to
+    /// the session JSONL — with a synthetic marker.
+    ///
+    /// Asserts all three properties at once: the batch aborts long
+    /// before the 30s sleep would end, the completed tool keeps its real
+    /// output, and the un-run tool gets the marker in call order.
+    #[tokio::test]
+    async fn sequential_cancel_interrupts_and_keeps_completed_results() {
+        let dir = tmp();
+        let session_path = dir.join("seqcancel.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::Sequential,
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        let ct = tokio_util::sync::CancellationToken::new();
+        let ct_clone = ct.clone();
+        // Long enough for the `echo` to finish and the `sleep` to be the
+        // in-flight future; far shorter than the sleep itself.
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            ct_clone.cancel();
+        });
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let start = std::time::Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "call_fast".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "echo FIRST_DONE"}),
+                    },
+                    ToolCall {
+                        id: "call_slow".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 30"}),
+                    },
+                    ToolCall {
+                        id: "call_never".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "echo NEVER_RAN"}),
+                    },
+                ],
+                &tx,
+                Some(ct),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        drop(tx);
+        canceller.await.ok();
+        drain.await.ok();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cancel must interrupt the in-flight tool, not wait it out; took {elapsed:?}"
+        );
+
+        // Every tool_use needs a paired tool_result, in the original
+        // call order — Anthropic 400s otherwise.
+        let tools: Vec<(&str, &str)> = agent
+            .context
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } => Some((tool_call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["call_fast", "call_slow", "call_never"],
+            "tool_results must stay paired and in call order"
+        );
+        assert!(
+            tools[0].1.contains("FIRST_DONE"),
+            "completed tool must keep its real output, got {:?}",
+            tools[0].1
+        );
+        assert!(
+            tools[1].1.contains("cancelled by user"),
+            "interrupted tool must get the cancel marker, got {:?}",
+            tools[1].1
+        );
+        assert!(
+            tools[2].1.contains("cancelled by user"),
+            "never-started tool must get the cancel marker, got {:?}",
+            tools[2].1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: cancelling a Parallel batch wrote TWO `tool_result`
+    /// entries for a tool that had already finished — its real one from
+    /// `run_one_tool`, then a synthetic cancel marker on top, because
+    /// `join_all` reports an empty Vec when cancel wins and the
+    /// finished work looked un-run.
+    ///
+    /// The assertion is on the session file, not on context, because
+    /// that is where the damage was permanent: `load_session` replays
+    /// every entry, and two `tool_result` blocks sharing one
+    /// `tool_use_id` is a 400 from Anthropic on every future resume,
+    /// fork, or `--continue` of that session.
+    ///
+    /// Parallel is the default mode, so this was the reachable one.
+    #[tokio::test]
+    async fn cancelled_parallel_batch_writes_one_result_per_call() {
+        for mode in [
+            crate::config::ToolExecMode::Parallel,
+            crate::config::ToolExecMode::Sequential,
+        ] {
+            let dir = tmp();
+            let session_path = dir.join("s.jsonl");
+            std::fs::write(&session_path, "").unwrap();
+            let mut agent = Agent {
+                context: Context::default(),
+                provider: Box::new(fake_provider()),
+                registry: ToolRegistry::standard(),
+                session_path: session_path.clone(),
+                session_id: uuid::v7().to_string(),
+                cwd: dir.clone(),
+                permission: PermissionGate::from_cli(false, None),
+                hooks: HooksConfig::default(),
+                model: String::new(),
+                base_url: String::new(),
+                api_key: String::new(),
+                usage_total: Usage::default(),
+                turn_count: 0,
+                skills: Vec::new(),
+                no_context_files: false,
+                pending_follow_ups: Default::default(),
+                tool_exec_mode: mode,
+                tool_exec_overrides: Default::default(),
+                plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+                event_subscribers: Default::default(),
+                prompt_overrides:
+                    crate::agent::prompt_override::PromptOverrides::default(),
+                system_base: None,
+            };
+
+            let ct = tokio_util::sync::CancellationToken::new();
+            let ct2 = ct.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                ct2.cancel();
+            });
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+            agent
+                .execute_tool_calls(
+                    vec![
+                        ToolCall {
+                            id: "c_fast".into(),
+                            name: "bash".into(),
+                            arguments: json!({"command": "echo FIRST_DONE"}),
+                        },
+                        ToolCall {
+                            id: "c_slow".into(),
+                            name: "bash".into(),
+                            arguments: json!({"command": "sleep 30"}),
+                        },
+                    ],
+                    &tx,
+                    Some(ct),
+                )
+                .await
+                .unwrap();
+            drop(tx);
+            drain.await.ok();
+
+            let raw = std::fs::read_to_string(&session_path).unwrap();
+            let ids: Vec<String> = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                .filter_map(|v| {
+                    v.get("tool_call_id")
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string)
+                })
+                .collect();
+
+            let fast = ids.iter().filter(|i| *i == "c_fast").count();
+            let slow = ids.iter().filter(|i| *i == "c_slow").count();
+            assert_eq!(
+                fast, 1,
+                "{mode:?}: c_fast got {fast} tool_result entries in the session file; \
+                 a resumed session would 400"
+            );
+            assert_eq!(slow, 1, "{mode:?}: c_slow got {slow} tool_result entries");
+
+            // The finished tool must also keep its real output rather
+            // than being overwritten by the cancel marker.
+            assert!(
+                raw.contains("FIRST_DONE"),
+                "{mode:?}: completed work was discarded"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Regression: a steer that the channel ACCEPTED could still be
+    /// lost. c15c8a9 handled the send failing; it did not handle the
+    /// turn being cancelled after a successful send but before the pump
+    /// reached the message. The user had already seen `[steer] …`
+    /// echoed, and the text died with the receiver — no context entry,
+    /// no session entry, no follow-up.
+    ///
+    /// On cancel a pending steer becomes a follow-up: there is no turn
+    /// left to steer, but the text is still something the user typed.
+    #[tokio::test]
+    async fn cancelled_turn_keeps_pending_steers_as_follow_ups() {
+        let dir = tmp();
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(fake_provider()),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+
+        // Two messages buffered and a token already cancelled, so
+        // `run_turn` takes its very first early return.
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(8);
+        steer_tx
+            .send(SteerMessage::Steering { text: "first".into() })
+            .await
+            .unwrap();
+        steer_tx
+            .send(SteerMessage::Steering { text: "second".into() })
+            .await
+            .unwrap();
+        let ct = tokio_util::sync::CancellationToken::new();
+        ct.cancel();
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .run_turn("go", &tx, Some(ct), Some(steer_rx))
+            .await
+            .unwrap();
+
+        let queued: Vec<&str> = agent
+            .pending_follow_ups
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["first", "second"],
+            "pending steers must survive cancellation, in order and all of them"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1263,7 +3790,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -1339,7 +3873,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -1355,7 +3896,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let out = agent.run_turn("do something forever", &tx, Some(ct)).await;
+        let out = agent.run_turn("do something forever", &tx, Some(ct), None).await;
         canceller.await.ok();
         let elapsed = start.elapsed();
 
@@ -1397,6 +3938,34 @@ mod tests {
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
+
+        // The marker must also be PERSISTED — the half that was
+        // unpinned (`docs/claims-and-races.md` tool-execution table).
+        // The assertions above read `agent.context`, so the
+        // `append_entry` one statement away could be deleted and this
+        // test stayed green. It matters more here than for an ordinary
+        // message: on `--continue` a transcript without the marker
+        // replays as an assistant turn that simply stops mid-answer,
+        // so the resumed model has no way to know it was aborted and
+        // does the exact thing the marker exists to prevent — continue
+        // the dead answer instead of reading the new question.
+        let persisted = std::fs::read_to_string(&agent.session_path).unwrap();
+        let markers = persisted
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .filter(|v| {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("aborted by the user"))
+            })
+            .count();
+        assert_eq!(
+            markers, 1,
+            "the abort marker must be persisted exactly once; session file was:\n{persisted}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1437,7 +4006,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
         (agent, dir)
     }
@@ -1580,7 +4156,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -1594,7 +4177,7 @@ mod tests {
             got_error
         });
 
-        let r = agent.run_turn("hi", &tx, None).await;
+        let r = agent.run_turn("hi", &tx, None, None).await;
         drop(tx);
         let got_error_event = drain.await.unwrap();
 
@@ -1610,7 +4193,7 @@ mod tests {
     }
 
     /// Regression: v0.9.1 discovered `--no-hooks` didn't gate the
-    /// session lifecycle hooks — SessionStart and SessionEnd fired
+    /// session lifecycle hooks — SessionStart and SessionShutdown fired
     /// regardless. Fix guarded both on `permission.hooks_active()`.
     /// This test writes a marker file from a session_start hook and
     /// asserts the marker never appears when `--no-hooks` is set.
@@ -1634,7 +4217,7 @@ mod tests {
         )
         .unwrap();
 
-        // Same hook wired for both session_start and session_end.
+        // Same hook wired for both session_start and session_shutdown.
         let hook_cfg = HookConfig {
             matcher: "*".into(),
             kind: "command".into(),
@@ -1654,11 +4237,9 @@ mod tests {
             cwd: dir.clone(),
             permission: PermissionGate::from_cli(true /*no_hooks*/, None),
             hooks: HooksConfig {
-                pre_tool_use: vec![],
-                post_tool_use: vec![],
-                user_prompt_submit: vec![],
                 session_start: vec![hook_cfg.clone()],
-                session_end: vec![hook_cfg],
+                session_shutdown: vec![hook_cfg],
+                ..Default::default()
             },
             model: "m".into(),
             base_url: String::new(),
@@ -1667,40 +4248,230 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
-        agent.fire_session_start().await;
-        agent.fire_session_end().await;
+        agent.fire_session_start("startup").await;
+        agent.fire_session_shutdown("quit").await;
 
         assert!(
             !marker.exists(),
-            "--no-hooks must disable both session_start and session_end"
+            "--no-hooks must disable both session_start and session_shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0: session_start payload must carry an honest `reason` in
+    /// `arguments` and the real session id in `session_id`.
+    #[tokio::test]
+    async fn session_start_payload_carries_reason_and_real_session_id() {
+        let dir = tmp();
+        let out = dir.join("payload.json");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat > {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let session_path = dir.join("s.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"m\",\"base_url\":\"\"}\n",
+        )
+        .unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        let session_id = uuid::v7().to_string();
+
+        let agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: session_id.clone(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig {
+                session_start: vec![hook_cfg],
+                ..Default::default()
+            },
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+        agent.fire_session_start("startup").await;
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["arguments"]["reason"], "startup");
+        assert_eq!(payload["session_id"], session_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12.0 regression: compaction hook payloads must carry the real
+    /// session id, not the compaction reason string, in `session_id`.
+    /// Previously `session_id` held `"threshold"`/`"manual"` — a lie.
+    #[tokio::test]
+    async fn compact_now_session_hooks_carry_real_session_id_not_reason() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let out = dir.join("compact_payload.json");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat > {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        agent.hooks.session_before_compact = vec![hook_cfg];
+        let session_id = agent.session_id.clone();
+
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+
+        agent.compact_now(None, "threshold").await;
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["arguments"]["reason"], "threshold");
+        assert_eq!(
+            payload["session_id"], session_id,
+            "session_id must be the real session id, not the reason string"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A context small enough to fit entirely in the verbatim tail has
+    /// no head to summarize, so no pass runs — and `compact_now` must
+    /// say so. `/compact` on a short session printed
+    /// `[compacted: 2158 → 2158 chars]`: the no-op was correct, the
+    /// claim was not.
+    #[tokio::test]
+    async fn compact_now_reports_false_when_there_is_nothing_to_compact() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        agent.context.push_user_text("hi".to_string());
+        agent.context.push_assistant_text("hello".to_string());
+        let before = agent.context.estimate_chars();
+
+        let ran = agent.compact_now(None, "manual").await;
+
+        assert!(!ran, "nothing to compact must not report a pass");
+        assert_eq!(
+            agent.context.estimate_chars(),
+            before,
+            "a no-op pass must leave the context untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the inverse, so the flag isn't just wired to `false`.
+    #[tokio::test]
+    async fn compact_now_reports_true_when_a_pass_actually_runs() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let big = "x".repeat(10_000 * crate::agent::compact::CHARS_PER_TOKEN_ESTIMATE);
+        for i in 1..=10 {
+            agent.context.push_user_text(format!("u{i}-{big}"));
+            agent.context.push_assistant_text(format!("a{i}-{big}"));
+        }
+        let before = agent.context.estimate_chars();
+
+        let ran = agent.compact_now(None, "manual").await;
+
+        assert!(ran, "a real pass must report itself");
+        assert!(
+            agent.context.estimate_chars() < before,
+            "a real pass must shrink the context"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hook pair must be balanced. A `session_before_compact` with
+    /// no matching `session_compact` is indistinguishable, from a hook
+    /// author's side, from nanopi crashing mid-compaction — and that is
+    /// exactly what a no-op `/compact` used to write into the log.
+    #[tokio::test]
+    async fn a_no_op_compaction_fires_neither_hook() {
+        let (mut agent, dir) = agent_for_compact_test("SUMMARY");
+        let out = dir.join("hooks.jsonl");
+        let hook_script = dir.join("hook.sh");
+        std::fs::write(
+            &hook_script,
+            format!("#!/usr/bin/env bash\ncat >> {}\n", out.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook_cfg = HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: hook_script.display().to_string(),
+            timeout: 3000,
+        };
+        agent.hooks.session_before_compact = vec![hook_cfg.clone()];
+        agent.hooks.session_compact = vec![hook_cfg];
+
+        agent.context.push_user_text("hi".to_string());
+        agent.context.push_assistant_text("hello".to_string());
+        let ran = agent.compact_now(None, "manual").await;
+
+        assert!(!ran);
+        assert!(
+            !out.exists(),
+            "a compaction that never ran must not announce one: {:?}",
+            std::fs::read_to_string(&out).unwrap_or_default()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─────── v0.6: --continue / active_session ───────
 
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// No active session registered for this cwd → returns None.
     #[test]
     fn active_session_returns_none_when_no_history() {
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let got = crate::session::active_session(&cwd);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
         assert!(got.is_none(), "expected None, got {got:?}");
@@ -1710,10 +4481,8 @@ mod tests {
     /// that session's path.
     #[test]
     fn active_session_returns_path_after_use() {
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
 
         let cwd = tmp();
         let (path, _header) = crate::session::new_session(&cwd, "m", "http://x").expect("new");
@@ -1722,11 +4491,6 @@ mod tests {
         let got = crate::session::active_session(&cwd).expect("some");
         assert_eq!(got, path);
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1737,10 +4501,8 @@ mod tests {
     /// into a single summary user message on load. Tail is preserved.
     #[test]
     fn load_session_replays_compaction() {
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = tmp();
 
         let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
@@ -1803,11 +4565,6 @@ mod tests {
             _ => panic!("expected trailing user"),
         }
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1819,13 +4576,269 @@ mod tests {
     /// text+tool_call assistant turn round-trips through load_session as
     /// one Assistant message holding both blocks, followed by the Tool
     /// result and the next assistant text.
+    /// The unresumable-session bug.
+    ///
+    /// A `tool_call` is persisted before the tool runs, so losing the
+    /// process during a long command leaves the file ending on a call
+    /// with no result. Replayed verbatim that is an assistant
+    /// `tool_use` block with nothing answering it — rejected by both
+    /// wire protocols, so every later `--continue` / `/resume` died on
+    /// a provider 400 that explained none of it.
+    #[test]
+    fn an_orphaned_tool_call_gets_an_unknown_outcome_result() {
+        use crate::agent::context::ContextMessage;
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("run the migration".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![crate::agent::context::AssistantBlock::ToolCall {
+                call: crate::agent::context::ToolCallBlock {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "./migrate.sh"}),
+                },
+            }],
+        });
+
+        repair_orphaned_tool_calls(&mut ctx);
+
+        assert_eq!(ctx.messages.len(), 3, "a result must have been inserted");
+        match &ctx.messages[2] {
+            ContextMessage::Tool {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_1");
+                assert!(*is_error, "the model must not read this as output");
+                // The load-bearing property: it says nobody knows,
+                // rather than inventing a result or claiming failure.
+                // `./migrate.sh` may well have completed.
+                assert!(content.contains("UNKNOWN"), "{content}");
+                assert!(
+                    content.contains("Do not assume it failed"),
+                    "a synthetic result must not imply the command failed: {content}"
+                );
+                assert!(
+                    content.contains("side effects"),
+                    "the model needs to know effects may already have landed: {content}"
+                );
+            }
+            other => panic!("expected a Tool message, got {other:?}"),
+        }
+    }
+
+    /// Placement matters as much as presence: the Anthropic wire wants
+    /// the results directly after the `tool_use` that asked for them.
+    /// A repair appended at the end would still be a 400.
+    #[test]
+    fn a_synthesized_result_lands_directly_after_its_call() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let call = |id: &str| AssistantBlock::ToolCall {
+            call: ToolCallBlock {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+        };
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("first".to_string());
+        // An interior orphan, with a complete turn after it.
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![call("orphan")],
+        });
+        ctx.push_user_text("second".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![call("answered")],
+        });
+        ctx.push_tool_result_with_images("answered", "ok", false, Vec::new());
+
+        repair_orphaned_tool_calls(&mut ctx);
+
+        let shape: Vec<&str> = ctx
+            .messages
+            .iter()
+            .map(|m| match m {
+                ContextMessage::User { .. } => "user",
+                ContextMessage::Assistant { .. } => "assistant",
+                ContextMessage::Tool { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["user", "assistant", "tool", "user", "assistant", "tool"],
+            "the synthetic result must sit between the assistant and the \
+             next user message, not at the end"
+        );
+        // And the already-answered call gained nothing.
+        let tool_ids: Vec<String> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_ids, vec!["orphan", "answered"]);
+    }
+
+    /// Several calls in one assistant message, only some answered:
+    /// each missing one gets its own result, in call order. A batch
+    /// where the process died partway through is the realistic shape,
+    /// since tools can run in parallel.
+    #[test]
+    fn a_partially_answered_batch_fills_only_the_gaps() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let call = |id: &str| AssistantBlock::ToolCall {
+            call: ToolCallBlock {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+        };
+        let mut ctx = Context::default();
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![call("a"), call("b"), call("c")],
+        });
+        ctx.push_tool_result_with_images("b", "done", false, Vec::new());
+
+        repair_orphaned_tool_calls(&mut ctx);
+
+        let tool_ids: Vec<String> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        // `a` and `c` synthesized in call order, then the real `b`.
+        assert_eq!(tool_ids, vec!["a", "c", "b"]);
+    }
+
+    /// A healthy session must come back byte-identical. This runs on
+    /// every resume, so a false positive would inject a fabricated
+    /// tool result into working conversations.
+    #[test]
+    fn a_complete_session_is_left_alone() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("hi".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![
+                AssistantBlock::Text {
+                    text: "checking".into(),
+                },
+                AssistantBlock::ToolCall {
+                    call: ToolCallBlock {
+                        id: "call_1".into(),
+                        name: "ls".into(),
+                        arguments: serde_json::json!({"path": "."}),
+                    },
+                },
+            ],
+        });
+        ctx.push_tool_result_with_images("call_1", "a\nb", false, Vec::new());
+        ctx.push_assistant_text("two files".to_string());
+
+        let before = serde_json::to_value(&ctx.messages).unwrap();
+        repair_orphaned_tool_calls(&mut ctx);
+        assert_eq!(
+            serde_json::to_value(&ctx.messages).unwrap(),
+            before,
+            "a healthy session must not be touched"
+        );
+    }
+
+    /// An assistant message with no tool calls at all — the ordinary
+    /// text turn — is the most common shape and must not be disturbed.
+    #[test]
+    fn a_text_only_session_is_left_alone() {
+        let mut ctx = Context::default();
+        ctx.push_user_text("hi".to_string());
+        ctx.push_assistant_text("hello".to_string());
+        let before = serde_json::to_value(&ctx.messages).unwrap();
+        repair_orphaned_tool_calls(&mut ctx);
+        assert_eq!(serde_json::to_value(&ctx.messages).unwrap(), before);
+    }
+
+    /// End to end through the real replay path, on the exact file a
+    /// killed process leaves: header, user message, `tool_call`, EOF.
+    #[test]
+    fn load_session_repairs_the_file_a_killed_process_leaves() {
+        use crate::agent::context::ContextMessage;
+        let dir = tmp();
+        let path = dir.join("killed.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":2,"id":"019fe000-0000-7000-8000-000000000000","timestamp":"2026-09-04T00:00:00Z","cwd":"/tmp","model":"m","base_url":""}"#, "\n",
+                r#"{"type":"message","id":"1","timestamp":"2026-09-04T00:00:01Z","role":"user","content":"run the slow thing"}"#, "\n",
+                r#"{"type":"tool_call","id":"call_1","timestamp":"2026-09-04T00:00:02Z","tool_name":"bash","arguments":{"command":"sleep 300"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let agent = Agent::load_session(&path, &dir).expect("load");
+
+        // Before the fix this was [user, assistant(tool_use)] — an
+        // unanswered tool_use, which both wire protocols reject, so the
+        // session could never be resumed again.
+        let shape: Vec<&str> = agent
+            .context
+            .messages
+            .iter()
+            .map(|m| match m {
+                ContextMessage::User { .. } => "user",
+                ContextMessage::Assistant { .. } => "assistant",
+                ContextMessage::Tool { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(shape, vec!["user", "assistant", "tool"]);
+
+        // Every tool_use id in the context has an answer — the property
+        // the providers actually enforce.
+        let calls: std::collections::HashSet<String> = agent
+            .context
+            .messages
+            .iter()
+            .flat_map(|m| match m {
+                ContextMessage::Assistant { content } => content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::agent::context::AssistantBlock::ToolCall { call } => {
+                            Some(call.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let answered: std::collections::HashSet<String> = agent
+            .context
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ContextMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, answered, "every tool_use must have a tool_result");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn load_session_replays_tool_calls() {
         use crate::agent::context::{AssistantBlock, ContextMessage};
-        let _g = lock();
-        let home = tmp();
-        let prev = std::env::var_os("NANOPI_HOME");
-        std::env::set_var("NANOPI_HOME", &home);
+        let _h = crate::TempNanopiHome::new();
+        let home = _h.path().to_path_buf();
         let cwd = tmp();
 
         let (path, _hdr) = crate::session::new_session(&cwd, "m", "http://x").expect("new session");
@@ -1965,11 +4978,6 @@ mod tests {
             m => panic!("expected Assistant with lone ToolCall, got {m:?}"),
         }
 
-        if let Some(p) = prev {
-            std::env::set_var("NANOPI_HOME", p);
-        } else {
-            std::env::remove_var("NANOPI_HOME");
-        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -2083,14 +5091,21 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         // Drain events so the sender doesn't block.
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let final_text = agent.run_turn("go", &tx, None).await.expect("turn");
+        let final_text = agent.run_turn("go", &tx, None, None).await.expect("turn");
         drop(tx);
         drain.await.unwrap();
 
@@ -2121,10 +5136,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The counterpart to `execute_tool_calls_runs_in_parallel_not_sequence`:
+    /// with no override, two `bash` calls are SERIAL, and the wall
+    /// clock is the only thing that can show it.
+    ///
+    /// This is the cost of the fix, asserted rather than left implicit:
+    /// a model that emits two long `bash` calls in one batch now waits
+    /// for the sum instead of the max. That is the trade
+    /// `parallel_bash_calls_on_one_file_lose_an_update` buys — both
+    /// commands used to report success while one silently reverted the
+    /// other — and `[tool_exec_overrides]` is how a user takes the
+    /// speed back if they want it.
+    #[tokio::test]
+    async fn a_default_batch_of_two_bash_calls_is_serial() {
+        use std::time::Instant;
+
+        let dir = tmp();
+        let session_path = dir.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        let start = Instant::now();
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 1; echo a"}),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 1; echo b"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("batch");
+        let elapsed = start.elapsed();
+
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1900),
+            "two bash calls must SERIALIZE by default (>=1.9s), got {elapsed:?} \
+             — if this is fast again, bash lost its Sequential declaration"
+        );
+    }
+
     #[tokio::test]
     async fn execute_tool_calls_runs_in_parallel_not_sequence() {
         use std::time::Instant;
 
+        // Two `bash` calls no longer run concurrently BY DEFAULT —
+        // `bash` declares ExecutionMode::Sequential, because concurrent
+        // bash silently lost updates (see
+        // `parallel_bash_calls_on_one_file_lose_an_update`, which was
+        // `#[ignore]`d as a known bug until that landed).
+        //
+        // This test is still worth keeping, and still worth writing
+        // with bash: it is the only tool that can prove concurrency by
+        // wall clock. So it opts back in through the user-facing
+        // override, which also makes it the pin for that override
+        // actually reaching `execute_tool_calls` rather than only
+        // `group_batch`. `a_default_batch_of_two_bash_calls_is_serial`
+        // is its counterpart for the default.
         let dir = tmp();
         let session_path = dir.join("p.jsonl");
         std::fs::write(&session_path, "").unwrap();
@@ -2147,7 +5230,18 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+                m
+            },
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -2264,7 +5358,14 @@ mod tests {
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -2278,7 +5379,7 @@ mod tests {
             got_error
         });
 
-        let r = agent.run_turn("hi", &tx, None).await;
+        let r = agent.run_turn("hi", &tx, None, None).await;
         drop(tx);
         let got_error_event = drain.await.unwrap();
 
@@ -2303,5 +5404,1057 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3 regression: `SteerMessage::Steering` sent mid-turn must be
+    /// picked up at the next iteration boundary and injected as a
+    /// fresh user message. Two-iteration SteppedProvider: first
+    /// iteration emits text + tool_call, second iteration emits
+    /// final text. The test sends `Steering { text: "hi steer" }`
+    /// before the second iteration starts.
+    #[tokio::test]
+    async fn steer_message_injected_as_user_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct SteppedProvider {
+            step: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for SteppedProvider {
+            fn id(&self) -> &'static str {
+                "stepped"
+            }
+            async fn stream_turn(
+                &self,
+                ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let step = self.step.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(AgentEvent::Start { message_id: "m".into() }).await;
+                match step {
+                    0 => {
+                        let _ = tx.send(AgentEvent::TextDelta {
+                            content_index: 0,
+                            text: "first".into(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::ToolCall {
+                            content_index: 0,
+                            call: ToolCall {
+                                id: "c1".into(),
+                                name: "bash".into(),
+                                arguments: json!({"command": "echo hi"}),
+                            },
+                        }).await;
+                        let _ = tx.send(AgentEvent::Done {
+                            finish_reason: FinishReason::ToolCalls,
+                            usage: Usage::default(),
+                        }).await;
+                    }
+                    1 => {
+                        // The steer message should now be in context
+                        // as a user turn. Verify by checking the
+                        // context's last user message.
+                        let steer_present = ctx.messages.iter().any(|m| match m {
+                            ContextMessage::User { content } => content.iter().any(|b| match b {
+                                ContentBlock::Text { text } => text.contains("hi steer"),
+                                _ => false,
+                            }),
+                            _ => false,
+                        });
+                        assert!(
+                            steer_present,
+                            "steer message must be in context by iteration 2"
+                        );
+                        let _ = tx.send(AgentEvent::TextDelta {
+                            content_index: 0,
+                            text: "done".into(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::Done {
+                            finish_reason: FinishReason::Stop,
+                            usage: Usage::default(),
+                        }).await;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("steer.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"stepped\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let step = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(SteppedProvider { step: step.clone() }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "stepped".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+
+        // Fire the steer AFTER the first iteration's tool_call is
+        // processed but BEFORE the second iteration's stream_turn.
+        // The real TUI sends it while the user types mid-turn; here
+        // we just enqueue it before calling run_turn and let the
+        // try_recv drain it on the second iteration boundary.
+        let _ = steer_tx.send(SteerMessage::Steering {
+            text: "hi steer".into(),
+        }).await;
+
+        let final_text = agent.run_turn("go", &tx, None, Some(steer_rx)).await.expect("turn");
+        assert_eq!(final_text, "firstdone");
+
+        // The steer must land in the context the model sees...
+        assert!(
+            agent.context.messages.iter().any(|m| match m {
+                crate::agent::context::ContextMessage::User { content } =>
+                    content.iter().any(|b| matches!(
+                        b,
+                        crate::agent::context::ContentBlock::Text { text }
+                            if text.contains("hi steer")
+                    )),
+                _ => false,
+            }),
+            "the steer must be pushed into the context as a user message"
+        );
+
+        // ...AND be persisted, which is the half that was unpinned
+        // (`docs/claims-and-races.md` steering table). The two are one
+        // statement apart in the pump, and only the first was asserted:
+        // the `append_entry` could be deleted and this test stayed
+        // green. The failure would surface only on `--continue`, as a
+        // resumed session missing a turn the user typed — the worst
+        // place to find it, because the transcript is the only record
+        // that the user said it at all.
+        let persisted = std::fs::read_to_string(&session_path).unwrap();
+        let steer_entries = persisted
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter(|v| {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("hi steer"))
+            })
+            .count();
+        assert_eq!(
+            steer_entries, 1,
+            "the steer must be persisted exactly once; session file was:\n{persisted}"
+        );
+
+        // Drain channel.
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A steer that arrives during a turn which ends without tool calls
+    /// must not vanish.
+    ///
+    /// The steer pump only runs at the top of an iteration, so a turn
+    /// finishing on `Stop` — the common single-shot case — has no next
+    /// iteration to drain it. The message stayed in the channel: never
+    /// pushed into context, never persisted, never seen by the model.
+    /// The TUI had already drawn `[steer] …`, so the user was told it
+    /// landed, and on resume the session showed one question and an
+    /// answer that had never been asked.
+    ///
+    /// Observed with `who are you` + a mid-stream `who mai`: the saved
+    /// session held only the first, and the reply addressed only the
+    /// first.
+    #[tokio::test]
+    async fn a_steer_that_misses_its_turn_becomes_a_follow_up() {
+        let dir = tmp();
+        let session_path = dir.join("late_steer.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        // Single-shot provider: text, then Stop. No tool calls, so
+        // `run_turn` never comes back around to the steer pump.
+        //
+        // The steer is sent from INSIDE `stream_turn`, which is the
+        // only way to land in the window that matters: the pump at the
+        // top of iteration 1 has already run, and there is no
+        // iteration 2. Enqueuing before `run_turn` instead exercises
+        // the pump, which always worked.
+        struct OneShot {
+            steer_tx: mpsc::Sender<SteerMessage>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for OneShot {
+            fn id(&self) -> &'static str {
+                "oneshot"
+            }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let _ = tx
+                    .send(AgentEvent::Start {
+                        message_id: "m".into(),
+                    })
+                    .await;
+                // The user types mid-stream. The send SUCCEEDS — the
+                // receiver is alive — which is what distinguishes this
+                // from the TUI's dropped-receiver fallback.
+                self.steer_tx
+                    .send(SteerMessage::Steering {
+                        text: "who am i".into(),
+                    })
+                    .await
+                    .expect("steer channel must still be open mid-stream");
+                let _ = tx
+                    .send(AgentEvent::TextDelta {
+                        content_index: 0,
+                        text: "I'm a model.".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::Stop,
+                        usage: Usage::default(),
+                    })
+                    .await;
+                Ok(Usage::default())
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(OneShot { steer_tx }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "oneshot".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+        };
+
+        let _ = agent
+            .run_turn("who are you", &tx, None, Some(steer_rx))
+            .await
+            .expect("turn");
+
+        assert_eq!(
+            agent.pending_follow_ups.pop_front().as_deref(),
+            Some("who am i"),
+            "a steer that missed its turn must survive as a follow-up, \
+             not be dropped after the TUI has already echoed it"
+        );
+
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Follow-up messages: a FollowUp steer message queues text for
+    /// after the turn ends. `pending_follow_up` must be populated.
+    #[tokio::test]
+    async fn follow_up_message_populates_pending() {
+        let dir = tmp();
+        let session_path = dir.join("fu.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+
+        // Enqueue a follow-up message before calling run_turn.
+        let _ = steer_tx.send(SteerMessage::FollowUp {
+            text: "next question".into(),
+        }).await;
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider { response: "ok".into() }),
+            registry: ToolRegistry::standard(),
+            session_path: session_path.clone(),
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+        };
+
+        agent.run_turn("go", &tx, None, Some(steer_rx)).await.unwrap();
+
+        assert_eq!(
+            agent.pending_follow_ups.front().map(String::as_str),
+            Some("next question"),
+            "FollowUp message must surface on agent.pending_follow_ups"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────── concurrent file mutation under Parallel tool exec ───────
+    //
+    // `execute_tool_calls` groups a parallel batch by
+    // `tool::mutation_key` and runs same-key calls serially, so `edit`
+    // and `write` against one file are serialized. `bash` has no key
+    // (its command string is not analyzable) and stays fully parallel,
+    // so it can still lose an update. The tests below pin down both
+    // halves of that split, with the variable being *which tool*
+    // performs the concurrent mutation:
+    //
+    //   edit + edit  → safe, guaranteed by the per-path grouping
+    //   bash + bash  → genuinely races (no key, so no serialization)
+    //   Sequential   → the bash race disappears too, confirming the
+    //                  config knob is the real mitigation for bash
+
+    /// Builds an Agent wired to `dir` with the given exec mode.
+    fn concurrency_agent(dir: &std::path::Path, mode: crate::config::ToolExecMode) -> Agent {
+        let session_path = dir.join("p.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "ok".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.to_path_buf(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: mode,
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        }
+    }
+
+    /// Two `edit` calls hitting the same file in one parallel batch,
+    /// each replacing a different line. Both changes must survive.
+    ///
+    /// What guarantees this now is the per-path pipeline: both calls
+    /// resolve to the same `tool::mutation_key`, so
+    /// `execute_tool_calls` puts them in one group and awaits the first
+    /// to completion before starting the second. The second edit reads
+    /// a file that already contains the first edit's write.
+    ///
+    /// It is worth being precise about what changed, because the test
+    /// body did not. Before the pipeline this test also passed, but by
+    /// accident: `EditTool::execute` contains no `.await` between
+    /// `read_to_string` and `fs::write`, and `join_all` polls every
+    /// tool future on ONE task, so nothing could preempt an edit
+    /// mid-read-modify-write. That property still holds, and it must
+    /// still not be relied on — it is one keystroke from evaporating
+    /// (switching `edit` to `tokio::fs::…().await` reads like a
+    /// harmless async cleanup), and a second mechanism quietly
+    /// disappearing is exactly the kind of thing that goes unnoticed
+    /// while a test stays green for the wrong reason. The grouping is
+    /// the designed guarantee; the no-await property is an accident
+    /// that happens to agree with it.
+    ///
+    /// So this test now asserts the pipeline works. If it goes red,
+    /// suspect the grouping in `execute_tool_calls` or the key in
+    /// `tool::mutation_key`, not `edit.rs`.
+    #[tokio::test]
+    async fn parallel_edits_to_one_file_keep_both_changes() {
+        let dir = tmp();
+        let target = dir.join("foo.txt");
+        std::fs::write(&target, "alpha\nbravo\n").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "edit".into(),
+                        arguments: json!({
+                            "path": "foo.txt",
+                            "oldText": "alpha",
+                            "newText": "ALPHA"
+                        }),
+                    },
+                    ToolCall {
+                        id: "e2".into(),
+                        name: "edit".into(),
+                        arguments: json!({
+                            "path": "foo.txt",
+                            "oldText": "bravo",
+                            "newText": "BRAVO"
+                        }),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got, "ALPHA\nBRAVO\n",
+            "both edits must survive; a lost update here means the \
+             read-modify-write in edit.rs gained a yield point"
+        );
+    }
+
+    /// The batch shape that actually loses data: two `bash` calls
+    /// mutating one file.
+    ///
+    /// `bash` awaits, so unlike `edit` it has no atomic critical
+    /// section. Both children are spawned before either yields control
+    /// back, both snapshot the file at t≈spawn, both write their own
+    /// snapshot back at t≈spawn+300ms — so whichever writes second
+    /// silently reverts the other. Each command is a read-modify-write
+    /// straddling a sleep, which is the shape of any real `sed -i`,
+    /// formatter, or codemod the model might reach for.
+    ///
+    /// Note this is NOT reachable by pairing `bash` with `edit`: a
+    /// same-batch `edit` finishes its whole read-modify-write in
+    /// microseconds, while bash needs milliseconds just to fork/exec,
+    /// so bash always snapshots the post-edit file. The exposure is
+    /// specifically bash-against-bash, where the two sides are
+    /// symmetric and neither has an atomic section.
+    ///
+    /// **Fixed by per-tool `executionMode`.** `bash` declares
+    /// [`crate::tool::ExecutionMode::Sequential`], and a `Sequential`
+    /// tool anywhere in a batch serializes the whole batch, so the two
+    /// commands can no longer overlap. Previously this test was
+    /// `#[ignore]`d as a known bug — it failed nondeterministically
+    /// while BOTH tools reported success, so nothing surfaced the loss
+    /// to the model. It is the pin for the fix now, not a
+    /// demonstration of the bug.
+    ///
+    /// Teeth: set `bash`'s `execution_mode` back to `Parallel`, or add
+    /// `bash = "parallel"` to `[tool_exec_overrides]`, and this reds.
+    #[tokio::test]
+    async fn parallel_bash_calls_on_one_file_lose_an_update() {
+        let dir = tmp();
+        let target = dir.join("foo.txt");
+        std::fs::write(&target, "alpha\nbravo\n").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/alpha/ALPHA}\" > foo.txt"
+                        }),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/bravo/BRAVO}\" > foo.txt"
+                        }),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            got.contains("ALPHA") && got.contains("BRAVO"),
+            "both mutations must survive, got {got:?} — one bash wrote \
+             back a snapshot taken before the other committed"
+        );
+    }
+
+    // ─────────── the per-path pipeline itself (v0.11.0) ───────────
+
+    /// A stand-in for `write` that yields for `delay_ms` before touching
+    /// the file, so the grouping becomes observable in wall-clock time.
+    ///
+    /// The real `write` finishes its whole read-modify-write without an
+    /// `.await`, which is precisely why timing cannot distinguish
+    /// parallel from serial with it. This tool has the yield point the
+    /// real one lacks — i.e. it is the shape the real one might become —
+    /// so it measures the pipeline rather than an implementation
+    /// accident of `write.rs`.
+    struct SlowWriteTool {
+        delay_ms: u64,
+        /// Tags in the order calls actually *finished*. Some effects of
+        /// (mis)grouping are invisible in the resulting file contents
+        /// but plain here — notably a reorder, where the same writes
+        /// land in the same places, just not in the order the model
+        /// asked for.
+        journal: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// How many calls are inside `execute` right now.
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// High-water mark of `in_flight`. This, not wall clock, is what
+        /// the grouping tests assert on: "2 calls took less than 750ms"
+        /// infers overlap from a stopwatch, and a loaded machine running
+        /// the rest of the suite in parallel can blow that budget while
+        /// the calls really were concurrent. Watching the counter
+        /// answers the actual question — did two of these run at once —
+        /// with no timing assumption at all.
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for SlowWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "slow write stand-in".into(),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            }
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            ctx: &crate::tool::ToolContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            use std::sync::atomic::Ordering;
+            let path = args["path"].as_str().unwrap_or_default().to_string();
+            let abs = crate::tool::resolve_in_cwd(&ctx.cwd, &path)
+                .map_err(crate::tool::ToolError::Execution)?;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            // Read-modify-write straddling a yield: appends its own tag
+            // to whatever it saw. Two of these racing lose a tag.
+            let before = std::fs::read_to_string(&abs).unwrap_or_default();
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let tag = args["content"].as_str().unwrap_or("?");
+            std::fs::write(&abs, format!("{before}{tag}")).unwrap();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.journal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(tag.to_string());
+            Ok(crate::tool::ToolOutput {
+                content: "ok".into(),
+                is_error: false,
+                metadata: None,
+                images: Vec::new(),
+            })
+        }
+    }
+
+    /// Registry whose `write` is the slow stand-in above, plus the
+    /// completion journal and the concurrency watermark it writes into.
+    /// Built from `new()` rather than `standard()` so `register_external`
+    /// does not hit the anti-shadowing refusal.
+    #[allow(clippy::type_complexity)]
+    fn slow_write_registry(
+        delay_ms: u64,
+    ) -> (
+        ToolRegistry,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let journal = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut r = ToolRegistry::new();
+        r.register_external(std::sync::Arc::new(SlowWriteTool {
+            delay_ms,
+            journal: journal.clone(),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: peak.clone(),
+        }))
+        .expect("fresh registry has no `write` to shadow");
+        (r, journal, peak)
+    }
+
+    /// The over-serialization guard. Two `write` calls to DIFFERENT
+    /// files get different mutation keys, so they must land in different
+    /// groups and still run concurrently.
+    ///
+    /// This is the failure mode a naive "just take one global file lock"
+    /// fix would have: correct, and quietly half the throughput on every
+    /// multi-file batch the model emits (which is most of them).
+    #[tokio::test]
+    async fn parallel_writes_to_different_paths_stay_parallel() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        std::fs::write(dir.join("b.txt"), "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (registry, _journal, peak) = slow_write_registry(100);
+        agent.registry = registry;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "A"}),
+                    },
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "b.txt", "content": "B"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let b = std::fs::read_to_string(dir.join("b.txt")).unwrap();
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            ("A", "B"),
+            "both writes must land"
+        );
+        assert_eq!(
+            peak, 2,
+            "two writes to different paths must be in flight at once; peak \
+             concurrency was {peak} — the mutation key is over-matching and \
+             grouping unrelated files together"
+        );
+    }
+
+    /// The other side of the same coin: two `write` calls to the SAME
+    /// file share a key, so the pipeline must serialize them.
+    ///
+    /// Both assertions matter. The concurrency watermark proves they
+    /// did not overlap; the content one proves the serialization
+    /// actually prevented the lost update, and that the calls ran in
+    /// the order the model emitted them rather than whatever order the
+    /// executor found convenient.
+    #[tokio::test]
+    async fn parallel_writes_to_one_path_are_serialized_in_order() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Parallel);
+        let (registry, _journal, peak) = slow_write_registry(100);
+        agent.registry = registry;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "A"}),
+                    },
+                    // Same file, spelled differently on purpose: the key
+                    // must collapse `./a.txt` onto `a.txt`.
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "./a.txt", "content": "B"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got, "AB",
+            "same-file writes must serialize in model order; {got:?} means \
+             the second call snapshotted the file before the first wrote"
+        );
+        assert_eq!(
+            peak, 1,
+            "the two spellings must share a key and never overlap; peak \
+             concurrency was {peak}"
+        );
+    }
+
+    /// The grouping contract, tested directly on the pure function so
+    /// the ordering properties `execute_tool_calls` relies on are pinned
+    /// without timing.
+    /// A `Sequential` tool anywhere collapses the batch to one group,
+    /// which is what serializes it. The opposite mistake — N groups of
+    /// one — looks similar and runs everything concurrently, so this
+    /// asserts the shape and not just the count.
+    #[test]
+    fn a_sequential_tool_anywhere_serializes_the_whole_batch() {
+        let reg = ToolRegistry::standard();
+        let cwd = tmp();
+        let calls = vec![
+            ToolCall { id: "r".into(), name: "read".into(), arguments: json!({"path": "a"}) },
+            ToolCall { id: "b".into(), name: "bash".into(), arguments: json!({"command": "true"}) },
+            ToolCall { id: "g".into(), name: "grep".into(), arguments: json!({"pattern": "x"}) },
+        ];
+        let groups = group_batch(&reg, &cwd, calls, &Default::default());
+        assert_eq!(groups.len(), 1, "one group = serial; got {groups:?}");
+        assert_eq!(groups[0].len(), 3, "all three calls in that one group");
+        // Model order preserved inside the group.
+        let ids: Vec<&str> = groups[0].iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["r", "b", "g"]);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Without a `Sequential` tool the batcher behaves exactly as
+    /// before, which is what keeps the fix from costing every batch.
+    #[test]
+    fn a_batch_with_no_sequential_tool_still_groups_by_path() {
+        let reg = ToolRegistry::standard();
+        let cwd = tmp();
+        let calls = vec![
+            ToolCall { id: "r".into(), name: "read".into(), arguments: json!({"path": "a"}) },
+            ToolCall { id: "g".into(), name: "grep".into(), arguments: json!({"pattern": "x"}) },
+        ];
+        let groups = group_batch(&reg, &cwd, calls, &Default::default());
+        assert_eq!(groups.len(), 2, "still concurrent; got {groups:?}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The override outranks the tool in BOTH directions. The
+    /// parallel-bash direction is the one worth pinning: it is the
+    /// user taking back a safety default, which they are allowed to do
+    /// and which a one-directional implementation would silently
+    /// ignore.
+    #[test]
+    fn a_user_override_outranks_the_tools_own_declaration() {
+        let reg = ToolRegistry::standard();
+        let cwd = tmp();
+        let bash_and_read = || {
+            vec![
+                ToolCall { id: "b".into(), name: "bash".into(), arguments: json!({"command": "true"}) },
+                ToolCall { id: "r".into(), name: "read".into(), arguments: json!({"path": "a"}) },
+            ]
+        };
+
+        // bash forced back to parallel: two groups again.
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+        assert_eq!(
+            group_batch(&reg, &cwd, bash_and_read(), &ov).len(),
+            2,
+            "an explicit `bash = \"parallel\"` must be honored"
+        );
+
+        // read forced to sequential: one group, even though bash is
+        // the only tool that declares it.
+        let mut ov = std::collections::BTreeMap::new();
+        ov.insert("read".to_string(), crate::tool::ExecutionMode::Sequential);
+        ov.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+        assert_eq!(
+            group_batch(&reg, &cwd, bash_and_read(), &ov).len(),
+            1,
+            "`read = \"sequential\"` must serialize the batch"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn group_by_mutation_key_shapes_the_batch() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let registry = ToolRegistry::standard();
+
+        let call = |id: &str, name: &str, args: serde_json::Value| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args,
+        };
+
+        // `bash` is forced back to Parallel for this test ONLY. It is
+        // about mutation-key grouping, and bash's Sequential
+        // declaration would collapse the whole batch to one group
+        // before the key logic ever ran — a real behaviour, pinned by
+        // `a_sequential_tool_anywhere_serializes_the_whole_batch`, but
+        // not the one under test here.
+        let mut bash_parallel = std::collections::BTreeMap::new();
+        bash_parallel.insert("bash".to_string(), crate::tool::ExecutionMode::Parallel);
+
+        let groups = group_batch(
+            &registry,
+            &dir,
+            vec![
+                call(
+                    "1",
+                    "edit",
+                    json!({"path": "a.txt", "oldText": "x", "newText": "y"}),
+                ),
+                call("2", "bash", json!({"command": "ls"})),
+                call("3", "write", json!({"path": "./a.txt", "content": "z"})),
+                call("4", "read", json!({"path": "a.txt"})),
+                call("5", "write", json!({"path": "b.txt", "content": "z"})),
+                call(
+                    "6",
+                    "edit",
+                    json!({"path": "a.txt", "oldText": "x", "newText": "w"}),
+                ),
+            ],
+            &bash_parallel
+        );
+
+        let ids: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|g| g.iter().map(|c| c.id.as_str()).collect())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                // a.txt: all three spellings collapse, in model order,
+                // and the group sits where its FIRST member was.
+                vec!["1", "3", "6"],
+                // bash and read are unserialized, each its own group.
+                vec!["2"],
+                vec!["4"],
+                // b.txt is a separate file, so a separate group.
+                vec!["5"],
+            ],
+            "grouping must collapse same-file mutations in model order \
+             while leaving everything else parallel"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gateway-mangled names must still group. If `Write_tool` failed to
+    /// canonicalize to `write` here, the key would come back `None` and
+    /// the serialization would silently not happen — a failure that is
+    /// invisible except as a rare lost update.
+    #[test]
+    fn group_by_mutation_key_canonicalizes_mangled_tool_names() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let groups = group_batch(
+            &ToolRegistry::standard(),
+            &dir,
+            vec![
+                ToolCall {
+                    id: "1".into(),
+                    name: "Write_tool".into(),
+                    arguments: json!({"path": "a.txt", "content": "z"}),
+                },
+                ToolCall {
+                    id: "2".into(),
+                    name: "EDIT_TOOL".into(),
+                    arguments: json!({"path": "a.txt", "oldText": "x", "newText": "y"}),
+                },
+            ],
+            &Default::default()
+        );
+
+        assert_eq!(groups.len(), 1, "mangled names must canonicalize and group");
+        assert_eq!(groups[0].len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sequential mode must NOT be regrouped: its contract is "every
+    /// call, one at a time, in the order the model emitted them", and
+    /// grouping reorders a batch — same-key calls migrate to the
+    /// position of the first of them. In the batch below, grouping would
+    /// hoist `C` (a.txt) ahead of `B` (b.txt).
+    ///
+    /// The assertion is on completion ORDER, not on timing or file
+    /// contents, because those two do not distinguish the cases: a
+    /// grouped Sequential run still awaits every group serially, so it
+    /// still takes 3×200ms, and `a.txt` still ends up "AC" and `b.txt`
+    /// still "B" either way. The reorder is the entire observable
+    /// difference, and for a `write`-then-`bash`-then-`write` chain —
+    /// exactly what `sequential` exists to serve — a reorder is a
+    /// correctness bug.
+    #[tokio::test]
+    async fn sequential_mode_is_not_regrouped() {
+        let dir = tmp();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        std::fs::write(dir.join("b.txt"), "").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Sequential);
+        let (registry, journal, _peak) = slow_write_registry(50);
+        agent.registry = registry;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "A"}),
+                    },
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "b.txt", "content": "B"}),
+                    },
+                    // Same key as w1. Grouping would pull this call up
+                    // next to it, ahead of w2.
+                    ToolCall {
+                        id: "w3".into(),
+                        name: "write".into(),
+                        arguments: json!({"path": "a.txt", "content": "C"}),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let order = journal.lock().unwrap().clone();
+        let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        let b = std::fs::read_to_string(dir.join("b.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            order,
+            vec!["A", "B", "C"],
+            "sequential mode must run the batch in model order; \
+             [\"A\", \"C\", \"B\"] means the per-path grouping leaked into \
+             the Sequential arm and reordered the batch"
+        );
+        assert_eq!((a.as_str(), b.as_str()), ("AC", "B"));
+    }
+
+    /// The same batch as the test above under
+    /// `tool_exec_mode = "sequential"`. The first bash is awaited to
+    /// completion before the second is spawned at all, so the second
+    /// snapshots the first's output instead of racing it and both
+    /// mutations land.
+    ///
+    /// This is what makes `sequential` a genuine mitigation rather than
+    /// a placebo — at the cost of serialising every tool in the batch.
+    #[tokio::test]
+    async fn sequential_mode_prevents_the_concurrent_bash_race() {
+        let dir = tmp();
+        let target = dir.join("foo.txt");
+        std::fs::write(&target, "alpha\nbravo\n").unwrap();
+
+        let mut agent = concurrency_agent(&dir, crate::config::ToolExecMode::Sequential);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+
+        agent
+            .execute_tool_calls(
+                vec![
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/alpha/ALPHA}\" > foo.txt"
+                        }),
+                    },
+                    ToolCall {
+                        id: "b2".into(),
+                        name: "bash".into(),
+                        arguments: json!({
+                            "command":
+                                "snap=$(cat foo.txt); sleep 0.3; \
+                                 printf '%s' \"${snap/bravo/BRAVO}\" > foo.txt"
+                        }),
+                    },
+                ],
+                &tx,
+                None,
+            )
+            .await
+            .expect("execute");
+        while rx.try_recv().is_ok() {}
+
+        let got = std::fs::read_to_string(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            got.contains("ALPHA") && got.contains("BRAVO"),
+            "sequential mode must serialise the batch, got {got:?}"
+        );
     }
 }
