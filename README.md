@@ -304,6 +304,8 @@ A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhan
 
 For plugins meant to be *used* rather than read: [`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) is durable project memory — facts are markdown files in `.nanopi/memory/` that you can diff and commit, and only the compact index enters the model's context, with `recall` fetching the full text of whatever looks relevant. [`examples/wasm-plugin-report/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-report) records per-tool time and failures across sessions, which answers "why was that slow" — `tool_execution_end` carries a `duration_ms` that nothing else persists.
 
+All five plugins are indexed in [`examples/README.md`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples) — a table of what each one does, the grants it needs, and which WIT world it targets.
+
 Step-by-step guides for writing, debugging, and gating a plugin are in the [wiki](https://github.com/ChrisZhangJin/nanopi/wiki) (English and Chinese).
 
 **Sandboxing.** Components run inside wasmtime with no ambient authority — a plugin reaches the outside world only through host functions you opt into.

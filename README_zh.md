@@ -299,6 +299,8 @@ path = "~/.nanopi/extensions/my-tool.wasm"
 
 两个**能直接用**而不只是拿来读的插件：[`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) 是持久化的项目记忆 —— 每条记忆是 `.nanopi/memory/` 下一个 markdown 文件，可 diff 可提交；注入模型上下文的只有那份精简索引，全文由模型按需调 `recall` 取。[`examples/wasm-plugin-report/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-report) 跨会话记录每个工具的耗时与失败，用来回答「刚才为什么慢」—— `tool_execution_end` 带的那个 `duration_ms` 别处都不持久化。
 
+五个插件在 [`examples/README.md`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples) 里有总表 —— 每个插件做什么、需要哪些 grant、目标是哪个 WIT world。
+
 写插件、调试插件、能力门的分步指南在 [wiki](https://github.com/ChrisZhangJin/nanopi/wiki)（中英双语）。
 
 **沙箱。** 组件跑在 wasmtime 里，没有环境权限 —— 插件只能通过你显式开启的宿主函数接触外部。
