@@ -100,16 +100,17 @@ jobs:
             ext: ''
             features: ''
             cross: true
-            # UPX's arm64 packing is markedly less reliable than x86's;
-            # a 4 MB static binary is small enough to ship unpacked.
-            upx: false
+            # UPX 4.x packs linux/arm64 as well as x86: measured 3730232 ->
+            # 1527248 (40.9%) on the v0.12.0-preview artifact. The `|| true`
+            # in the staging step still covers a stub that refuses to run.
+            upx: true
           - name: linux-aarch64-musl-wasm
             runner: ubuntu-latest
             target: aarch64-unknown-linux-musl
             ext: ''
             features: '--features wasm'
             cross: true
-            upx: false
+            upx: true
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64-apple-darwin

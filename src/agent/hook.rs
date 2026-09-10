@@ -540,7 +540,14 @@ pub async fn run_hook(
 
     let env = extract_env(extra_env);
 
-    let mut cmd = Command::new("bash");
+    // Same resolution as the bash tool: bash where present, `sh` where
+    // not. This matters more here than there. A spawn error becomes
+    // `HookError::Spawn`, and the caller fails OPEN on it (see the
+    // `Err(e)` arm of `run_matching_hooks`) — so on a bashless host
+    // every hook silently never ran, including a `deny`. Hooks are the
+    // only veto channel in the tool pipeline; losing them to ENOENT is
+    // a bypass, not a degradation.
+    let mut cmd = Command::new(crate::util::shell::shell());
     cmd.arg("-c")
         .arg(&cmd_str)
         .env_clear()

@@ -1,4 +1,11 @@
-//! `bash` tool — runs a shell command via `bash -c "<command>"`.
+//! `bash` tool — runs a shell command via `<shell> -c "<command>"`.
+//!
+//! The shell is resolved once per process by `util::shell` — bash where it
+//! exists, `sh` where it does not (bare Android shells, busybox/distroless
+//! containers). The tool keeps the name `bash` regardless: it is baked
+//! into model priors and into every session transcript on disk, and
+//! renaming it per host would make the tool call non-portable across
+//! machines for no gain.
 //!
 //! Output truncation:
 //!   - cap at `max_bytes` (default 30 KB)
@@ -14,7 +21,7 @@
 //! with `is_error: true`.
 //!
 //! v0.5: bash output goes through stdout+stderr (merged). The full cmd
-//! is `bash -c "<command>"` with no shell expansion safeguards.
+//! is `<shell> -c "<command>"` with no shell expansion safeguards.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -70,7 +77,22 @@ impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `bash -c`. Returns combined stdout+stderr. Output is truncated at 30 KB / 2000 lines; overflow is saved to a temp file.".into(),
+            // The description is built per process rather than being a
+            // constant so the POSIX case is stated to the model. Telling
+            // it up front that bashisms will not parse is cheaper than
+            // letting it emit `[[ ]]` and read back a syntax error.
+            description: {
+                let sh = crate::util::shell::shell_display();
+                let mut d = format!(
+                    "Run a shell command via `{sh} -c`. Returns combined stdout+stderr. Output is truncated at 30 KB / 2000 lines; overflow is saved to a temp file."
+                );
+                if crate::util::shell::is_posix_fallback() {
+                    d.push_str(
+                        " No bash available on this host: use POSIX sh syntax only — no `[[ ]]`, arrays, `local`, or process substitution.",
+                    );
+                }
+                d
+            },
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -90,7 +112,8 @@ impl Tool for BashTool {
             .ok_or_else(|| ToolError::InvalidArgs("command must be a string".into()))?
             .to_string();
 
-        let mut child = Command::new("bash")
+        let sh = crate::util::shell::shell();
+        let mut child = Command::new(sh)
             .arg("-c")
             .arg(&cmd)
             .current_dir(&ctx.cwd)
@@ -99,7 +122,7 @@ impl Tool for BashTool {
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| ToolError::Execution(format!("failed to spawn bash: {e}")))?;
+            .map_err(|e| ToolError::Execution(format!("failed to spawn {sh}: {e}")))?;
 
         let stdout = child
             .stdout
