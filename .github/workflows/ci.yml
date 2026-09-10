@@ -30,6 +30,14 @@ jobs:
       - name: cargo check
         run: cargo check --all-targets
 
+      # The release matrix ships `-wasm` variants for every Linux target, so
+      # a compile error that only appears under the feature would otherwise
+      # stay invisible until a tag is pushed. Checked, not tested: pulling in
+      # wasmtime + cranelift already costs a few minutes, and the feature's
+      # behavioural tests run via `make test` (Makefile:258).
+      - name: cargo check --features wasm
+        run: cargo check --all-targets --features wasm
+
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
         continue-on-error: true

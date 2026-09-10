@@ -63,9 +63,9 @@ Pi 是个好用的编码 agent,但上游选择不支持一些真实用户切实�
 - **glibc 2.12+(CentOS 6)** —— 动态版覆盖老服务器,musl 版覆盖其余环境
 - **~4 MB** —— Rust + LTO + `opt-level = "z"` + `panic = abort` + strip;
   发布的二进制经 UPX 压缩到 1.6 MB
-- **预编译覆盖** `linux-x86_64`、`linux-x86_64-musl`、`macos-aarch64`、
-  `windows-x86_64`。Linux ARM 暂无预编译,需自行编译:
-  `cargo build --release --target aarch64-unknown-linux-musl`
+- **预编译覆盖** `linux-x86_64`、`linux-x86_64-musl`、`linux-aarch64-musl`、
+  `macos-aarch64`、`windows-x86_64`。每个 Linux target 另有一份编入插件
+  运行时的 `-wasm` 变体
 
 ## 安装
 
@@ -85,10 +85,27 @@ chmod +x nanopi
 每个 release 提供预编译二进制：
 - `nanopi-<ver>-linux-x86_64-musl` —— 全静态 Linux，跑在任何地方（推荐）
 - `nanopi-<ver>-linux-x86_64` —— 动态 glibc Linux，体积稍小
+- `nanopi-<ver>-linux-aarch64-musl` —— 全静态 arm64：树莓派、arm64 服务器，
+  以及 Termux 下的 Android
 - `nanopi-<ver>-macos-aarch64` —— Apple Silicon（M1+）
 - `nanopi-<ver>-windows-x86_64.exe` —— Windows 10/11
 
+以上每个 Linux 产物都另有一份 `-wasm` 双胞胎（如
+`nanopi-<ver>-linux-x86_64-musl-wasm`），用 `--features wasm` 构建。只有要跑
+`[[extensions]]` WASM 插件时才需要它 —— 它内含 wasmtime 运行时，约 7.2 MiB，
+而标准版约 4 MB。
+
+macOS 和 Windows 只发标准版；要插件支持请自行编译 `cargo build --release --features wasm`。
+
 macOS Intel 不预编译（GitHub 的 Intel Mac runner 供给紧俏）；有需要自己编：`cargo build --target x86_64-apple-darwin`。
+
+macOS 下载的二进制没有签名，会被 Gatekeeper 拦住。清掉 quarantine 属性并
+临时签名即可：
+
+```bash
+xattr -d com.apple.quarantine ./nanopi-<ver>-macos-aarch64 2>/dev/null || true
+codesign --force --sign - ./nanopi-<ver>-macos-aarch64
+```
 
 ### 从源码编译
 

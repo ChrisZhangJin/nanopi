@@ -68,9 +68,9 @@ case:**
   the musl build covers everything else
 - **~4 MB** — Rust + LTO + `opt-level = "z"` + `panic = abort` + strip;
   the published binary is UPX-packed down to 1.6 MB
-- **Prebuilt for** `linux-x86_64`, `linux-x86_64-musl`, `macos-aarch64`
-  and `windows-x86_64`. Linux ARM is not prebuilt yet — build from source
-  with `cargo build --release --target aarch64-unknown-linux-musl`.
+- **Prebuilt for** `linux-x86_64`, `linux-x86_64-musl`,
+  `linux-aarch64-musl`, `macos-aarch64` and `windows-x86_64`. Each Linux
+  target also ships a `-wasm` variant with the plugin runtime compiled in.
 
 ## Install
 
@@ -90,10 +90,27 @@ chmod +x nanopi
 Per release, prebuilt binaries ship for:
 - `nanopi-<ver>-linux-x86_64-musl` — fully static Linux, works on anything (recommended)
 - `nanopi-<ver>-linux-x86_64` — dynamic glibc Linux, slightly smaller
+- `nanopi-<ver>-linux-aarch64-musl` — static arm64: Raspberry Pi, arm64
+  servers, and Android under Termux
 - `nanopi-<ver>-macos-aarch64` — Apple Silicon (M1+)
 - `nanopi-<ver>-windows-x86_64.exe` — Windows 10/11
 
+Every Linux asset above also has a `-wasm` twin (e.g.
+`nanopi-<ver>-linux-x86_64-musl-wasm`) built with `--features wasm`. Take it
+only if you use `[[extensions]]` WASM plugins — it carries the wasmtime
+runtime and is ~7.2 MiB against the stock build's ~4 MB.
+
+macOS and Windows are stock-only; for plugin support there, build from source with `cargo build --release --features wasm`.
+
 macOS Intel isn't prebuilt (GitHub runner supply is scarce); build from source with `cargo build --target x86_64-apple-darwin`.
+
+On macOS the download is unsigned, so Gatekeeper blocks it. Clear the
+quarantine attribute and ad-hoc sign it:
+
+```bash
+xattr -d com.apple.quarantine ./nanopi-<ver>-macos-aarch64 2>/dev/null || true
+codesign --force --sign - ./nanopi-<ver>-macos-aarch64
+```
 
 ### Build from source
 

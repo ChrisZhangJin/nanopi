@@ -53,21 +53,70 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `features` is the literal cargo flag string (empty = stock build).
+        # `cross` selects the docker-based cross toolchain; `upx` gates
+        # packing. Every Linux target ships twice: a stock ~4 MB binary and
+        # a `-wasm` one (~7.2 MiB, see docs/v0.12-events.md) with the plugin
+        # runtime compiled in. macOS/Windows stay stock-only — plugin users
+        # are overwhelmingly on Linux, and doubling those jobs buys little.
         include:
           - name: linux-x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ''
+            features: ''
+            cross: false
+            upx: true
+          - name: linux-x86_64-wasm
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ''
+            features: '--features wasm'
+            cross: false
+            upx: true
           # Fully static build for old glibc systems (CentOS 7 etc.).
           # rustls-tls means no OpenSSL C dep — musl links clean.
           - name: linux-x86_64-musl
             runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
             ext: ''
+            features: ''
+            cross: false
+            upx: true
+          - name: linux-x86_64-musl-wasm
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ''
+            features: '--features wasm'
+            cross: false
+            upx: true
+          # arm64 static: covers Raspberry Pi / arm64 servers and runs under
+          # Termux on Android (bundled webpki CA roots and PATH-resolved
+          # `bash` mean no bionic-specific build is needed). `ring` pulls a
+          # C/asm dep, so this needs a real cross toolchain — hence `cross`.
+          - name: linux-aarch64-musl
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            ext: ''
+            features: ''
+            cross: true
+            # UPX's arm64 packing is markedly less reliable than x86's;
+            # a 4 MB static binary is small enough to ship unpacked.
+            upx: false
+          - name: linux-aarch64-musl-wasm
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            ext: ''
+            features: '--features wasm'
+            cross: true
+            upx: false
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64-apple-darwin
             ext: ''
+            features: ''
+            cross: false
+            upx: true
           # macos-x86_64 (Intel) dropped: GitHub's `macos-13` runner supply
           # is scarce (jobs sit in queue for 10+ min) and Apple Silicon covers
           # M1+ users. Intel users can `cargo build --target x86_64-apple-darwin`.
@@ -75,6 +124,9 @@ jobs:
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             ext: '.exe'
+            features: ''
+            cross: false
+            upx: true
 
     steps:
       - name: checkout
@@ -101,28 +153,37 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Native musl only. The aarch64 musl build gets its sysroot from the
+      # `cross` docker image instead, and musl-tools would be the wrong arch.
       - name: install musl toolchain
-        if: contains(matrix.target, 'musl')
+        if: contains(matrix.target, 'musl') && !matrix.cross
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: install cross
+        if: matrix.cross
+        run: cargo install cross --locked --version 0.2.5
+
+      # Keyed on matrix.name, not matrix.target: stock and -wasm builds share
+      # a target triple but produce different artifacts, and a shared key
+      # would let one clobber the other's cache.
       - name: cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.name }}
 
       - name: build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: install upx (ubuntu)
-        if: startsWith(matrix.runner, 'ubuntu')
-        run: sudo apt-get install -y upx-ucl
+        if: matrix.upx && startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
 
       - name: install upx (macos)
-        if: startsWith(matrix.runner, 'macos')
+        if: matrix.upx && startsWith(matrix.runner, 'macos')
         run: brew install upx
 
       - name: install upx (windows)
-        if: startsWith(matrix.runner, 'windows')
+        if: matrix.upx && startsWith(matrix.runner, 'windows')
         shell: pwsh
         run: choco install upx --no-progress -y
 
@@ -135,18 +196,21 @@ jobs:
           OUT="nanopi-${TAG}-${{ matrix.name }}${{ matrix.ext }}"
           mkdir -p dist
           cp "$SRC" "dist/$OUT"
-          # Strip on Unix targets first (UPX packs better against
-          # stripped binaries). Windows keeps symbols so debuggers can
-          # find them.
-          if [ "${{ matrix.name }}" != "windows-x86_64" ]; then
+          # [profile.release] already sets strip = true, so this is belt and
+          # braces on Unix. Skipped for cross builds: the host `strip` is
+          # x86-only and would just error on an aarch64 binary. Windows keeps
+          # symbols so debuggers can find them.
+          if [ "${{ matrix.ext }}" != ".exe" ] && [ "${{ matrix.cross }}" != "true" ]; then
             strip "dist/$OUT" || true
           fi
-          # UPX-pack every platform: --best --lzma gives ~60% shrink at
+          # UPX-pack where enabled: --best --lzma gives ~60% shrink at
           # a ~100 ms startup cost, which is unnoticeable for TUI use.
           # `|| true` so a platform that trips UPX (rare, but possible
           # on some macOS builds) doesn't fail the whole release —
           # the unpacked binary is still uploaded.
-          upx --best --lzma "dist/$OUT" || true
+          if [ "${{ matrix.upx }}" = "true" ]; then
+            upx --best --lzma "dist/$OUT" || true
+          fi
           ls -lh "dist/$OUT"
 
       - name: upload to release
