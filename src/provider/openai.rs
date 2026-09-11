@@ -221,7 +221,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
-            client: reqwest::Client::builder()
+            client: crate::net::client_builder()
                 .build()
                 .expect("build reqwest client"),
             vendor: None,

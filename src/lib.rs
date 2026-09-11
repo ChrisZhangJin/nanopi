@@ -8,6 +8,7 @@ pub mod event;
 pub mod keys;
 pub mod paths;
 pub mod models;
+pub mod net;
 /// Unconditionally compiled, like `subscriber` below and for the same
 /// reason: turn assembly in `agent::loop_` reads it, and that path must
 /// stay free of `#[cfg(feature = "wasm")]`. Without the feature the

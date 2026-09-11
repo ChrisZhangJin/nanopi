@@ -111,6 +111,38 @@ jobs:
             features: '--features wasm'
             cross: true
             upx: true
+          # Bionic-linked Android. Distinct from the musl build above in
+          # exactly one way that matters: bionic's getaddrinfo goes
+          # through netd, so DNS works with no /etc/resolv.conf and no
+          # NANOPI_DNS. The musl artifact needs `src/net.rs` to be given
+          # nameservers out of band; this one does not. Runs on Android
+          # directly (adb shell, /data/local/tmp) as well as in Termux.
+          - name: android-aarch64
+            runner: ubuntu-latest
+            target: aarch64-linux-android
+            ext: ''
+            features: ''
+            cross: false
+            # cargo-ndk rather than `cross`: ubuntu-latest ships the
+            # Android NDK preinstalled, so this needs no docker and no
+            # ghcr.io pull, which is two fewer things to fail.
+            ndk: true
+            abi: arm64-v8a
+            # Left unpacked: a UPX stub self-modifies its own mapping,
+            # and Android's linker + SELinux policy vary enough across
+            # ROMs that a packed binary is a support problem we cannot
+            # reproduce here — unlike the musl arm64 artifact, which was
+            # verified packed under qemu. Revisit with a real device.
+            upx: false
+          - name: android-aarch64-wasm
+            runner: ubuntu-latest
+            target: aarch64-linux-android
+            ext: ''
+            features: '--features wasm'
+            cross: false
+            ndk: true
+            abi: arm64-v8a
+            upx: false
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64-apple-darwin
@@ -164,6 +196,13 @@ jobs:
         if: matrix.cross
         run: cargo install cross --locked --version 0.2.5
 
+      # Sets the NDK's clang as the linker and injects the sysroot, which
+      # is the whole reason a bare `cargo build --target
+      # aarch64-linux-android` fails: `ring` needs a working C toolchain.
+      - name: install cargo-ndk
+        if: matrix.ndk
+        run: cargo install cargo-ndk --locked
+
       # Keyed on matrix.name, not matrix.target: stock and -wasm builds share
       # a target triple but produce different artifacts, and a shared key
       # would let one clobber the other's cache.
@@ -173,7 +212,18 @@ jobs:
           key: ${{ matrix.name }}
 
       - name: build release
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }} ${{ matrix.features }}
+        shell: bash
+        run: |
+          set -eux
+          if [ "${{ matrix.ndk }}" = "true" ]; then
+            # cargo-ndk picks the target from -t, so --target is omitted;
+            # output still lands in target/aarch64-linux-android/release.
+            cargo ndk -t ${{ matrix.abi }} build --release ${{ matrix.features }}
+          elif [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} ${{ matrix.features }}
+          else
+            cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+          fi
 
       - name: install upx (ubuntu)
         if: matrix.upx && startsWith(matrix.runner, 'ubuntu')
@@ -201,7 +251,9 @@ jobs:
           # braces on Unix. Skipped for cross builds: the host `strip` is
           # x86-only and would just error on an aarch64 binary. Windows keeps
           # symbols so debuggers can find them.
-          if [ "${{ matrix.ext }}" != ".exe" ] && [ "${{ matrix.cross }}" != "true" ]; then
+          if [ "${{ matrix.ext }}" != ".exe" ] \
+             && [ "${{ matrix.cross }}" != "true" ] \
+             && [ "${{ matrix.ndk }}" != "true" ]; then
             strip "dist/$OUT" || true
           fi
           # UPX-pack where enabled: --best --lzma gives ~60% shrink at

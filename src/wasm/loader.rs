@@ -654,7 +654,7 @@ fn fetch_url(url: String) -> Result<String, String> {
             // unwrapped — the turn must survive it.
             Err(e) => Err(format!("cannot start network runtime: {e}")),
             Ok(rt) => rt.block_on(async move {
-                let client = reqwest::Client::builder()
+                let client = crate::net::client_builder()
                     // A plugin must not be able to hang a turn.
                     .timeout(std::time::Duration::from_secs(10))
                     // Deliberate: following a 3xx would land the fetch

@@ -89,6 +89,13 @@ regex = { version = "1.10", default-features = false, features = ["std"] }
 # with `\` before this was adopted.
 url = { version = "2.5", default-features = false }
 
+# Explicit DNS nameservers when the host has no /etc/resolv.conf
+# (Android). Already in the tree as a transitive dep of reqwest's
+# `hickory-dns` feature, so declaring it costs zero download and zero
+# binary size — it is declared because `net.rs` constructs a resolver
+# directly and must not depend on reqwest re-exporting it.
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
+
 # Date/time (RFC3339 for sessions)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

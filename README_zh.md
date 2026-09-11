@@ -64,8 +64,8 @@ Pi 是个好用的编码 agent,但上游选择不支持一些真实用户切实�
 - **~4 MB** —— Rust + LTO + `opt-level = "z"` + `panic = abort` + strip;
   发布的二进制经 UPX 压缩到 1.6 MB
 - **预编译覆盖** `linux-x86_64`、`linux-x86_64-musl`、`linux-aarch64-musl`、
-  `macos-aarch64`、`windows-x86_64`。每个 Linux target 另有一份编入插件
-  运行时的 `-wasm` 变体
+  `android-aarch64`、`macos-aarch64`、`windows-x86_64`。每个 Linux 和
+  Android target 另有一份编入插件运行时的 `-wasm` 变体
 
 ## 安装
 
@@ -85,17 +85,37 @@ chmod +x nanopi
 每个 release 提供预编译二进制：
 - `nanopi-<ver>-linux-x86_64-musl` —— 全静态 Linux，跑在任何地方（推荐）
 - `nanopi-<ver>-linux-x86_64` —— 动态 glibc Linux，体积稍小
-- `nanopi-<ver>-linux-aarch64-musl` —— 全静态 arm64：树莓派、arm64 服务器，
-  以及 Termux 下的 Android
+- `nanopi-<ver>-linux-aarch64-musl` —— 全静态 arm64：树莓派、arm64 服务器
+- `nanopi-<ver>-android-aarch64` —— Android（Termux 或 `adb shell`）。
+  手机上优先用这个而不是 musl 版：它链接 bionic，DNS 走系统解析器，无需额外配置
 - `nanopi-<ver>-macos-aarch64` —— Apple Silicon（M1+）
 - `nanopi-<ver>-windows-x86_64.exe` —— Windows 10/11
 
-以上每个 Linux 产物都另有一份 `-wasm` 双胞胎（如
+以上每个 Linux 和 Android 产物都另有一份 `-wasm` 双胞胎（如
 `nanopi-<ver>-linux-x86_64-musl-wasm`），用 `--features wasm` 构建。只有要跑
 `[[extensions]]` WASM 插件时才需要它 —— 它内含 wasmtime 运行时，约 7.2 MiB，
 而标准版约 4 MB。
 
 macOS 和 Windows 只发标准版；要插件支持请自行编译 `cargo build --release --features wasm`。
+
+### 没有 `/etc/resolv.conf` 的主机上的 DNS
+
+nanopi 用内置的 hickory 解析器，它只读 `/etc/resolv.conf`，没有别的来源。
+Android 上没有这个文件（DNS 由 netd 负责），所以**静态 musl** 版在手机上
+每个请求都会失败：`error reading DNS system conf for hickory-dns: io error: os error 2`。
+
+`android-aarch64` 产物没有这个问题——它链接 bionic，走系统解析器。如果你用的
+是 musl 版，显式给它 nameserver：
+
+```bash
+export NANOPI_DNS=223.5.5.5,119.29.29.29     # 或任意 IP[:port] 列表
+# 或者持久化：
+printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > ~/.nanopi/resolv.conf
+```
+
+`NANOPI_DNS=system` 可强制回到默认行为，适用于 `/etc/resolv.conf` 正常但
+`~/.nanopi/resolv.conf` 是遗留文件的情况。注意显式 nameserver 会绕过 VPN 的
+解析器，如果你依赖分流 DNS 需要留意。
 
 macOS Intel 不预编译（GitHub 的 Intel Mac runner 供给紧俏）；有需要自己编：`cargo build --target x86_64-apple-darwin`。
 

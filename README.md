@@ -69,8 +69,9 @@ case:**
 - **~4 MB** — Rust + LTO + `opt-level = "z"` + `panic = abort` + strip;
   the published binary is UPX-packed down to 1.6 MB
 - **Prebuilt for** `linux-x86_64`, `linux-x86_64-musl`,
-  `linux-aarch64-musl`, `macos-aarch64` and `windows-x86_64`. Each Linux
-  target also ships a `-wasm` variant with the plugin runtime compiled in.
+  `linux-aarch64-musl`, `android-aarch64`, `macos-aarch64` and
+  `windows-x86_64`. Each Linux and Android target also ships a `-wasm`
+  variant with the plugin runtime compiled in.
 
 ## Install
 
@@ -90,17 +91,42 @@ chmod +x nanopi
 Per release, prebuilt binaries ship for:
 - `nanopi-<ver>-linux-x86_64-musl` — fully static Linux, works on anything (recommended)
 - `nanopi-<ver>-linux-x86_64` — dynamic glibc Linux, slightly smaller
-- `nanopi-<ver>-linux-aarch64-musl` — static arm64: Raspberry Pi, arm64
-  servers, and Android under Termux
+- `nanopi-<ver>-linux-aarch64-musl` — static arm64: Raspberry Pi and
+  arm64 servers
+- `nanopi-<ver>-android-aarch64` — Android (Termux or `adb shell`).
+  Prefer this over the musl build on a phone: it links bionic, so DNS
+  resolves through the system resolver with no extra setup
 - `nanopi-<ver>-macos-aarch64` — Apple Silicon (M1+)
 - `nanopi-<ver>-windows-x86_64.exe` — Windows 10/11
 
-Every Linux asset above also has a `-wasm` twin (e.g.
+Every Linux and Android asset above also has a `-wasm` twin (e.g.
 `nanopi-<ver>-linux-x86_64-musl-wasm`) built with `--features wasm`. Take it
 only if you use `[[extensions]]` WASM plugins — it carries the wasmtime
 runtime and is ~7.2 MiB against the stock build's ~4 MB.
 
 macOS and Windows are stock-only; for plugin support there, build from source with `cargo build --release --features wasm`.
+
+### DNS on hosts without `/etc/resolv.conf`
+
+nanopi resolves names with the bundled hickory resolver, which reads
+`/etc/resolv.conf` and nothing else. Android has no such file — DNS is
+done by netd — so a **static musl** build on a phone fails every request
+with `error reading DNS system conf for hickory-dns: io error: os error 2`.
+
+The `android-aarch64` asset does not have this problem: it links bionic
+and goes through the system resolver. If you are on the musl build
+instead, give it nameservers explicitly:
+
+```bash
+export NANOPI_DNS=223.5.5.5,119.29.29.29     # or any IP[:port] list
+# or, persistently:
+printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n' > ~/.nanopi/resolv.conf
+```
+
+`NANOPI_DNS=system` forces the default behaviour, for a host that has a
+working `/etc/resolv.conf` but a stale `~/.nanopi/resolv.conf`. Note that
+explicit nameservers bypass any VPN's resolver, which can matter for
+split-horizon DNS.
 
 macOS Intel isn't prebuilt (GitHub runner supply is scarce); build from source with `cargo build --target x86_64-apple-darwin`.
 
