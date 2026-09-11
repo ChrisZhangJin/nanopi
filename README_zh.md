@@ -104,8 +104,13 @@ nanopi 用内置的 hickory 解析器，它只读 `/etc/resolv.conf`，没有别
 Android 上没有这个文件（DNS 由 netd 负责），所以**静态 musl** 版在手机上
 每个请求都会失败：`error reading DNS system conf for hickory-dns: io error: os error 2`。
 
-`android-aarch64` 产物没有这个问题——它链接 bionic，走系统解析器。如果你用的
-是 musl 版，显式给它 nameserver：
+`android-aarch64` 产物已经处理好了：在 Android 上 nanopi 会关掉 hickory，改用
+libc 的 `getaddrinfo`，在链接 bionic 的二进制里它会走到 netd。（注意**光链接
+bionic 是不够的**——reqwest 是按编译期 feature 选解析器的，这个切换必须在运行时
+做，见 `src/net.rs`。）静态 musl 版做不到这点：musl 自己的解析器读同一个不存在
+的文件，然后默认 `127.0.0.1:53`。
+
+所以手机上优先用 `android-aarch64`。如果你用的是 musl 版，显式给它 nameserver：
 
 ```bash
 export NANOPI_DNS=223.5.5.5,119.29.29.29     # 或任意 IP[:port] 列表

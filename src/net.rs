@@ -90,6 +90,7 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     let b = reqwest::Client::builder();
     match dns_plan() {
         DnsPlan::System => b,
+        DnsPlan::PlatformGai => b.hickory_dns(false),
         DnsPlan::Explicit(servers) => b.dns_resolver(Arc::new(ExplicitResolver {
             servers: servers.clone(),
             state: Arc::new(OnceLock::new()),
@@ -97,13 +98,29 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     }
 }
 
-/// What the resolver should do. `System` covers both "a normal host with
-/// /etc/resolv.conf" and "nothing configured anywhere" — in the second
-/// case the note has already been emitted and reqwest's own error is the
-/// most accurate thing we can surface.
+/// What the resolver should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DnsPlan {
+    /// Leave reqwest alone: hickory, reading `/etc/resolv.conf`. Covers
+    /// both "a normal host" and "nothing configured anywhere" — in the
+    /// second case the note has already been emitted and reqwest's own
+    /// error is the most accurate thing we can surface.
     System,
+    /// `hickory_dns(false)`, i.e. libc `getaddrinfo` on a threadpool.
+    ///
+    /// This is the Android default, and it is the ONLY thing that makes
+    /// the bionic-linked NDK artifact behave differently from the static
+    /// musl one. Linking bionic is not by itself enough: reqwest decides
+    /// hickory-vs-getaddrinfo from `cfg!(feature = "hickory-dns")`, which
+    /// is a compile-time constant that is just as true for the Android
+    /// target as for any other. Without this branch the NDK build reads
+    /// the same missing `/etc/resolv.conf` and fails identically — which
+    /// is exactly what shipping it "fixed by construction" would have
+    /// quietly delivered.
+    ///
+    /// Only on Android. Everywhere else hickory is deliberate (96aa4e4,
+    /// surviving a poisoned system resolver) and must not be traded away.
+    PlatformGai,
     Explicit(Vec<SocketAddr>),
 }
 
@@ -113,7 +130,7 @@ fn dns_plan() -> DnsPlan {
         let plan = decide(
             std::env::var("NANOPI_DNS").ok(),
             crate::paths::nanopi_home().map(|h| h.join("resolv.conf")),
-            std::path::Path::new("/etc/resolv.conf").is_file(),
+            cfg!(target_os = "android"),
         );
         if let DnsPlan::System = plan {
             // Only warn in the genuinely broken case: no explicit
@@ -140,14 +157,19 @@ fn dns_plan() -> DnsPlan {
 /// set `$NANOPI_DNS` would either read a value cached by an earlier test
 /// or poison a later one, and the interesting cases are exactly the ones
 /// that need different environments.
-fn decide(env: Option<String>, home_resolv: Option<PathBuf>, etc_resolv: bool) -> DnsPlan {
+fn decide(env: Option<String>, home_resolv: Option<PathBuf>, android: bool) -> DnsPlan {
+    let system = if android {
+        DnsPlan::PlatformGai
+    } else {
+        DnsPlan::System
+    };
     if let Some(raw) = env {
         let raw = raw.trim();
-        // An explicit opt-out, for someone who wants the system resolver
-        // on a host where we would otherwise pick up a stale
+        // An explicit opt-out, for someone who wants the platform's own
+        // resolver on a host where we would otherwise pick up a stale
         // ~/.nanopi/resolv.conf.
         if raw.eq_ignore_ascii_case("system") {
-            return DnsPlan::System;
+            return system;
         }
         let servers = parse_server_list(raw);
         if !servers.is_empty() {
@@ -165,8 +187,7 @@ fn decide(env: Option<String>, home_resolv: Option<PathBuf>, etc_resolv: bool) -
             }
         }
     }
-    let _ = etc_resolv;
-    DnsPlan::System
+    system
 }
 
 /// `1.1.1.1, 8.8.8.8:5353` → two addrs. Bare IPv6 must be bracketed to
@@ -310,13 +331,41 @@ domain example.com
         );
     }
 
-    /// The Android case this module was written for: no /etc/resolv.conf
-    /// and no home file, so we stay on `System` and let the note plus
-    /// reqwest's own error explain it. Asserting that we do NOT silently
-    /// invent a nameserver.
+    /// The Android case this module was written for. `PlatformGai`, NOT
+    /// `System`: on Android, leaving reqwest alone means hickory reading
+    /// a `/etc/resolv.conf` that cannot exist. This assertion is the one
+    /// that would have caught the claim that a bionic-linked NDK build
+    /// fixes DNS by itself — it does not; this branch is what fixes it.
     #[test]
-    fn android_with_nothing_configured_stays_on_system() {
+    fn android_with_nothing_configured_uses_the_platform_resolver() {
+        assert_eq!(decide(None, None, true), DnsPlan::PlatformGai);
+    }
+
+    /// And the non-Android default must stay on hickory. Turning
+    /// getaddrinfo on everywhere would silently undo 96aa4e4, whose
+    /// whole point was surviving a poisoned system resolver.
+    #[test]
+    fn non_android_stays_on_hickory() {
         assert_eq!(decide(None, None, false), DnsPlan::System);
+    }
+
+    /// Explicit nameservers still win on Android — the NDK build is the
+    /// recommended one there, but someone on the musl artifact under
+    /// Termux must still be able to point it somewhere.
+    #[test]
+    fn env_still_wins_on_android() {
+        assert_eq!(
+            decide(Some("1.1.1.1".into()), None, true),
+            DnsPlan::Explicit(vec![sa("1.1.1.1:53")])
+        );
+    }
+
+    /// `system` on Android means Android's resolver, not hickory-on-a-
+    /// missing-file. Returning `System` here would make the documented
+    /// opt-out the one setting guaranteed to break.
+    #[test]
+    fn explicit_system_on_android_means_getaddrinfo() {
+        assert_eq!(decide(Some("system".into()), None, true), DnsPlan::PlatformGai);
     }
 
     /// And the actual fix path: an env var alone is enough, with no
@@ -359,8 +408,8 @@ domain example.com
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("resolv.conf");
         std::fs::write(&f, "nameserver 10.0.0.1\n").unwrap();
-        assert_eq!(decide(Some("system".into()), Some(f), true), DnsPlan::System);
-        assert_eq!(decide(Some("SYSTEM".into()), None, true), DnsPlan::System);
+        assert_eq!(decide(Some("system".into()), Some(f), false), DnsPlan::System);
+        assert_eq!(decide(Some("SYSTEM".into()), None, false), DnsPlan::System);
     }
 
     /// An empty or comment-only file must not count as "configured" —
@@ -371,7 +420,7 @@ domain example.com
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("resolv.conf");
         std::fs::write(&f, "# nothing here\n\n").unwrap();
-        assert_eq!(decide(None, Some(f), true), DnsPlan::System);
+        assert_eq!(decide(None, Some(f), false), DnsPlan::System);
     }
 
     /// A one-shot DNS server that answers A queries with `answer` and

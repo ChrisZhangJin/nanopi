@@ -113,8 +113,15 @@ nanopi resolves names with the bundled hickory resolver, which reads
 done by netd — so a **static musl** build on a phone fails every request
 with `error reading DNS system conf for hickory-dns: io error: os error 2`.
 
-The `android-aarch64` asset does not have this problem: it links bionic
-and goes through the system resolver. If you are on the musl build
+The `android-aarch64` asset handles this for you: on Android nanopi
+switches off hickory and resolves through libc `getaddrinfo`, which on a
+bionic-linked binary reaches netd. (Linking bionic is not sufficient on
+its own — reqwest picks the resolver from a compile-time feature flag,
+so the switch has to be made at runtime. See `src/net.rs`.) The static
+musl build cannot do this: musl's own resolver reads the same missing
+file and then defaults to `127.0.0.1:53`.
+
+So on a phone, prefer `android-aarch64`. If you are on the musl build
 instead, give it nameservers explicitly:
 
 ```bash
