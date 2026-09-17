@@ -65,6 +65,11 @@ crossterm = { version = "0.29", default-features = false, features = ["events", 
 # The interactive TUI. Layered on crossterm.
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
+# Display-width measurement for soft-wrapping the input box (CJK/wide
+# chars count as 2 columns). Already in the tree via ratatui; pinned
+# here so the wrap math has a direct, stable handle on it.
+unicode-width = "0.2"
+
 # UUID v7 (time-ordered). `std` is for now_v7()'s timestamp source.
 # No `serde`: session ids are stored as plain strings.
 uuid = { version = "1.10", default-features = false, features = ["v7", "std"] }

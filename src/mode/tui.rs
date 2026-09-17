@@ -569,6 +569,9 @@ pub async fn run_tui_mode(
     // later pick_vendor() (model swap, /new, /fork) reads it from there,
     // and it used to sit at None forever, silently ignoring the field.
     app.cfg_provider = cfg_provider.clone();
+    app.max_replay_entries = cfg_for_build
+        .max_replay_entries
+        .unwrap_or(DEFAULT_MAX_REPLAY_ENTRIES);
     app.inline_think_tags = inline_think_tags;
     let initial_vendor = crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), model);
     app.vendor_id = Some(initial_vendor.id().to_string());
@@ -796,6 +799,10 @@ struct App {
     /// v0.9.3: cached `config.provider` string used by every
     /// `pick_vendor()` call at Agent build. Populated at startup.
     cfg_provider: Option<String>,
+    /// `config.max_replay_entries` — how many trailing session entries
+    /// `replay_history` repaints into scrollback on resume. Cosmetic
+    /// only (full history still loads into context). Defaults to 40.
+    max_replay_entries: usize,
     /// `config.inline_think_tags` — escape hatch for the inline
     /// `<think>` splitter (on by default), threaded to every follow-up
     /// `provider::build()` call the same way `cfg_provider` is.
@@ -931,6 +938,7 @@ impl App {
             api_kind,
             bindings: crate::keys::KeyBindings::default(),
             cfg_provider: None,
+            max_replay_entries: DEFAULT_MAX_REPLAY_ENTRIES,
             inline_think_tags: None,
             vendor_id: None,
             usage: crate::event::Usage::default(),
@@ -2012,14 +2020,34 @@ async fn run_app(
                         refresh_status(app, &agent_slot).await;
                         if let Some(t) = turn_task.take() {
                             match t.await {
-                                Ok(Ok(_)) => {}
+                                Ok(Ok(_)) => {
+                                    // v0.12: pull the post-turn snapshot
+                                    // (usage_total, context_chars, turn
+                                    // count) into `app` so the footbar
+                                    // reflects what just happened. Without
+                                    // this the status line kept showing
+                                    // pre-turn values -- `0` tokens,
+                                    // stale context size -- until the
+                                    // next /new, /resume, /model, or
+                                    // explicit compaction fires. Status
+                                    // data lives in agent.usage_total and
+                                    // agent.context.estimate_chars();
+                                    // `refresh_status` is the one place
+                                    // that copies both.
+                                    refresh_status(app, &agent_slot).await;
+                                }
                                 Ok(Err(e)) => {
+                                    // Refresh before showing the error so
+                                    // any partial usage accumulated before
+                                    // the failure is visible.
+                                    refresh_status(app, &agent_slot).await;
                                     insert_line(term, Line::from(vec![
                                         Span::styled(format!("[error: {e}]"),
                                             Style::default().fg(Color::Red)),
                                     ]))?;
                                 }
                                 Err(join_err) => {
+                                    refresh_status(app, &agent_slot).await;
                                     insert_line(term, Line::from(vec![
                                         Span::styled(format!("[turn panic: {join_err}]"),
                                             Style::default().fg(Color::Red)),
@@ -2346,6 +2374,14 @@ async fn handle_action(
                     None => return Ok(()),
                 }
             };
+            // Diagnostic: show the cwd we're filtering against.
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    format!("[resume] current cwd: {}", cwd.display()),
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            )?;
             let items_meta = session::list_sessions_for_cwd(&cwd, Some(&current_path));
             if items_meta.is_empty() {
                 insert_line(
@@ -2357,6 +2393,45 @@ async fn handle_action(
                             .add_modifier(Modifier::ITALIC),
                     )]),
                 )?;
+                // Diagnostic: list every session file on disk with its
+                // recorded header.cwd so the user can compare values.
+                if let Some(dir) = session::sessions_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for e in entries.flatten() {
+                            let path = e.path();
+                            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                                continue;
+                            }
+                            match session::read_session(&path) {
+                                Ok((header, _)) => insert_line(
+                                    term,
+                                    Line::from(vec![Span::styled(
+                                        format!(
+                                            "  {} -> cwd: {}",
+                                            path.file_name()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("?"),
+                                            header.cwd.display()
+                                        ),
+                                        Style::default().fg(Color::DarkGray),
+                                    )]),
+                                )?,
+                                Err(err) => insert_line(
+                                    term,
+                                    Line::from(vec![Span::styled(
+                                        format!(
+                                            "  {} -> (unreadable: {err})",
+                                            path.file_name()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("?")
+                                        ),
+                                        Style::default().fg(Color::DarkGray),
+                                    )]),
+                                )?,
+                            }
+                        }
+                    }
+                }
                 return Ok(());
             }
             let items: Vec<MenuItem<PathBuf>> = items_meta
@@ -4161,19 +4236,57 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
         AgentEvent::CompactionEnd {
             replaced_count,
             used_llm,
+            chars_before,
+            chars_after,
+            usage,
         } => {
             let via = if used_llm { "summary" } else { "truncation" };
+            // Calculate before/after in tokens (chars / 4) and savings percentage
+            let tokens_before = chars_before / 4;
+            let tokens_after = chars_after / 4;
+            let savings_pct = if chars_before > 0 {
+                ((chars_before - chars_after) * 100) / chars_before
+            } else {
+                0
+            };
+            let detail = format!(
+                "[compacted {replaced_count} messages via {via} · {}→{} tokens (-{}%)]",
+                crate::models::fmt_tokens(tokens_before as u32),
+                crate::models::fmt_tokens(tokens_after as u32),
+                savings_pct
+            );
             insert_line(
                 term,
                 Line::from(vec![Span::styled(
-                    format!("[compacted {replaced_count} messages via {via}]"),
+                    detail,
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
                 )]),
             )?;
-            // Refresh cached context estimate for the status footer.
-            app.context_chars = 0; // will be re-populated on next event
+            // Separate notice for what the summarization call itself
+            // cost — distinct from the before/after context size above.
+            // Matches PI's `addCompactionCostNotice` ("Compaction: N
+            // tokens billed"); nanopi has no per-model pricing table
+            // yet, so unlike PI this omits the `(~$0.15)` cost suffix.
+            if let Some(u) = usage {
+                let billed = u.input_tokens
+                    + u.output_tokens
+                    + u.cache_read_tokens
+                    + u.cache_write_tokens;
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
+                        format!(
+                            "Compaction: {} tokens billed",
+                            crate::models::fmt_tokens(billed)
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    )]),
+                )?;
+            }
+            // Update cached context estimate immediately to the new value
+            app.context_chars = chars_after;
         }
         AgentEvent::SkillInvocation {
             name,
@@ -4512,12 +4625,48 @@ fn render_user_echo(term: &mut Term, msg: &str) -> Result<()> {
 /// compaction markers, branch summaries). Called from
 /// KeyAction::ResumeSession so `/resume` shows the full past
 /// conversation, matching PI's behavior.
+/// Upper bound on how many trailing session entries we *visually*
+/// repaint into scrollback on resume. The full history is always
+/// loaded into the model's context by `Agent::load_session` — this cap
+/// only affects the cosmetic transcript redraw. Without it, resuming a
+/// long session (hundreds of tool calls / large payloads) paints every
+/// line one-by-one through `insert_before`, which is slow terminal I/O
+/// and floods the screen for many seconds before the prompt appears.
+///
+/// Overridable via `max_replay_entries` in config.toml; this is the
+/// fallback when the field is unset.
+const DEFAULT_MAX_REPLAY_ENTRIES: usize = 40;
+
 fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEntry]) -> Result<()> {
     // Ensure any live-streaming state is fresh (fenced-block toggle etc).
     app.md_state = crate::render::markdown::MdState::default();
     app.stream_buf.clear();
     app.thinking_buf.clear();
     app.pending_tool_calls.clear();
+
+    // Only repaint the tail of long transcripts. The hidden prefix is
+    // still in context; we just note how much was elided so the user
+    // knows the screen isn't the whole story. `max_replay_entries` (from
+    // config.toml) tunes the cap; 0 shows only the summary line.
+    let cap = app.max_replay_entries;
+    let entries: &[session::SessionEntry] = if entries.len() > cap {
+        let hidden = entries.len() - cap;
+        insert_line(
+            term,
+            Line::from(vec![Span::styled(
+                format!(
+                    "[{hidden} earlier entries hidden — full history loaded into context; showing last {cap}]"
+                ),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]),
+        )?;
+        insert_line(term, Line::from(""))?;
+        &entries[entries.len() - cap..]
+    } else {
+        entries
+    };
 
     for entry in entries {
         match entry {
@@ -4806,6 +4955,78 @@ fn input_scroll_window(cursor_row: usize, total: usize, visible: usize) -> (usiz
     (start, end)
 }
 
+/// One on-screen row of the input box after soft-wrapping. Points back
+/// into a logical line by byte range so the renderer can slice the text
+/// and place the cursor without re-measuring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputDisplayRow {
+    /// Which logical line (index into `TextBuffer::lines`) this came from.
+    logical_row: usize,
+    /// First wrapped segment of its logical line — gets the `> ` marker.
+    is_first: bool,
+    /// Byte range `[start, end)` within the logical line.
+    start: usize,
+    end: usize,
+}
+
+/// Soft-wrap logical input lines to `width` display columns (wide/CJK
+/// chars count as 2). Returns the flat list of display rows plus the
+/// index of the row the cursor sits on. A long single line becomes
+/// several display rows so its tail — and the cursor — stay visible.
+fn wrap_input_lines(
+    lines: &[String],
+    width: usize,
+    cursor: (usize, usize),
+) -> (Vec<InputDisplayRow>, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let (crow, ccol) = cursor;
+    let mut rows: Vec<InputDisplayRow> = Vec::new();
+    let mut cursor_index = 0usize;
+    for (li, line) in lines.iter().enumerate() {
+        let seg_start_before = rows.len();
+        let mut seg_start = 0usize;
+        let mut col = 0usize;
+        let mut is_first = true;
+        for (bi, ch) in line.char_indices() {
+            let w = ch.width().unwrap_or(0);
+            if col + w > width && bi > seg_start {
+                rows.push(InputDisplayRow {
+                    logical_row: li,
+                    is_first,
+                    start: seg_start,
+                    end: bi,
+                });
+                is_first = false;
+                seg_start = bi;
+                col = 0;
+            }
+            col += w;
+        }
+        // Always push the trailing segment (covers empty lines too).
+        rows.push(InputDisplayRow {
+            logical_row: li,
+            is_first,
+            start: seg_start,
+            end: line.len(),
+        });
+        // Locate the cursor's display row within this logical line.
+        if li == crow {
+            let mut found = None;
+            for (idx, r) in rows.iter().enumerate().skip(seg_start_before) {
+                if ccol >= r.start && ccol < r.end {
+                    found = Some(idx);
+                    break;
+                }
+            }
+            // At end-of-line (ccol == line.len()) no segment contains it;
+            // pin to the last segment of this logical line.
+            cursor_index = found.unwrap_or_else(|| rows.len() - 1);
+        }
+    }
+    (rows, cursor_index)
+}
+
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // Is a dropdown overlay open? When one is, it claims the top 4 rows
     // and the input box collapses to a single content line. When none is
@@ -4819,7 +5040,14 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         || app.settings_menu.is_some()
         || app.keybindings_menu.is_some();
     let max_input_lines = if overlay_open { 1 } else { MAX_INPUT_LINES };
-    let input_content_h = app.input.row_count().clamp(1, max_input_lines) as u16;
+    // Content width available for the input text: full dock width minus
+    // the 2-column `> ` marker (the box has no left/right border). Wrap
+    // the buffer to that width so long lines occupy several display rows
+    // instead of running off the right edge.
+    let input_width = (area.width as usize).saturating_sub(2);
+    let (wrapped_rows, cursor_display_index) =
+        wrap_input_lines(app.input.lines(), input_width, app.input.cursor());
+    let input_content_h = wrapped_rows.len().clamp(1, max_input_lines) as u16;
 
     // Layout: [overlay/top-slack] + status(1) + input(2 border+content)
     // + footer(2) = DOCK_HEIGHT. `Min(0)` absorbs the slack at the top so
@@ -4862,24 +5090,35 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // The box shows up to `input_content_h` buffer lines, scrolling so
     // the cursor's line stays visible. The bordered block is
     // (2 + input_content_h) rows total (top ─, content…, bottom ─).
-    let (cursor_row, cursor_col) = app.input.cursor();
+    let (cursor_row, _cursor_col) = app.input.cursor();
     let lines = app.input.lines();
-    let total = lines.len();
+    let total = wrapped_rows.len();
     let visible = input_content_h as usize;
-    let (start, end) = input_scroll_window(cursor_row, total, visible);
+    let (start, end) = input_scroll_window(cursor_display_index, total, visible);
 
     let marker_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let mut input_lines: Vec<Line> = Vec::with_capacity(end - start);
-    for row in start..end {
-        let text = lines.get(row).map(String::as_str).unwrap_or("");
-        // Prompt marker on the first logical line; continuation lines get
-        // matching 2-space indent so text stays column-aligned.
-        let marker = if row == 0 { "> " } else { "  " };
+    for idx in start..end {
+        let dr = &wrapped_rows[idx];
+        let line = lines.get(dr.logical_row).map(String::as_str).unwrap_or("");
+        let text = &line[dr.start..dr.end.min(line.len())];
+        // Prompt marker on the first wrapped segment of the first logical
+        // line; continuation / wrapped rows get a matching 2-space indent
+        // so text stays column-aligned.
+        let marker = if dr.logical_row == 0 && dr.is_first {
+            "> "
+        } else {
+            "  "
+        };
         let mut spans: Vec<Span> = vec![Span::styled(marker, marker_style)];
-        if row == cursor_row {
-            let (pre, post) = split_at_col(text, cursor_col);
+        if idx == cursor_display_index {
+            // Cursor column is a byte offset into the logical line; make
+            // it relative to this display segment.
+            let (_, ccol) = app.input.cursor();
+            let rel = ccol.saturating_sub(dr.start).min(text.len());
+            let (pre, post) = split_at_col(text, rel);
             spans.push(Span::raw(pre.to_string()));
             // Reverse-video block as cursor; char under it or a space.
             let cursor_char: String = post
@@ -4906,10 +5145,10 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         }
         // Only when the buffer overflows the box do we hint at scroll
         // position — shown once, on the top visible row.
-        if total > visible && row == start {
+        if total > visible && idx == start {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                format!("(line {}/{})", cursor_row + 1, total),
+                format!("(line {}/{})", cursor_row + 1, lines.len()),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -4975,12 +5214,18 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     if let Some(ratio) =
         crate::render::status_line::context_ratio(&app.model, app.context_chars, true)
     {
-        let pct = crate::render::status_line::context_percent(&app.model, app.context_chars)
-            .unwrap_or(0.0);
-        let color = match crate::render::status_line::context_color(pct) {
-            "red" => Color::Red,
-            "yellow" => Color::Yellow,
-            _ => Color::Indexed(108), // muted sage — matches Morandi theme
+        // Only color-code when we have a real percentage (known window)
+        let color = if let Some(pct) =
+            crate::render::status_line::context_percent(&app.model, app.context_chars)
+        {
+            match crate::render::status_line::context_color(pct) {
+                "red" => Color::Red,
+                "yellow" => Color::Yellow,
+                _ => Color::Indexed(108),
+            }
+        } else {
+            // Unknown window: use default sage color, not misleading green
+            Color::Indexed(108)
         };
         l2.push(Span::raw("  "));
         l2.push(Span::styled(ratio, Style::default().fg(color)));
@@ -5696,6 +5941,61 @@ mod tests {
     fn input_scroll_window_fits_without_scroll() {
         // 3 lines, cursor on line 1, window of 5 → show all, no scroll.
         assert_eq!(input_scroll_window(1, 3, 5), (0, 3));
+    }
+
+    #[test]
+    fn wrap_input_lines_splits_long_line() {
+        let lines = vec!["abcdefghij".to_string()];
+        // Width 4 → "abcd" / "efgh" / "ij" (3 display rows).
+        let (rows, cur) = wrap_input_lines(&lines, 4, (0, 10));
+        let texts: Vec<&str> = rows
+            .iter()
+            .map(|r| &lines[r.logical_row][r.start..r.end])
+            .collect();
+        assert_eq!(texts, vec!["abcd", "efgh", "ij"]);
+        // Only the first segment carries the marker.
+        assert!(rows[0].is_first && !rows[1].is_first && !rows[2].is_first);
+        // Cursor at end-of-line lands on the last display row.
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn wrap_input_lines_cursor_midline() {
+        let lines = vec!["abcdefghij".to_string()];
+        // Cursor at byte 5 (the 'f') sits in the second segment "efgh".
+        let (_, cur) = wrap_input_lines(&lines, 4, (0, 5));
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn wrap_input_lines_wide_chars_count_two() {
+        // CJK chars are width 2, so width 4 fits two per row.
+        let lines = vec!["你好世界".to_string()];
+        let (rows, _) = wrap_input_lines(&lines, 4, (0, 0));
+        assert_eq!(rows.len(), 2);
+        let texts: Vec<&str> = rows
+            .iter()
+            .map(|r| &lines[r.logical_row][r.start..r.end])
+            .collect();
+        assert_eq!(texts, vec!["你好", "世界"]);
+    }
+
+    #[test]
+    fn wrap_input_lines_empty_line_yields_one_row() {
+        let lines = vec![String::new()];
+        let (rows, cur) = wrap_input_lines(&lines, 10, (0, 0));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn wrap_input_lines_multiple_logical_lines() {
+        let lines = vec!["short".to_string(), "another".to_string()];
+        let (rows, cur) = wrap_input_lines(&lines, 80, (1, 7));
+        assert_eq!(rows.len(), 2);
+        // Each logical line's first (only) row is a marker row.
+        assert!(rows[0].is_first && rows[1].is_first);
+        assert_eq!(cur, 1);
     }
 
     #[test]
