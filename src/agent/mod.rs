@@ -1,6 +1,7 @@
 //! Agent runtime — the heart of nanopi.
 //! Filled in Tasks 14 (hook), 15 (permission), 16 (loop).
 
+pub mod agents;
 pub mod branch_summary;
 pub mod build;
 pub mod compact;

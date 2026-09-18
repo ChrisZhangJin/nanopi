@@ -538,6 +538,49 @@ impl ToolRegistry {
         r.register(Arc::new(ls::LsTool));
         r
     }
+
+    /// Build the standard registry, then — if `allow` is non-empty —
+    /// retain only the named built-in tools. Mirrors PI's `--tools
+    /// a,b,c` allowlist (`pi/packages/coding-agent/src/cli/args.ts`).
+    ///
+    /// Names are matched by [`canonical_name`] (lowercase, `_tool`
+    /// suffix stripped), so `bash,Read_tool,GREP` all resolve. An
+    /// empty `allow` means "no restriction" and returns the full
+    /// `standard()` set unchanged — the backward-compatible default.
+    ///
+    /// A name matching no built-in is a hard error listing the valid
+    /// names, rather than a silent drop: a typo'd `--tools reed` that
+    /// quietly left the model with no `read` tool would be a maddening
+    /// thing to debug.
+    ///
+    /// [`canonical_name`]: Self::canonical_name
+    pub fn standard_with_allowlist(allow: &[String]) -> Result<Self, String> {
+        let full = Self::standard();
+        if allow.is_empty() {
+            return Ok(full);
+        }
+        let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for requested in allow {
+            match full.canonical_name(requested) {
+                Some(canonical) => {
+                    keep.insert(canonical);
+                }
+                None => {
+                    return Err(format!(
+                        "unknown tool {requested:?} in --tools; valid tools: {}",
+                        full.names().join(", ")
+                    ));
+                }
+            }
+        }
+        let mut filtered = Self::new();
+        for (name, tool) in full.tools {
+            if keep.contains(&name) {
+                filtered.tools.insert(name, tool);
+            }
+        }
+        Ok(filtered)
+    }
 }
 
 #[cfg(test)]

@@ -256,7 +256,7 @@ fn parse_and_push(path: &Path, source: SkillSource, out: &mut LoadSkillsResult) 
 /// The Agent Skills spec fields (`name`, `description`,
 /// `disable-model-invocation`) are all flat scalars, so this covers
 /// every real-world SKILL.md we care about.
-fn parse_flat_frontmatter(text: &str) -> HashMap<String, String> {
+pub(crate) fn parse_flat_frontmatter(text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for line in text.lines() {
         let line = line.trim();

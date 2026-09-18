@@ -414,6 +414,8 @@ pub async fn run_tui_mode(
     // `config.inline_think_tags` — escape hatch for the inline
     // `<think>` splitter (on by default). `None` leaves it on.
     inline_think_tags: Option<bool>,
+    // `--tools` allowlist. Empty = all built-in tools load.
+    tools_allow: Vec<String>,
 ) -> Result<i32> {
     let permission = PermissionGate::from_cli(no_hooks, approve);
 
@@ -459,7 +461,8 @@ pub async fn run_tui_mode(
         )),
         inline_think_tags,
     );
-    let registry = ToolRegistry::standard();
+    let registry = ToolRegistry::standard_with_allowlist(&tools_allow)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.

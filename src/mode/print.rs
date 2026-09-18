@@ -60,6 +60,8 @@ pub async fn run_print_mode(
     // `config.inline_think_tags` — escape hatch for the inline
     // `<think>` splitter (on by default). `None` leaves it on.
     inline_think_tags: Option<bool>,
+    // `--tools` allowlist. Empty = all built-in tools load.
+    tools_allow: Vec<String>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
@@ -126,7 +128,8 @@ pub async fn run_print_mode(
     // event key, which has always been fatal.
     let hooks = settings::load_settings(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let registry = ToolRegistry::standard();
+    let registry = ToolRegistry::standard_with_allowlist(&tools_allow)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` live in config.toml,
     // which isn't threaded through this function's parameter list.

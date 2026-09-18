@@ -137,6 +137,11 @@ pub fn project_skills_dir(cwd: &Path) -> PathBuf {
     cwd.join(".nanopi").join("skills")
 }
 
+/// User-scope agents root (`~/.nanopi/agents`).
+pub fn user_agents_dir() -> Option<PathBuf> {
+    nanopi_home().map(|h| h.join("agents"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

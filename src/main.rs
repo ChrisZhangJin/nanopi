@@ -134,6 +134,14 @@ struct Args {
     /// `.nanopi/APPEND_SYSTEM.md` discovery.
     #[arg(long = "append-system-prompt", value_name = "TEXT_OR_PATH")]
     append_system_prompt: Vec<String>,
+
+    /// Restrict the built-in tools available to the model for this run
+    /// to this comma-separated allowlist (e.g. `--tools bash,read,grep`).
+    /// Names are canonicalized (lowercase, `_tool` stripped). Absent =
+    /// all tools load, as before. Mirrors PI's `--tools`
+    /// (`pi/packages/coding-agent/src/cli/args.ts`).
+    #[arg(long = "tools", value_name = "LIST", value_delimiter = ',')]
+    tools: Vec<String>,
 }
 
 #[tokio::main]
@@ -399,6 +407,7 @@ async fn main() -> ExitCode {
             args.no_context_files,
             prompt_overrides.clone(),
             cfg.inline_think_tags,
+            args.tools.clone(),
         )
         .await
     } else {
@@ -419,6 +428,7 @@ async fn main() -> ExitCode {
             args.no_context_files,
             prompt_overrides.clone(),
             cfg.inline_think_tags,
+            args.tools.clone(),
         )
         .await
     };
