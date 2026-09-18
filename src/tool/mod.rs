@@ -691,6 +691,39 @@ mod tests {
         assert_eq!(r.all_specs().len(), 1);
     }
 
+    /// Empty allowlist = no restriction: identical to `standard()`.
+    #[test]
+    fn standard_with_allowlist_empty_is_full_set() {
+        let full = ToolRegistry::standard().names();
+        let filtered = ToolRegistry::standard_with_allowlist(&[]).unwrap().names();
+        assert_eq!(full, filtered);
+    }
+
+    /// A non-empty allowlist keeps exactly the named built-ins, and
+    /// matches by canonical name (case + `_tool` suffix insensitive).
+    #[test]
+    fn standard_with_allowlist_filters_by_canonical_name() {
+        let r = ToolRegistry::standard_with_allowlist(&[
+            "bash".into(),
+            "Read_tool".into(),
+            "GREP".into(),
+        ])
+        .unwrap();
+        assert_eq!(r.names(), vec!["bash", "grep", "read"]);
+        assert!(r.get("edit").is_none(), "unlisted tool must be dropped");
+    }
+
+    /// An unknown tool name is a hard error listing the valid names,
+    /// never a silent drop.
+    #[test]
+    fn standard_with_allowlist_rejects_unknown_name() {
+        let err = ToolRegistry::standard_with_allowlist(&["reed".into()])
+            .err()
+            .expect("unknown name must error");
+        assert!(err.contains("reed"), "{err}");
+        assert!(err.contains("read"), "error must list valid names: {err}");
+    }
+
     /// `standard()` must expose exactly the documented tool set. Guards
     /// against a tool being added to the enum-ish list but not wired
     /// into the registry (or vice versa).

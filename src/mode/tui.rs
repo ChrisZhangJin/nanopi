@@ -562,6 +562,7 @@ pub async fn run_tui_mode(
         no_context_files,
         prompt_overrides_for_rebuilds,
         cfg_for_build.extensions.clone(),
+        tools_allow.clone(),
         session_path.with_extension("history.txt"),
     );
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
@@ -882,6 +883,11 @@ struct App {
     /// mid-session can't swap plugins under a live registry — plugin
     /// reload needs an unregister path that doesn't exist yet.
     extensions: Vec<crate::config::ExtensionConfig>,
+    /// `--tools` allowlist, remembered from startup so `/new`, `/fork`,
+    /// `/resume`, and `/model` rebuild the Agent with the same
+    /// restricted built-in tool set. Empty = no restriction. Already
+    /// validated at startup, so rebuilds can't hit an unknown name.
+    tools_allow: Vec<String>,
     /// Most recent skill invocation, captured collapsed on scrollback.
     /// Ctrl-O expands it once. `None` outside a skill invocation.
     last_skill_block: Option<CollapsedSkill>,
@@ -927,6 +933,7 @@ impl App {
         no_context_files: bool,
         prompt_overrides: crate::agent::prompt_override::PromptOverrides,
         extensions: Vec<crate::config::ExtensionConfig>,
+        tools_allow: Vec<String>,
         history_path: PathBuf,
     ) -> Self {
         Self {
@@ -972,6 +979,7 @@ impl App {
             no_context_files,
             prompt_overrides,
             extensions,
+            tools_allow,
             last_skill_block: None,
             skills_cache: Vec::new(),
             commands_cache: Vec::new(),
@@ -2314,7 +2322,7 @@ async fn handle_action(
                 }
             };
             let _ = session::set_active_session(&cwd, &new_path);
-            let registry = crate::tool::ToolRegistry::standard();
+            let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
             // `/new` rebuilds the agent from scratch, so re-read
             // config for exec mode + extensions the same way startup
             // does. Picks up an edited config.toml without a restart.
@@ -2482,7 +2490,7 @@ async fn handle_action(
                 }
             };
             let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-            let registry = crate::tool::ToolRegistry::standard();
+            let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
                 provider,
@@ -2929,7 +2937,7 @@ async fn handle_action(
                 }
             };
             let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-            let registry = crate::tool::ToolRegistry::standard();
+            let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
                 provider,
@@ -3746,7 +3754,7 @@ async fn execute_fork(
         }
     };
     let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-    let registry = crate::tool::ToolRegistry::standard();
+    let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
     new_agent.context.tools = registry.all_specs();
     let diags = new_agent.hydrate_resumed(
         provider,
@@ -6208,6 +6216,7 @@ mod tests {
             crate::agent::build::SkillLoadPolicy::default(),
             false,
             crate::agent::prompt_override::PromptOverrides::from_cli(None, Vec::new(), false),
+            Vec::new(),
             Vec::new(),
             std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
         )
