@@ -10,6 +10,11 @@ use std::path::Path;
 use crate::event::Usage;
 use crate::models;
 
+/// Default context window fallback (in tokens) when the model's actual
+/// window is unknown. Matches PI's behavior: assume 128k to avoid hiding
+/// the context indicator entirely.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
+
 /// Human-readable current-directory string, with `$HOME` folded to `~`.
 pub fn cwd_display(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
@@ -69,13 +74,24 @@ pub fn context_percent(model: &str, chars: usize) -> Option<f64> {
     Some(pct.clamp(0.0, 999.0))
 }
 
-/// Formatted `{:.1}%/<windowStr>` string — matches PI's footer
-/// (`1.4%/205k`). Returns None if the model's window isn't in our
-/// table. `(auto)` suffix appended when auto_compact is on.
+/// Formatted context ratio string — matches PI's footer (`1.4%/205k`).
+/// When the model's window is known, shows `{:.1}%/{window}`. When unknown,
+/// falls back to DEFAULT_CONTEXT_WINDOW and shows `?/{window}` (e.g.,
+/// `?/128k`). Always returns Some(...) so the footer never hides the
+/// context segment. `(auto)` suffix appended when auto_compact is on.
 pub fn context_ratio(model: &str, chars: usize, auto_compact: bool) -> Option<String> {
-    let pct = context_percent(model, chars)?;
-    let window = models::context_window(model)?;
-    let base = format!("{:.1}%/{}", pct, models::fmt_tokens(window));
+    let known_window = models::context_window(model);
+    let window = known_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    
+    let base = if let Some(w) = known_window {
+        // Window known: show real percentage
+        let pct = context_percent(model, chars).unwrap_or(0.0);
+        format!("{:.1}%/{}", pct, models::fmt_tokens(w))
+    } else {
+        // Window unknown: show ? instead of percentage
+        format!("?/{}", models::fmt_tokens(window))
+    };
+    
     if auto_compact {
         Some(format!("{} (auto)", base))
     } else {
@@ -168,6 +184,23 @@ mod tests {
         // Small usage no longer rounds to 0.
         let s = context_ratio("claude-opus-4-7", 12_000, false).unwrap();
         assert_eq!(s, "0.3%/1.0M");
+    }
+
+    #[test]
+    fn context_ratio_fallback_for_unknown_model() {
+        // Unknown model: should return Some with ? and fallback window
+        let s = context_ratio("unknown-model-xyz", 50_000, false).unwrap();
+        assert_eq!(s, "?/128.0k");
+        // With auto suffix
+        let s = context_ratio("unknown-model-xyz", 50_000, true).unwrap();
+        assert_eq!(s, "?/128.0k (auto)");
+    }
+
+    #[test]
+    fn context_percent_none_for_unknown_model() {
+        // context_percent should still return None for unknown models
+        // (so callers can distinguish known vs unknown)
+        assert_eq!(context_percent("no-such-model", 10_000), None);
     }
 
     #[test]

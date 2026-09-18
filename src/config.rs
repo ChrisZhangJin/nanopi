@@ -141,6 +141,25 @@ pub struct Config {
     /// refused.
     #[serde(default)]
     pub tool_exec_overrides: std::collections::BTreeMap<String, crate::tool::ExecutionMode>,
+
+    /// v0.12: how many trailing session entries to *visually* repaint
+    /// into scrollback when resuming a session (`--continue`,
+    /// `--session`, `--fork`, and the in-session `/resume`).
+    ///
+    /// This is a COSMETIC cap only — the full history is always loaded
+    /// into the model's context by `Agent::load_session`. Without a cap,
+    /// resuming a long session repaints every line one-by-one through
+    /// the terminal, which floods the screen and stalls for seconds
+    /// before the prompt appears.
+    ///
+    /// `None` (the default) means 40. `Some(0)` disables the transcript
+    /// redraw entirely (only a summary line is shown).
+    ///
+    /// ```toml
+    /// max_replay_entries = 40
+    /// ```
+    #[serde(default)]
+    pub max_replay_entries: Option<usize>,
 }
 
 /// Global tool execution mode. Deserialized from
@@ -379,6 +398,7 @@ impl Config {
             extensions: Vec::new(),
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
+            max_replay_entries: None,
         }
     }
 }
@@ -561,6 +581,8 @@ fn merge(a: Config, b: Config) -> Config {
             m.extend(b.tool_exec_overrides);
             m
         },
+        // Scalar Option: b (project) wins if set, else a (global).
+        max_replay_entries: b.max_replay_entries.or(a.max_replay_entries),
     }
 }
 
@@ -874,6 +896,7 @@ command = "echo hi"
             extensions: Vec::new(),
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
+            max_replay_entries: None,
         };
         let b = Config {
             model: None,
@@ -889,6 +912,7 @@ command = "echo hi"
             extensions: Vec::new(),
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
+            max_replay_entries: None,
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));
@@ -972,5 +996,39 @@ command = "/bin/true"
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("b-model"));
+    }
+
+    #[test]
+    fn merge_project_max_replay_entries_wins_else_global() {
+        // Project (b) set, global (a) unset -> project wins.
+        let a = Config::builtin_defaults();
+        let b = Config {
+            max_replay_entries: Some(10),
+            ..Config::builtin_defaults()
+        };
+        assert_eq!(merge(a, b).max_replay_entries, Some(10));
+
+        // Global (a) set, project (b) unset -> global preserved.
+        let a = Config {
+            max_replay_entries: Some(80),
+            ..Config::builtin_defaults()
+        };
+        let b = Config::builtin_defaults();
+        assert_eq!(merge(a, b).max_replay_entries, Some(80));
+
+        // Both unset -> None (caller applies the 40 default).
+        assert_eq!(
+            merge(Config::builtin_defaults(), Config::builtin_defaults()).max_replay_entries,
+            None
+        );
+    }
+
+    #[test]
+    fn config_parses_max_replay_entries() {
+        let _h = crate::TempNanopiHome::new();
+        let tmp = TempDir::new();
+        tmp.write(".nanopi/config.toml", "max_replay_entries = 5\n");
+        let c = load_config(tmp.path()).unwrap();
+        assert_eq!(c.max_replay_entries, Some(5));
     }
 }

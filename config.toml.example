@@ -111,6 +111,23 @@ base_url = "https://api.openai.com/v1"
 # concurrent bash is simply still broken. Plugin tools are governed by
 # their own executionMode and cannot be listed here.
 
+# ─── Resume transcript redraw (v0.12) ───────────────────────────────
+#
+# When you resume a session (`--continue`, `--session`, `--fork`, or
+# the in-session `/resume`), nanopi repaints the prior conversation into
+# scrollback so you can see what you're picking up on. For a long
+# session this can print hundreds of lines one-by-one and stall for
+# several seconds before the prompt appears.
+#
+# This caps how many trailing entries get REDRAWN. It is cosmetic only:
+# the full history is always loaded into the model's context regardless.
+# When the transcript is longer than the cap, a single dim line notes
+# how many earlier entries were hidden.
+#
+# Default: 40. Set 0 to skip the redraw entirely (summary line only),
+# or a large number to restore the old "repaint everything" behavior.
+# max_replay_entries = 40
+
 # ─── WASM extensions (v0.11.0) ──────────────────────────────────────
 #
 # Requires a build with `--features wasm`. The stock release binary

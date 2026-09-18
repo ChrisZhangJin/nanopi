@@ -28,6 +28,61 @@ use crate::tool::{ImageAttachment, Tool, ToolContext, ToolError, ToolOutput};
 /// corrupt image that the model would fail to decode).
 const MAX_IMAGE_RAW_BYTES: usize = 3_500_000;
 
+/// Default cap applied when the model doesn't (or over-)request more
+/// than this via `offset`/`limit`. Matches PI's `read.ts` /
+/// `truncate.ts` defaults (`DEFAULT_MAX_LINES` / `DEFAULT_MAX_BYTES`)
+/// and the description Claude Code / PI ship for their own `read`
+/// tool: "output is truncated to 2000 lines or 50KB (whichever is hit
+/// first)".
+///
+/// Before this cap existed, `read` had NO default limit at all — a
+/// full `README.md` or `config.toml` went into context verbatim on
+/// every read, no matter the file's size. That's the single biggest
+/// contributor to context bloat we found while investigating
+/// premature auto-compaction (see MEMORY.md): four whole-file reads
+/// alone accounted for ~50k of a 62k-char session. `bash` already had
+/// an equivalent cap (`DEFAULT_MAX_BYTES`/`DEFAULT_MAX_LINES` in
+/// `tool/bash.rs`); `read` was the odd one out.
+const DEFAULT_MAX_LINES: usize = 2000;
+const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+
+/// Apply the default line/byte cap to an already offset/limit-sliced
+/// set of lines. Returns the joined content, which limit (if any) was
+/// hit, and how many of `slice`'s lines made it into the output.
+///
+/// Line-count and byte budget are both enforced; whichever is hit
+/// first wins — same contract as `tool/bash.rs`'s truncation. The
+/// first line is always included even if it alone exceeds the byte
+/// budget (so a single enormous line doesn't produce empty output).
+fn apply_default_cap(
+    slice: &[&str],
+    max_lines: usize,
+    max_bytes: usize,
+) -> (String, Option<&'static str>, usize) {
+    let mut used_lines = 0usize;
+    let mut used_bytes = 0usize;
+    let mut truncated_by: Option<&'static str> = None;
+    for (i, line) in slice.iter().enumerate() {
+        if i >= max_lines {
+            truncated_by = Some("line");
+            break;
+        }
+        let line_bytes = line.len() + 1; // +1 for the joining '\n'
+        if used_bytes + line_bytes > max_bytes && used_lines > 0 {
+            truncated_by = Some("byte");
+            break;
+        }
+        used_bytes += line_bytes;
+        used_lines += 1;
+    }
+    let content = if used_lines == 0 {
+        String::new()
+    } else {
+        slice[..used_lines].join("\n") + "\n"
+    };
+    (content, truncated_by, used_lines)
+}
+
 pub struct ReadTool;
 
 #[async_trait]
@@ -35,7 +90,10 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read".into(),
-            description: "Read a file from disk. Text files return their content; PNG / JPEG / GIF / WebP images return a multimodal block for vision-capable models.".into(),
+            description: format!(
+                "Read a file from disk. Text files return their content; PNG / JPEG / GIF / WebP images return a multimodal block for vision-capable models. Text output is capped at {DEFAULT_MAX_LINES} lines or {}KB (whichever is hit first); use offset/limit to page through larger files.",
+                DEFAULT_MAX_BYTES / 1024
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -109,18 +167,30 @@ impl Tool for ReadTool {
         let start = offset.min(total);
         let end = limit.map(|n| (start + n).min(total)).unwrap_or(total);
         let slice: Vec<&str> = lines[start..end].to_vec();
-        let out = if slice.is_empty() {
-            String::new()
-        } else {
-            slice.join("\n") + "\n"
-        };
+
+        // Default cap: even when the model didn't pass `limit` (or
+        // asked for more than this), never dump more than
+        // DEFAULT_MAX_LINES / DEFAULT_MAX_BYTES into context in one
+        // call. This is cosmetic to the tool boundary only — the model
+        // can always page through the rest via `offset`.
+        let (mut out, truncated_by, used_lines) =
+            apply_default_cap(&slice, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let truncated = truncated_by.is_some();
+        if let Some(reason) = truncated_by {
+            let start_display = start + 1;
+            let end_display = start + used_lines;
+            let next_offset = start + used_lines;
+            out.push_str(&format!(
+                "\n[read: showing lines {start_display}-{end_display} of {total} ({reason} limit hit); pass offset={next_offset} to continue]\n"
+            ));
+        }
 
         Ok(ToolOutput {
             content: out,
             is_error: false,
             images: Vec::new(),
             metadata: Some(
-                json!({"path": abs.display().to_string(), "lines": total, "offset": start, "limit": limit}),
+                json!({"path": abs.display().to_string(), "lines": total, "offset": start, "limit": limit, "truncated": truncated}),
             ),
         })
     }
@@ -194,6 +264,84 @@ mod tests {
         assert!(out.content.contains("line4"));
         assert!(out.content.contains("line5"));
         assert!(!out.content.contains("line6"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file with more than `DEFAULT_MAX_LINES` lines is capped by
+    /// default — no `limit` needed to trigger it — and the tail carries
+    /// a continuation note with the next `offset` to use.
+    #[tokio::test]
+    async fn caps_large_file_by_default_line_limit() {
+        let dir = tmp();
+        let body = (1..=(DEFAULT_MAX_LINES + 500))
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("big.txt"), &body).unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        let out = ReadTool
+            .execute(json!({"path": "big.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("line1\n"));
+        assert!(out.content.contains(&format!("line{DEFAULT_MAX_LINES}")));
+        assert!(
+            !out.content.contains(&format!("line{}", DEFAULT_MAX_LINES + 1)),
+            "expected truncation before line {}",
+            DEFAULT_MAX_LINES + 1
+        );
+        assert!(out.content.contains("line limit hit"), "got {:?}", out.content);
+        assert!(out.content.contains(&format!("offset={DEFAULT_MAX_LINES}")));
+        assert_eq!(
+            out.metadata.as_ref().and_then(|m| m["truncated"].as_bool()),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Many short lines that together exceed the byte budget are capped
+    /// even though they're well under the line-count cap.
+    #[tokio::test]
+    async fn caps_large_file_by_default_byte_limit() {
+        let dir = tmp();
+        // 2000 lines of 100 chars each = ~200KB, well over the 50KB
+        // default byte cap but under the 2000-line cap.
+        let line = "x".repeat(100);
+        let body = std::iter::repeat(line.as_str())
+            .take(2000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("wide.txt"), &body).unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        let out = ReadTool
+            .execute(json!({"path": "wide.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.len() < body.len());
+        assert!(out.content.contains("byte limit hit"), "got tail of {:?}", &out.content[out.content.len().saturating_sub(120)..]);
+        assert_eq!(
+            out.metadata.as_ref().and_then(|m| m["truncated"].as_bool()),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A small file well under both caps is returned untouched, with no
+    /// continuation note appended.
+    #[tokio::test]
+    async fn small_file_is_not_truncated() {
+        let dir = tmp();
+        std::fs::write(dir.join("small.txt"), "a\nb\nc\n").unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        let out = ReadTool
+            .execute(json!({"path": "small.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.content.contains("limit hit"));
+        assert_eq!(
+            out.metadata.as_ref().and_then(|m| m["truncated"].as_bool()),
+            Some(false)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

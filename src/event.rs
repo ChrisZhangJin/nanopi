@@ -81,6 +81,14 @@ pub enum AgentEvent {
         replaced_count: usize,
         /// True if the LLM actually summarized; false = placeholder fallback.
         used_llm: bool,
+        /// Context size (in chars) before compaction.
+        chars_before: usize,
+        /// Context size (in chars) after compaction.
+        chars_after: usize,
+        /// Token usage billed for the summarization LLM call itself
+        /// (`None` when `used_llm` is false — the placeholder fallback
+        /// made no LLM call). Matches PI's `CompactionCostNotice`.
+        usage: Option<Usage>,
     },
 
     /// User invoked a skill via `/skill:name [args]`. Emitted after

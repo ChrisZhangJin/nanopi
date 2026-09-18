@@ -613,6 +613,9 @@ impl Agent {
                 .send(AgentEvent::CompactionEnd {
                     replaced_count: result.replaced_count,
                     used_llm: result.used_llm,
+                    chars_before: result.chars_before,
+                    chars_after: result.chars_after,
+                    usage: result.usage.clone(),
                 })
                 .await;
         }
@@ -4042,9 +4045,16 @@ mod tests {
                 AgentEvent::CompactionEnd {
                     used_llm,
                     replaced_count,
+                    chars_before,
+                    chars_after,
+                    usage,
                 } => {
                     assert!(used_llm, "expected used_llm=true from FakeProvider");
                     assert!(replaced_count > 0);
+                    assert!(chars_before > 0);
+                    assert!(chars_after > 0);
+                    assert!(chars_after < chars_before, "compaction should reduce context size");
+                    assert!(usage.is_some(), "used_llm=true should carry the summarization call's usage");
                     got_end = true;
                 }
                 _ => {}

@@ -24,10 +24,18 @@ pub struct ModelInfo {
 /// Prefix match, so `claude-opus-4-7-20260101` resolves via
 /// `claude-opus-4-7`. `MODELS` is ordered longest-id-first, which makes
 /// first-match-wins equivalent to longest-prefix-wins.
+///
+/// Comparison is case-insensitive: vendors occasionally surface ids in
+/// a different casing than the catalogue spells (e.g. `minimax-M3` vs
+/// the canonical `MiniMax-M3`), and a hard miss meant the status bar
+/// silently fell back to "?/128k" -- the window was known, the lookup
+/// just disagreed. `MODELS` ids themselves stay mixed-case; only the
+/// comparison folds case.
 pub fn context_window(model_id: &str) -> Option<u32> {
+    let id_lc = model_id.to_ascii_lowercase();
     MODELS
         .iter()
-        .find(|m| model_id.starts_with(m.id))
+        .find(|m| id_lc.starts_with(&m.id.to_ascii_lowercase()))
         .map(|m| m.context_window)
 }
 
@@ -832,6 +840,17 @@ mod tests {
         assert!(mm.iter().any(|m| m.id == "MiniMax-M3"), "{mm:?}");
         // `fallback` is a real vendor id with no catalogue — must not panic.
         assert!(models_for_vendor("fallback").is_empty());
+    }
+
+    /// Vendors sometimes surface the same model id with a different
+    /// case (`minimax-M3` vs the catalogue's `MiniMax-M3`). The status
+    /// bar must still resolve the window, not fall through to the
+    /// 128k unknown-model default.
+    #[test]
+    fn context_window_is_case_insensitive() {
+        assert_eq!(context_window("minimax-M3"), Some(1_000_000));
+        assert_eq!(context_window("MINIMAX-M3"), Some(1_000_000));
+        assert_eq!(context_window("minimax-m3"), Some(1_000_000));
     }
 
     #[test]

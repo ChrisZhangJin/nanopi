@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::context::{AssistantBlock, ContentBlock, Context, ContextMessage};
 use crate::agent::loop_::Provider;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, Usage};
 
 /// Fallback char-count threshold used when we don't know the model's
 /// context window (unknown model id). Roughly 25k tokens. Prefer the
@@ -147,6 +147,18 @@ pub struct CompactionResult {
     pub replaced_count: usize,
     /// True if the LLM was used; false if we fell back to a placeholder.
     pub used_llm: bool,
+    /// Context size (in chars) before compaction.
+    pub chars_before: usize,
+    /// Context size (in chars) after compaction.
+    pub chars_after: usize,
+    /// Token usage of the summarization LLM call itself — this is
+    /// what the compaction pass actually cost to run (not to be
+    /// confused with `chars_before`/`chars_after`, which describe the
+    /// context it produced). `None` when `used_llm` is false (the
+    /// placeholder fallback made no LLM call). Matches PI's
+    /// `CompactionCostNotice` (`interactive-mode.ts`'s
+    /// `addCompactionCostNotice`, "Compaction: N tokens billed").
+    pub usage: Option<Usage>,
 }
 
 /// Approximate token cost of a single message. Chars/4, matching
@@ -261,7 +273,7 @@ pub async fn summarize_via_provider(
     provider: &dyn Provider,
     transcript: &str,
     previous_summary: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, Usage)> {
     // Pick the fresh vs. update prompt based on whether we've compacted
     // before this session. On update, append the prior summary as a
     // <previous-summary> block so the model has explicit access to
@@ -287,23 +299,33 @@ pub async fn summarize_via_provider(
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
     let collect = tokio::spawn(async move {
         let mut text = String::new();
+        let mut usage = Usage::default();
         while let Some(ev) = rx.recv().await {
-            if let AgentEvent::TextDelta { text: t, .. } = ev {
-                text.push_str(&t);
+            match ev {
+                AgentEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                // The summarization call's own billed usage — this is
+                // what actually costs money to run compaction, as
+                // opposed to `chars_before`/`chars_after` which
+                // describe the context shape it produced. Previously
+                // dropped entirely (only `TextDelta` was collected),
+                // so nanopi had no way to report it, unlike PI's
+                // "Compaction: N tokens billed" notice.
+                AgentEvent::Done { usage: u, .. } => usage = u,
+                _ => {}
             }
         }
-        text
+        (text, usage)
     });
 
     let stream_res = provider.stream_turn(&ctx, tx).await;
     // tx dropped inside stream_turn; rx.recv returns None; collect completes.
-    let text = collect.await.ok()?;
+    let (text, usage) = collect.await.ok()?;
     stream_res.ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some((trimmed.to_string(), usage))
     }
 }
 
@@ -335,6 +357,7 @@ fn extract_prior_summary(messages: &[ContextMessage]) -> Option<String> {
 /// new range into the existing summary rather than starting over.
 /// Matches PI's `runSessionCompaction` update path.
 pub async fn compact(ctx: &mut Context, provider: &dyn Provider) -> Option<CompactionResult> {
+    let chars_before = ctx.estimate_chars();
     let cut = find_compact_boundary(&ctx.messages, KEEP_RECENT_TOKENS)?;
 
     // Detect a prior summary at position 0 so we can drive incremental
@@ -349,15 +372,16 @@ pub async fn compact(ctx: &mut Context, provider: &dyn Provider) -> Option<Compa
     };
     let transcript = ctx.flatten_range(summarize_start, cut);
 
-    let (summary, used_llm) =
+    let (summary, used_llm, usage) =
         match summarize_via_provider(provider, &transcript, prior.as_deref()).await {
-            Some(s) => (s, true),
+            Some((s, u)) => (s, true, Some(u)),
             None => (
                 format!(
                     "[{} earlier messages truncated to save tokens]",
                     replaced_count
                 ),
                 false,
+                None,
             ),
         };
 
@@ -370,10 +394,15 @@ pub async fn compact(ctx: &mut Context, provider: &dyn Provider) -> Option<Compa
     });
     ctx.messages.extend(kept);
 
+    let chars_after = ctx.estimate_chars();
+
     Some(CompactionResult {
         summary,
         replaced_count,
         used_llm,
+        chars_before,
+        chars_after,
+        usage,
     })
 }
 
@@ -576,6 +605,10 @@ mod tests {
         let res = compact(&mut ctx, &Fake).await;
         let res = res.expect("compaction should occur");
         assert!(res.used_llm);
+        assert!(
+            res.usage.is_some(),
+            "used_llm=true should carry the summarization call's billed usage"
+        );
         assert_eq!(res.summary, "SUMMARY");
         // First message is the summary user.
         match &ctx.messages[0] {
@@ -626,6 +659,10 @@ mod tests {
             .await
             .expect("compaction should still occur with fallback");
         assert!(!res.used_llm);
+        assert!(
+            res.usage.is_none(),
+            "placeholder fallback made no LLM call, so there's nothing to bill"
+        );
         assert!(res.summary.contains("earlier messages truncated"));
     }
 }

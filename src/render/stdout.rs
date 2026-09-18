@@ -311,13 +311,41 @@ impl StdoutRenderer {
             AgentEvent::CompactionEnd {
                 replaced_count,
                 used_llm,
+                chars_before,
+                chars_after,
+                usage,
             } => {
                 let via = if *used_llm { "summary" } else { "truncation" };
+                let tokens_before = chars_before / 4;
+                let tokens_after = chars_after / 4;
+                let savings_pct = if *chars_before > 0 {
+                    ((chars_before - chars_after) * 100) / chars_before
+                } else {
+                    0
+                };
                 write!(
                     out,
-                    "\x1b[2m[compacted {} messages via {}]\x1b[0m\n",
-                    replaced_count, via
+                    "\x1b[2m[compacted {} messages via {} · {}→{} tokens (-{}%)]\x1b[0m\n",
+                    replaced_count,
+                    via,
+                    crate::models::fmt_tokens(tokens_before as u32),
+                    crate::models::fmt_tokens(tokens_after as u32),
+                    savings_pct
                 )?;
+                // Separate notice for the summarization call's own
+                // billed usage, matching PI's "Compaction: N tokens
+                // billed" (no cost suffix — nanopi has no pricing table).
+                if let Some(u) = usage {
+                    let billed = u.input_tokens
+                        + u.output_tokens
+                        + u.cache_read_tokens
+                        + u.cache_write_tokens;
+                    write!(
+                        out,
+                        "\x1b[33mCompaction: {} tokens billed\x1b[0m\n",
+                        crate::models::fmt_tokens(billed)
+                    )?;
+                }
                 out.flush()?;
             }
             AgentEvent::SkillInvocation { name, .. } => {
