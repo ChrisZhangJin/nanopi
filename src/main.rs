@@ -142,6 +142,16 @@ struct Args {
     /// (`pi/packages/coding-agent/src/cli/args.ts`).
     #[arg(long = "tools", value_name = "LIST", value_delimiter = ',')]
     tools: Vec<String>,
+
+    /// Don't save session (ephemeral). Nothing is persisted to
+    /// `~/.nanopi/sessions/` and this run does not become the cwd's
+    /// active session. A supplied `--session-id` is still used as the
+    /// id in the JSON envelope. Incompatible with
+    /// `--continue`/`--fork`/`--session`, which resume from disk.
+    /// Mirrors PI's `--no-session`
+    /// (`pi/packages/coding-agent/src/cli/args.ts:121`; `main.ts:367`).
+    #[arg(long = "no-session")]
+    no_session: bool,
 }
 
 #[tokio::main]
@@ -149,6 +159,17 @@ async fn main() -> ExitCode {
     let args = Args::parse();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // `--no-session` makes a run ephemeral, so it cannot combine with the
+    // flags that load/resume a session from disk. Reject early with a
+    // clear message rather than silently ignoring one side (PI rejects
+    // the same combo).
+    if args.no_session
+        && (args.continue_session || args.fork_id.is_some() || args.session_id.is_some())
+    {
+        eprintln!("error: --no-session cannot be combined with --continue/--fork/--session");
+        return ExitCode::from(2);
+    }
 
     // `nanopi init` — explicit invocation of the first-run wizard.
     // Recognized as a positional message value with no other options
@@ -408,9 +429,18 @@ async fn main() -> ExitCode {
             prompt_overrides.clone(),
             cfg.inline_think_tags,
             args.tools.clone(),
+            args.no_session,
         )
         .await
     } else {
+        // Ephemeral runs are only wired through the non-interactive print
+        // path (which is where the subagent tool and scripts use it). The
+        // TUI persists across turns and has no clean single teardown to
+        // hang temp-file cleanup on; rather than half-wire it, refuse.
+        if args.no_session {
+            eprintln!("error: --no-session is only supported in print mode (-p)");
+            return ExitCode::from(2);
+        }
         tui::run_tui_mode(
             api_kind,
             cfg.provider.clone(),

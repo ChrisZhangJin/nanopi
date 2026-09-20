@@ -711,3 +711,91 @@ fn valid_hook_config_still_starts_and_completes_a_turn() {
         "the turn should still complete: {stdout:?}"
     );
 }
+
+/// `--no-session` must be ephemeral: after the run, `~/.nanopi/sessions/`
+/// holds no session file and no `active` pointer, yet the JSON envelope
+/// still carries the exchange (read back before the temp file is
+/// deleted). Mirrors PI's `SessionManager.inMemory`.
+#[test]
+fn no_session_leaves_no_session_file_behind() {
+    let port = spawn_sse_server(vec![delta("content", "ANSWER"), finish("stop")]);
+
+    let dir = std::env::temp_dir().join(format!("nanopi-p-e2e-nosession-{port}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("tmp cwd");
+    let home = dir.join("home");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(&dir)
+        .args(["-p", "--output", "json", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-hooks", "--no-skills", "--no-context-files"])
+        .arg("--no-session")
+        .arg("hello world")
+        .env("NANOPI_HOME", &home)
+        .output()
+        .expect("run nanopi -p --no-session");
+
+    let stdout = strip_sgr(&String::from_utf8_lossy(&out.stdout));
+
+    // The envelope still carries the exchange.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"));
+    let has_answer = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|m| m.iter().any(|e| e.to_string().contains("ANSWER")))
+        .unwrap_or(false);
+    assert!(has_answer, "envelope lost the exchange: {v}");
+
+    // No session file, no active pointer — nothing persisted.
+    let sessions = home.join("sessions");
+    let leftover: Vec<_> = std::fs::read_dir(&sessions)
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "--no-session persisted something: {leftover:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--no-session` combined with a resume flag is a contradiction (one
+/// says "don't persist", the other "reload from disk"). It must be
+/// rejected up front with a clear error, not silently honored.
+#[test]
+fn no_session_rejects_incompatible_resume_flags() {
+    for flag in ["--continue", "--fork=abc", "--session=abc"] {
+        let dir = std::env::temp_dir()
+            .join(format!("nanopi-p-e2e-nosession-bad{}", flag.replace(['-', '='], "")));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp cwd");
+
+        let out = Command::new(env!("CARGO_BIN_EXE_nanopi"))
+            .current_dir(&dir)
+            .args(["-p", "--base-url", "http://127.0.0.1:1"])
+            .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+            .args(["--no-hooks", "--no-skills", "--no-context-files"])
+            .arg("--no-session")
+            .arg(flag)
+            .arg("hello")
+            .env("NANOPI_HOME", dir.join("home"))
+            .output()
+            .expect("run nanopi -p");
+
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !out.status.success(),
+            "--no-session {flag} must be rejected; exit={:?} stderr={stderr:?}",
+            out.status.code()
+        );
+        assert!(
+            stderr.contains("--no-session cannot be combined"),
+            "error must explain the conflict for {flag}: {stderr:?}"
+        );
+    }
+}

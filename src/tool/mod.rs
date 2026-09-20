@@ -14,6 +14,7 @@ pub mod find;
 pub mod grep;
 pub mod ls;
 pub mod read;
+pub mod subagent;
 pub mod write;
 
 use std::collections::HashMap;
@@ -536,6 +537,7 @@ impl ToolRegistry {
         r.register(Arc::new(grep::GrepTool));
         r.register(Arc::new(find::FindTool));
         r.register(Arc::new(ls::LsTool));
+        r.register(Arc::new(subagent::SubagentTool));
         r
     }
 
@@ -732,7 +734,7 @@ mod tests {
         let names = ToolRegistry::standard().names();
         assert_eq!(
             names,
-            vec!["bash", "edit", "find", "grep", "ls", "read", "write"]
+            vec!["bash", "edit", "find", "grep", "ls", "read", "subagent", "write"]
         );
     }
 
@@ -775,7 +777,7 @@ mod tests {
             .expect("greet does not collide");
 
         let entries = r.entries();
-        assert_eq!(entries.len(), 8, "7 built-ins + 1 plugin tool");
+        assert_eq!(entries.len(), 9, "8 built-ins + 1 plugin tool");
 
         let by_name = |n: &str| -> ToolSource {
             entries
@@ -831,7 +833,7 @@ mod tests {
         assert_eq!(err, "bash");
 
         let entries = r.entries();
-        assert_eq!(entries.len(), 7, "the refused tool must not appear");
+        assert_eq!(entries.len(), 8, "the refused tool must not appear");
         let bash = entries.iter().find(|(s, _)| s.name == "bash").unwrap();
         assert_eq!(bash.1, ToolSource::Builtin, "bash is still the built-in");
     }
@@ -875,7 +877,7 @@ mod tests {
             r.register_external(Arc::new(NamedPluginTool { tool, plugin }))
                 .expect("no collision");
         }
-        assert_eq!(r.names().len(), 10, "7 built-ins + 3 plugin tools");
+        assert_eq!(r.names().len(), 11, "8 built-ins + 3 plugin tools");
 
         let removed = r.unregister_plugin("alpha");
         assert_eq!(removed, vec!["greet".to_string(), "wave".to_string()]);
@@ -884,7 +886,7 @@ mod tests {
         assert!(r.get("query").is_some(), "beta's tool must survive");
         assert!(r.get("greet").is_none());
         assert!(r.get("wave").is_none());
-        assert_eq!(r.names().len(), 8, "7 built-ins + beta's one tool");
+        assert_eq!(r.names().len(), 9, "8 built-ins + beta's one tool");
     }
 
     /// The safety property, and the reason the signature takes a plugin

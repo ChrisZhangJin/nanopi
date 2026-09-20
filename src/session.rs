@@ -280,6 +280,52 @@ pub fn new_session_with_id(
     Ok((path, header))
 }
 
+/// Create an **ephemeral** session file under the OS temp dir instead of
+/// `~/.nanopi/sessions/`. Backs `--no-session`: the run is never
+/// registered as the cwd's active session and the caller is expected to
+/// delete the file once the run's JSON envelope has read it back.
+///
+/// An explicit id (from `--session-id`) is still honored as the header
+/// id, matching PI's `SessionManager.inMemory(cwd, {id})`
+/// (`main.ts:367`). The on-disk filename always carries its own fresh
+/// UUID so two ephemeral runs sharing an explicit id can't collide.
+pub fn new_ephemeral_session(
+    cwd: &Path,
+    model: &str,
+    base_url: &str,
+    id: Option<&str>,
+) -> Result<(PathBuf, SessionHeader), SessionError> {
+    let id: String = match id {
+        Some(explicit) => {
+            validate_session_id(explicit)?;
+            explicit.to_string()
+        }
+        None => uuid::v7().to_string(),
+    };
+    let mut path = std::env::temp_dir();
+    path.push(format!("nanopi-session-{}.jsonl", uuid::v7()));
+    let header = SessionHeader {
+        id: id.clone(),
+        parent_id: None,
+        cwd: cwd.to_path_buf(),
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        name: None,
+    };
+    let entry = SessionEntry::Header {
+        version: 2,
+        id,
+        parent_id: None,
+        timestamp: time::now_iso8601(),
+        cwd: cwd.display().to_string(),
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        name: None,
+    };
+    append_entry(&path, &entry)?;
+    Ok((path, header))
+}
+
 /// Append one entry to a session file. Each entry is one line.
 pub fn append_entry(path: &Path, entry: &SessionEntry) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {

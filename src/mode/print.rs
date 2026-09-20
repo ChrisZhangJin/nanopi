@@ -62,21 +62,38 @@ pub async fn run_print_mode(
     inline_think_tags: Option<bool>,
     // `--tools` allowlist. Empty = all built-in tools load.
     tools_allow: Vec<String>,
+    // `--no-session`: ephemeral run. Nothing is persisted to
+    // `~/.nanopi/sessions/` and this run never becomes the cwd's active
+    // session. Mirrors PI's `SessionManager.inMemory` (`main.ts:367`).
+    no_session: bool,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
-    // Resolve which session to use: --fork > --session > --continue > new.
-    let choice = session::resolve_session(
-        &cwd,
-        continue_session,
-        session_id.as_deref(),
-        fork_id.as_deref(),
-        exact_session_id.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?;
+    // Resolve which session to use. For an ephemeral run there is nothing
+    // to resolve — `--no-session` is incompatible with the resume flags
+    // (rejected in main.rs) — so we go straight to a temp-file session.
+    let choice = if no_session {
+        None
+    } else {
+        // --fork > --session > --continue > new.
+        Some(
+            session::resolve_session(
+                &cwd,
+                continue_session,
+                session_id.as_deref(),
+                fork_id.as_deref(),
+                exact_session_id.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("resolve session: {e}"))?,
+        )
+    };
 
     let (session_path, header) = match &choice {
-        session::SessionChoice::Resume(p) => {
+        // Ephemeral: temp file, deleted at end of run. An explicit
+        // --session-id is still honored as the id.
+        None => session::new_ephemeral_session(&cwd, model, base_url, exact_session_id.as_deref())
+            .map_err(|e| anyhow::anyhow!("create ephemeral session: {e}"))?,
+        Some(session::SessionChoice::Resume(p)) => {
             // Reuse the existing session. We trust its recorded model /
             // base_url; if those are wrong the user can pass them again
             // via flags and the next turn will pick them up.
@@ -84,9 +101,9 @@ pub async fn run_print_mode(
                 .map_err(|e| anyhow::anyhow!("read resumed session: {e}"))?;
             (p.clone(), h)
         }
-        session::SessionChoice::New => session::new_session(&cwd, model, base_url)
+        Some(session::SessionChoice::New) => session::new_session(&cwd, model, base_url)
             .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
-        session::SessionChoice::NewWithId(id) => {
+        Some(session::SessionChoice::NewWithId(id)) => {
             // PI warns here too — a typo'd --session-id silently starting
             // a fresh conversation instead of resuming is worth a line on
             // stderr (main.ts:390-399).
@@ -100,7 +117,10 @@ pub async fn run_print_mode(
     };
 
     // Register this cwd's active session pointer (used by next --continue).
-    let _ = session::set_active_session(&cwd, &session_path);
+    // Skipped for ephemeral runs — they must leave no trace.
+    if !no_session {
+        let _ = session::set_active_session(&cwd, &session_path);
+    }
 
     // Build the agent.
     let provider = crate::provider::build(
@@ -141,7 +161,7 @@ pub async fn run_print_mode(
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
-    let agent = if let session::SessionChoice::Resume(_) = &choice {
+    let agent = if let Some(session::SessionChoice::Resume(_)) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
         let diags = a.hydrate_resumed(
@@ -227,13 +247,17 @@ pub async fn run_print_mode(
 
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    match output {
+    let result = match output {
         OutputFormat::Text => {
-            eprintln!(
-                "\n✓ session {} saved to {}",
-                header.id,
-                session_path.display()
-            );
+            if no_session {
+                eprintln!("\n✓ ephemeral session {} (not saved)", header.id);
+            } else {
+                eprintln!(
+                    "\n✓ session {} saved to {}",
+                    header.id,
+                    session_path.display()
+                );
+            }
             Ok(0)
         }
         OutputFormat::Json => {
@@ -243,14 +267,22 @@ pub async fn run_print_mode(
                 finish_reason: "stop".into(),
                 duration_ms,
                 usage: json!({}),
+                // Read entries back BEFORE the ephemeral file is deleted.
                 messages: collect_messages(&session_path)?,
             };
             let s = serde_json::to_string(&envelope)?;
             println!("{s}");
             Ok(0)
         }
+    };
+
+    // Ephemeral cleanup: the JSON envelope (if any) has already read the
+    // messages back, so the temp file has served its purpose.
+    if no_session {
+        let _ = std::fs::remove_file(&session_path);
     }
-    .map(|code| {
+
+    result.map(|code| {
         let _ = final_text; // silence unused warning if json branch
         code
     })
