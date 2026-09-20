@@ -60,6 +60,7 @@ fn arg_preview(tool_name: &str, args: &serde_json::Value) -> String {
             Some(base) => format!("{p}  in {base}"),
             None => p.to_owned(),
         }),
+        "subagent" => crate::render::subagent_preview(args),
         _ => None,
     }
     .unwrap_or_else(|| args.to_string());
@@ -714,6 +715,54 @@ mod tests {
         assert_eq!(arg_preview("mystery", &json!({"k": 1})), "{\"k\":1}");
         // Missing expected field → falls back instead of printing empty.
         assert_eq!(arg_preview("bash", &json!({})), "{}");
+    }
+
+    #[test]
+    fn arg_preview_renders_subagent_modes_readably() {
+        // single: `<agent>: <task>`
+        assert_eq!(
+            arg_preview("subagent", &json!({"agent": "scout", "task": "map the render layer"})),
+            "scout: map the render layer"
+        );
+        // single task collapses whitespace and caps at ~60 chars.
+        let long = arg_preview(
+            "subagent",
+            &json!({"agent": "scout", "task": "x".repeat(80)}),
+        );
+        assert!(long.starts_with("scout: "), "{long:?}");
+        assert!(long.ends_with('…'), "a cut task must announce itself: {long:?}");
+        // parallel: `parallel xN: a, b, ...`
+        assert_eq!(
+            arg_preview(
+                "subagent",
+                &json!({"tasks": [{"agent": "scout", "task": "a"}, {"agent": "worker", "task": "b"}]})
+            ),
+            "parallel x2: scout, worker"
+        );
+        // chain: `chain: a -> b -> c`
+        assert_eq!(
+            arg_preview(
+                "subagent",
+                &json!({"chain": [{"agent": "planner", "task": "p"}, {"agent": "worker", "task": "w"}, {"agent": "reviewer", "task": "r"}]})
+            ),
+            "chain: planner -> worker -> reviewer"
+        );
+    }
+
+    #[test]
+    fn arg_preview_handles_malformed_subagent_args_gracefully() {
+        // Missing agent in single mode → a sensible placeholder, no panic.
+        assert_eq!(
+            arg_preview("subagent", &json!({"task": "do it"})),
+            "agent: do it"
+        );
+        // Entries missing `agent` still count, shown as `?`.
+        assert_eq!(
+            arg_preview("subagent", &json!({"tasks": [{"task": "a"}, {"agent": "worker"}]})),
+            "parallel x2: ?, worker"
+        );
+        // No recognized shape → falls back to compact JSON, never empty.
+        assert_eq!(arg_preview("subagent", &json!({"nonsense": 1})), "{\"nonsense\":1}");
     }
 
     #[test]

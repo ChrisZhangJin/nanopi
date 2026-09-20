@@ -36,7 +36,14 @@ impl ToolPanel {
         } else {
             args_str.clone()
         };
-        let summary = format!("{} {}", call.name, preview);
+        // The subagent tool's args are a nested task/tasks/chain shape
+        // that reads as opaque JSON; give it the same human-readable
+        // preview the `-p` renderer uses, falling back to the generic
+        // form for any shape we don't recognize.
+        let summary = match (call.name.as_str(), crate::render::subagent_preview(&call.arguments)) {
+            ("subagent", Some(s)) => s,
+            _ => format!("{} {}", call.name, preview),
+        };
         Self {
             call_id: call.id.clone(),
             tool_name: call.name.clone(),
@@ -169,6 +176,35 @@ mod tests {
         p.render(&mut buf).unwrap();
         let line = String::from_utf8(buf).unwrap();
         assert!(line.contains("[err"), "want err tag, got: {line:?}");
+    }
+
+    #[test]
+    fn subagent_panel_summary_is_human_readable() {
+        // single
+        let p = ToolPanel::new(&call(
+            "subagent",
+            json!({"agent": "scout", "task": "map the render layer"}),
+        ));
+        assert_eq!(p.summary, "scout: map the render layer");
+        // parallel
+        let p = ToolPanel::new(&call(
+            "subagent",
+            json!({"tasks": [{"agent": "scout", "task": "a"}, {"agent": "worker", "task": "b"}]}),
+        ));
+        assert_eq!(p.summary, "parallel x2: scout, worker");
+        // chain
+        let p = ToolPanel::new(&call(
+            "subagent",
+            json!({"chain": [{"agent": "planner", "task": "p"}, {"agent": "worker", "task": "w"}]}),
+        ));
+        assert_eq!(p.summary, "chain: planner -> worker");
+    }
+
+    #[test]
+    fn subagent_panel_summary_falls_back_on_malformed_args() {
+        // No recognized shape → the generic `name args` summary, no panic.
+        let p = ToolPanel::new(&call("subagent", json!({"nonsense": 1})));
+        assert!(p.summary.starts_with("subagent "), "{:?}", p.summary);
     }
 
     #[test]
