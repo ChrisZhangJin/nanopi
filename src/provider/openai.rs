@@ -817,6 +817,7 @@ async fn flush_pending_tool_calls(
     tx: &mpsc::Sender<AgentEvent>,
     content_index: u32,
 ) {
+    coalesce_index_split_call(pending);
     let drained: Vec<(u32, PendingToolCall)> = pending.drain().collect();
     for (idx, p) in drained {
         let id = p.id.unwrap_or_else(|| format!("call_{idx}"));
@@ -853,6 +854,55 @@ async fn flush_pending_tool_calls(
                 },
             })
             .await;
+    }
+}
+
+/// Recovery for gateways that split ONE tool call across multiple
+/// `index` buckets — the name arrives under one index and the arguments
+/// under the next (observed in the wild: a gateway that increments
+/// `index` per streaming *chunk* instead of per *call*). Left unhandled
+/// this surfaces as a named call with empty args (`bash` → "command must
+/// be a string") PLUS a nameless "unknown" call carrying the real
+/// arguments.
+///
+/// Only acts when it's unambiguous: exactly one pending call carries a
+/// usable name AND it has no arguments of its own. Then every nameless
+/// argument fragment (in ascending index order) is folded into it.
+/// Multiple named calls are left untouched — real parallel tool calls
+/// keep their own indices and must never be cross-merged.
+fn coalesce_index_split_call(pending: &mut std::collections::HashMap<u32, PendingToolCall>) {
+    let named: Vec<u32> = pending
+        .iter()
+        .filter(|(_, p)| p.name.as_deref().is_some_and(|n| !n.is_empty()))
+        .map(|(i, _)| *i)
+        .collect();
+    if named.len() != 1 {
+        return;
+    }
+    let target = named[0];
+    if !pending.get(&target).is_some_and(|p| p.args_buf.is_empty()) {
+        return;
+    }
+    let mut orphans: Vec<u32> = pending
+        .iter()
+        .filter(|(i, p)| {
+            **i != target
+                && p.name.as_deref().map_or(true, |n| n.is_empty())
+                && !p.args_buf.is_empty()
+        })
+        .map(|(i, _)| *i)
+        .collect();
+    orphans.sort_unstable();
+    let mut merged = String::new();
+    for i in &orphans {
+        if let Some(p) = pending.remove(i) {
+            merged.push_str(&p.args_buf);
+        }
+    }
+    if !merged.is_empty() {
+        if let Some(p) = pending.get_mut(&target) {
+            p.args_buf = merged;
+        }
     }
 }
 
@@ -1212,6 +1262,80 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    /// Regression: a gateway that put the tool NAME under index 0 and
+    /// the ARGUMENTS under index 1 used to flush as two calls — a `bash`
+    /// with empty args ("command must be a string") plus a nameless
+    /// "unknown" call carrying the real command. They must coalesce into
+    /// one well-formed `bash` call.
+    #[tokio::test]
+    async fn flush_coalesces_index_split_call() {
+        let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
+        pending.insert(
+            0,
+            PendingToolCall {
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                args_buf: String::new(),
+            },
+        );
+        pending.insert(
+            1,
+            PendingToolCall {
+                id: None,
+                name: None,
+                args_buf: r#"{"command":"ls"}"#.into(),
+            },
+        );
+        let mut emitted: std::collections::HashSet<String> = Default::default();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+        flush_pending_tool_calls(&mut pending, &mut emitted, &tx, 0).await;
+        drop(tx);
+        let ev = rx.recv().await.expect("expected a ToolCall event");
+        match ev {
+            AgentEvent::ToolCall { call, .. } => {
+                assert_eq!(call.name, "bash");
+                assert_eq!(call.id, "call_1");
+                assert_eq!(call.arguments, serde_json::json!({"command": "ls"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        // Exactly one call — the orphan must not surface separately.
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// Two genuine parallel tool calls (both named) must NOT be merged
+    /// by the coalescing recovery, even if one legitimately has no args.
+    #[tokio::test]
+    async fn flush_does_not_merge_parallel_named_calls() {
+        let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
+        pending.insert(
+            0,
+            PendingToolCall {
+                id: Some("call_a".into()),
+                name: Some("ls".into()),
+                args_buf: String::new(),
+            },
+        );
+        pending.insert(
+            1,
+            PendingToolCall {
+                id: Some("call_b".into()),
+                name: Some("bash".into()),
+                args_buf: r#"{"command":"pwd"}"#.into(),
+            },
+        );
+        let mut emitted: std::collections::HashSet<String> = Default::default();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+        flush_pending_tool_calls(&mut pending, &mut emitted, &tx, 0).await;
+        drop(tx);
+        let mut names = Vec::new();
+        while let Some(AgentEvent::ToolCall { call, .. }) = rx.recv().await {
+            names.push(call.name);
+        }
+        names.sort();
+        assert_eq!(names, vec!["bash".to_string(), "ls".to_string()]);
     }
 
     #[test]

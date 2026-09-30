@@ -69,6 +69,11 @@ pub async fn run_print_mode(
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
+    // `-p` is non-interactive/scriptable: suppress startup diagnostic
+    // blocks (e.g. `[Extensions]`) that are TUI terminal chrome. Set
+    // before extensions load so their notices never emit.
+    crate::render::notice::set_quiet(true);
+
     // Resolve which session to use. For an ephemeral run there is nothing
     // to resolve — `--no-session` is incompatible with the resume flags
     // (rejected in main.rs) — so we go straight to a temp-file session.

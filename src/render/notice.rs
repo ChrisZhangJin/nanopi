@@ -244,8 +244,22 @@ pub fn block_lines(title: &str, notices: &[Notice], width: usize) -> Vec<String>
     lines
 }
 
-/// Print a titled block to stderr, raw-mode-aware.
+/// Process-global switch: when set, [`emit`] does nothing. Print mode
+/// (`-p`) turns this on so startup diagnostic blocks like `[Extensions]`
+/// — which are terminal chrome for the interactive TUI — don't leak into
+/// a non-interactive, scriptable run. Mirrors `raw_tty`'s global flag.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Suppress (or re-enable) all future [`emit`] output for this process.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Print a titled block to stderr, raw-mode-aware. No-op when quiet.
 pub fn emit(title: &str, notices: &[Notice]) {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     for line in block_lines(title, notices, text_width()) {
         crate::render::raw_tty::note(&line);
     }
