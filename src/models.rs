@@ -152,9 +152,24 @@ const MODELS: &[ModelInfo] = &[
         context_window: 4096,
     },
     ModelInfo {
+        id: "gpt-daybreak-blue-latest",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
+        id: "mimo-v2.6-pro-ultraspeed",
+        vendor: "xiaomi",
+        context_window: 1048576,
+    },
+    ModelInfo {
         id: "qwen2-5-vl-72b-instruct",
         vendor: "qwen",
         context_window: 131072,
+    },
+    ModelInfo {
+        id: "gpt-daybreak-red-latest",
+        vendor: "openai",
+        context_window: 400000,
     },
     ModelInfo {
         id: "MiniMax-M2.5-highspeed",
@@ -232,6 +247,11 @@ const MODELS: &[ModelInfo] = &[
         context_window: 131072,
     },
     ModelInfo {
+        id: "qwen3.8-omni-flash",
+        vendor: "qwen",
+        context_window: 1000000,
+    },
+    ModelInfo {
         id: "claude-sonnet-4-5",
         vendor: "anthropic",
         context_window: 1000000,
@@ -277,6 +297,11 @@ const MODELS: &[ModelInfo] = &[
         context_window: 262144,
     },
     ModelInfo {
+        id: "claude-sonnet-5-5",
+        vendor: "anthropic",
+        context_window: 1000000,
+    },
+    ModelInfo {
         id: "claude-haiku-4-5",
         vendor: "anthropic",
         context_window: 200000,
@@ -300,6 +325,11 @@ const MODELS: &[ModelInfo] = &[
         id: "qwen3-vl-30b-a3b",
         vendor: "qwen",
         context_window: 131072,
+    },
+    ModelInfo {
+        id: "claude-fable-5-1",
+        vendor: "anthropic",
+        context_window: 1000000,
     },
     ModelInfo {
         id: "claude-opus-4-5",
@@ -362,6 +392,16 @@ const MODELS: &[ModelInfo] = &[
         context_window: 262144,
     },
     ModelInfo {
+        id: "claude-opus-5-5",
+        vendor: "anthropic",
+        context_window: 1000000,
+    },
+    ModelInfo {
+        id: "mimo-v2.6-flash",
+        vendor: "xiaomi",
+        context_window: 1048576,
+    },
+    ModelInfo {
         id: "claude-fable-5",
         vendor: "anthropic",
         context_window: 1000000,
@@ -380,6 +420,21 @@ const MODELS: &[ModelInfo] = &[
         id: "qwen-math-plus",
         vendor: "qwen",
         context_window: 4096,
+    },
+    ModelInfo {
+        id: "deepseek-flash",
+        vendor: "deepseek",
+        context_window: 1000000,
+    },
+    ModelInfo {
+        id: "glm-4.6v-flash",
+        vendor: "zai",
+        context_window: 128000,
+    },
+    ModelInfo {
+        id: "glm-5.3-flashx",
+        vendor: "zai",
+        context_window: 1000000,
     },
     ModelInfo {
         id: "claude-opus-5",
@@ -434,6 +489,21 @@ const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "qwen3.7-flash",
         vendor: "qwen",
+        context_window: 1000000,
+    },
+    ModelInfo {
+        id: "qwen3.8-flash",
+        vendor: "qwen",
+        context_window: 1000000,
+    },
+    ModelInfo {
+        id: "mimo-v2.6-pro",
+        vendor: "xiaomi",
+        context_window: 1048576,
+    },
+    ModelInfo {
+        id: "glm-5.3-flash",
+        vendor: "zai",
         context_window: 1000000,
     },
     ModelInfo {
@@ -577,9 +647,19 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1000000,
     },
     ModelInfo {
+        id: "gpt-6-astra",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
+        id: "gpt-6.1-sol",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
         id: "MiniMax-M2",
         vendor: "minimax",
-        context_window: 196608,
+        context_window: 204800,
     },
     ModelInfo {
         id: "MiniMax-M3",
@@ -605,6 +685,11 @@ const MODELS: &[ModelInfo] = &[
         id: "qwen-turbo",
         vendor: "qwen",
         context_window: 1000000,
+    },
+    ModelInfo {
+        id: "gpt-6-luna",
+        vendor: "openai",
+        context_window: 1050000,
     },
     ModelInfo {
         id: "gpt-5-pro",
@@ -640,6 +725,11 @@ const MODELS: &[ModelInfo] = &[
         id: "qwen3-max",
         vendor: "qwen",
         context_window: 262144,
+    },
+    ModelInfo {
+        id: "gpt-6-sol",
+        vendor: "openai",
+        context_window: 1050000,
     },
     ModelInfo {
         id: "glm-4.5v",
@@ -799,6 +889,9 @@ mod tests {
         // Date-suffixed variant resolves through the base id.
         assert_eq!(context_window("claude-opus-4-7-20260101"), Some(1_000_000));
         assert_eq!(context_window("no-such-model"), None);
+        assert_eq!(context_window("mimo-v2.6-flash"), Some(1_048_576));
+        assert_eq!(context_window("claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(context_window("MiniMax-M2"), Some(204_800));
     }
 
     /// Longest-first ordering is load-bearing: with `gpt-5` earlier in

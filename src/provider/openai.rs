@@ -249,8 +249,16 @@ struct WireRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage>,
     stream: bool,
+    /// Without `include_usage`, OpenAI-compatible servers omit the
+    /// `usage` block from streamed replies and the ↑/↓ counters stay 0.
+    stream_options: WireStreamOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WireStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -442,6 +450,9 @@ fn build_request<'a>(ctx: &'a Context, model: &'a str) -> WireRequest<'a> {
         model,
         messages,
         stream: true,
+        stream_options: WireStreamOptions {
+            include_usage: true,
+        },
         tools,
     }
 }
@@ -1121,6 +1132,7 @@ mod tests {
         // `skip_serializing_if` path that hid the bug.
         let req = build_request(&agent.context, "minimax-M3");
         let body = serde_json::to_value(&req).expect("serialize wire body");
+        assert_eq!(body["stream_options"]["include_usage"], true);
         let tools = body.get("tools").expect(
             "outgoing request after --continue must include a `tools` key \
              (empty Vec is dropped by skip_serializing_if, which caused \
