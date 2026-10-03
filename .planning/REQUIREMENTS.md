@@ -7,17 +7,17 @@ owner decisions made on 2026-10-03.
 
 ### Runtime (RT) — in-process subagents
 
-- [ ] **RT-01**: Subagents run as in-process tasks; the child-process
+- [x] **RT-01**: Subagents run as in-process tasks; the child-process
   runtime (`run_single` / `spawn_and_collect`) is removed.
 
-- [ ] **RT-02**: Each subagent has its own cancel token. A foreground
+- [x] **RT-02**: Each subagent has its own cancel token. A foreground
   subagent stops when the user presses Esc on the main turn.
   Background subagents are not affected by Esc.
 
 - [x] **RT-03**: The user can stop all running subagents with one
   shortcut.
 
-- [ ] **RT-04**: Each subagent has its own session transcript, and
+- [x] **RT-04**: Each subagent has its own session transcript, and
   nothing leaks into the parent session.
 
 - [x] **RT-05**: Subagents cannot spawn subagents (deny-list). A global
@@ -31,7 +31,7 @@ owner decisions made on 2026-10-03.
   request is queued for the user rather than interrupting the main
   conversation. The subagent waits until the user decides.
 
-- [ ] **RT-08**: A subagent failure or provider error never takes down
+- [x] **RT-08**: A subagent failure or provider error never takes down
   the nanopi process. It is reported as a failed agent.
 
 ### Dynamic dispatch (DYN)
@@ -175,14 +175,14 @@ owner decisions made on 2026-10-03.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RT-01 | Phase 1 | Pending |
-| RT-02 | Phase 1 | Pending |
+| RT-01 | Phase 1 | Complete |
+| RT-02 | Phase 1 | Complete |
 | RT-03 | Phase 1 | Complete |
-| RT-04 | Phase 1 | Pending |
+| RT-04 | Phase 1 | Complete |
 | RT-05 | Phase 1 | Complete |
 | RT-06 | Phase 1 | Complete |
 | RT-07 | Phase 1 | Complete |
-| RT-08 | Phase 1 | Pending |
+| RT-08 | Phase 1 | Complete |
 | ISO-03 | Phase 1 | Complete |
 | ARC-01 | Phase 2 | Pending |
 | ARC-02 | Phase 2 | Pending |

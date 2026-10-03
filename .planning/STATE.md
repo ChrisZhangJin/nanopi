@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
-status: Plan 01-03 executed — 2 tasks committed, SUMMARY written, cargo test --lib green (826 passed), cargo build --features wasm green
-last_updated: "2026-10-03T07:03:18.326Z"
-last_activity: "2026-10-03 — Executed 01-03-PLAN.md (subagent-ready agent loop: per-agent limits, StopReason, Ask routing, ToolContext wiring)"
+status: Plan 01-04 executed — 2 tasks committed, SUMMARY written, cargo test --lib green (830 passed), cargo test --features wasm green (951 passed), cargo build --release green
+last_updated: "2026-10-03T08:00:00.000Z"
+last_activity: "2026-10-03 — Executed 01-04-PLAN.md (in-process subagent dispatcher replacing child-process runtime; panic audit of subagent execution path)"
 progress:
   total_phases: 6
   completed_phases: 0
@@ -18,9 +18,11 @@ progress:
 ## Current Position
 
 Phase: 1 of 6 (In-process runtime) — in progress
-Plan: 03 of N complete (Subagent-ready agent loop: hook agent_id/Ask outcome, tool deny-list, per-agent limits/StopReason/permission-broker routing)
-Status: Plan 01-03 executed — 2 tasks committed, SUMMARY written, cargo test --lib green (826 passed), cargo build --features wasm green
-Last activity: 2026-10-03 — Executed 01-03-PLAN.md (subagent-ready agent loop: per-agent limits, StopReason, Ask routing, ToolContext wiring)
+Plan: 04 of 6 complete (In-process subagent dispatcher: Agent::build_fresh + tokio::spawn replacing the child-process runtime; panic audit of the subagent execution path)
+Status: Plan 01-04 executed — 2 tasks committed, SUMMARY written, cargo test --lib green (830 passed), cargo test --features wasm green (951 passed), cargo build --release green
+Last activity: 2026-10-03 — Executed 01-04-PLAN.md (in-process subagent dispatcher replacing child-process runtime; panic audit of subagent execution path)
+
+Note: this line previously read "completed_plans: 4" before 01-04 actually ran — that count was incorrect at the time (only 01-01..01-03 were done, i.e. 3/6). It is correct now that 01-04 has, in fact, completed.
 
 ---
 
@@ -302,3 +304,6 @@ pinned by wall-clock tests.
 
 - [Phase ?]: Agent gets 5 flat fields rather than a bundled sub-struct
 - [Phase ?]: Only ToolExecutionStart routes a hook Ask outcome through the permission broker (D-13); other hooks treat Ask as Allow
+- [01-04]: Mid-stream turn cancellation now sets `stop_reason = Some(Cancelled)` to match the pre-iteration cancel check, so callers inspecting `stop_reason` after a successful `run_turn` (e.g. the subagent dispatcher) see cancellation correctly
+- [01-04]: Provider constructors fall back to `reqwest::Client::new()` instead of panicking on a TLS-backend-only build failure, since every subagent spawn builds its own Provider via `provider_factory` (D-11/T-01-12); not generalized to a `Result`-returning constructor across all call sites, which would be an architectural change outside this plan's scope
+- [01-04]: `run_item` checks the registry template before resolving the agent name, so "subagent runtime not initialised" is reported deterministically ahead of "unknown agent"

@@ -144,7 +144,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 
 | Phase | Name | Goal | Requirements | Depends on |
 |-------|------|------|--------------|------------|
-| 1 | In-process runtime | 3/6 | In Progress|  |
+| 1 | In-process runtime | 4/6 | In Progress|  |
 | 2 | Archive & lifecycle | Every subagent leaves a durable `.md` trail | ARC-01..ARC-05 | 1 |
 | 3 | Dynamic subagents | The model dispatches by describing the task | DYN-01..DYN-05 | 1, 2 |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
@@ -177,7 +177,7 @@ Plans:
 - [x] 01-01-PLAN.md — [subagent] config, SubagentRegistry + PermissionBroker, FileStateTracker, widened ToolContext
 - [x] 01-02-PLAN.md — ISO-03 stale-write guard in read/write/edit
 - [x] 01-03-PLAN.md — agent loop limits/stop reason, hook agent_id + ask, subagent deny-list
-- [ ] 01-04-PLAN.md — in-process subagent dispatcher (old runtime removed) + panic audit
+- [x] 01-04-PLAN.md — in-process subagent dispatcher (old runtime removed) + panic audit
 - [ ] 01-05-PLAN.md — TUI/print wiring: Ctrl+X stop-all, inline permission prompt, -p deny
 - [ ] 01-06-PLAN.md — end-to-end success-criteria tests + human check
 
