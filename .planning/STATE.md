@@ -4,7 +4,7 @@ milestone: v0.13.0
 milestone_name: Orchestrator & Dynamic Subagents
 status: planning
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -16,10 +16,10 @@ last_activity: "2026-10-03 — Milestone v0.13.0 started"
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 1 of 6 (In-process runtime) — ready to plan
 Plan: —
-Status: Defining requirements
-Last activity: 2026-10-03 — Milestone v0.13.0 started
+Status: Ready to plan
+Last activity: 2026-10-03 — Roadmap for v0.13.0 created (6 phases, 39/39 requirements mapped)
 
 ---
 

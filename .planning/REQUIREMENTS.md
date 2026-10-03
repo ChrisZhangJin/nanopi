@@ -143,4 +143,46 @@ owner decisions made on 2026-10-03.
 
 ## Traceability
 
-(filled by roadmap)
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| RT-01 | Phase 1 | Pending |
+| RT-02 | Phase 1 | Pending |
+| RT-03 | Phase 1 | Pending |
+| RT-04 | Phase 1 | Pending |
+| RT-05 | Phase 1 | Pending |
+| RT-06 | Phase 1 | Pending |
+| RT-07 | Phase 1 | Pending |
+| RT-08 | Phase 1 | Pending |
+| ISO-03 | Phase 1 | Pending |
+| ARC-01 | Phase 2 | Pending |
+| ARC-02 | Phase 2 | Pending |
+| ARC-03 | Phase 2 | Pending |
+| ARC-04 | Phase 2 | Pending |
+| ARC-05 | Phase 2 | Pending |
+| DYN-01 | Phase 3 | Pending |
+| DYN-02 | Phase 3 | Pending |
+| DYN-03 | Phase 3 | Pending |
+| DYN-04 | Phase 3 | Pending |
+| DYN-05 | Phase 3 | Pending |
+| CTL-01 | Phase 4 | Pending |
+| CTL-02 | Phase 4 | Pending |
+| CTL-03 | Phase 4 | Pending |
+| CTL-04 | Phase 4 | Pending |
+| CTL-05 | Phase 4 | Pending |
+| CTL-06 | Phase 4 | Pending |
+| CTL-07 | Phase 4 | Pending |
+| ISO-01 | Phase 4 | Pending |
+| ISO-02 | Phase 4 | Pending |
+| UI-01 | Phase 5 | Pending |
+| UI-02 | Phase 5 | Pending |
+| UI-03 | Phase 5 | Pending |
+| UI-04 | Phase 5 | Pending |
+| ORC-01 | Phase 6 | Pending |
+| ORC-02 | Phase 6 | Pending |
+| ORC-03 | Phase 6 | Pending |
+| ORC-04 | Phase 6 | Pending |
+| ORC-05 | Phase 6 | Pending |
+| QA-01 | Phase 6 | Pending |
+| QA-02 | Phase 6 | Pending |
+
+Coverage: 39/39 v1 requirements mapped, no orphans, no duplicates.
