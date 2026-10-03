@@ -7,7 +7,7 @@ owner decisions made on 2026-10-03.
 
 ### Runtime (RT) — child-process subagents (owner decision 2026-10-03)
 
-- [ ] **RT-01**: Each subagent runs as an isolated `nanopi -p` child
+- [x] **RT-01**: Each subagent runs as an isolated `nanopi -p` child
   process. A crash, panic, stack overflow or OOM in a subagent never
   affects the main nanopi process.
 
@@ -22,7 +22,7 @@ owner decisions made on 2026-10-03.
 - [ ] **RT-04**: Each subagent has its own session transcript in its
   agent directory, and nothing leaks into the parent session.
 
-- [ ] **RT-05**: Subagents cannot spawn subagents (the child is started
+- [x] **RT-05**: Subagents cannot spawn subagents (the child is started
   without the subagent/control tools). A global cap limits how many
   child processes are alive at once.
 
@@ -30,12 +30,12 @@ owner decisions made on 2026-10-03.
   passed to the child on its command line, with configurable defaults.
   When it hits either, it stops and reports partial work.
 
-- [ ] **RT-07**: Permissions are decided by the orchestrator at dispatch
+- [x] **RT-07**: Permissions are decided by the orchestrator at dispatch
   time: the dispatch carries the allowed tool list, and the child runs
   with exactly those tools. A child never prompts; anything outside the
   list is denied in-band.
 
-- [ ] **RT-08**: A child that exits non-zero, crashes, times out or
+- [x] **RT-08**: A child that exits non-zero, crashes, times out or
   produces unparseable output is reported as a failed agent with its
   error text; nanopi keeps running.
 
@@ -191,14 +191,14 @@ owner decisions made on 2026-10-03.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RT-01 | Phase 1 | Pending |
+| RT-01 | Phase 1 | Complete |
 | RT-02 | Phase 1 | Pending |
 | RT-03 | Phase 1 | Pending |
 | RT-04 | Phase 1 | Pending |
-| RT-05 | Phase 1 | Pending |
+| RT-05 | Phase 1 | Complete |
 | RT-06 | Phase 1 | Complete |
-| RT-07 | Phase 1 | Pending |
-| RT-08 | Phase 1 | Pending |
+| RT-07 | Phase 1 | Complete |
+| RT-08 | Phase 1 | Complete |
 | RT-09 | Phase 1 | Complete |
 | ISO-03 | Phase 1 | Complete |
 | ARC-01 | Phase 2 | Pending |
