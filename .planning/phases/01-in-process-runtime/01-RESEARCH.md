@@ -489,7 +489,9 @@ let _permit = sem.acquire().await.expect("subagent semaphore is never closed");
 | A2 | "Non-interactive default is deny" (D-14's premise) accurately describes nanopi's CURRENT `-p` permission behavior | Common Pitfalls #4 | If `-p` mode currently defaults to allow (or errors) rather than deny for unanswerable permission prompts, D-14's "check it" instruction surfaces a real discrepancy the planner must resolve — this needs a direct read of the current `-p`/non-interactive permission code path, which was not located precisely in this research pass. |
 | A3 | A cheap content hash (not a full diff) is sufficient for the ISO-03 stale-check without false negatives in practice | Pattern 3, Pitfall 6 | Low risk — any collision-resistant hash (even a fast non-cryptographic one) over file bytes is adequate for "did this change", and mtime alone is a reasonable first-pass signal already used elsewhere in the ecosystem. |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+Resolved in planning: Q1 → deny in -p (01-01, 01-05; user confirmed hook "ask" trigger); Q2 → always-present Arc<SubagentRegistry> (01-01); Q3 → std DefaultHasher (01-01).
 
 1. **Exact current `-p` (print mode) behavior for an unanswerable permission prompt**
    - What we know: STATE.md and D-14 both reference "the existing non-interactive rule. Today that is deny; check it."

@@ -147,3 +147,7 @@ later phases.
   across agents, which is why D-15 exists.
 
 </code_context>
+
+
+### Post-planning decision (2026-10-03)
+- RT-07 trigger: user confirmed hook `"decision":"ask"` routes calls into the shared permission queue (main agent asks labelled `[main]`; `-p` denies).
