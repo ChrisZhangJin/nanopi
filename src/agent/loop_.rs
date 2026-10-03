@@ -73,6 +73,22 @@ pub struct HooksConfig {
 }
 
 /// The agent — owns context, provider, tool registry, session, permissions.
+/// Per-turn loop limits. `max_turns` caps LLM iterations within one
+/// `run_turn` (default 50); `token_budget` caps cumulative
+/// input+output tokens for the turn (default unlimited).
+#[derive(Debug, Clone)]
+pub struct TurnLimits {
+    pub max_turns: u32,
+    pub token_budget: Option<u64>,
+    last_limit_hit: Option<&'static str>,
+}
+
+impl Default for TurnLimits {
+    fn default() -> Self {
+        Self { max_turns: 50, token_budget: None, last_limit_hit: None }
+    }
+}
+
 pub struct Agent {
     pub context: Context,
     pub provider: Box<dyn Provider>,
@@ -99,6 +115,9 @@ pub struct Agent {
     /// the status bar; never resets except on `Agent::load_session`
     /// (fresh Agent starts at zero).
     pub usage_total: Usage,
+    /// Per-turn safety limits (turn cap, token budget) and the reason
+    /// the last turn stopped on one, if it did.
+    pub limits: TurnLimits,
     /// Turn counter, incremented at the start of every `run_turn`.
     pub turn_count: u32,
     /// Skills loaded at Agent build time (via `Agent::build_fresh` or
@@ -416,6 +435,7 @@ impl Agent {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -725,6 +745,22 @@ impl Agent {
     /// fields cannot drift. Every caller that used to assign
     /// `context.system = Some(compose_system_prompt(…))` goes through
     /// here instead.
+    /// Cap LLM iterations per turn (min 1).
+    pub fn set_max_turns(&mut self, n: u32) {
+        self.limits.max_turns = n.max(1);
+    }
+
+    /// Cap cumulative input+output tokens per turn; `None` = unlimited.
+    pub fn set_token_budget(&mut self, budget: Option<u64>) {
+        self.limits.token_budget = budget;
+    }
+
+    /// Which limit ended the most recent turn: `"max_turns"`,
+    /// `"token_budget"`, or `None` if it ended normally.
+    pub fn last_limit_hit(&self) -> Option<&'static str> {
+        self.limits.last_limit_hit
+    }
+
     pub fn set_system_base(&mut self, base: String) {
         self.system_base = Some(base);
         self.refresh_system_prompt();
@@ -1056,14 +1092,17 @@ impl Agent {
         // giving up the safety belt. Bumping this alone is not a fix
         // for a stuck-looking session; see the fix below to
         // SessionEntry::Message content that also went out in v0.9.1.
-        const MAX_ITERATIONS: u32 = 50;
+        let max_turns = self.limits.max_turns.max(1);
+        let token_budget = self.limits.token_budget;
+        let mut turn_tokens: u64 = 0;
+        self.limits.last_limit_hit = None;
 
         // Tripwire for "stuck retrying the same failing tool_call" —
         // observed in the wild with minimax-M3 through an OpenAI-compat
         // gateway that streamed tool_calls with an empty `name` field:
         // every iteration got an "unknown tool: unknown" tool_result,
         // the model responded with the identical empty-name call, and
-        // MAX_ITERATIONS would let it burn ~50 rounds before quitting.
+        // max_turns would let it burn ~50 rounds before quitting.
         // Break out after `STUCK_LIMIT` consecutive rounds where the
         // tool_call fingerprints match AND every call errored. Args
         // are stringified so `{"command":"ls"}` compares byte-for-byte
@@ -1080,7 +1119,7 @@ impl Agent {
         let mut steer_rx = steer_rx;
         let mut follow_up_queue: Vec<String> = Vec::new();
 
-        for iteration_idx in 0..MAX_ITERATIONS {
+        for iteration_idx in 0..max_turns {
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
@@ -1404,6 +1443,9 @@ impl Agent {
                 .usage_total
                 .cache_write_tokens
                 .saturating_add(usage.cache_write_tokens);
+            turn_tokens = turn_tokens
+                .saturating_add(u64::from(usage.input_tokens))
+                .saturating_add(u64::from(usage.output_tokens));
 
             // Snapshot had_tool_calls before the match — `calls` is moved
             // inside the ToolCalls arm, so the TurnEnd hook below needs
@@ -1504,6 +1546,20 @@ impl Agent {
                         )
                     })
                     .await;
+            }
+
+            // ── Turn limits (RT-06) ─────────────────────────────────────
+            // Only reached when the model asked for tools and the loop
+            // would go round again. Hitting a limit ends the turn
+            // cleanly (not an error); callers read `last_limit_hit()`.
+            if let Some(budget) = token_budget {
+                if turn_tokens >= budget {
+                    self.limits.last_limit_hit = Some("token_budget");
+                    break;
+                }
+            }
+            if iteration_idx + 1 >= max_turns {
+                self.limits.last_limit_hit = Some("max_turns");
             }
         }
         // ── MessageEnd hook (v0.11.0) ───────────────────────────────────
@@ -2406,6 +2462,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -2505,6 +2562,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -2599,6 +2657,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -2742,6 +2801,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -2836,6 +2896,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -2993,6 +3054,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3163,6 +3225,7 @@ mod tests {
                 base_url: String::new(),
                 api_key: String::new(),
                 usage_total: Usage::default(),
+                limits: Default::default(),
                 turn_count: 0,
                 skills: Vec::new(),
                 no_context_files: false,
@@ -3241,6 +3304,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3319,6 +3383,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3417,6 +3482,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3486,6 +3552,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3620,6 +3687,7 @@ mod tests {
                 base_url: String::new(),
                 api_key: String::new(),
                 usage_total: Usage::default(),
+                limits: Default::default(),
                 turn_count: 0,
                 skills: Vec::new(),
                 no_context_files: false,
@@ -3724,6 +3792,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3790,6 +3859,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -3873,6 +3943,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -4006,6 +4077,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -4163,6 +4235,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -4255,6 +4328,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -4325,6 +4399,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5098,6 +5173,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5237,6 +5313,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5296,7 +5373,7 @@ mod tests {
     /// "same failing tool_call K rounds in a row" pattern and aborts
     /// the turn with a visible error — otherwise a future upstream
     /// glitch could produce a similar loop and burn 50 iterations
-    /// (`MAX_ITERATIONS`) before self-terminating.
+    /// (`TurnLimits::max_turns`) before self-terminating.
     #[tokio::test]
     async fn identical_failing_tool_calls_break_the_loop() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5365,6 +5442,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5394,7 +5472,7 @@ mod tests {
         let got_error_event = drain.await.unwrap();
 
         // Must abort with a Provider error — not silently exhaust
-        // MAX_ITERATIONS (50).
+        // max_turns (default 50).
         assert!(
             matches!(r, Err(AgentError::Provider(_))),
             "expected stuck-loop tripwire to fire, got {r:?}"
@@ -5402,7 +5480,7 @@ mod tests {
         // And the renderer must have seen the Error event.
         assert!(got_error_event, "renderer must receive an Error event");
         // Streak trips at 3 identical rounds — must fire well before
-        // MAX_ITERATIONS. Give a little slack for future tweaks: 5.
+        // max_turns. Give a little slack for future tweaks: 5.
         let calls = call_counter.load(Ordering::SeqCst);
         assert!(
             calls <= 5,
@@ -5413,6 +5491,123 @@ mod tests {
             "tripwire should require ≥3 identical rounds before firing, got {calls}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Provider that always asks for a (distinct, failing) tool call and
+    /// reports `tokens` input tokens per iteration.
+    struct AlwaysToolProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokens: u32,
+    }
+    #[async_trait::async_trait]
+    impl Provider for AlwaysToolProvider {
+        fn id(&self) -> &'static str {
+            "always-tool"
+        }
+        async fn stream_turn(
+            &self,
+            _ctx: &Context,
+            tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<Usage, String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(AgentEvent::Start { message_id: "m".into() }).await;
+            let _ = tx
+                .send(AgentEvent::ToolCall {
+                    content_index: 0,
+                    call: ToolCall {
+                        id: format!("call_{n}"),
+                        name: "nosuchtool".into(),
+                        arguments: json!({ "n": n }),
+                    },
+                })
+                .await;
+            let usage = Usage { input_tokens: self.tokens, ..Usage::default() };
+            let _ = tx
+                .send(AgentEvent::Done { finish_reason: FinishReason::ToolCalls, usage: usage.clone() })
+                .await;
+            Ok(usage)
+        }
+    }
+
+    fn limit_agent(tokens: u32) -> (Agent, std::sync::Arc<std::sync::atomic::AtomicUsize>, PathBuf) {
+        let dir = tmp();
+        let session_path = dir.join("limits.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000000\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"x\",\"base_url\":\"\"}\n",
+        )
+        .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            context: Context::default(),
+            provider: Box::new(AlwaysToolProvider { calls: calls.clone(), tokens }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "x".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            limits: Default::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+        (agent, calls, dir)
+    }
+
+    async fn run_limited(agent: &mut Agent) -> Result<String, AgentError> {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let r = agent.run_turn("hi", &tx, None, None).await;
+        drop(tx);
+        drain.await.unwrap();
+        r
+    }
+
+    #[test]
+    fn default_limits_are_unchanged() {
+        let l = TurnLimits::default();
+        assert_eq!(l.max_turns, 50);
+        assert_eq!(l.token_budget, None);
+    }
+
+    #[tokio::test]
+    async fn max_turns_limit_stops_loop() {
+        let (mut agent, calls, dir) = limit_agent(0);
+        agent.set_max_turns(2);
+        let r = run_limited(&mut agent).await;
+        assert!(r.is_ok(), "hitting a limit is not an error: {r:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(agent.last_limit_hit(), Some("max_turns"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn token_budget_limit_stops_loop() {
+        let (mut agent, calls, dir) = limit_agent(20);
+        agent.set_token_budget(Some(10));
+        let r = run_limited(&mut agent).await;
+        assert!(r.is_ok(), "hitting a limit is not an error: {r:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(agent.last_limit_hit(), Some("token_budget"));
+        // Reset on the next turn.
+        agent.set_token_budget(None);
+        agent.set_max_turns(1);
+        let _ = run_limited(&mut agent).await;
+        assert_eq!(agent.last_limit_hit(), Some("max_turns"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5512,6 +5707,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5673,6 +5869,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5732,6 +5929,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
@@ -5790,6 +5988,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,

@@ -6076,6 +6076,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             usage_total: crate::event::Usage::default(),
+            limits: Default::default(),
             turn_count: 0,
             skills: Vec::new(),
             no_context_files: false,
