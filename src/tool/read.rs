@@ -128,6 +128,9 @@ impl Tool for ReadTool {
         // return garbage.
         let raw = std::fs::read(&abs)
             .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
+        // Stale-write guard (ISO-03): stamp the FULL bytes just read, not
+        // the capped page returned to the model.
+        crate::tool::file_state::global().record_bytes(&abs, &raw);
 
         if let Some(media_type) = crate::util::image_detect::detect_media_type(&raw) {
             if raw.len() > MAX_IMAGE_RAW_BYTES {

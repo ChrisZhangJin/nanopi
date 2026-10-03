@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{file_state, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct WriteTool;
 
@@ -51,14 +51,24 @@ impl Tool for WriteTool {
         let abs = crate::tool::resolve_in_cwd(&ctx.cwd, path_str)
             .map_err(ToolError::Execution)?;
 
+        // Stale-write guard (ISO-03): refuse if another process changed
+        // the file since this process read it.
+        file_state::global()
+            .check(&abs)
+            .map_err(ToolError::Execution)?;
+
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ToolError::Execution(format!("cannot create parent {}: {e}", parent.display()))
             })?;
         }
 
-        write_no_follow(&abs, content)
-            .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
+        // Symlink / hard-link refusal, atomic temp+rename, stamp refresh.
+        // Tool calls in one batch run concurrently, so a `bash` call can
+        // swap the final component for a symlink after `resolve_in_cwd`;
+        // the explicit `symlink_metadata` refusal covers that, and rename
+        // replaces rather than follows a link in any case.
+        file_state::guarded_write(&abs, content.as_bytes()).map_err(ToolError::Execution)?;
 
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {}", content.len(), abs.display()),
@@ -67,61 +77,6 @@ impl Tool for WriteTool {
             metadata: Some(json!({"path": abs.display().to_string(), "bytes": content.len()})),
         })
     }
-}
-
-/// Open with `O_NOFOLLOW` and refuse a multiply-linked target.
-///
-/// `resolve_in_cwd` decides whether a path is inside the tree; this
-/// decides that the thing finally opened is the thing that was checked.
-/// Between the two there is a window, and it is not theoretical — tool
-/// calls in one response run concurrently by default, so a `bash` call
-/// swapping a component for a symlink races a `write` call in the same
-/// batch. Measured at roughly 0.6% success over a few thousand attempts
-/// before this guard.
-///
-/// `O_NOFOLLOW` closes the symlink half: if the final component became
-/// a link after the check, the open fails instead of following it. The
-/// hard-link half cannot be closed by path resolution at all — a hard
-/// link is not a reference to a name, it is the same inode — so the
-/// link count is checked instead, which is coarse but honest.
-///
-/// Neither is a complete answer. The complete answer is `openat2` with
-/// `RESOLVE_BENEATH`, which is Linux 5.6+ and would abandon the older
-/// kernels this project exists to support.
-fn write_no_follow(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-
-    // Deliberately NOT `truncate(true)`. Truncation happens at open,
-    // which would empty the file before the link count could be
-    // checked — destroying the very data the check exists to protect.
-    // The file is truncated below, after it has been accepted.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut f = opts.open(path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // Queried through the open descriptor, not the path, so this
-        // cannot be raced the way a second `stat` could.
-        let meta = f.metadata()?;
-        if meta.nlink() > 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "refusing to write a file with multiple hard links: the same \
-                 inode is reachable from outside the working directory",
-            ));
-        }
-    }
-
-    f.set_len(0)?;
-    f.write_all(content.as_bytes())?;
-    f.flush()
 }
 
 #[cfg(test)]
@@ -383,6 +338,46 @@ mod tests {
             !dir.parent().unwrap().join(&name).exists(),
             "a refused write must not create directories outside cwd"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_refuses_stale_file() {
+        let dir = tmp();
+        std::fs::write(dir.join("s.txt"), "aaaa").unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "s.txt"}), &ctx)
+            .await
+            .unwrap();
+        std::fs::write(dir.join("s.txt"), "bbbb").unwrap();
+        let r = WriteTool
+            .execute(json!({"path": "s.txt", "content": "mine"}), &ctx)
+            .await;
+        match r {
+            Err(e) => assert!(e.to_string().contains("file changed since you read it")),
+            Ok(o) => panic!("stale write must be refused, got {o:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("s.txt")).unwrap(), "bbbb");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_after_read_and_own_write_succeeds() {
+        let dir = tmp();
+        std::fs::write(dir.join("s.txt"), "a").unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "s.txt"}), &ctx)
+            .await
+            .unwrap();
+        for c in ["one", "two"] {
+            WriteTool
+                .execute(json!({"path": "s.txt", "content": c}), &ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("s.txt")).unwrap(), "two");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

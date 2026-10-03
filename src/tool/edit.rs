@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::agent::context::ToolSpec;
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{file_state, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct EditTool;
 
@@ -46,6 +46,11 @@ impl Tool for EditTool {
         let abs = crate::tool::resolve_in_cwd(&ctx.cwd, path_str)
             .map_err(ToolError::Execution)?;
 
+        // Stale-write guard (ISO-03).
+        file_state::global()
+            .check(&abs)
+            .map_err(ToolError::Execution)?;
+
         let content = std::fs::read_to_string(&abs)
             .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
 
@@ -60,8 +65,7 @@ impl Tool for EditTool {
         }
 
         let updated = content.replacen(old, new, 1);
-        std::fs::write(&abs, &updated)
-            .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
+        file_state::guarded_write(&abs, updated.as_bytes()).map_err(ToolError::Execution)?;
 
         // Compute a tiny diff metadata (count of removed/added lines).
         let old_lines: Vec<&str> = old.lines().collect();
@@ -186,6 +190,66 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_stale_file() {
+        let dir = tmp();
+        std::fs::write(dir.join("f.txt"), "foo\n").unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx)
+            .await
+            .unwrap();
+        std::fs::write(dir.join("f.txt"), "fox\n").unwrap();
+        let r = EditTool
+            .execute(json!({"path": "f.txt", "oldText": "fox", "newText": "bar"}), &ctx)
+            .await;
+        match r {
+            Err(ToolError::Execution(m)) => assert!(m.contains("file changed since you read it")),
+            other => panic!("expected stale refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "fox\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_then_two_own_edits_succeed() {
+        let dir = tmp();
+        std::fs::write(dir.join("f.txt"), "a b\n").unwrap();
+        let ctx = ToolContext { cwd: dir.clone() };
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx)
+            .await
+            .unwrap();
+        EditTool
+            .execute(json!({"path": "f.txt", "oldText": "a", "newText": "x"}), &ctx)
+            .await
+            .unwrap();
+        EditTool
+            .execute(json!({"path": "f.txt", "oldText": "b", "newText": "y"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "x y\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_refuses_hard_link() {
+        let base = tmp();
+        let outside = base.join("victim.txt");
+        std::fs::write(&outside, "original").unwrap();
+        let cwd = base.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::hard_link(&outside, cwd.join("in.txt")).unwrap();
+        let ctx = ToolContext { cwd: cwd.clone() };
+        let r = EditTool
+            .execute(json!({"path": "in.txt", "oldText": "original", "newText": "pwned"}), &ctx)
+            .await;
+        assert!(r.is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
