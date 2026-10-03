@@ -181,6 +181,30 @@ fn is_agent_mode(args: &Args) -> bool {
     args.brief.is_some() || std::env::var_os("NANOPI_AGENT_ID").is_some()
 }
 
+/// Resolve on SIGINT (-> 130) or SIGTERM (-> 143).
+async fn wait_for_term_signal() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return 130;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => 130,
+            _ = term.recv() => 143,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        130
+    }
+}
+
 /// Tie a child's lifetime to its parent (D-12, T-01-10). On Linux the
 /// kernel delivers SIGKILL when the parent dies; the getppid check
 /// closes the race where the parent died before prctl ran. Returns
@@ -499,7 +523,7 @@ async fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        print::run_print_mode(
+        let print_fut = print::run_print_mode(
             api_kind,
             cfg.provider.clone(),
             &base_url,
@@ -528,8 +552,18 @@ async fn main() -> ExitCode {
                 agent_id: std::env::var("NANOPI_AGENT_ID").ok(),
                 agent_mode,
             },
-        )
-        .await
+        );
+        // SIGINT/SIGTERM in print mode: kill every subagent child, then exit
+        // 130/143. Dropping the print future also drops each child's guard.
+        tokio::select! {
+            r = print_fut => r,
+            code = wait_for_term_signal() => {
+                if let Some(reg) = nanopi::subagent_registry::global() {
+                    reg.kill_all();
+                }
+                Ok(code)
+            }
+        }
     } else {
         // Ephemeral runs are only wired through the non-interactive print
         // path (which is where the subagent tool and scripts use it). The

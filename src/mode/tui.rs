@@ -613,6 +613,10 @@ pub async fn run_tui_mode(
     }
 
     let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
+    // TUI quit: stop every live subagent child before anything else.
+    if let Some(reg) = crate::subagent_registry::global() {
+        reg.kill_all();
+    }
     let _ = teardown_terminal(&mut terminal);
 
     // Session-end hook.
