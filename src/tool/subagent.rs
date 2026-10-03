@@ -764,6 +764,8 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
 const STDOUT_CAP: usize = 8 * 1024 * 1024;
 /// Max bytes of child stderr retained — the *tail* is kept.
 const STDERR_TAIL: usize = 64 * 1024;
+/// How long to keep draining pipes after the child exits (WR-04).
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// The executable (plus leading args) used to launch a child. Defaults
 /// to the running binary; tests substitute `sh -c ...`.
@@ -906,44 +908,65 @@ async fn spawn_and_collect_with(
 
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
-    let mut out_truncated = false;
-    // Wait for the leader to exit WITHOUT reaping it (WR-03): the zombie
-    // keeps the pgid reserved, so the group sweep below cannot hit an
-    // unrelated group that reused the id.
-    let waited = tokio::time::timeout(timeout, async {
-        let (t, _, exited) = tokio::join!(
-            drain_head(stdout, &mut out_buf, STDOUT_CAP),
-            drain_tail(stderr, &mut err_buf, STDERR_TAIL),
-            wait_exited(&mut child, pid)
-        );
-        out_truncated = t;
-        exited
-    })
-    .await;
-
-    let stderr_tail = String::from_utf8_lossy(&err_buf).to_string();
-    let status = match waited {
-        Err(_) => {
-            drop(guard); // SIGKILL the group
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-            return failed_output(
-                &format!("timed out after {}s", timeout.as_secs_f64()),
-                &stderr_tail,
+    // `Ok(status)` = reaped normally; `Err(reason)` = failure already mapped.
+    let (outcome, out_truncated) = {
+        let drains = async {
+            let (t, _) = tokio::join!(
+                drain_head(stdout, &mut out_buf, STDOUT_CAP),
+                drain_tail(stderr, &mut err_buf, STDERR_TAIL)
             );
-        }
-        Ok(Err(e)) => return failed_output(&format!("waiting for subagent: {e}"), &stderr_tail),
-        Ok(Ok(())) => {
-            // Leader exited but is not yet reaped: sweep stray
-            // grandchildren while the zombie still owns the pgid, then reap.
-            drop(guard);
-            match child.wait().await {
-                Ok(s) => s,
-                Err(e) => {
-                    return failed_output(&format!("waiting for subagent: {e}"), &stderr_tail)
+            t
+        };
+        tokio::pin!(drains);
+        let mut drained: Option<bool> = None;
+        // Wait for the leader to exit WITHOUT reaping it (WR-03): the
+        // zombie keeps the pgid reserved, so the group sweep below cannot
+        // hit an unrelated group that reused the id.
+        let waited = tokio::time::timeout(timeout, async {
+            let exit = wait_exited(&mut child, pid);
+            tokio::pin!(exit);
+            tokio::select! {
+                t = &mut drains => {
+                    drained = Some(t);
+                    (&mut exit).await
+                }
+                r = &mut exit => r,
+            }
+        })
+        .await;
+        match waited {
+            Err(_) => {
+                drop(guard); // SIGKILL the group
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                (Err(format!("timed out after {}s", timeout.as_secs_f64())), false)
+            }
+            Ok(Err(e)) => (Err(format!("waiting for subagent: {e}")), false),
+            Ok(Ok(())) => {
+                // WR-04: the leader is gone. Something it spawned may
+                // still hold the pipes open; give the drains a short
+                // grace period instead of waiting out the full timeout.
+                if drained.is_none() {
+                    drained = tokio::time::timeout(DRAIN_GRACE, &mut drains).await.ok();
+                }
+                // Sweep stray grandchildren while the zombie still owns
+                // the pgid, then let the drains see EOF and reap.
+                drop(guard);
+                if drained.is_none() {
+                    drained = tokio::time::timeout(DRAIN_GRACE, &mut drains).await.ok();
+                }
+                match child.wait().await {
+                    Ok(s) => (Ok(s), drained.unwrap_or(false)),
+                    Err(e) => (Err(format!("waiting for subagent: {e}")), false),
                 }
             }
         }
+    };
+
+    let stderr_tail = String::from_utf8_lossy(&err_buf).to_string();
+    let status = match outcome {
+        Ok(s) => s,
+        Err(reason) => return failed_output(&reason, &stderr_tail),
     };
 
     if !status.success() {
@@ -1465,6 +1488,20 @@ mod tests {
         }
         assert!(dead, "grandchild {pid} survived the post-exit sweep");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WR-04: a grandchild that inherited stdout must not turn a
+    /// finished child into a timeout; the buffered envelope is used.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grandchild_holding_stdout_does_not_cause_timeout() {
+        let ok = r#"{"session_id":"s","model":"m","finish_reason":"stop","duration_ms":1,"usage":{},"messages":[{"role":"assistant","content":"hi"}],"status":"completed"}"#;
+        let script = format!("echo '{ok}'; sleep 300 &");
+        let started = std::time::Instant::now();
+        let out = spawn_and_collect(sh(&script), Duration::from_secs(60)).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(status_of(&out), "completed");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
     }
 
     #[cfg(unix)]
