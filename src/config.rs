@@ -160,6 +160,12 @@ pub struct Config {
     /// ```
     #[serde(default)]
     pub max_replay_entries: Option<usize>,
+
+    /// v0.13.0: `[subagent]` — limits for in-process subagents (RT-05,
+    /// RT-06, D-08). All fields optional; missing ones default via
+    /// `SubagentConfig::default()`.
+    #[serde(default)]
+    pub subagent: SubagentConfig,
 }
 
 /// Global tool execution mode. Deserialized from
@@ -381,6 +387,68 @@ pub struct TrustConfig {
     pub default: Option<String>,
 }
 
+/// `[subagent]` — limits for in-process subagents (D-08).
+///
+/// ```toml
+/// [subagent]
+/// max_live = 2
+/// ```
+/// parses with the other three fields defaulted. A zero value in any
+/// field is clamped to 1 at load, with a stderr warning, following the
+/// same "don't let a setting silently misbehave" convention as other
+/// validated fields in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct SubagentConfig {
+    /// Global concurrency cap, enforced with a semaphore. Excess
+    /// dispatches queue rather than fail.
+    pub max_concurrency: usize,
+    /// Cap on queued + running + waiting-on-permission agents at once.
+    /// A dispatch beyond this fails with an in-band error.
+    pub max_live: usize,
+    /// Per-agent turn limit before it stops with `status: limit_reached`.
+    pub max_turns: u32,
+    /// Per-agent input+output token budget before it stops with
+    /// `status: limit_reached`.
+    pub token_budget: u64,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: 4,
+            max_live: 8,
+            max_turns: 50,
+            token_budget: 300_000,
+        }
+    }
+}
+
+impl SubagentConfig {
+    /// Clamp any zero field to 1, warning on stderr. Called once at
+    /// load time so a misconfigured `[subagent]` section degrades to
+    /// "at least 1" rather than "nothing can ever run."
+    fn clamp_zeros(mut self) -> Self {
+        if self.max_concurrency == 0 {
+            eprintln!("warning: [subagent] max_concurrency = 0 is invalid; using 1");
+            self.max_concurrency = 1;
+        }
+        if self.max_live == 0 {
+            eprintln!("warning: [subagent] max_live = 0 is invalid; using 1");
+            self.max_live = 1;
+        }
+        if self.max_turns == 0 {
+            eprintln!("warning: [subagent] max_turns = 0 is invalid; using 1");
+            self.max_turns = 1;
+        }
+        if self.token_budget == 0 {
+            eprintln!("warning: [subagent] token_budget = 0 is invalid; using 1");
+            self.token_budget = 1;
+        }
+        self
+    }
+}
+
 impl Config {
     /// Built-in defaults when no config files exist.
     pub fn builtin_defaults() -> Self {
@@ -399,6 +467,7 @@ impl Config {
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
+            subagent: SubagentConfig::default(),
         }
     }
 }
@@ -422,6 +491,7 @@ pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
     }
 
     validate_tool_exec_overrides(&merged)?;
+    merged.subagent = merged.subagent.clamp_zeros();
 
     Ok(merged)
 }
@@ -583,6 +653,13 @@ fn merge(a: Config, b: Config) -> Config {
         },
         // Scalar Option: b (project) wins if set, else a (global).
         max_replay_entries: b.max_replay_entries.or(a.max_replay_entries),
+        // b (project) wins wholesale if it differs from the default;
+        // same "last explicit wins" rule as tool_exec_mode above.
+        subagent: if b.subagent != SubagentConfig::default() {
+            b.subagent
+        } else {
+            a.subagent
+        },
     }
 }
 
@@ -897,6 +974,7 @@ command = "echo hi"
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
+            subagent: SubagentConfig::default(),
         };
         let b = Config {
             model: None,
@@ -913,6 +991,7 @@ command = "echo hi"
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
+            subagent: SubagentConfig::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));
@@ -1030,5 +1109,30 @@ command = "/bin/true"
         tmp.write(".nanopi/config.toml", "max_replay_entries = 5\n");
         let c = load_config(tmp.path()).unwrap();
         assert_eq!(c.max_replay_entries, Some(5));
+    }
+
+    #[test]
+    fn subagent_section_parses_with_other_fields_defaulted() {
+        let _h = crate::TempNanopiHome::new();
+        let tmp = TempDir::new();
+        tmp.write(".nanopi/config.toml", "[subagent]\nmax_live = 2\n");
+        let c = load_config(tmp.path()).unwrap();
+        assert_eq!(c.subagent.max_live, 2);
+        assert_eq!(c.subagent.max_concurrency, 4);
+        assert_eq!(c.subagent.max_turns, 50);
+        assert_eq!(c.subagent.token_budget, 300_000);
+    }
+
+    #[test]
+    fn subagent_zero_fields_are_clamped_to_one() {
+        let _h = crate::TempNanopiHome::new();
+        let tmp = TempDir::new();
+        tmp.write(
+            ".nanopi/config.toml",
+            "[subagent]\nmax_live = 0\nmax_concurrency = 0\n",
+        );
+        let c = load_config(tmp.path()).unwrap();
+        assert_eq!(c.subagent.max_live, 1);
+        assert_eq!(c.subagent.max_concurrency, 1);
     }
 }
