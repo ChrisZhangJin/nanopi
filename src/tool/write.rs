@@ -139,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn creates_new_file() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         WriteTool
             .execute(json!({"path": "out.txt", "content": "hello"}), &ctx)
             .await
@@ -155,7 +155,7 @@ mod tests {
     async fn overwrites_existing() {
         let dir = tmp();
         std::fs::write(dir.join("x.txt"), "old").unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         WriteTool
             .execute(json!({"path": "x.txt", "content": "new"}), &ctx)
             .await
@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn creates_parent_dirs() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         WriteTool
             .execute(json!({"path": "a/b/c.txt", "content": "x"}), &ctx)
             .await
@@ -179,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_absolute_outside_cwd() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let r = WriteTool
             .execute(json!({"path": "/tmp/nope.txt", "content": "x"}), &ctx)
             .await;
@@ -193,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_absolute_traversal_out_of_cwd() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         // Unique per run: a fixed name would be satisfied by a
         // leftover from an earlier failing run, turning the assertion
         // below into a false pass — or, worse, a false failure.
@@ -219,7 +219,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_relative_traversal_out_of_cwd() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let name = format!("escaped-rel-{}.txt", crate::util::uuid::v7());
         let r = WriteTool
             .execute(json!({"path": format!("../{name}"), "content": "x"}), &ctx)
@@ -241,7 +241,7 @@ mod tests {
         let dir = tmp();
         let outside = tmp();
         std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let r = WriteTool
             .execute(json!({"path": "link/pwned.txt", "content": "x"}), &ctx)
             .await;
@@ -276,7 +276,7 @@ mod tests {
         assert!(!outside.exists(), "target must not exist — that is the point");
         std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
 
-        let ctx = ToolContext { cwd: cwd.clone() };
+        let ctx = ToolContext::new(cwd.clone());
         let r = WriteTool
             .execute(json!({"path": "link", "content": "pwned"}), &ctx)
             .await;
@@ -324,7 +324,7 @@ mod tests {
         std::fs::remove_file(&target).unwrap();
         std::os::unix::fs::symlink(&outside, &target).unwrap();
 
-        let ctx = ToolContext { cwd: cwd.clone() };
+        let ctx = ToolContext::new(cwd.clone());
         let r = WriteTool
             .execute(json!({"path": "f.txt", "content": "pwned"}), &ctx)
             .await;
@@ -351,7 +351,7 @@ mod tests {
         std::fs::write(&outside, "original").unwrap();
         std::fs::hard_link(&outside, cwd.join("inside.txt")).unwrap();
 
-        let ctx = ToolContext { cwd: cwd.clone() };
+        let ctx = ToolContext::new(cwd.clone());
         let r = WriteTool
             .execute(json!({"path": "inside.txt", "content": "pwned"}), &ctx)
             .await;
@@ -370,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn refusal_creates_no_directories_outside_cwd() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let name = format!("sibling-{}", crate::util::uuid::v7());
         let r = WriteTool
             .execute(
@@ -389,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn missing_path_arg_is_error() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let r = WriteTool.execute(json!({"content": "x"}), &ctx).await;
         assert!(matches!(r, Err(ToolError::InvalidArgs(_))));
         let _ = std::fs::remove_dir_all(&dir);

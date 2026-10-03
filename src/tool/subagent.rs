@@ -749,7 +749,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nanopi-sa-cap-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = SubagentTool;
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let tasks: Vec<Value> = (0..MAX_TASKS + 1)
             .map(|_| json!({"agent": "x", "task": "y"}))
             .collect();
@@ -854,7 +854,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nanopi-sa-test-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = SubagentTool;
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let out = tool
             .execute(
                 json!({"agent": "__definitely_not_an_agent__", "task": "x", "agent_scope": "project"}),

@@ -317,7 +317,7 @@ mod tests {
             Arc::from("/tmp/test_plugin.wasm"),
             Arc::new(NoopBridge),
         );
-        let ctx = ToolContext { cwd: std::path::PathBuf::from("/tmp") };
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
         let out = tool.execute(serde_json::json!({"sql": "SELECT 1"}), &ctx).await.unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("plugin error"));
@@ -394,7 +394,7 @@ mod tests {
 
         // Occupies the single worker for the duration of the call.
         let call = tokio::spawn(async move {
-            let ctx = ToolContext { cwd: std::path::PathBuf::from("/tmp") };
+            let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
             tool.execute(serde_json::json!({}), &ctx).await
         });
 

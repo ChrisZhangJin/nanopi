@@ -101,7 +101,7 @@ mod tests {
     async fn replaces_unique_text() {
         let dir = tmp();
         std::fs::write(dir.join("f.txt"), "hello world\nfoo bar\n").unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         EditTool
             .execute(
                 json!({"path": "f.txt", "oldText": "foo bar", "newText": "baz qux"}),
@@ -119,7 +119,7 @@ mod tests {
     async fn errors_when_not_found() {
         let dir = tmp();
         std::fs::write(dir.join("f.txt"), "hello\n").unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let r = EditTool
             .execute(
                 json!({"path": "f.txt", "oldText": "missing", "newText": "x"}),
@@ -134,7 +134,7 @@ mod tests {
     async fn errors_when_ambiguous() {
         let dir = tmp();
         std::fs::write(dir.join("f.txt"), "foo\nfoo\n").unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let r = EditTool
             .execute(
                 json!({"path": "f.txt", "oldText": "foo", "newText": "bar"}),
@@ -159,7 +159,7 @@ mod tests {
         let outside = tmp();
         let target = outside.join("victim.txt");
         std::fs::write(&target, "original\n").unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
 
         for path in [
             dir.join("..").join(outside.file_name().unwrap()).join("victim.txt")
@@ -192,7 +192,7 @@ mod tests {
     async fn preserves_unrelated_content() {
         let dir = tmp();
         std::fs::write(dir.join("f.txt"), "AAA\nkeep me\nCCC\n").unwrap();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         EditTool
             .execute(
                 json!({"path": "f.txt", "oldText": "AAA", "newText": "BBB"}),

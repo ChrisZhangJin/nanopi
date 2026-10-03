@@ -319,9 +319,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_returns_output_produced_before_the_deadline() {
         use super::*;
-        let ctx = ToolContext {
-            cwd: std::env::temp_dir(),
-        };
+        let ctx = ToolContext::new(std::env::temp_dir());
         // Short deadline, constructed directly: the timeout is a field
         // on the tool, not a call argument.
         let tool = BashTool {
@@ -363,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn runs_simple_command() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let out = BashTool::new()
             .execute(json!({"command": "echo hello"}), &ctx)
             .await
@@ -376,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn non_zero_exit_is_error() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let out = BashTool::new()
             .execute(json!({"command": "exit 7"}), &ctx)
             .await
@@ -388,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stderr() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let out = BashTool::new()
             .execute(json!({"command": "echo err 1>&2"}), &ctx)
             .await
@@ -400,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn truncates_large_output() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let out = BashTool::new()
             .execute(json!({"command": "yes line | head -n 10000"}), &ctx)
             .await
@@ -419,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn small_output_writes_no_overflow_file() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         for cmd in ["echo hi", "printf 'no trailing newline'", "echo 你好世界"] {
             let out = BashTool::new()
                 .execute(json!({ "command": cmd }), &ctx)
@@ -450,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn byte_cap_does_not_split_utf8() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         // One ASCII byte then 20k x 3-byte chars = 60 KB on a single
         // line: blows the byte cap without hitting the line cap. The
         // leading byte shifts the 30_000 cut off a char boundary — with
@@ -471,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn runs_in_ctx_cwd() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let out = BashTool::new()
             .execute(json!({"command": "pwd"}), &ctx)
             .await
@@ -488,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn missing_command_arg_is_error() {
         let dir = tmp();
-        let ctx = ToolContext { cwd: dir.clone() };
+        let ctx = ToolContext::new(dir.clone());
         let r = BashTool::new().execute(json!({}), &ctx).await;
         assert!(matches!(r, Err(ToolError::InvalidArgs(_))));
         let _ = std::fs::remove_dir_all(&dir);

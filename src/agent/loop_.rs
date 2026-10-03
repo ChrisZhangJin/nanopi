@@ -2188,7 +2188,7 @@ pub(crate) async fn run_one_tool(
     let started = std::time::Instant::now();
     let (mut content, mut is_error, images) = match registry.get(&call.name) {
         Some(tool) => {
-            let ctx = ToolContext { cwd: cwd.clone() };
+            let ctx = ToolContext::new(cwd.clone());
             let executed = match origin.deadline() {
                 None => tool.execute(effective_args.clone(), &ctx).await.map(Some),
                 Some(d) => {

@@ -10,6 +10,7 @@
 
 pub mod bash;
 pub mod edit;
+pub mod file_state;
 pub mod find;
 pub mod grep;
 pub mod ls;
@@ -25,8 +26,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::context::ToolSpec;
+use crate::agent::subagent_registry::SubagentRegistry;
+use crate::tool::file_state::FileStateTracker;
 
 /// Resolve a model-supplied path for a *mutating* tool, refusing
 /// anything that lands outside `cwd`.
@@ -304,10 +308,37 @@ pub struct ToolOutput {
 }
 
 /// Context passed to every tool execution. Holds the session's cwd so
-/// tools resolve relative paths against the right root.
+/// tools resolve relative paths against the right root, plus (v0.13.0,
+/// Phase 1) the subagent registry, the calling agent's id, its turn's
+/// cancel token, and its file-state tracker (D-01, ISO-03).
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
+    /// Always present — `ToolContext::new` fills in a `standalone()`
+    /// registry for call sites with no real subagent run behind them,
+    /// so nothing here needs an `Option` unwrap.
+    pub registry: Arc<SubagentRegistry>,
+    /// `None` for the main agent; `Some("a1")` etc. for a subagent.
+    pub agent_id: Option<String>,
+    /// This call's turn-level cancel token, if any.
+    pub turn_cancel: Option<CancellationToken>,
+    /// Per-agent read/write staleness tracker (ISO-03).
+    pub file_state: Arc<FileStateTracker>,
+}
+
+impl ToolContext {
+    /// Build a context for the main agent (or any call site with no
+    /// real subagent run behind it): a standalone registry, no agent
+    /// id, no turn cancel token, and a fresh file-state tracker.
+    pub fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            registry: Arc::new(SubagentRegistry::standalone()),
+            agent_id: None,
+            turn_cancel: None,
+            file_state: Arc::new(FileStateTracker::default()),
+        }
+    }
 }
 
 /// Where a registered tool came from.
@@ -1147,9 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn tool_execute_returns_content() {
         let tool = EchoTool;
-        let ctx = ToolContext {
-            cwd: PathBuf::from("/tmp"),
-        };
+        let ctx = ToolContext::new(PathBuf::from("/tmp"));
         let out = tool.execute(json!({"text":"hi"}), &ctx).await.unwrap();
         assert_eq!(out.content, "hi");
         assert!(!out.is_error);
