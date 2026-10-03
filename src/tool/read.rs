@@ -129,6 +129,15 @@ impl Tool for ReadTool {
         let raw = std::fs::read(&abs)
             .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
 
+        // Record this read's fingerprint (mtime + content hash) so a
+        // later write/edit by this agent can detect a stale read
+        // (ISO-03, D-15). Recording never fails the read itself — a
+        // failure here only means a later staleness check cannot see
+        // this read, not that the read failed.
+        if let Some(key) = crate::tool::file_state::canonical_key(&ctx.cwd, path_str) {
+            ctx.file_state.record(&key, &raw);
+        }
+
         if let Some(media_type) = crate::util::image_detect::detect_media_type(&raw) {
             if raw.len() > MAX_IMAGE_RAW_BYTES {
                 return Err(ToolError::Execution(format!(

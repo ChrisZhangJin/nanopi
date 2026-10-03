@@ -51,6 +51,22 @@ impl Tool for WriteTool {
         let abs = crate::tool::resolve_in_cwd(&ctx.cwd, path_str)
             .map_err(ToolError::Execution)?;
 
+        // Serialize writes to this path across every agent in the
+        // process (D-15), and refuse a write if this agent's read of
+        // the file is stale. Held until the write below completes —
+        // a write in progress always runs to completion (D-07), it
+        // just cannot start if another agent is mid-write on the same
+        // path, or if this agent's own fingerprint is stale.
+        let key = crate::tool::file_state::canonical_key(&ctx.cwd, path_str);
+        let _path_guard = if let Some(ref k) = key {
+            let lock = crate::tool::file_state::path_lock(k);
+            let guard = lock.lock_owned().await;
+            ctx.file_state.check(k).map_err(ToolError::Execution)?;
+            Some(guard)
+        } else {
+            None
+        };
+
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ToolError::Execution(format!("cannot create parent {}: {e}", parent.display()))
@@ -59,6 +75,10 @@ impl Tool for WriteTool {
 
         write_no_follow(&abs, content)
             .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
+
+        if let Some(ref k) = key {
+            ctx.file_state.update_after_write(k, content.as_bytes());
+        }
 
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {}", content.len(), abs.display()),

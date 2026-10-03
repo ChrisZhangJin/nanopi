@@ -46,6 +46,19 @@ impl Tool for EditTool {
         let abs = crate::tool::resolve_in_cwd(&ctx.cwd, path_str)
             .map_err(ToolError::Execution)?;
 
+        // Serialize edits to this path across every agent in the
+        // process (D-15), and refuse an edit if this agent's read of
+        // the file is stale. Held until the write below completes.
+        let key = crate::tool::file_state::canonical_key(&ctx.cwd, path_str);
+        let _path_guard = if let Some(ref k) = key {
+            let lock = crate::tool::file_state::path_lock(k);
+            let guard = lock.lock_owned().await;
+            ctx.file_state.check(k).map_err(ToolError::Execution)?;
+            Some(guard)
+        } else {
+            None
+        };
+
         let content = std::fs::read_to_string(&abs)
             .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
 
@@ -62,6 +75,10 @@ impl Tool for EditTool {
         let updated = content.replacen(old, new, 1);
         std::fs::write(&abs, &updated)
             .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
+
+        if let Some(ref k) = key {
+            ctx.file_state.update_after_write(k, updated.as_bytes());
+        }
 
         // Compute a tiny diff metadata (count of removed/added lines).
         let old_lines: Vec<&str> = old.lines().collect();
@@ -186,6 +203,127 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// ISO-03 happy path: this agent reads, then edits with no external
+    /// change in between — the edit must succeed.
+    #[tokio::test]
+    async fn edit_after_own_read_succeeds() {
+        let dir = tmp();
+        std::fs::write(dir.join("f.txt"), "hello world\n").unwrap();
+        let ctx = ToolContext::new(dir.clone());
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx)
+            .await
+            .unwrap();
+        let r = EditTool
+            .execute(
+                json!({"path": "f.txt", "oldText": "hello", "newText": "goodbye"}),
+                &ctx,
+            )
+            .await;
+        assert!(r.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ISO-03 core behaviour (D-15): agent A reads, then a *different*
+    /// `ToolContext` (simulating a second agent, with its own
+    /// `FileStateTracker`) changes the file via `write`. A's `edit` must
+    /// be refused with the stale-read message, and the file content must
+    /// remain the second writer's — untouched by the refused edit.
+    #[tokio::test]
+    async fn stale_write_refused_after_concurrent_change() {
+        let dir = tmp();
+        std::fs::write(dir.join("f.txt"), "hello world\n").unwrap();
+
+        let ctx_a = ToolContext::new(dir.clone());
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx_a)
+            .await
+            .unwrap();
+
+        // Simulate a second agent: a distinct ToolContext (and hence a
+        // distinct FileStateTracker) writing the same file.
+        let ctx_b = ToolContext::new(dir.clone());
+        crate::tool::write::WriteTool
+            .execute(
+                json!({"path": "f.txt", "content": "changed by agent b\n"}),
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+
+        let r = EditTool
+            .execute(
+                json!({"path": "f.txt", "oldText": "hello", "newText": "pwned"}),
+                &ctx_a,
+            )
+            .await;
+        match r {
+            Err(ToolError::Execution(msg)) => {
+                assert!(
+                    msg.contains("file changed since you read it — re-read first"),
+                    "got {msg:?}"
+                );
+            }
+            other => panic!("expected stale-read refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "changed by agent b\n",
+            "the refused edit must not have touched the file"
+        );
+
+        // After A re-reads, the edit succeeds.
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx_a)
+            .await
+            .unwrap();
+        let r2 = EditTool
+            .execute(
+                json!({"path": "f.txt", "oldText": "changed by agent b", "newText": "now agent a"}),
+                &ctx_a,
+            )
+            .await;
+        assert!(r2.is_ok(), "edit after re-read must succeed: {r2:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "now agent a\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent's own successive edits to a file it read are not
+    /// refused — each edit's post-write update keeps the tracker's
+    /// fingerprint current for the next one.
+    #[tokio::test]
+    async fn successive_own_edits_are_not_refused() {
+        let dir = tmp();
+        std::fs::write(dir.join("f.txt"), "one two three\n").unwrap();
+        let ctx = ToolContext::new(dir.clone());
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx)
+            .await
+            .unwrap();
+
+        let r1 = EditTool
+            .execute(
+                json!({"path": "f.txt", "oldText": "one", "newText": "ONE"}),
+                &ctx,
+            )
+            .await;
+        assert!(r1.is_ok());
+
+        let r2 = EditTool
+            .execute(
+                json!({"path": "f.txt", "oldText": "two", "newText": "TWO"}),
+                &ctx,
+            )
+            .await;
+        assert!(r2.is_ok(), "second own edit must not be refused: {r2:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
