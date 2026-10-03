@@ -221,13 +221,14 @@ pub async fn run_print_mode(
         let api_kind_captured = api_kind;
         let cfg_provider_captured = cfg_provider.clone();
         let base_url_captured = base_url.to_string();
+        let api_key_captured = api_key.to_string();
         let inline_think_tags_captured = inline_think_tags;
         let provider_factory: Arc<dyn Fn(&str) -> Box<dyn crate::agent::loop_::Provider> + Send + Sync> =
             Arc::new(move |m: &str| {
                 crate::provider::build(
                     api_kind_captured,
                     &base_url_captured,
-                    "",
+                    &api_key_captured,
                     m,
                     Some(crate::vendor::pick_vendor(
                         cfg_provider_captured.as_deref(),
