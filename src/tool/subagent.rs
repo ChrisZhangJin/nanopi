@@ -30,6 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -41,6 +42,7 @@ use tokio::sync::Semaphore;
 use crate::agent::agents::{discover_agents, AgentConfig, AgentScope, AgentSource};
 use crate::agent::context::ToolSpec;
 use crate::mode::print::JsonEnvelope;
+use crate::subagent_registry::ChildGuard;
 use crate::tool::{ExecutionMode, Tool, ToolContext, ToolError, ToolOutput};
 
 pub struct SubagentTool;
@@ -82,9 +84,7 @@ fn select_mode(args: &Value) -> Result<Mode, String> {
         (true, false, false) => Ok(Mode::Single),
         (false, true, false) => Ok(Mode::Parallel),
         (false, false, true) => Ok(Mode::Chain),
-        (false, false, false) => {
-            Err("provide exactly one of `task`, `tasks`, or `chain`".into())
-        }
+        (false, false, false) => Err("provide exactly one of `task`, `tasks`, or `chain`".into()),
         _ => Err("provide exactly one of `task`, `tasks`, or `chain` (got more than one)".into()),
     }
 }
@@ -405,7 +405,12 @@ fn resolve_agent(
     run_cwd: &Path,
 ) -> Result<AgentConfig, ToolOutput> {
     let discovery = discover_agents(run_cwd, scope);
-    let Some(agent) = discovery.agents.iter().find(|a| a.name == agent_name).cloned() else {
+    let Some(agent) = discovery
+        .agents
+        .iter()
+        .find(|a| a.name == agent_name)
+        .cloned()
+    else {
         let available = if discovery.agents.is_empty() {
             "none".to_string()
         } else {
@@ -506,9 +511,10 @@ async fn run_single(
     let prompt_file = if agent.system_prompt.trim().is_empty() {
         None
     } else {
-        Some(write_prompt_tempfile(&agent.name, &agent.system_prompt).map_err(|e| {
-            ToolError::Execution(format!("failed to stage system prompt: {e}"))
-        })?)
+        Some(
+            write_prompt_tempfile(&agent.name, &agent.system_prompt)
+                .map_err(|e| ToolError::Execution(format!("failed to stage system prompt: {e}")))?,
+        )
     };
 
     let mut command = Command::new(nanopi_invocation());
@@ -516,15 +522,8 @@ async fn run_single(
         .arg("-p")
         .arg("--output")
         .arg("json")
-        // Ephemeral: a subagent is a throwaway context window, so it must
-        // not pollute `~/.nanopi/sessions/` or steal the cwd's active
-        // session pointer.
         .arg("--no-session")
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .current_dir(cwd);
 
     if let Some(model) = &agent.model {
         command.arg("--model").arg(model);
@@ -542,7 +541,7 @@ async fn run_single(
     // Keep the child on this future's stack: a drop (parent cancelled)
     // propagates through kill_on_drop → SIGKILL, the same discipline
     // `bash` uses so Esc kills a long subagent immediately.
-    let result = spawn_and_collect(command).await;
+    let result = Ok(spawn_and_collect(command, Duration::from_secs(1800)).await);
 
     if let Some(path) = prompt_file {
         let _ = std::fs::remove_file(path);
@@ -551,77 +550,248 @@ async fn run_single(
     result
 }
 
-async fn spawn_and_collect(mut command: Command) -> Result<ToolOutput, ToolError> {
-    let mut child = command
-        .spawn()
-        .map_err(|e| ToolError::Execution(format!("failed to spawn subagent: {e}")))?;
+/// Max bytes of child stdout retained (T-01-11). A larger envelope is
+/// treated as unparseable rather than buffered without bound.
+const STDOUT_CAP: usize = 8 * 1024 * 1024;
+/// Max bytes of child stderr retained — the *tail* is kept.
+const STDERR_TAIL: usize = 64 * 1024;
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ToolError::Execution("subagent stdout not captured".into()))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ToolError::Execution("subagent stderr not captured".into()))?;
+/// The executable (plus leading args) used to launch a child. Defaults
+/// to the running binary; tests substitute `sh -c ...`.
+#[derive(Debug, Clone)]
+pub struct ChildProgram {
+    pub program: PathBuf,
+    pub leading_args: Vec<String>,
+}
+
+impl Default for ChildProgram {
+    fn default() -> Self {
+        Self {
+            program: nanopi_invocation(),
+            leading_args: Vec::new(),
+        }
+    }
+}
+
+impl ChildProgram {
+    pub fn command(&self) -> Command {
+        let mut c = Command::new(&self.program);
+        c.args(&self.leading_args);
+        c
+    }
+}
+
+/// Human name for a common signal number.
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+/// In-band failure result: never an `Err`, so one child's fault cannot
+/// abort the parent turn or its siblings.
+fn failed_output(reason: &str, stderr_tail: &str) -> ToolOutput {
+    let tail = stderr_tail.trim();
+    let content = if tail.is_empty() {
+        format!("Subagent failed: {reason}")
+    } else {
+        format!("Subagent failed: {reason}\n--- stderr (tail) ---\n{tail}")
+    };
+    ToolOutput {
+        content,
+        is_error: true,
+        metadata: Some(json!({
+            "status": "failed",
+            "error": reason,
+            "stderr_tail": tail,
+        })),
+        images: Vec::new(),
+    }
+}
+
+/// Read `r` to EOF keeping at most `cap` bytes (head). Returns whether
+/// anything was dropped.
+async fn drain_head<R: tokio::io::AsyncRead + Unpin>(r: R, buf: &mut Vec<u8>, cap: usize) -> bool {
+    let mut r = BufReader::new(r);
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => return truncated,
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                if n > room {
+                    truncated = true;
+                }
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
+}
+
+/// Read `r` to EOF keeping only the last `cap` bytes.
+async fn drain_tail<R: tokio::io::AsyncRead + Unpin>(r: R, buf: &mut Vec<u8>, cap: usize) {
+    let mut r = BufReader::new(r);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > cap {
+                    let excess = buf.len() - cap;
+                    buf.drain(..excess);
+                }
+            }
+        }
+    }
+}
+
+/// Spawn a child and collect its `-p --output json` envelope. Every
+/// fault (spawn error, non-zero exit, signal, timeout, garbage stdout)
+/// maps to an in-band `failed_output`; this never returns `Err`.
+pub async fn spawn_and_collect(command: Command, timeout: Duration) -> ToolOutput {
+    spawn_and_collect_with(command, timeout, |_| {}).await
+}
+
+/// [`spawn_and_collect`] with a hook invoked with the child pid right
+/// after spawn (used to record it in the registry).
+async fn spawn_and_collect_with(
+    mut command: Command,
+    timeout: Duration,
+    on_pid: impl FnOnce(u32),
+) -> ToolOutput {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // RT-03: own process group, so a terminal SIGINT aimed at the parent's
+    // foreground group does not reach the child, and the guard can kill
+    // the child together with anything it backgrounded.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return failed_output(&format!("failed to spawn subagent: {e}"), ""),
+    };
+    let pid = child.id();
+    // Kills the whole group if this future is dropped (cancel) or times out.
+    let guard = ChildGuard::new(pid);
+    if let Some(pid) = pid {
+        on_pid(pid);
+    }
+
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return failed_output("subagent stdio not captured", "");
+    };
 
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
-    let read_and_wait = async {
-        let drain_out = async {
-            let mut r = BufReader::new(&mut stdout);
-            let _ = r.read_to_end(&mut out_buf).await;
-        };
-        let drain_err = async {
-            let mut r = BufReader::new(&mut stderr);
-            let _ = r.read_to_end(&mut err_buf).await;
-        };
-        let (_, _, status) = tokio::join!(drain_out, drain_err, child.wait());
+    let mut out_truncated = false;
+    let waited = tokio::time::timeout(timeout, async {
+        let (t, _, status) = tokio::join!(
+            drain_head(stdout, &mut out_buf, STDOUT_CAP),
+            drain_tail(stderr, &mut err_buf, STDERR_TAIL),
+            child.wait()
+        );
+        out_truncated = t;
         status
-    };
-    let status = read_and_wait
-        .await
-        .map_err(|e| ToolError::Execution(format!("waiting for subagent: {e}")))?;
+    })
+    .await;
 
-    let stdout_str = String::from_utf8_lossy(&out_buf);
-    let stderr_str = String::from_utf8_lossy(&err_buf);
+    let stderr_tail = String::from_utf8_lossy(&err_buf).to_string();
+    let status = match waited {
+        Err(_) => {
+            drop(guard); // SIGKILL the group
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return failed_output(
+                &format!("timed out after {}s", timeout.as_secs_f64()),
+                &stderr_tail,
+            );
+        }
+        Ok(Err(e)) => return failed_output(&format!("waiting for subagent: {e}"), &stderr_tail),
+        Ok(Ok(s)) => s,
+    };
+    // Reaped normally; still sweep the group for stray grandchildren.
+    drop(guard);
 
     if !status.success() {
-        let detail = if !stderr_str.trim().is_empty() {
-            stderr_str.trim().to_string()
-        } else if !stdout_str.trim().is_empty() {
-            stdout_str.trim().to_string()
-        } else {
-            "(no output)".to_string()
-        };
-        return Ok(ToolOutput {
-            content: format!("Subagent exited with an error: {detail}"),
-            is_error: true,
-            metadata: None,
-            images: Vec::new(),
-        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                return failed_output(
+                    &format!("killed by signal {sig} ({})", signal_name(sig)),
+                    &stderr_tail,
+                );
+            }
+        }
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        return failed_output(&format!("exit code {code}"), &stderr_tail);
+    }
+    if out_truncated {
+        return failed_output("unparseable output (stdout exceeded 8 MiB)", &stderr_tail);
     }
 
-    let env: JsonEnvelope = serde_json::from_str(stdout_str.trim()).map_err(|e| {
-        ToolError::Execution(format!(
-            "subagent produced unparseable output: {e}\n---stdout---\n{}\n---stderr---\n{}",
-            stdout_str.trim(),
-            stderr_str.trim()
-        ))
-    })?;
+    let stdout_str = String::from_utf8_lossy(&out_buf);
+    let env: JsonEnvelope = match serde_json::from_str(stdout_str.trim()) {
+        Ok(e) => e,
+        Err(e) => return failed_output(&format!("unparseable output: {e}"), &stderr_tail),
+    };
+    envelope_output(env, &stderr_tail)
+}
 
+/// Map a parsed child envelope to the tool result.
+fn envelope_output(env: JsonEnvelope, stderr_tail: &str) -> ToolOutput {
+    let status = match env.status.as_deref() {
+        Some(s) => s.to_string(),
+        None if env.finish_reason == "error" => "failed".into(),
+        None => "completed".into(),
+    };
+    if status == "failed" {
+        let reason = env
+            .error
+            .clone()
+            .unwrap_or_else(|| "child reported failure".into());
+        let mut out = failed_output(&reason, stderr_tail);
+        if let Some(m) = out.metadata.as_mut() {
+            m["agent_id"] = json!(env.agent_id);
+            m["report_path"] = json!(env.report_path);
+        }
+        return out;
+    }
     let text = final_assistant_text(&env);
-    let content = if text.trim().is_empty() {
+    let mut content = if text.trim().is_empty() {
         "(subagent produced no output)".to_string()
     } else {
         text
     };
-    let is_error = env.finish_reason == "error";
-
-    Ok(ToolOutput {
+    if status == "limit_reached" {
+        let limit = env.limit.clone().unwrap_or_else(|| "limit".into());
+        content = format!("[subagent stopped: {limit} reached]\n\n{content}");
+    }
+    ToolOutput {
         content,
-        is_error,
+        is_error: false,
         metadata: Some(json!({
+            "status": status,
+            "limit": env.limit,
+            "agent_id": env.agent_id,
+            "report_path": env.report_path,
             "session_id": env.session_id,
             "model": env.model,
             "finish_reason": env.finish_reason,
@@ -629,17 +799,26 @@ async fn spawn_and_collect(mut command: Command) -> Result<ToolOutput, ToolError
             "usage": env.usage,
         })),
         images: Vec::new(),
-    })
+    }
 }
 
 /// Write `prompt` to a private temp file and return its path.
 fn write_prompt_tempfile(agent_name: &str, prompt: &str) -> std::io::Result<PathBuf> {
     let safe: String = agent_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let mut path = std::env::temp_dir();
-    path.push(format!("nanopi-subagent-{safe}-{}.md", crate::util::uuid::v7()));
+    path.push(format!(
+        "nanopi-subagent-{safe}-{}.md",
+        crate::util::uuid::v7()
+    ));
     std::fs::write(&path, prompt)?;
     #[cfg(unix)]
     {
@@ -767,7 +946,10 @@ mod tests {
     fn format_parallel_aggregates_and_flags_errors() {
         let results = vec![
             ("scout".to_string(), ok_output("found it")),
-            ("lint".to_string(), soft_error("Unknown agent \"lint\".".to_string())),
+            (
+                "lint".to_string(),
+                soft_error("Unknown agent \"lint\".".to_string()),
+            ),
         ];
         let out = format_parallel(&results);
         assert!(out.is_error, "any failing task marks the batch errored");
@@ -866,6 +1048,171 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("Unknown agent"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Task 1: failure isolation (unix) ──
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(script);
+        c
+    }
+
+    #[cfg(unix)]
+    fn pid_dead(pid: i32) -> bool {
+        // Zombies count as dead (container PID 1 may not reap).
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(s) => s
+                .rsplit(')')
+                .next()
+                .map(|r| r.trim_start().starts_with('Z'))
+                .unwrap_or(false),
+        }
+    }
+
+    #[cfg(unix)]
+    fn status_of(out: &ToolOutput) -> String {
+        out.metadata.as_ref().unwrap()["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_nonzero_exit_is_in_band() {
+        let out = spawn_and_collect(sh("echo boom >&2; exit 3"), Duration::from_secs(10)).await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(out.content.contains("exit code 3"), "{}", out.content);
+        assert!(out.content.contains("boom"), "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_signal_names_sigkill() {
+        let out = spawn_and_collect(sh("kill -9 $$"), Duration::from_secs(10)).await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(
+            out.content.contains("SIGKILL") && out.content.contains("signal 9"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_garbage_stdout_is_unparseable() {
+        let out = spawn_and_collect(sh("echo not json"), Duration::from_secs(10)).await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(
+            out.content.contains("unparseable output"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_timeout_kills_group() {
+        let dir = std::env::temp_dir().join(format!("nanopi-sa-to-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", f.display());
+        let out = spawn_and_collect(sh(&script), Duration::from_secs(1)).await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(out.content.contains("timed out"), "{}", out.content);
+        let pid: i32 = std::fs::read_to_string(&f).unwrap().trim().parse().unwrap();
+        let mut dead = false;
+        for _ in 0..50 {
+            if pid_dead(pid) {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(dead, "grandchild {pid} survived timeout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_spawn_error_is_in_band() {
+        let out = spawn_and_collect(
+            Command::new("/definitely/not/a/program-xyz"),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(out.content.contains("failed to spawn"), "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_stderr_tail_is_capped() {
+        // ~200 KiB of stderr, then a distinctive last line.
+        let script = "i=0; while [ $i -lt 2000 ]; do printf '%0100d\\n' 0 >&2; i=$((i+1)); done; echo LAST-LINE >&2; exit 1";
+        let out = spawn_and_collect(sh(script), Duration::from_secs(20)).await;
+        let tail = out.metadata.as_ref().unwrap()["stderr_tail"]
+            .as_str()
+            .unwrap();
+        assert!(tail.len() <= STDERR_TAIL, "tail {} bytes", tail.len());
+        assert!(tail.ends_with("LAST-LINE"), "keeps the tail");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_envelope_statuses_map() {
+        let ok = r#"{"session_id":"s","model":"m","finish_reason":"stop","duration_ms":1,"usage":{},"messages":[{"role":"assistant","content":"hi"}],"status":"limit_reached","limit":"max_turns"}"#;
+        let out = spawn_and_collect(sh(&format!("echo '{ok}'")), Duration::from_secs(5)).await;
+        assert!(!out.is_error);
+        assert_eq!(status_of(&out), "limit_reached");
+        assert!(out.content.contains("max_turns"));
+        let bad = r#"{"session_id":"s","model":"m","finish_reason":"error","duration_ms":1,"usage":{},"messages":[],"status":"failed","error":"provider down"}"#;
+        let out = spawn_and_collect(sh(&format!("echo '{bad}'")), Duration::from_secs(5)).await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(out.content.contains("provider down"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_on_cancel_kills_backgrounded_grandchild() {
+        let dir = std::env::temp_dir().join(format!("nanopi-sa-kc-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("pid");
+        let script = format!("sleep 300 & echo $! > {}; wait", f.display());
+        let handle = tokio::spawn(spawn_and_collect(sh(&script), Duration::from_secs(600)));
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&f) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    pid = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("pidfile appeared");
+        assert!(!pid_dead(pid));
+        handle.abort();
+        let _ = handle.await;
+        let mut dead = false;
+        for _ in 0..50 {
+            if pid_dead(pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(dead, "grandchild {pid} survived cancel");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
