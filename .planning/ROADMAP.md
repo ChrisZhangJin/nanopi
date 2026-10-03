@@ -156,7 +156,15 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
   4. A child gets exactly the tools the dispatch allows, never the subagent/control tools, never prompts; turn limit and token budget end it with a partial report; the global live cap is enforced.
   5. Appending an amendment to a running child's brief is applied at its next turn boundary; before finishing, the child re-reads the brief and its report lists every item as done or not done.
   6. Two agents (two processes) editing the same file: the second edit is refused because the file changed on disk since it was read.
-**Plans**: TBD
+**Plans**: 7 plans
+Plans:
+- [ ] 01-01-PLAN.md — ISO-03 cross-process stale-write guard + atomic writes
+- [ ] 01-02-PLAN.md — loop turn/token limits, hook agent_id, brief text model
+- [ ] 01-03-PLAN.md — SubagentRegistry, caps, process-group ChildGuard, [subagent] config
+- [ ] 01-04-PLAN.md — child `-p` flags, session file, recursion strip, PDEATHSIG, envelope status
+- [ ] 01-05-PLAN.md — parent supervisor: brief, registry, inherited provider, failure mapping
+- [ ] 01-06-PLAN.md — brief watcher amendments, self-check, report.md checklist
+- [ ] 01-07-PLAN.md — exit-path kill_all, docs, end-to-end success-criteria tests
 **Research flags**: needs research — `-p` flags for tools/limits/brief/session, process-group kill, cross-process stale-write guard.
 **Superseded**: the in-process design (2026-10-03) was executed then rolled back (`2bd0343`); its plans are kept under `phases/01-child-process-runtime/superseded-inprocess/`.
 
