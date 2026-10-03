@@ -5,27 +5,38 @@ owner decisions made on 2026-10-03.
 
 ## v1 Requirements (this milestone)
 
-### Runtime (RT) — in-process subagents
+### Runtime (RT) — child-process subagents (owner decision 2026-10-03)
 
-- [ ] **RT-01**: Subagents run as in-process tasks; the child-process
-  runtime (`run_single` / `spawn_and_collect`) is removed.
-- [ ] **RT-02**: Each subagent has its own cancel token. A foreground
-  subagent stops when the user presses Esc on the main turn.
-  Background subagents are not affected by Esc.
-- [ ] **RT-03**: The user can stop all running subagents with one
-  shortcut.
-- [ ] **RT-04**: Each subagent has its own session transcript, and
-  nothing leaks into the parent session.
-- [ ] **RT-05**: Subagents cannot spawn subagents (deny-list). A global
-  cap limits how many subagents are alive at once.
-- [ ] **RT-06**: Each subagent has a turn limit and a token budget, with
-  configurable defaults. When it hits either, it stops and reports
-  partial work.
-- [ ] **RT-07**: When a background subagent needs permission, the
-  request is queued for the user rather than interrupting the main
-  conversation. The subagent waits until the user decides.
-- [ ] **RT-08**: A subagent failure or provider error never takes down
-  the nanopi process. It is reported as a failed agent.
+- [ ] **RT-01**: Each subagent runs as an isolated `nanopi -p` child
+  process. A crash, panic, stack overflow or OOM in a subagent never
+  affects the main nanopi process.
+- [ ] **RT-02**: Every child process is tracked by the orchestrator
+  (id, pid, state) and is killed when it is stopped, when its parent
+  turn is cancelled, or when nanopi exits. No orphaned processes.
+- [ ] **RT-03**: Subagents are controlled only by the orchestrator
+  (main agent) through tools. The user never stops, answers or messages
+  a subagent directly; they talk only to the orchestrator.
+- [ ] **RT-04**: Each subagent has its own session transcript in its
+  agent directory, and nothing leaks into the parent session.
+- [ ] **RT-05**: Subagents cannot spawn subagents (the child is started
+  without the subagent/control tools). A global cap limits how many
+  child processes are alive at once.
+- [ ] **RT-06**: Each subagent has a turn limit and a token budget,
+  passed to the child on its command line, with configurable defaults.
+  When it hits either, it stops and reports partial work.
+- [ ] **RT-07**: Permissions are decided by the orchestrator at dispatch
+  time: the dispatch carries the allowed tool list, and the child runs
+  with exactly those tools. A child never prompts; anything outside the
+  list is denied in-band.
+- [ ] **RT-08**: A child that exits non-zero, crashes, times out or
+  produces unparseable output is reported as a failed agent with its
+  error text; nanopi keeps running.
+- [ ] **RT-09**: The child works from a brief file. While it runs, the
+  orchestrator may only append `## Amendment N` sections to the brief;
+  the child checks the brief between turns and injects new amendments
+  as steering messages. Before finishing, the child re-reads the brief
+  and checks every requirement and amendment is done (bounded to a few
+  extra turns), then writes its report with a per-item checklist.
 
 ### Dynamic dispatch (DYN)
 
@@ -44,9 +55,10 @@ owner decisions made on 2026-10-03.
 
 - [ ] **CTL-01**: The model can launch a subagent in the background and
   keep working; every agent has an id.
-- [ ] **CTL-02**: The model can amend a running subagent's task. The
-  change is applied between the subagent's turns, never in the middle
-  of a tool call.
+- [ ] **CTL-02**: The model can amend a running subagent's task by
+  appending to its brief file (RT-09). The child picks it up between
+  turns, never in the middle of a tool call. If the child has already
+  finished, the amendment is handled by continuing it (CTL-06).
 - [ ] **CTL-03**: The model can stop a running subagent, and the
   subagent reports its partial work.
 - [ ] **CTL-04**: The model can list subagents with their status.
@@ -55,7 +67,8 @@ owner decisions made on 2026-10-03.
   report starts a new turn; if it is streaming, the report is queued as
   a follow-up.
 - [ ] **CTL-06**: The model can continue a finished subagent with a new
-  message, and the subagent keeps its previous context.
+  message: a new `nanopi -p` is started on the same session, so the
+  subagent keeps its previous context.
 - [ ] **CTL-07**: In print mode (`-p`), nanopi waits for background
   subagents (or stops them) before exiting, so no task is left
   orphaned.
@@ -83,7 +96,8 @@ owner decisions made on 2026-10-03.
 - [ ] **ISO-02**: Worktrees with no changes are removed automatically;
   worktrees with changes are kept and listed.
 - [ ] **ISO-03**: An edit is refused if the file was changed by another
-  agent since this agent read it. This protects agents that share a
+  agent (another process) since this agent read it, based on the file's
+  on-disk mtime and content hash. This protects agents that share a
   working tree.
 
 ### TUI agents strip (UI)
@@ -95,8 +109,9 @@ owner decisions made on 2026-10-03.
 - [ ] **UI-02**: The user can expand and collapse the strip with a
   shortcut (default **Ctrl+G**, if it is free in `keys.rs`). The
   expanded view shows each agent's latest activity and its report path.
-- [ ] **UI-03**: Pending permission requests are shown in the strip,
-  and the user can approve or deny them there.
+- [ ] **UI-03**: The strip is display-only. It has no stop, approve or
+  message actions; subagents are controlled through the orchestrator
+  (RT-03).
 - [ ] **UI-04**: The strip is redrawn from a registry snapshot on the
   TUI tick, not once per event.
 
@@ -118,8 +133,8 @@ owner decisions made on 2026-10-03.
 
 ### Quality (QA)
 
-- [ ] **QA-01**: Each new control (amend, stop, stop-all, expand,
-  approve, toggle, clean) has a row in the manual end-to-end test plan.
+- [ ] **QA-01**: Each new control (amend, stop, continue, expand,
+  toggle, clean) has a row in the manual end-to-end test plan.
 - [ ] **QA-02**: The release binary grows by no more than about
   150 KB, and no new crates are added unless justified.
 
@@ -153,6 +168,7 @@ owner decisions made on 2026-10-03.
 | RT-06 | Phase 1 | Pending |
 | RT-07 | Phase 1 | Pending |
 | RT-08 | Phase 1 | Pending |
+| RT-09 | Phase 1 | Pending |
 | ISO-03 | Phase 1 | Pending |
 | ARC-01 | Phase 2 | Pending |
 | ARC-02 | Phase 2 | Pending |

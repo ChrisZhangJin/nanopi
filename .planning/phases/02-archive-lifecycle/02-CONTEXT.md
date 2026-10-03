@@ -93,3 +93,9 @@ a run. Keep them readable, not machine dumps.
   temp-file-then-rename pattern.
 
 </code_context>
+
+
+## Revision 2026-10-03 (supersedes conflicting decisions above)
+
+Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Subagents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
+- brief.md is the amendment channel: the orchestrator appends `## Amendment N`; the child reads it between turns and self-checks it before writing report.md (P1 D-09..D-11). report.md carries a per-item checklist.

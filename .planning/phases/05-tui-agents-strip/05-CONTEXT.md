@@ -108,3 +108,9 @@ Lessons from v0.12: keybindings and controls must be reachable, so
 every new key needs a manual end-to-end test row (QA-01).
 
 </code_context>
+
+
+## Revision 2026-10-03 (supersedes conflicting decisions above)
+
+Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Subagents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
+- The strip is display-only (UI-03 revised): no approve/deny, stop or message actions. Subagents never prompt; permissions are decided by the orchestrator at dispatch.

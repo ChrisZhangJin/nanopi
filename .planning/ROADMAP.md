@@ -131,40 +131,34 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 
 | Phase | Name | Goal | Requirements | Depends on |
 |-------|------|------|--------------|------------|
-| 1 | In-process runtime | Subagents run as safe in-process tasks | RT-01..RT-08, ISO-03 | — |
+| 1 | Child-process runtime | Subagents run as isolated `nanopi -p` processes driven by a brief file | RT-01..RT-09, ISO-03 | — |
 | 2 | Archive & lifecycle | Every subagent leaves a durable `.md` trail | ARC-01..ARC-05 | 1 |
 | 3 | Dynamic subagents | The model dispatches by describing the task | DYN-01..DYN-05 | 1, 2 |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
-| 5 | TUI agents strip | The user can watch and approve agents at a glance | UI-01..UI-04 | 4 |
+| 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
 
-- [ ] **Phase 1: In-process runtime** - replace child-process subagents with in-process tasks, cancel tree, caps, isolation of sessions
+- [ ] **Phase 1: Child-process runtime** - isolated `nanopi -p` children, process tracking/kill, caps, brief-file amendments and final self-check
 - [ ] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup
 - [ ] **Phase 3: Dynamic subagents** - optional agent name, inline role/tools/model, capped report
 - [ ] **Phase 4: Background launch & control** - background ids, amend/stop/list/continue, report injection, print-mode drain, worktrees
-- [ ] **Phase 5: TUI agents strip** - collapsible bottom strip with states and approvals
+- [ ] **Phase 5: TUI agents strip** - collapsible, display-only bottom strip with states
 - [ ] **Phase 6: Orchestrator mode** - `/orchestrator` toggle, restricted tools, coordinator prompt, release gates
 
-### Phase 1: In-process runtime
-**Goal**: Subagents run in-process, are stoppable, bounded, and can never crash nanopi or leak into the parent session.
+### Phase 1: Child-process runtime
+**Goal**: Subagents run as isolated `nanopi -p` child processes, controlled only by the orchestrator, driven by a brief file that can be amended mid-run, and can never crash nanopi or leak into the parent session.
 **Depends on**: Nothing (first phase)
-**Requirements**: RT-01, RT-02, RT-03, RT-04, RT-05, RT-06, RT-07, RT-08, ISO-03
+**Requirements**: RT-01, RT-02, RT-03, RT-04, RT-05, RT-06, RT-07, RT-08, RT-09, ISO-03
 **Success Criteria** (what must be TRUE):
-  1. A single / parallel / chain `subagent` call completes with no child `nanopi` process spawned, and the old `run_single` / `spawn_and_collect` code is gone.
-  2. Pressing Esc during a foreground subagent stops it promptly with no orphaned task; one shortcut stops all running subagents.
-  3. Each subagent writes its own session transcript; the parent session file contains only the tool call and its result.
-  4. A subagent that hits its turn limit, token budget, provider error, or tries to spawn a subagent ends as a reported failure/partial result while nanopi keeps running; the global live-agent cap is enforced.
-  5. Two agents editing the same file: the second edit is refused because the file changed since it was read; a permission request from a subagent is queued and the subagent waits for a decision.
-**Plans**: 6 plans
-Plans:
-- [ ] 01-01-PLAN.md — [subagent] config, SubagentRegistry + PermissionBroker, FileStateTracker, widened ToolContext
-- [ ] 01-02-PLAN.md — ISO-03 stale-write guard in read/write/edit
-- [ ] 01-03-PLAN.md — agent loop limits/stop reason, hook agent_id + ask, subagent deny-list
-- [ ] 01-04-PLAN.md — in-process subagent dispatcher (old runtime removed) + panic audit
-- [ ] 01-05-PLAN.md — TUI/print wiring: Ctrl+X stop-all, inline permission prompt, -p deny
-- [ ] 01-06-PLAN.md — end-to-end success-criteria tests + human check
-**Research flags**: needs research — WASM extensions shared across agents, `panic = "abort"` audit, file-state design, shared 429 backoff.
-**Interim (owner decision 2026-10-03)**: until Phase 5 ships the strip approval surface (UI-03), queued subagent permission requests are answered through a simple inline confirmation prompt in the TUI, labelled with the requesting agent's id. Phase 5 replaces it.
+  1. A single / parallel / chain `subagent` call runs each agent as a `nanopi -p` child; a child that panics or is killed is reported as failed and the main process keeps running (tested with a release build).
+  2. Stopping an agent, cancelling the parent turn, or exiting nanopi kills its children; no orphan `nanopi` processes remain.
+  3. Each child writes its own transcript in its agent directory; the parent session contains only the tool call and its result.
+  4. A child gets exactly the tools the dispatch allows, never the subagent/control tools, never prompts; turn limit and token budget end it with a partial report; the global live cap is enforced.
+  5. Appending an amendment to a running child's brief is applied at its next turn boundary; before finishing, the child re-reads the brief and its report lists every item as done or not done.
+  6. Two agents (two processes) editing the same file: the second edit is refused because the file changed on disk since it was read.
+**Plans**: TBD
+**Research flags**: needs research — `-p` flags for tools/limits/brief/session, process-group kill, cross-process stale-write guard.
+**Superseded**: the in-process design (2026-10-03) was executed then rolled back (`2bd0343`); its plans are kept under `phases/01-child-process-runtime/superseded-inprocess/`.
 
 ### Phase 2: Archive & lifecycle
 **Goal**: Every subagent leaves an inspectable, loss-proof `.md` trail with a clear lifecycle state.
@@ -197,21 +191,21 @@ Plans:
 **Requirements**: CTL-01, CTL-02, CTL-03, CTL-04, CTL-05, CTL-06, CTL-07, ISO-01, ISO-02
 **Success Criteria** (what must be TRUE):
   1. The model launches a background agent, gets its id immediately and keeps working; `list_agents` shows its status.
-  2. Amending a running agent takes effect at its next turn boundary (never mid tool call); stopping it yields a partial report.
-  3. A finished background report starts a new main turn when idle, or is queued as a follow-up while streaming; a finished agent can be continued with its prior context.
+  2. Amending a running agent appends to its brief and takes effect at its next turn boundary (never mid tool call); stopping it yields a partial report.
+  3. A finished background report starts a new main turn when idle, or is queued as a follow-up while streaming; a finished agent can be continued by a new `-p` on its session.
   4. In `-p` mode, nanopi waits for (or stops) background agents before exiting — no orphans.
   5. A writer dispatched with worktree isolation reports its worktree path and branch; unchanged worktrees are removed, changed ones kept and listed.
 **Plans**: TBD
 **Research flags**: needs research — report injection path and print-mode exit.
 
 ### Phase 5: TUI agents strip
-**Goal**: The user can see every subagent's state at a glance and handle their permission requests without leaving the conversation.
+**Goal**: The user can see every subagent's state at a glance without leaving the conversation (display-only).
 **Depends on**: Phase 4
 **Requirements**: UI-01, UI-02, UI-03, UI-04
 **Success Criteria** (what must be TRUE):
   1. With subagents present, a 1–3 line strip above the input shows id, role, short task, state and elapsed time; it disappears when none exist.
   2. Ctrl+G (or the chosen free key) expands/collapses the strip; the expanded view shows latest activity and report path.
-  3. A pending permission request appears in the strip and can be approved or denied there, unblocking the waiting agent.
+  3. The strip is display-only: no approve/stop/message actions (control goes through the orchestrator).
   4. The strip updates on the TUI tick from a registry snapshot, with no flicker or redraw storm under many agent events.
 **Plans**: TBD
 **UI hint**: yes
@@ -226,7 +220,7 @@ Plans:
   2. In orchestrator mode the main agent has only read/grep/glob plus dispatch/amend/stop/list/continue; write, edit and bash are absent (tested).
   3. Given a multi-part task, the orchestrator splits it, dispatches subagents, and presents a synthesised summary of their reports.
   4. With the mode off, prompts and tool specs are byte-identical to v0.12 (tested).
-  5. The manual E2E plan has rows for amend, stop, stop-all, expand, approve, toggle and clean; the release binary grew by no more than ~150 KB with no unjustified new crates.
+  5. The manual E2E plan has rows for amend, stop, expand, toggle and clean; the release binary grew by no more than ~150 KB with no unjustified new crates.
 **Plans**: TBD
 **UI hint**: yes
 **Research flags**: needs research — orchestrator prompt and cost evaluation.
