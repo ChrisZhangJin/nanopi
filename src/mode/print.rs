@@ -319,9 +319,33 @@ pub async fn run_print_mode(
         Some(p) => match std::fs::read_to_string(p) {
             Ok(b) if message.trim().is_empty() => b,
             Ok(b) => format!("{b}\n\n{message}"),
+            // WR-01: an unreadable brief is fatal — never run an empty task.
             Err(e) => {
-                eprintln!("nanopi: cannot read brief {}: {e}", p.display());
-                message.to_string()
+                let reason = format!("cannot read brief {}: {e}", p.display());
+                agent.fire_session_shutdown("quit").await;
+                if output == OutputFormat::Json {
+                    let envelope = JsonEnvelope {
+                        session_id: header.id.clone(),
+                        model: model.to_string(),
+                        finish_reason: "error".into(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        usage: json!({}),
+                        messages: Vec::new(),
+                        status: Some("failed".into()),
+                        agent_id: child.agent_id.clone(),
+                        error: Some(reason),
+                        ..Default::default()
+                    };
+                    println!("{}", serde_json::to_string(&envelope)?);
+                    if no_session {
+                        let _ = std::fs::remove_file(&session_path);
+                    }
+                    return Ok(1);
+                }
+                if no_session {
+                    let _ = std::fs::remove_file(&session_path);
+                }
+                anyhow::bail!(reason);
             }
         },
         None => message.to_string(),

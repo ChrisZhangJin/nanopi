@@ -1037,6 +1037,7 @@ fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
     ]);
     let dir = fresh_dir("agentallow", port);
     let brief = dir.join("brief.md");
+    std::fs::write(&brief, "# Brief\n\n## Task\n\ngo\n\n<!-- nanopi:amendments -->\n").unwrap();
     let (status, v, stderr) = run_child(
         &dir,
         port,
@@ -1075,6 +1076,21 @@ fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
 }
 
 // ── Brief-driven child (01-06, RT-09) ──
+
+/// WR-01: an unreadable brief must fail the run in-band (JSON mode)
+/// without calling the model on an empty task.
+#[test]
+fn unreadable_brief_fails_without_calling_model() {
+    let (port, log) = spawn_recording_server(vec![vec![delta("content", "x"), finish("stop")]]);
+    let dir = fresh_dir("nobrief", port);
+    let missing = dir.join("agents/a1/missing-brief.md");
+    let (status, v, stderr) = run_child(&dir, port, &["--brief", missing.to_str().unwrap()], &[]);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert_eq!(v["status"], "failed", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("cannot read brief"), "{v}");
+    assert!(log.lock().unwrap().is_empty(), "model must not be called");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 fn write_brief(dir: &std::path::Path, task: &str) -> std::path::PathBuf {
     let p = dir.join("agents/a1/brief.md");
