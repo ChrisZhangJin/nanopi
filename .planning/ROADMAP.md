@@ -15,6 +15,7 @@ nanopi is a tiny Rust port of the Pi coding-agent CLI — a ~4 MB static binary 
 Improve first-time and everyday console UX so nanopi is usable without hand-editing TOML.
 
 **Quick tasks (see STATE.md for the running log):**
+
 - First-run wizard for config bootstrap.
 - (future work — added as it comes up)
 
@@ -26,12 +27,15 @@ comparison that scoped this. All four phases shipped on `v0.11.0`.
 - **P0** ✅ Shell-hook event coverage extended to `before_agent_start`,
   `turn_start`, `turn_end`, `message_end` (`410d12c`). Later joined by
   `session_before_compact` / `session_compact` (`675cd02`).
+
 - **P1** ✅ `post_tool_use` can transform the tool result, not just
   observe it (`a2e3994`) — enables redaction / scrubbing hooks.
+
 - **P2** ✅ WASM plugin system behind `--features wasm`
   (`667bf30`, `d4aff4b`, `82d36d7`). Components declared in
   `[[extensions]]` are compiled, instantiated, and their exported
   tools registered alongside the built-ins.
+
 - **P3** ✅ `steer` / `follow-up` injection (`1767238`), wired to the
   TUI so mid-stream typing steers the running turn (`d45bb42`) and
   queued follow-ups auto-start the next one (`7064b10`).
@@ -40,6 +44,7 @@ Also landed in this milestone:
 
 - `tool_exec_mode` (parallel vs sequential tool execution). Pi has a
   per-tool override too, which is deferred.
+
 - **Capability-gated host functions** — `host-fs-read` (`788705c`,
   read-only, cwd-confined, symlink-aware) and `host-http-get`
   (`83bbe68`…`28c2e75`, gated on `allow_network` then a deny-by-default
@@ -49,10 +54,12 @@ Also landed in this milestone:
   at `src/wasm/loader.rs:447,478`.
   *(This was listed as deferred until 2026-09-01; it had in fact
   shipped on 2026-08-28.)*
+
 - A hardening pass over the whole milestone — ~20 `fix(...)` commits
   covering plugin epoch deadlines, trap isolation, allowlist bypass,
   cwd-guard escapes, cancel-safety of parallel tool batches, and
   session-file corruption on cancel.
+
 - VERSION centralization (`VERSION` + `make bump` + a tag-vs-VERSION
   gate in `release.yml`), per `.planning/PLAN-VERSION.md` — that plan
   is **done**, not pending.
@@ -77,6 +84,7 @@ one shipped in v0.12.0, 2026-09-07**:
   configurability: `bash` now declares itself Sequential, which fixed
   the concurrent-bash data loss that had been sitting `#[ignore]`d as a
   known bug. `[tool_exec_overrides]` takes the speed back.
+
 - ~~**Plugin hot reload.**~~ ✅ `34866aa`…`0a2f10c`. Both prerequisites
   named here were built: `ToolRegistry::unregister_plugin` (keyed on the
   plugin, never a tool name, so removing a built-in is unwritable) and
@@ -84,6 +92,7 @@ one shipped in v0.12.0, 2026-09-07**:
   refused in-band, with different wording depending on whether it had
   already entered the guest — one says the result is discarded, the
   other says side effects already stand.
+
 - ~~Richer session metadata.~~ ✅ `483aec8`, and it was three things:
   **labels were already done** (`/name`); **`ModelChange` was a bug, not
   a feature** — reader, replay, `/export` and a roundtrip test all
@@ -92,6 +101,7 @@ one shipped in v0.12.0, 2026-09-07**:
   *Custom entries deliberately NOT built* — under-specified, and a
   plugin-written entry runs into invariant 15. Needs a decision about
   who writes and who reads.
+
 - **Provider registration from plugins** — still deferred, and moved to
   `docs/BACKLOG.md` with the full argument. Short version: it is a new
   ABI shape (streaming inverts the guest-calls-host flow every one of
@@ -99,6 +109,7 @@ one shipped in v0.12.0, 2026-09-07**:
   and it requires deciding whether a plugin provider is exempt from
   `url_allowlist`. **That last one is a decision for the project owner
   and blocks the other two.**
+
 - Session-management hooks beyond compaction — untouched, no demand yet.
 
 ### M3 · Bugfix Line (v0.10.1) — shipped 2026-09-01
@@ -108,12 +119,14 @@ new is developed there. **Released:** tag `v0.10.1` == `d19d3c2`, also
 fast-forwarded into `main`, four platform assets published.
 
 Contents:
+
 - `fix(config)` — the Windows first run died with `cannot read
   api_key_file ~/.nanopi/api_key`. The wizard now writes an absolute
   `api_key_file`, and `paths::expand_home` is the single expansion
   point shared by `main` and `agent::hook` (falls back to
   `dirs::home_dir()` when `$HOME` is unset, accepts `\`, honors
   `NANOPI_HOME`).
+
 - `fix(vendor)` — MiniMax default base_url → `api.minimaxi.com`.
 - `fix(provider)` — gateway HTML error pages flattened to one line
   (`retry::flatten_error_body`) instead of being shredded by the TUI
@@ -131,7 +144,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 
 | Phase | Name | Goal | Requirements | Depends on |
 |-------|------|------|--------------|------------|
-| 1 | Child-process runtime | Subagents run as isolated `nanopi -p` processes driven by a brief file | RT-01..RT-09, ISO-03 | — |
+| 1 | Child-process runtime | 1/7 | In Progress|  |
 | 2 | Archive & lifecycle | Every subagent leaves a durable `.md` trail | ARC-01..ARC-05 | 1 |
 | 3 | Dynamic subagents | The model dispatches by describing the task | DYN-01..DYN-05 | 1, 2 |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
@@ -146,89 +159,109 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 - [ ] **Phase 6: Orchestrator mode** - `/orchestrator` toggle, restricted tools, coordinator prompt, release gates
 
 ### Phase 1: Child-process runtime
+
 **Goal**: Subagents run as isolated `nanopi -p` child processes, controlled only by the orchestrator, driven by a brief file that can be amended mid-run, and can never crash nanopi or leak into the parent session.
 **Depends on**: Nothing (first phase)
 **Requirements**: RT-01, RT-02, RT-03, RT-04, RT-05, RT-06, RT-07, RT-08, RT-09, ISO-03
 **Success Criteria** (what must be TRUE):
+
   1. A single / parallel / chain `subagent` call runs each agent as a `nanopi -p` child; a child that panics or is killed is reported as failed and the main process keeps running (tested with a release build).
   2. Stopping an agent, cancelling the parent turn, or exiting nanopi kills its children; no orphan `nanopi` processes remain.
   3. Each child writes its own transcript in its agent directory; the parent session contains only the tool call and its result.
   4. A child gets exactly the tools the dispatch allows, never the subagent/control tools, never prompts; turn limit and token budget end it with a partial report; the global live cap is enforced.
   5. Appending an amendment to a running child's brief is applied at its next turn boundary; before finishing, the child re-reads the brief and its report lists every item as done or not done.
   6. Two agents (two processes) editing the same file: the second edit is refused because the file changed on disk since it was read.
+
 **Plans**: 7 plans
 Plans:
-- [ ] 01-01-PLAN.md — ISO-03 cross-process stale-write guard + atomic writes
+
+- [x] 01-01-PLAN.md — ISO-03 cross-process stale-write guard + atomic writes
 - [ ] 01-02-PLAN.md — loop turn/token limits, hook agent_id, brief text model
 - [ ] 01-03-PLAN.md — SubagentRegistry, caps, process-group ChildGuard, [subagent] config
 - [ ] 01-04-PLAN.md — child `-p` flags, session file, recursion strip, PDEATHSIG, envelope status
 - [ ] 01-05-PLAN.md — parent supervisor: brief, registry, inherited provider, failure mapping
 - [ ] 01-06-PLAN.md — brief watcher amendments, self-check, report.md checklist
 - [ ] 01-07-PLAN.md — exit-path kill_all, docs, end-to-end success-criteria tests
+
 **Research flags**: needs research — `-p` flags for tools/limits/brief/session, process-group kill, cross-process stale-write guard.
 **Superseded**: the in-process design (2026-10-03) was executed then rolled back (`2bd0343`); its plans are kept under `phases/01-child-process-runtime/superseded-inprocess/`.
 
 ### Phase 2: Archive & lifecycle
+
 **Goal**: Every subagent leaves an inspectable, loss-proof `.md` trail with a clear lifecycle state.
 **Depends on**: Phase 1
 **Requirements**: ARC-01, ARC-02, ARC-03, ARC-04, ARC-05
 **Success Criteria** (what must be TRUE):
+
   1. Starting a subagent creates `.nanopi/agents/<run>/<id>/brief.md` with task, role, tools and model; amendments are appended to it.
   2. `report.md` exists on disk before the parent sees the result.
   3. `.nanopi/agents/` appears in `.gitignore` and never shows up in agents' grep/glob results.
   4. After killing nanopi mid-run, the next start marks those agents `interrupted` without re-running them.
   5. `/agents clean` keeps the most recent N runs or removes all.
+
 **Plans**: TBD
 **Research flags**: standard patterns.
 
 ### Phase 3: Dynamic subagents
+
 **Goal**: The model can dispatch a subagent just by describing the task, with optional ad-hoc role, tools and model.
 **Depends on**: Phase 1, Phase 2
 **Requirements**: DYN-01, DYN-02, DYN-03, DYN-04, DYN-05
 **Success Criteria** (what must be TRUE):
+
   1. A `subagent` call with only a task runs a general-purpose agent and returns a result.
   2. A call with an inline role prompt, toolset and model runs with exactly those (validated against allowlist/deny-list; disallowed tools rejected with a clear error).
   3. Existing predefined agent files and single / parallel / chain modes behave as in v0.12.
   4. The parent receives a capped summary, never the full child transcript.
+
 **Plans**: TBD
 **Research flags**: standard patterns.
 
 ### Phase 4: Background launch & control
+
 **Goal**: The model can launch agents in the background and amend, stop, list and continue them, with reports delivered back automatically.
 **Depends on**: Phase 3
 **Requirements**: CTL-01, CTL-02, CTL-03, CTL-04, CTL-05, CTL-06, CTL-07, ISO-01, ISO-02
 **Success Criteria** (what must be TRUE):
+
   1. The model launches a background agent, gets its id immediately and keeps working; `list_agents` shows its status.
   2. Amending a running agent appends to its brief and takes effect at its next turn boundary (never mid tool call); stopping it yields a partial report.
   3. A finished background report starts a new main turn when idle, or is queued as a follow-up while streaming; a finished agent can be continued by a new `-p` on its session.
   4. In `-p` mode, nanopi waits for (or stops) background agents before exiting — no orphans.
   5. A writer dispatched with worktree isolation reports its worktree path and branch; unchanged worktrees are removed, changed ones kept and listed.
+
 **Plans**: TBD
 **Research flags**: needs research — report injection path and print-mode exit.
 
 ### Phase 5: TUI agents strip
+
 **Goal**: The user can see every subagent's state at a glance without leaving the conversation (display-only).
 **Depends on**: Phase 4
 **Requirements**: UI-01, UI-02, UI-03, UI-04
 **Success Criteria** (what must be TRUE):
+
   1. With subagents present, a 1–3 line strip above the input shows id, role, short task, state and elapsed time; it disappears when none exist.
   2. Ctrl+G (or the chosen free key) expands/collapses the strip; the expanded view shows latest activity and report path.
   3. The strip is display-only: no approve/stop/message actions (control goes through the orchestrator).
   4. The strip updates on the TUI tick from a registry snapshot, with no flicker or redraw storm under many agent events.
+
 **Plans**: TBD
 **UI hint**: yes
 **Research flags**: standard patterns.
 
 ### Phase 6: Orchestrator mode
+
 **Goal**: The user can opt into an experimental mode where the main agent only plans, delegates, monitors and summarises — and the default flow is untouched.
 **Depends on**: Phase 3, Phase 4, Phase 5
 **Requirements**: ORC-01, ORC-02, ORC-03, ORC-04, ORC-05, QA-01, QA-02
 **Success Criteria** (what must be TRUE):
+
   1. `/orchestrator` (or `experimental.orchestrator`) toggles the mode; it is off by default and the status line shows when it is on.
   2. In orchestrator mode the main agent has only read/grep/glob plus dispatch/amend/stop/list/continue; write, edit and bash are absent (tested).
   3. Given a multi-part task, the orchestrator splits it, dispatches subagents, and presents a synthesised summary of their reports.
   4. With the mode off, prompts and tool specs are byte-identical to v0.12 (tested).
   5. The manual E2E plan has rows for amend, stop, expand, toggle and clean; the release binary grew by no more than ~150 KB with no unjustified new crates.
+
 **Plans**: TBD
 **UI hint**: yes
 **Research flags**: needs research — orchestrator prompt and cost evaluation.
