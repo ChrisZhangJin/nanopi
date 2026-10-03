@@ -221,9 +221,14 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
+            // See the matching comment in `AnthropicProvider::new`: a
+            // TLS backend init failure here does not depend on any
+            // per-request input, so a panic on this subagent-reachable
+            // construction path (D-11/T-01-12) is strictly worse than
+            // falling back to `reqwest::Client::new()`.
             client: crate::net::client_builder()
                 .build()
-                .expect("build reqwest client"),
+                .unwrap_or_else(|_| reqwest::Client::new()),
             vendor: None,
             split_inline_think: true,
         }
