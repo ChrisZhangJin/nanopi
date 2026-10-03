@@ -18,7 +18,7 @@ last_activity: "2026-10-03 — Milestone v0.13.0 started"
 
 Phase: 1 of 6 (In-process runtime) — ready to plan
 Plan: —
-Status: Ready to plan
+Status: Ready to plan — all 6 phases have CONTEXT.md (discussed 2026-10-03)
 Last activity: 2026-10-03 — Roadmap for v0.13.0 created (6 phases, 39/39 requirements mapped)
 
 ---
