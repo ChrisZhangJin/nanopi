@@ -946,6 +946,18 @@ async fn spawn_and_collect_with(
                 );
             }
         }
+        // CR-02: a JSON-mode child that fails prints a `status: failed`
+        // envelope and exits 1. Prefer that envelope (it carries the real
+        // error, agent_id and report_path) over the bare exit code.
+        if !out_truncated {
+            if let Ok(env) =
+                serde_json::from_str::<JsonEnvelope>(String::from_utf8_lossy(&out_buf).trim())
+            {
+                if env.status.as_deref() == Some("failed") {
+                    return envelope_output(env, &stderr_tail);
+                }
+            }
+        }
         let code = status
             .code()
             .map(|c| c.to_string())
@@ -1363,6 +1375,25 @@ mod tests {
         assert!(out.is_error);
         assert_eq!(status_of(&out), "failed");
         assert!(out.content.contains("provider down"));
+    }
+
+    /// CR-02 regression: a real JSON-mode child prints its failed
+    /// envelope and exits 1; the parent must surface the envelope's
+    /// error text rather than a bare "exit code 1".
+    #[tokio::test]
+    async fn failed_envelope_with_exit_1_surfaces_error() {
+        let bad = r#"{"session_id":"s","model":"m","finish_reason":"error","duration_ms":1,"usage":{},"messages":[],"status":"failed","error":"provider down: 503","agent_id":"a1","report_path":"/tmp/x/report.md"}"#;
+        let out = spawn_and_collect(sh(&format!("echo '{bad}'; exit 1")), Duration::from_secs(5)).await;
+        assert!(out.is_error);
+        assert_eq!(status_of(&out), "failed");
+        assert!(out.content.contains("provider down: 503"), "{}", out.content);
+        let m = out.metadata.as_ref().unwrap();
+        assert_eq!(m["agent_id"], "a1");
+        assert_eq!(m["report_path"], "/tmp/x/report.md");
+        // Non-envelope stdout with exit 1 still maps to the exit code.
+        let out = spawn_and_collect(sh("echo garbage; exit 1"), Duration::from_secs(5)).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("exit code 1"), "{}", out.content);
     }
 
     #[cfg(unix)]
