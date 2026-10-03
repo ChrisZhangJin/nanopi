@@ -172,6 +172,7 @@ fn action_toml_key(a: ActionId) -> &'static str {
         ActionId::NewlineInInput => "newline_in_input",
         ActionId::OpenSlashPalette => "open_slash_palette",
         ActionId::OpenSettings => "open_settings",
+        ActionId::StopAllSubagents => "stop_all_subagents",
     }
 }
 
