@@ -1365,6 +1365,15 @@ impl Agent {
                 )?;
                 self.context.push_assistant_text(marker);
                 self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
+                // Mid-stream cancellation (Esc while the HTTP response was
+                // still streaming) reaches this branch the same way the
+                // pre-iteration cancel check above does, but previously
+                // left `stop_reason` untouched — only the pre-check path
+                // set `Cancelled`. A caller that only inspects
+                // `stop_reason` after an `Ok` return (e.g. a subagent
+                // dispatcher mapping it to a `status: "cancelled"` tool
+                // result) would misreport this as a normal completion.
+                self.stop_reason = Some(StopReason::Cancelled);
                 return Ok(final_text);
             }
 
