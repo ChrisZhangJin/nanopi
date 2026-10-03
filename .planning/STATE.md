@@ -1,13 +1,29 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.12.0
-milestone_name: milestone
-status: ready-to-release
-last_updated: "2026-09-08T09:10:00.000Z"
-last_activity: "2026-09-08 — the v0.12 manual test plan was executed end to end: 64/64 rows filled, a new hot-reload chapter written, and release notes rewritten. Six defects found and fixed with teeth (one of them breaks EVERY parallel tool batch); one found and deferred on a decision. 844 lib tests green with --features wasm, 0 ignored, 0 warnings, parallel 3/3. Still not tagged and not pushed — both are the owner's call."
+milestone: v0.13.0
+milestone_name: Orchestrator & Dynamic Subagents
+status: planning
+progress:
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+last_updated: "2026-10-03T00:00:00.000Z"
+last_activity: "2026-10-03 — Milestone v0.13.0 started"
 ---
 
 # Project State
+
+## Current Position
+
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-10-03 — Milestone v0.13.0 started
+
+---
+
+*Everything below is the accumulated context from v0.12.x, kept as-is.*
 
 Last activity: 2026-09-08 — **the manual test plan was actually run.**
 All 64 rows are filled from a live-model session; the plan's
