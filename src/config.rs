@@ -455,6 +455,7 @@ pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
     }
 
     validate_tool_exec_overrides(&merged)?;
+    validate_subagent(&merged)?;
 
     Ok(merged)
 }
@@ -501,6 +502,34 @@ fn validate_tool_exec_overrides(cfg: &Config) -> Result<(), ConfigError> {
                 .join(", "),
             if unknown.len() == 1 { "is" } else { "are" },
             known.join(", ")
+        )),
+    })
+}
+
+/// `[subagent]` caps of 0 would silently disable subagents
+/// (`max_live = 0` refuses every spawn, `timeout_secs = 0` times every
+/// child out at once), so they are refused at load, naming the key (WR-06).
+fn validate_subagent(cfg: &Config) -> Result<(), ConfigError> {
+    let s = &cfg.subagent;
+    let zero: Vec<&str> = [
+        ("max_live", s.max_live == 0),
+        ("max_concurrency", s.max_concurrency == 0),
+        ("max_turns", s.max_turns == 0),
+        ("token_budget", s.token_budget == 0),
+        ("timeout_secs", s.timeout_secs == 0),
+    ]
+    .into_iter()
+    .filter_map(|(k, bad)| bad.then_some(k))
+    .collect();
+    if zero.is_empty() {
+        return Ok(());
+    }
+    let path = global_config_path().unwrap_or_else(|| PathBuf::from("config.toml"));
+    Err(ConfigError::Toml {
+        path,
+        source: toml::de::Error::custom(format!(
+            "[subagent] {} must be at least 1 (0 would disable subagents)",
+            zero.join(", ")
         )),
     })
 }
@@ -1094,5 +1123,15 @@ command = "/bin/true"
         assert_eq!(c.subagent.max_live, 2);
         assert_eq!(c.subagent.max_concurrency, 4);
         assert_eq!(c.subagent.timeout_secs, 1800);
+    }
+
+    #[test]
+    fn subagent_zero_caps_rejected_at_load() {
+        for key in ["max_live", "timeout_secs"] {
+            let tmp = TempDir::new();
+            tmp.write(".nanopi/config.toml", &format!("[subagent]\n{key} = 0\n"));
+            let err = load_config(tmp.path()).unwrap_err().to_string();
+            assert!(err.contains(key), "{err}");
+        }
     }
 }
