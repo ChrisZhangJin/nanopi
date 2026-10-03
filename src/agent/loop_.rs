@@ -183,6 +183,37 @@ pub struct Agent {
     /// running on constrained hardware. The per-turn cost here is one
     /// string concatenation and one lock over a small map.
     pub system_base: Option<String>,
+    /// Subagent identity (`Some("a1")`, ...) or `None` for the main agent
+    /// (D-16). Threaded into `HookInput.agent_id`, `ToolContext.agent_id`,
+    /// and used to gate lifecycle hooks (BeforeAgentStart/TurnStart/
+    /// TurnEnd/MessageEnd skip entirely for subagents; ToolExecutionStart/
+    /// End still fire).
+    pub agent_id: Option<String>,
+    /// Per-agent limits (max_turns/token_budget) — `None` for the main
+    /// agent, which keeps today's unlimited `MAX_ITERATIONS`-bounded
+    /// behaviour (D-08/D-09).
+    pub limits: Option<crate::agent::subagent_registry::AgentLimits>,
+    /// Set at the end of `run_turn` to record why the loop stopped.
+    /// `None` until the first `run_turn` completes.
+    pub stop_reason: Option<StopReason>,
+    /// Shared subagent registry — `standalone()` for the main agent,
+    /// a real shared registry for subagents (so `set_state` /
+    /// `permissions()` reach the same broker/semaphore as siblings).
+    pub subagents: std::sync::Arc<crate::agent::subagent_registry::SubagentRegistry>,
+    /// Shared file-read fingerprint tracker (ISO-03), shared across all
+    /// agents in a run so cross-agent stale-write detection works.
+    pub file_state: std::sync::Arc<crate::tool::file_state::FileStateTracker>,
+}
+
+/// Why `run_turn` stopped iterating. `Completed` is the normal
+/// `break`-driven finish (today's only behaviour for the main agent,
+/// which has `limits: None`); `Cancelled` and `LimitReached` only ever
+/// occur when `limits` is `Some` or the turn's cancel token fires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    Completed,
+    Cancelled,
+    LimitReached { limit: &'static str },
 }
 
 /// Give every replayed tool call a result, synthesizing one where the
@@ -437,6 +468,11 @@ impl Agent {
             // reach the transcript and bake itself into every later
             // `--continue`.
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         })
     }
 
@@ -475,7 +511,8 @@ impl Agent {
                     &arguments,
                     &cwd,
                     Some(&session_id),
-                )
+                None,
+            )
             })
             .await;
     }
@@ -513,7 +550,8 @@ impl Agent {
                     &arguments,
                     &cwd,
                     Some(&session_id),
-                )
+                None,
+            )
             })
             .await;
     }
@@ -567,7 +605,7 @@ impl Agent {
         // ("threshold" or "manual"); `session_id` is the real session
         // id, carried honestly in the payload (v0.12.0 fix — this used
         // to be the reason string, not the actual session id).
-        if self.permission.hooks_active() {
+        if self.permission.hooks_active() && self.agent_id.is_none() {
             let arguments = serde_json::json!({"reason": reason});
             if !self.hooks.session_before_compact.is_empty() {
                 run_session_hooks(
@@ -590,7 +628,8 @@ impl Agent {
                         &arguments,
                         &cwd,
                         Some(&session_id),
-                    )
+                    None,
+                )
                 })
                 .await;
         }
@@ -624,7 +663,7 @@ impl Agent {
         // Fires after compaction completes. `subject` (matcher target)
         // is the compaction reason; `session_id` is the real session
         // id, carried honestly in the payload.
-        if self.permission.hooks_active() {
+        if self.permission.hooks_active() && self.agent_id.is_none() {
             let arguments = serde_json::json!({"reason": reason});
             if !self.hooks.session_compact.is_empty() {
                 run_session_hooks(
@@ -647,7 +686,8 @@ impl Agent {
                         &arguments,
                         &cwd,
                         Some(&session_id),
-                    )
+                    None,
+                )
                 })
                 .await;
         }
@@ -822,7 +862,7 @@ impl Agent {
         // seeding it from here is what makes the two prompt hooks chain
         // — BeforeAgentStart's output is Input's input.
         let mut pre_start_msg: Option<String> = None;
-        if self.permission.hooks_active() {
+        if self.permission.hooks_active() && self.agent_id.is_none() {
             let turn_label = self.turn_count.to_string();
             let arguments = serde_json::json!({
                 "turn_count": self.turn_count,
@@ -844,6 +884,7 @@ impl Agent {
                     arguments.clone(),
                     &self.cwd,
                     Some(&self.session_id.to_string()),
+                self.agent_id.as_deref(),
                 )
                 .await;
                 match outcome {
@@ -875,6 +916,13 @@ impl Agent {
                             }
                         }
                     }
+                    HookOutcome::Ask { .. } => {
+                        // BeforeAgentStart has no permission broker to
+                        // route through (only ToolExecutionStart does,
+                        // per D-13) — treat like Allow, same as
+                        // `report_advisory_outcome` does for the purely
+                        // advisory lifecycle events.
+                    }
                 }
             }
             let session_id = self.session_id.to_string();
@@ -887,6 +935,7 @@ impl Agent {
                         &arguments,
                         &cwd,
                         Some(&session_id),
+                    self.agent_id.as_deref(),
                     )
                 })
                 .await;
@@ -933,6 +982,7 @@ impl Agent {
                     arguments.clone(),
                     &self.cwd,
                     Some(&self.session_id.to_string()),
+                    self.agent_id.as_deref(),
                 )
                 .await;
                 match outcome {
@@ -955,6 +1005,10 @@ impl Agent {
                             }
                         }
                     }
+                    HookOutcome::Ask { .. } => {
+                        // Same reasoning as the BeforeAgentStart site
+                        // above — no broker here, treated like Allow.
+                    }
                 }
             }
             let session_id = self.session_id.to_string();
@@ -967,6 +1021,7 @@ impl Agent {
                         &arguments,
                         &cwd,
                         Some(&session_id),
+                    self.agent_id.as_deref(),
                     )
                 })
                 .await;
@@ -1080,13 +1135,46 @@ impl Agent {
         let mut steer_rx = steer_rx;
         let mut follow_up_queue: Vec<String> = Vec::new();
 
-        for iteration_idx in 0..MAX_ITERATIONS {
+        // D-16: reset at the start of every `run_turn` so a stale
+        // reason from a previous turn (or the previous call entirely)
+        // never leaks into this one.
+        self.stop_reason = None;
+        // D-08/D-09: the main agent (limits: None) keeps today's fixed
+        // MAX_ITERATIONS cap unchanged; a subagent's `max_turns` governs
+        // its own loop instead.
+        let iteration_cap = self
+            .limits
+            .as_ref()
+            .map(|l| l.max_turns)
+            .unwrap_or(MAX_ITERATIONS);
+
+        for iteration_idx in 0..iteration_cap {
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
                 if ct.is_cancelled() {
+                    self.stop_reason = Some(StopReason::Cancelled);
                     self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
                     return Ok(final_text);
+                }
+            }
+
+            // D-08/D-09: per-agent token budget, checked every
+            // iteration (not just once) so a long-running subagent is
+            // caught mid-turn rather than only at the loop's own
+            // boundary. `0` means "no budget" (unlimited), matching
+            // `AgentLimits`'s zero-clamp convention elsewhere.
+            if let Some(limits) = self.limits.as_ref() {
+                if limits.token_budget > 0 {
+                    let spent = u64::from(self.usage_total.input_tokens)
+                        + u64::from(self.usage_total.output_tokens);
+                    if spent >= limits.token_budget {
+                        self.stop_reason = Some(StopReason::LimitReached {
+                            limit: "token_budget",
+                        });
+                        self.drain_steer_to_follow_ups(&mut steer_rx, &mut follow_up_queue);
+                        return Ok(final_text);
+                    }
                 }
             }
 
@@ -1131,7 +1219,7 @@ impl Agent {
             // Advisory only — a Block is reported on stderr but does not
             // abort the iteration. matcher applied to turn_count (as
             // string).
-            if self.permission.hooks_active() {
+            if self.permission.hooks_active() && self.agent_id.is_none() {
                 let turn_label = self.turn_count.to_string();
                 let arguments = serde_json::json!({
                     "turn_count": self.turn_count,
@@ -1146,6 +1234,7 @@ impl Agent {
                         arguments.clone(),
                         &self.cwd,
                         Some(&self.session_id.to_string()),
+                    self.agent_id.as_deref(),
                     )
                     .await;
                     crate::agent::hook::report_advisory_outcome(
@@ -1163,6 +1252,7 @@ impl Agent {
                             &arguments,
                             &cwd,
                             Some(&session_id),
+                        self.agent_id.as_deref(),
                         )
                     })
                     .await;
@@ -1412,11 +1502,13 @@ impl Agent {
 
             match finish_reason {
                 FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
+                    self.stop_reason = Some(StopReason::Completed);
                     break;
                 }
                 FinishReason::ToolCalls => {
                     if calls.is_empty() {
                         // LLM said "tool calls" but emitted none — done.
+                        self.stop_reason = Some(StopReason::Completed);
                         break;
                     }
                     // Fingerprint BEFORE `calls` is moved into
@@ -1461,6 +1553,7 @@ impl Agent {
                     // Loop back to the next LLM turn.
                 }
                 FinishReason::Unknown => {
+                    self.stop_reason = Some(StopReason::Completed);
                     break;
                 }
             }
@@ -1468,7 +1561,7 @@ impl Agent {
             // ── TurnEnd hook (v0.11.0) ──────────────────────────────────
             // Advisory only — fired at the bottom of each iteration. A
             // Block is reported on stderr and otherwise ignored.
-            if self.permission.hooks_active() {
+            if self.permission.hooks_active() && self.agent_id.is_none() {
                 let turn_label = self.turn_count.to_string();
                 let arguments = serde_json::json!({
                     "turn_count": self.turn_count,
@@ -1484,6 +1577,7 @@ impl Agent {
                         arguments.clone(),
                         &self.cwd,
                         Some(&self.session_id.to_string()),
+                    self.agent_id.as_deref(),
                     )
                     .await;
                     crate::agent::hook::report_advisory_outcome(
@@ -1501,17 +1595,30 @@ impl Agent {
                             &arguments,
                             &cwd,
                             Some(&session_id),
+                        self.agent_id.as_deref(),
                         )
                     })
                     .await;
             }
+        }
+        // The for-loop above exhausted `iteration_cap` without ever
+        // hitting a `break` (every `break` site sets `Completed`
+        // first). For the main agent (`limits: None`) this is today's
+        // unchanged behaviour — `stop_reason` stays `None`, since
+        // nothing in the pre-existing contract ever asserted a value
+        // here. A subagent's `max_turns` governs its own loop, so this
+        // is the one place `LimitReached { "max_turns" }` is set.
+        if self.stop_reason.is_none() && self.limits.is_some() {
+            self.stop_reason = Some(StopReason::LimitReached {
+                limit: "max_turns",
+            });
         }
         // ── MessageEnd hook (v0.11.0) ───────────────────────────────────
         // Fires once after the for-loop completes (all tool rounds done),
         // just before post-turn compaction. Advisory only — a Block is
         // reported on stderr but does not abort the turn (which has
         // already ended anyway).
-        if self.permission.hooks_active() {
+        if self.permission.hooks_active() && self.agent_id.is_none() {
             let turn_label = self.turn_count.to_string();
             // Stage 5 (`docs/plugin-capabilities.md` §5): the payload
             // carries the assistant's text, not just its length. Built
@@ -1529,6 +1636,7 @@ impl Agent {
                     arguments.clone(),
                     &self.cwd,
                     Some(&self.session_id.to_string()),
+                self.agent_id.as_deref(),
                 )
                 .await;
                 crate::agent::hook::report_advisory_outcome(
@@ -1546,6 +1654,7 @@ impl Agent {
                         &arguments,
                         &cwd,
                         Some(&session_id),
+                    self.agent_id.as_deref(),
                     )
                 })
                 .await;
@@ -1600,6 +1709,9 @@ impl Agent {
         let permission = self.permission.clone();
         let hooks = self.hooks.clone();
         let subscribers = self.event_subscribers.clone();
+        let agent_id = self.agent_id.clone();
+        let subagents = self.subagents.clone();
+        let file_state = self.file_state.clone();
 
         // Keep id/name copies so we can synthesize cancelled results if
         // the whole batch gets dropped mid-flight (the calls Vec itself
@@ -1649,6 +1761,10 @@ impl Agent {
                 let subscribers = subscribers.clone();
                 let tx = tx.clone();
                 let done = completed.clone();
+                let agent_id = agent_id.clone();
+                let subagents = subagents.clone();
+                let file_state = file_state.clone();
+                let turn_cancel = cancel.clone();
                 async move {
                     // Serial within the group. Awaiting each call before
                     // starting the next is the whole guarantee: the
@@ -1666,6 +1782,10 @@ impl Agent {
                             subscribers.clone(),
                             tx.clone(),
                             ToolCallOrigin::Model,
+                            agent_id.clone(),
+                            subagents.clone(),
+                            file_state.clone(),
+                            turn_cancel.clone(),
                         )
                         .await;
                         // Recorded through a shared handle rather than
@@ -2031,6 +2151,10 @@ pub(crate) async fn run_one_tool(
     subscribers: crate::subscriber::EventSubscribers,
     tx: mpsc::Sender<AgentEvent>,
     origin: ToolCallOrigin,
+    agent_id: Option<String>,
+    subagents: std::sync::Arc<crate::agent::subagent_registry::SubagentRegistry>,
+    file_state: std::sync::Arc<crate::tool::file_state::FileStateTracker>,
+    turn_cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> ToolCallOutcome {
     // ToolExecutionStart hooks. `hook::PER_DELTA_EVENTS` (message_update,
     // tool_execution_update) are the two per-delta events that will never
@@ -2048,13 +2172,59 @@ pub(crate) async fn run_one_tool(
                 call.arguments.clone(),
                 &cwd,
                 Some(&session_id.to_string()),
+                agent_id.as_deref(),
             )
             .await;
             effective_args = transformed.unwrap_or(call.arguments.clone());
-            if let HookOutcome::Block { reason } = outcome {
-                if permission.should_honor_tool_execution_start_block() {
-                    block = Some(reason);
+            match outcome {
+                HookOutcome::Block { reason } => {
+                    if permission.should_honor_tool_execution_start_block() {
+                        block = Some(reason);
+                    }
                 }
+                HookOutcome::Ask { reason } => {
+                    // D-13/D-14: an `ask` outcome routes through the
+                    // shared `PermissionBroker` rather than being
+                    // decided here. Deny mode (the non-interactive
+                    // default, mirrors `-p`) resolves to `false`
+                    // immediately; a cancelled turn also resolves to
+                    // `false`. A later Block would have already won
+                    // above (Ask never short-circuits `run_hooks`), so
+                    // reaching here means nothing blocked outright —
+                    // only this ask remains to be resolved.
+                    let requesting_id = agent_id.clone().unwrap_or_else(|| "main".into());
+                    if let Some(id) = agent_id.as_deref() {
+                        subagents.set_state(
+                            id,
+                            crate::agent::subagent_registry::AgentState::WaitingPermission,
+                        );
+                    }
+                    let mut compact_args = effective_args.to_string();
+                    if compact_args.len() > 120 {
+                        compact_args.truncate(120);
+                    }
+                    let summary = format!("{} {}", call.name, compact_args);
+                    let fresh_token = tokio_util::sync::CancellationToken::new();
+                    let cancel_ref = turn_cancel.as_ref().unwrap_or(&fresh_token);
+                    let allowed = subagents
+                        .permissions()
+                        .request(
+                            crate::agent::subagent_registry::PermissionRequest {
+                                agent_id: requesting_id,
+                                summary,
+                            },
+                            cancel_ref,
+                        )
+                        .await;
+                    if let Some(id) = agent_id.as_deref() {
+                        subagents.set_state(id, crate::agent::subagent_registry::AgentState::Running);
+                    }
+                    if !allowed {
+                        let _ = &reason; // hook's own ask reason, logged via summary above
+                        block = Some("permission denied by user".to_string());
+                    }
+                }
+                HookOutcome::Allow | HookOutcome::Transform { .. } => {}
             }
         }
         // Tell the renderers (and, below, the model) that the call
@@ -2080,6 +2250,7 @@ pub(crate) async fn run_one_tool(
                     &call.arguments,
                     &cwd,
                     Some(&session_id_str),
+                agent_id.as_deref(),
                 )
             })
             .await;
@@ -2188,7 +2359,13 @@ pub(crate) async fn run_one_tool(
     let started = std::time::Instant::now();
     let (mut content, mut is_error, images) = match registry.get(&call.name) {
         Some(tool) => {
-            let ctx = ToolContext::new(cwd.clone());
+            let ctx = ToolContext {
+                cwd: cwd.clone(),
+                registry: subagents.clone(),
+                agent_id: agent_id.clone(),
+                turn_cancel: turn_cancel.clone(),
+                file_state: file_state.clone(),
+            };
             let executed = match origin.deadline() {
                 None => tool.execute(effective_args.clone(), &ctx).await.map(Some),
                 Some(d) => {
@@ -2295,6 +2472,7 @@ pub(crate) async fn run_one_tool(
                 post_payload.clone(),
                 &cwd,
                 Some(&session_id.to_string()),
+            agent_id.as_deref(),
             )
             .await;
             // P1: tool_execution_end Transform replaces the tool result content.
@@ -2329,6 +2507,7 @@ pub(crate) async fn run_one_tool(
                     &post_payload,
                     &cwd,
                     Some(&session_id_str),
+                agent_id.as_deref(),
                 )
             })
             .await;
@@ -2417,6 +2596,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -2516,6 +2700,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -2610,6 +2799,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -2753,6 +2947,11 @@ mod tests {
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -2847,6 +3046,11 @@ mod tests {
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
         // Enough tail that find_compact_boundary actually cuts —
         // otherwise `compact` returns None, the function returns before
@@ -3004,6 +3208,11 @@ mod tests {
             event_subscribers: subs,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -3067,6 +3276,10 @@ mod tests {
             Default::default(),
             tx,
             ToolCallOrigin::Model,
+            None,
+            std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
+            None,
         )
         .await;
 
@@ -3174,6 +3387,11 @@ mod tests {
                 event_subscribers: subs,
                 prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
                 system_base: None,
+                agent_id: None,
+                limits: None,
+                stop_reason: None,
+                subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+                file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
             };
 
             let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -3252,6 +3470,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -3330,6 +3553,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -3428,6 +3656,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
@@ -3497,6 +3730,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let ct = tokio_util::sync::CancellationToken::new();
@@ -3632,6 +3870,11 @@ mod tests {
                 prompt_overrides:
                     crate::agent::prompt_override::PromptOverrides::default(),
                 system_base: None,
+                agent_id: None,
+                limits: None,
+                stop_reason: None,
+                subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+                file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
             };
 
             let ct = tokio_util::sync::CancellationToken::new();
@@ -3735,6 +3978,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         // Two messages buffered and a token already cancelled, so
@@ -3801,6 +4049,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
         agent
@@ -3884,6 +4137,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
@@ -4017,6 +4275,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
         (agent, dir)
     }
@@ -4174,6 +4437,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
@@ -4266,6 +4534,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
         agent.fire_session_start("startup").await;
         agent.fire_session_shutdown("quit").await;
@@ -4336,6 +4609,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
         agent.fire_session_start("startup").await;
 
@@ -5109,6 +5387,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -5252,6 +5535,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -5376,6 +5664,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -5412,6 +5705,290 @@ mod tests {
             calls >= 3,
             "tripwire should require ≥3 identical rounds before firing, got {calls}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D-08/D-09: a subagent with `limits.max_turns` set must stop
+    /// after that many iterations — never reach `MAX_ITERATIONS` — and
+    /// record `StopReason::LimitReached { limit: "max_turns" }` rather
+    /// than `Completed`, even though the provider never sends
+    /// `FinishReason::Stop`.
+    #[tokio::test]
+    async fn turn_limit_yields_partial_report() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Always answers with a tool call — never naturally stops —
+        /// so the only thing that can end the turn is `max_turns`.
+        struct AlwaysToolCallProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for AlwaysToolCallProvider {
+            fn id(&self) -> &'static str {
+                "always-tool-call"
+            }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = tx
+                    .send(AgentEvent::Start {
+                        message_id: "m".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::ToolCall {
+                        content_index: 0,
+                        call: ToolCall {
+                            id: format!("call_{}", uuid::v7()),
+                            name: "ls".into(),
+                            arguments: json!({"path": "."}),
+                        },
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Usage::default(),
+                    })
+                    .await;
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("turn-limit.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000001\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"always-tool-call\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(AlwaysToolCallProvider {
+                calls: call_counter.clone(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "always-tool-call".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+            agent_id: Some("a1".into()),
+            limits: Some(crate::agent::subagent_registry::AgentLimits {
+                max_turns: 2,
+                token_budget: 0,
+            }),
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let r = agent.run_turn("go", &tx, None, None).await;
+        drop(tx);
+        drain.await.unwrap();
+
+        assert!(r.is_ok(), "a limit hit is a partial report, not an Err: {r:?}");
+        assert_eq!(
+            agent.stop_reason,
+            Some(StopReason::LimitReached { limit: "max_turns" }),
+            "expected max_turns LimitReached, got {:?}",
+            agent.stop_reason
+        );
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "provider must be called exactly max_turns times, never more"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D-08/D-09: a subagent with `limits.token_budget` set must stop
+    /// once cumulative usage reaches the budget, even on the very
+    /// first iteration, recording `LimitReached { "token_budget" }`.
+    #[tokio::test]
+    async fn token_budget_yields_partial_report() {
+        struct BigUsageProvider;
+        #[async_trait::async_trait]
+        impl Provider for BigUsageProvider {
+            fn id(&self) -> &'static str {
+                "big-usage"
+            }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let _ = tx
+                    .send(AgentEvent::Start {
+                        message_id: "m".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::ToolCall {
+                        content_index: 0,
+                        call: ToolCall {
+                            id: format!("call_{}", uuid::v7()),
+                            name: "ls".into(),
+                            arguments: json!({"path": "."}),
+                        },
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Usage {
+                            input_tokens: 20,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                        },
+                    })
+                    .await;
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("token-budget.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000002\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"big-usage\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(BigUsageProvider),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "big-usage".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+            agent_id: Some("a1".into()),
+            limits: Some(crate::agent::subagent_registry::AgentLimits {
+                max_turns: 50,
+                token_budget: 10,
+            }),
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let r = agent.run_turn("go", &tx, None, None).await;
+        drop(tx);
+        drain.await.unwrap();
+
+        assert!(r.is_ok(), "a budget hit is a partial report, not an Err: {r:?}");
+        assert_eq!(
+            agent.stop_reason,
+            Some(StopReason::LimitReached {
+                limit: "token_budget"
+            }),
+            "expected token_budget LimitReached, got {:?}",
+            agent.stop_reason
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sanity check matching the plan's success criteria: with
+    /// `agent_id`/`limits` both `None` (the main agent), behaviour is
+    /// unchanged — `stop_reason` ends up `Completed` on an ordinary
+    /// `FinishReason::Stop` turn, same as every pre-existing test in
+    /// this module already implicitly exercises.
+    #[tokio::test]
+    async fn main_agent_without_limits_completes_normally() {
+        let dir = tmp();
+        let session_path = dir.join("main-agent.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000003\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"fake\",\"base_url\":\"\"}\n",
+        ).unwrap();
+
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(FakeProvider {
+                response: "done".into(),
+            }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "fake".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
+        };
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let r = agent.run_turn("hi", &tx, None, None).await;
+        drop(tx);
+        drain.await.unwrap();
+
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(agent.stop_reason, Some(StopReason::Completed));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5517,6 +6094,11 @@ mod tests {
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
@@ -5678,6 +6260,11 @@ mod tests {
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
@@ -5737,6 +6324,11 @@ mod tests {
             no_context_files: false,
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
             pending_follow_ups: Default::default(),
             tool_exec_mode: crate::config::ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
@@ -5801,6 +6393,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         }
     }
 

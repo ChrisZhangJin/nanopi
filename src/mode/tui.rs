@@ -6086,6 +6086,11 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
+            agent_id: None,
+            limits: None,
+            stop_reason: None,
+            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
+            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         }
     }
 
