@@ -799,3 +799,265 @@ fn no_session_rejects_incompatible_resume_flags() {
         );
     }
 }
+
+// ── Child-process contract (01-04): --session-file, limits, allowlist ──
+
+/// Like [`spawn_sse_server_seq`], but also records each request body so
+/// a test can assert what context the child sent to the model.
+fn spawn_recording_server(
+    responses: Vec<Vec<String>>,
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log2 = log.clone();
+    let bodies: Vec<String> = responses
+        .iter()
+        .map(|chunks| {
+            let mut body = String::new();
+            for c in chunks {
+                body.push_str("data: ");
+                body.push_str(c);
+                body.push_str("\n\n");
+            }
+            body.push_str("data: [DONE]\n\n");
+            body
+        })
+        .collect();
+    std::thread::spawn(move || {
+        let mut n = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut req = vec![0u8; len];
+            let _ = stream.read_exact(&mut req);
+            log2.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&req).to_string());
+            let body = &bodies[n.min(bodies.len() - 1)];
+            n += 1;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, log)
+}
+
+/// A finish chunk that also carries usage numbers.
+fn finish_with_usage(reason: &str, prompt: u32, completion: u32) -> String {
+    format!(
+        r#"{{"id":"x","choices":[{{"index":0,"delta":{{}},"finish_reason":"{reason}"}}],"usage":{{"prompt_tokens":{prompt},"completion_tokens":{completion}}}}}"#
+    )
+}
+
+/// Run a child-style `nanopi -p --output json` in `dir` with HOME and
+/// NANOPI_HOME pointed inside it, stdin null, and a hard timeout so a
+/// child that waits on a prompt fails the test instead of hanging it.
+fn run_child(
+    dir: &std::path::Path,
+    port: u16,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (std::process::ExitStatus, serde_json::Value, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nanopi"));
+    cmd.current_dir(dir)
+        .args(["-p", "--output", "json", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-hooks", "--no-skills", "--no-context-files"])
+        .args(args)
+        .env("HOME", dir.join("home"))
+        .env("NANOPI_HOME", dir.join("home/.nanopi"))
+        .env_remove("NANOPI_AGENT_ID")
+        .env_remove("NANOPI_PARENT_PID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn nanopi");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("nanopi child hung (stdin null, non-interactive)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let stdout = strip_sgr(&stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+    (status, v, stderr)
+}
+
+fn fresh_dir(tag: &str, port: u16) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nanopi-p-e2e-{tag}-{port}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("home")).expect("tmp dir");
+    dir
+}
+
+#[test]
+fn session_file_writes_transcript_and_leaves_active_pointer_alone() {
+    let (port, _log) =
+        spawn_recording_server(vec![vec![delta("content", "REPLY-ONE"), finish("stop")]]);
+    let dir = fresh_dir("sessfile", port);
+    let tpath = dir.join("agents/t.jsonl");
+    let (status, v, stderr) = run_child(
+        &dir,
+        port,
+        &["--session-file", tpath.to_str().unwrap(), "FIRST-MSG"],
+        &[],
+    );
+    assert!(status.success(), "exit {status:?}: {stderr}");
+    assert_eq!(v["status"], "completed", "{v}");
+    let t = std::fs::read_to_string(&tpath).expect("transcript at --session-file");
+    assert!(t.contains("FIRST-MSG") && t.contains("REPLY-ONE"), "{t}");
+    let active = dir.join("home/.nanopi/sessions/active");
+    assert!(
+        !active.exists(),
+        "active-session pointer must not be written"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_file_resume_appends_and_replays_history() {
+    let (port, log) = spawn_recording_server(vec![
+        vec![delta("content", "REPLY-ONE"), finish("stop")],
+        vec![delta("content", "REPLY-TWO"), finish("stop")],
+    ]);
+    let dir = fresh_dir("sessresume", port);
+    let tpath = dir.join("t.jsonl");
+    let tp = tpath.to_str().unwrap();
+    let (s1, _, e1) = run_child(&dir, port, &["--session-file", tp, "FIRST-MSG"], &[]);
+    assert!(s1.success(), "{e1}");
+    let (s2, v2, e2) = run_child(&dir, port, &["--session-file", tp, "SECOND-MSG"], &[]);
+    assert!(s2.success(), "{e2}");
+    let reqs = log.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "one request per run");
+    assert!(
+        reqs[1].contains("FIRST-MSG") && reqs[1].contains("REPLY-ONE"),
+        "second run must send first run's history: {}",
+        reqs[1]
+    );
+    let t = std::fs::read_to_string(&tpath).unwrap();
+    for needle in ["FIRST-MSG", "REPLY-ONE", "SECOND-MSG", "REPLY-TWO"] {
+        assert!(t.contains(needle), "transcript missing {needle}: {t}");
+    }
+    assert_eq!(t.matches("\"type\":\"session\"").count(), 1, "one header");
+    assert!(v2.to_string().contains("REPLY-TWO"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn limit_max_turns_reports_limit_reached() {
+    let port = spawn_sse_server(vec![
+        tool_call_delta(0, "c1", "ls", r#"{"path":"."}"#),
+        finish("tool_calls"),
+    ]);
+    let dir = fresh_dir("maxturns", port);
+    let (status, v, stderr) = run_child(&dir, port, &["--max-turns", "2", "go"], &[]);
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(v["status"], "limit_reached", "{v}");
+    assert_eq!(v["limit"], "max_turns", "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn limit_token_budget_reports_limit_reached() {
+    let port = spawn_sse_server(vec![
+        tool_call_delta(0, "c1", "ls", r#"{"path":"."}"#),
+        finish_with_usage("tool_calls", 25, 25),
+    ]);
+    let dir = fresh_dir("budget", port);
+    let (status, v, stderr) = run_child(&dir, port, &["--token-budget", "10", "go"], &[]);
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(v["status"], "limit_reached", "{v}");
+    assert_eq!(v["limit"], "token_budget", "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
+    let (port, log) = spawn_recording_server(vec![
+        vec![
+            tool_call_delta(0, "c1", "bash", r#"{"command":"echo hi"}"#),
+            finish("tool_calls"),
+        ],
+        vec![delta("content", "DONE"), finish("stop")],
+    ]);
+    let dir = fresh_dir("agentallow", port);
+    let brief = dir.join("brief.md");
+    let (status, v, stderr) = run_child(
+        &dir,
+        port,
+        &[
+            "--tools",
+            "read,subagent",
+            "--brief",
+            brief.to_str().unwrap(),
+            "go",
+        ],
+        &[("NANOPI_AGENT_ID", "a1")],
+    );
+    assert!(status.success(), "{stderr}");
+    assert_eq!(v["agent_id"], "a1", "{v}");
+    assert_eq!(v["report_path"], brief.to_str().unwrap(), "{v}");
+    let msgs = v["messages"].as_array().unwrap();
+    let tool = msgs
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool result in envelope");
+    assert_eq!(tool["is_error"], true, "{tool}");
+    assert!(
+        tool["content"].as_str().unwrap().contains("unknown tool"),
+        "{tool}"
+    );
+    let first = &log.lock().unwrap()[0];
+    let req: serde_json::Value = serde_json::from_str(first).expect("request JSON");
+    let names: Vec<String> = req["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, vec!["read"], "only listed tools, subagent stripped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
