@@ -160,6 +160,38 @@ pub struct Config {
     /// ```
     #[serde(default)]
     pub max_replay_entries: Option<usize>,
+
+    /// Child-process subagent limits (`[subagent]` section).
+    #[serde(default)]
+    pub subagent: SubagentConfig,
+}
+
+/// `[subagent]` config: caps for orchestrator-spawned `nanopi -p` children.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct SubagentConfig {
+    /// Max simultaneously tracked (non-terminal) children. Default 8.
+    pub max_live: usize,
+    /// Max children running at once; the rest queue. Default 4.
+    pub max_concurrency: usize,
+    /// Per-child turn limit. Default 50.
+    pub max_turns: u32,
+    /// Per-child token budget. Default 300_000.
+    pub token_budget: u64,
+    /// Per-child wall-clock timeout in seconds. Default 1800.
+    pub timeout_secs: u64,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            max_live: 8,
+            max_concurrency: 4,
+            max_turns: 50,
+            token_budget: 300_000,
+            timeout_secs: 1800,
+        }
+    }
 }
 
 /// Global tool execution mode. Deserialized from
@@ -399,6 +431,7 @@ impl Config {
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
+            subagent: SubagentConfig::default(),
         }
     }
 }
@@ -583,6 +616,12 @@ fn merge(a: Config, b: Config) -> Config {
         },
         // Scalar Option: b (project) wins if set, else a (global).
         max_replay_entries: b.max_replay_entries.or(a.max_replay_entries),
+        // Section-level: project wins if it differs from defaults.
+        subagent: if b.subagent != SubagentConfig::default() {
+            b.subagent
+        } else {
+            a.subagent
+        },
     }
 }
 
@@ -897,6 +936,7 @@ command = "echo hi"
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
+            subagent: SubagentConfig::default(),
         };
         let b = Config {
             model: None,
@@ -913,6 +953,7 @@ command = "echo hi"
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
+            subagent: SubagentConfig::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));
@@ -1030,5 +1071,28 @@ command = "/bin/true"
         tmp.write(".nanopi/config.toml", "max_replay_entries = 5\n");
         let c = load_config(tmp.path()).unwrap();
         assert_eq!(c.max_replay_entries, Some(5));
+    }
+
+    #[test]
+    fn subagent_config_defaults() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            c.subagent,
+            SubagentConfig {
+                max_live: 8,
+                max_concurrency: 4,
+                max_turns: 50,
+                token_budget: 300_000,
+                timeout_secs: 1800,
+            }
+        );
+    }
+
+    #[test]
+    fn subagent_config_partial_override() {
+        let c: Config = toml::from_str("[subagent]\nmax_live = 2\n").unwrap();
+        assert_eq!(c.subagent.max_live, 2);
+        assert_eq!(c.subagent.max_concurrency, 4);
+        assert_eq!(c.subagent.timeout_secs, 1800);
     }
 }
