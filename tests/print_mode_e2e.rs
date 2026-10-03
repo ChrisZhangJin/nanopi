@@ -807,6 +807,15 @@ fn no_session_rejects_incompatible_resume_flags() {
 fn spawn_recording_server(
     responses: Vec<Vec<String>>,
 ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    spawn_recording_server_delayed(responses, Vec::new())
+}
+
+/// [`spawn_recording_server`] with a per-response delay (ms) applied
+/// after the request is logged and before the response is written.
+fn spawn_recording_server_delayed(
+    responses: Vec<Vec<String>>,
+    delays_ms: Vec<u64>,
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local_addr").port();
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -848,6 +857,9 @@ fn spawn_recording_server(
                 .unwrap()
                 .push(String::from_utf8_lossy(&req).to_string());
             let body = &bodies[n.min(bodies.len() - 1)];
+            if let Some(ms) = delays_ms.get(n) {
+                std::thread::sleep(std::time::Duration::from_millis(*ms));
+            }
             n += 1;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -1039,7 +1051,7 @@ fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
     );
     assert!(status.success(), "{stderr}");
     assert_eq!(v["agent_id"], "a1", "{v}");
-    assert_eq!(v["report_path"], brief.to_str().unwrap(), "{v}");
+    assert_eq!(v["report_path"], dir.join("report.md").to_str().unwrap(), "{v}");
     let msgs = v["messages"].as_array().unwrap();
     let tool = msgs
         .iter()
@@ -1059,5 +1071,171 @@ fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
         .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
         .collect();
     assert_eq!(names, vec!["read"], "only listed tools, subagent stripped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Brief-driven child (01-06, RT-09) ──
+
+fn write_brief(dir: &std::path::Path, task: &str) -> std::path::PathBuf {
+    let p = dir.join("agents/a1/brief.md");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let body = format!("# Brief\n\n## Task\n\n{task}\n\n<!-- nanopi:amendments -->\n");
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+fn req_user_texts(req: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(req).expect("request JSON");
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].to_string())
+        .collect()
+}
+
+#[test]
+fn brief_task_is_sent_as_the_user_task() {
+    let (port, log) = spawn_recording_server(vec![vec![
+        delta("content", "- [x] task — ok"),
+        finish("stop"),
+    ]]);
+    let dir = fresh_dir("brieftask", port);
+    let b = write_brief(&dir, "BRIEF-TASK-TEXT");
+    let (status, v, stderr) = run_child(&dir, port, &["--brief", b.to_str().unwrap()], &[]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(v["status"], "completed", "{v}");
+    let reqs = log.lock().unwrap().clone();
+    assert!(
+        req_user_texts(&reqs[0]).join("\n").contains("BRIEF-TASK-TEXT"),
+        "{}",
+        reqs[0]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn brief_amendment_is_injected_before_the_next_llm_call() {
+    let (port, log) = spawn_recording_server_delayed(
+        vec![
+            vec![
+                tool_call_delta(0, "c1", "ls", r#"{"path":"."}"#),
+                finish("tool_calls"),
+            ],
+            vec![delta("content", "DONE"), finish("stop")],
+        ],
+        vec![2500],
+    );
+    let dir = fresh_dir("briefamend", port);
+    let b = write_brief(&dir, "do the thing");
+    let b2 = b.clone();
+    let log2 = log.clone();
+    let appender = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while log2.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut f = std::fs::OpenOptions::new().append(true).open(&b2).unwrap();
+        f.write_all(b"\n## Amendment 1\n\nAlso do X\n").unwrap();
+    });
+    let (status, _v, stderr) = run_child(&dir, port, &["--brief", b.to_str().unwrap()], &[]);
+    appender.join().unwrap();
+    assert!(status.success(), "{stderr}");
+    let reqs = log.lock().unwrap().clone();
+    assert!(reqs.len() >= 2, "{reqs:?}");
+    assert!(!req_user_texts(&reqs[0]).join("\n").contains("Also do X"));
+    let second = req_user_texts(&reqs[1]).join("\n");
+    assert!(second.contains("Also do X"), "{second}");
+    assert_eq!(
+        second.matches("Amendment 1 to your brief").count(),
+        1,
+        "{second}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn brief_self_check_is_bounded_to_two_extra_turns() {
+    let (port, log) = spawn_recording_server(vec![
+        vec![delta("content", "ANSWER"), finish("stop")],
+        vec![delta("content", "- [ ] a — todo"), finish("stop")],
+    ]);
+    let dir = fresh_dir("briefself", port);
+    let b = write_brief(&dir, "SELF-CHECK-TASK");
+    let (status, v, stderr) = run_child(&dir, port, &["--brief", b.to_str().unwrap()], &[]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(v["status"], "completed", "{v}");
+    let reqs = log.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3, "1 task + at most 2 self-check turns");
+    let last_user = req_user_texts(&reqs[1]).pop().unwrap();
+    assert!(last_user.contains("SELF-CHECK-TASK"), "{last_user}");
+    assert!(last_user.contains("checklist"), "{last_user}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn brief_self_check_stops_early_when_all_done() {
+    let (port, log) = spawn_recording_server(vec![
+        vec![delta("content", "ANSWER"), finish("stop")],
+        vec![delta("content", "- [x] a — done"), finish("stop")],
+    ]);
+    let dir = fresh_dir("briefselfdone", port);
+    let b = write_brief(&dir, "t");
+    let (status, _v, stderr) = run_child(&dir, port, &["--brief", b.to_str().unwrap()], &[]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(log.lock().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn brief_report_written_with_checklist() {
+    let reply = vec![
+        delta("content", "- [x] write code — done\n- [ ] docs — skipped"),
+        finish("stop"),
+    ];
+    let (port, _log) = spawn_recording_server(vec![
+        vec![delta("content", "ANSWER"), finish("stop")],
+        reply,
+    ]);
+    let dir = fresh_dir("briefreport", port);
+    let b = write_brief(&dir, "t");
+    let (status, v, stderr) = run_child(&dir, port, &["--brief", b.to_str().unwrap()], &[]);
+    assert!(status.success(), "{stderr}");
+    let rp = b.parent().unwrap().join("report.md");
+    assert_eq!(v["report_path"], rp.to_str().unwrap(), "{v}");
+    let r = std::fs::read_to_string(&rp).expect("report.md");
+    assert!(r.contains("## Checklist"), "{r}");
+    assert!(r.contains("- [x] write code — done"), "{r}");
+    assert!(r.contains("- [ ] docs — skipped"), "{r}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&rp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn brief_report_on_limit_has_no_self_check() {
+    let (port, log) = spawn_recording_server(vec![vec![
+        tool_call_delta(0, "c1", "ls", r#"{"path":"."}"#),
+        finish("tool_calls"),
+    ]]);
+    let dir = fresh_dir("brieflimit", port);
+    let b = write_brief(&dir, "t");
+    let (status, v, stderr) = run_child(
+        &dir,
+        port,
+        &["--max-turns", "1", "--brief", b.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert_eq!(v["status"], "limit_reached", "{v}");
+    assert_eq!(log.lock().unwrap().len(), 1, "no self-check after a limit");
+    let r = std::fs::read_to_string(b.parent().unwrap().join("report.md")).expect("report.md");
+    assert!(r.contains("limit_reached") && r.contains("## Checklist"), "{r}");
+    assert!(r.contains("- [ ] checklist missing"), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }

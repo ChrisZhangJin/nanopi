@@ -459,6 +459,8 @@ async fn main() -> ExitCode {
             .or(args.positional_message.as_deref())
         {
             Some(m) => m,
+            // `--brief` alone: the brief file is the task (RT-09).
+            None if args.brief.is_some() => "",
             // No message argument: read the prompt from stdin, so
             // `echo "..." | nanopi -p` works. Only when stdin is
             // actually piped — on a TTY this would silently block

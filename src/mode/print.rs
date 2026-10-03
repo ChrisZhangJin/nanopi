@@ -307,17 +307,58 @@ pub async fn run_print_mode(
     // Fire session_start hooks before the first turn.
     agent.fire_session_start("startup").await;
 
+    // `--brief` (RT-09): the brief file is the task; a positional
+    // message, if any, follows it.
+    let brief_path = child.brief.clone();
+    let task = match &brief_path {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(b) if message.trim().is_empty() => b,
+            Ok(b) => format!("{b}\n\n{message}"),
+            Err(e) => {
+                eprintln!("nanopi: cannot read brief {}: {e}", p.display());
+                message.to_string()
+            }
+        },
+        None => message.to_string(),
+    };
+
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
-    let message_owned = message.to_string();
     let agent_task = {
         let mut agent = agent; // move
+        let brief_path = brief_path.clone();
         tokio::spawn(async move {
-            let r = agent.run_turn(message_owned.as_str(), &tx, None, None).await;
-            let limit = agent.last_limit_hit();
+            let steer = brief_path.as_ref().map(|p| start_brief_watch(p));
+            let mut r = agent.run_turn(task.as_str(), &tx, None, steer).await;
+            let mut limit = agent.last_limit_hit();
+            let mut checklist_reply: Option<String> = None;
+            // Bounded self-check (D-11, T-01-16): at most
+            // SELF_CHECK_TURNS extra turns, none after a limit or error.
+            if let Some(p) = brief_path.as_ref() {
+                for _ in 0..SELF_CHECK_TURNS {
+                    if r.is_err() || limit.is_some() {
+                        break;
+                    }
+                    let current = std::fs::read_to_string(p).unwrap_or_default();
+                    let prompt = self_check_prompt(&current);
+                    r = agent
+                        .run_turn(prompt.as_str(), &tx, None, Some(start_brief_watch(p)))
+                        .await;
+                    limit = agent.last_limit_hit();
+                    match &r {
+                        Ok(text) => {
+                            checklist_reply = Some(text.clone());
+                            if !has_open_items(text) {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
             agent.fire_session_shutdown("quit").await;
-            (r, limit)
+            (r, limit, checklist_reply)
         })
     };
 
@@ -345,20 +386,34 @@ pub async fn run_print_mode(
     if let Some(mut s) = spinner.take() {
         s.stop().await;
     }
-    let (turn_result, limit_hit) = agent_task.await?;
+    let (turn_result, limit_hit, checklist_reply) = agent_task.await?;
+    let status = if turn_result.is_err() {
+        "failed"
+    } else if limit_hit.is_some() {
+        "limit_reached"
+    } else {
+        "completed"
+    };
+    // report.md on every exit path (D-11). Best effort.
+    let report_path = brief_path.as_deref().map(|p| {
+        let rp = report_path_for(p);
+        let summary = match &turn_result {
+            Ok(t) => t.clone(),
+            Err(e) => format!("error: {e}"),
+        };
+        let items = checklist_items(checklist_reply.as_deref(), status);
+        let body = crate::agent::brief::render_report(status, &summary, &items);
+        if let Err(e) = write_private(&rp, &body) {
+            eprintln!("nanopi: cannot write report {}: {e}", rp.display());
+        }
+        rp
+    });
     // Text mode keeps the old behavior (error -> exit 1 via main). JSON
     // mode reports the failure in-band so the parent can parse it.
     let turn_error = match turn_result {
         Ok(_) => None,
         Err(e) if output == OutputFormat::Json => Some(e.to_string()),
         Err(e) => return Err(e.into()),
-    };
-    let status = if turn_error.is_some() {
-        "failed"
-    } else if limit_hit.is_some() {
-        "limit_reached"
-    } else {
-        "completed"
     };
 
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -387,7 +442,7 @@ pub async fn run_print_mode(
                 messages: collect_messages(&session_path)?,
                 status: Some(status.to_string()),
                 limit: limit_hit.map(str::to_string),
-                report_path: child.brief.as_ref().map(|p| p.display().to_string()),
+                report_path: report_path.as_ref().map(|p| p.display().to_string()),
                 agent_id: child.agent_id.clone(),
                 error: turn_error.clone(),
             };
@@ -404,6 +459,99 @@ pub async fn run_print_mode(
     }
 
     result
+}
+
+/// Poll interval for brief amendments (assumption A3).
+const BRIEF_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Hard cap on extra self-check turns (T-01-16).
+const SELF_CHECK_TURNS: usize = 2;
+
+/// Start an amendment watcher for one `run_turn`; the watcher exits when
+/// the returned receiver is dropped at the end of that turn.
+fn start_brief_watch(p: &std::path::Path) -> mpsc::Receiver<crate::event::SteerMessage> {
+    let content = std::fs::read_to_string(p).unwrap_or_default();
+    let last = crate::agent::brief::next_amendment_number(&content).saturating_sub(1);
+    let (stx, srx) = mpsc::channel(8);
+    crate::mode::brief_watch::spawn_brief_watcher(p.to_path_buf(), last, stx, BRIEF_POLL);
+    srx
+}
+
+fn self_check_prompt(brief: &str) -> String {
+    format!(
+        "Before finishing, re-read your brief below and check your work against it.\n\n\
+         ---\n{brief}\n---\n\n\
+         Reply with a checklist block, one line per requirement and amendment, \
+         formatted exactly as `- [x] item — note` (done) or `- [ ] item — note` (not done). \
+         If any item is not done, keep working on it first, then reply with the updated checklist."
+    )
+}
+
+fn checklist_lines(text: &str) -> impl Iterator<Item = (bool, &str)> {
+    text.lines().filter_map(|l| {
+        let l = l.trim_start();
+        if let Some(r) = l.strip_prefix("- [ ]") {
+            Some((false, r.trim()))
+        } else if let Some(r) = l.strip_prefix("- [x]").or_else(|| l.strip_prefix("- [X]")) {
+            Some((true, r.trim()))
+        } else {
+            None
+        }
+    })
+}
+
+fn has_open_items(text: &str) -> bool {
+    checklist_lines(text).any(|(done, _)| !done)
+}
+
+/// Parse the last self-check reply into checklist items.
+fn checklist_items(reply: Option<&str>, status: &str) -> Vec<crate::agent::brief::ChecklistItem> {
+    use crate::agent::brief::ChecklistItem;
+    let items: Vec<ChecklistItem> = reply
+        .map(|t| {
+            checklist_lines(t)
+                .map(|(done, rest)| {
+                    let (label, note) = match rest.split_once(" — ") {
+                        Some((a, b)) => (a.trim(), b.trim()),
+                        None => (rest, ""),
+                    };
+                    ChecklistItem {
+                        label: label.to_string(),
+                        done,
+                        note: note.to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        vec![ChecklistItem {
+            label: "checklist missing".into(),
+            done: false,
+            note: format!("no self-check checklist produced (status: {status})"),
+        }]
+    } else {
+        items
+    }
+}
+
+/// `report.md` next to the brief.
+fn report_path_for(brief: &std::path::Path) -> PathBuf {
+    brief
+        .parent()
+        .map(|d| d.join("report.md"))
+        .unwrap_or_else(|| PathBuf::from("report.md"))
+}
+
+fn write_private(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(body.as_bytes())
 }
 
 /// Read back all SessionEntries from a session file and present the
