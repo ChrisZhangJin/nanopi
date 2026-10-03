@@ -51,22 +51,6 @@ impl Tool for WriteTool {
         let abs = crate::tool::resolve_in_cwd(&ctx.cwd, path_str)
             .map_err(ToolError::Execution)?;
 
-        // Serialize writes to this path across every agent in the
-        // process (D-15), and refuse a write if this agent's read of
-        // the file is stale. Held until the write below completes —
-        // a write in progress always runs to completion (D-07), it
-        // just cannot start if another agent is mid-write on the same
-        // path, or if this agent's own fingerprint is stale.
-        let key = crate::tool::file_state::canonical_key(&ctx.cwd, path_str);
-        let _path_guard = if let Some(ref k) = key {
-            let lock = crate::tool::file_state::path_lock(k);
-            let guard = lock.lock_owned().await;
-            ctx.file_state.check(k).map_err(ToolError::Execution)?;
-            Some(guard)
-        } else {
-            None
-        };
-
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ToolError::Execution(format!("cannot create parent {}: {e}", parent.display()))
@@ -75,10 +59,6 @@ impl Tool for WriteTool {
 
         write_no_follow(&abs, content)
             .map_err(|e| ToolError::Execution(format!("cannot write {}: {e}", abs.display())))?;
-
-        if let Some(ref k) = key {
-            ctx.file_state.update_after_write(k, content.as_bytes());
-        }
 
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {}", content.len(), abs.display()),
@@ -159,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn creates_new_file() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         WriteTool
             .execute(json!({"path": "out.txt", "content": "hello"}), &ctx)
             .await
@@ -175,7 +155,7 @@ mod tests {
     async fn overwrites_existing() {
         let dir = tmp();
         std::fs::write(dir.join("x.txt"), "old").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         WriteTool
             .execute(json!({"path": "x.txt", "content": "new"}), &ctx)
             .await
@@ -187,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn creates_parent_dirs() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         WriteTool
             .execute(json!({"path": "a/b/c.txt", "content": "x"}), &ctx)
             .await
@@ -199,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_absolute_outside_cwd() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = WriteTool
             .execute(json!({"path": "/tmp/nope.txt", "content": "x"}), &ctx)
             .await;
@@ -213,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_absolute_traversal_out_of_cwd() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         // Unique per run: a fixed name would be satisfied by a
         // leftover from an earlier failing run, turning the assertion
         // below into a false pass — or, worse, a false failure.
@@ -239,7 +219,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_relative_traversal_out_of_cwd() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let name = format!("escaped-rel-{}.txt", crate::util::uuid::v7());
         let r = WriteTool
             .execute(json!({"path": format!("../{name}"), "content": "x"}), &ctx)
@@ -261,7 +241,7 @@ mod tests {
         let dir = tmp();
         let outside = tmp();
         std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = WriteTool
             .execute(json!({"path": "link/pwned.txt", "content": "x"}), &ctx)
             .await;
@@ -296,7 +276,7 @@ mod tests {
         assert!(!outside.exists(), "target must not exist — that is the point");
         std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
 
-        let ctx = ToolContext::new(cwd.clone());
+        let ctx = ToolContext { cwd: cwd.clone() };
         let r = WriteTool
             .execute(json!({"path": "link", "content": "pwned"}), &ctx)
             .await;
@@ -344,7 +324,7 @@ mod tests {
         std::fs::remove_file(&target).unwrap();
         std::os::unix::fs::symlink(&outside, &target).unwrap();
 
-        let ctx = ToolContext::new(cwd.clone());
+        let ctx = ToolContext { cwd: cwd.clone() };
         let r = WriteTool
             .execute(json!({"path": "f.txt", "content": "pwned"}), &ctx)
             .await;
@@ -371,7 +351,7 @@ mod tests {
         std::fs::write(&outside, "original").unwrap();
         std::fs::hard_link(&outside, cwd.join("inside.txt")).unwrap();
 
-        let ctx = ToolContext::new(cwd.clone());
+        let ctx = ToolContext { cwd: cwd.clone() };
         let r = WriteTool
             .execute(json!({"path": "inside.txt", "content": "pwned"}), &ctx)
             .await;
@@ -390,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn refusal_creates_no_directories_outside_cwd() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let name = format!("sibling-{}", crate::util::uuid::v7());
         let r = WriteTool
             .execute(
@@ -406,53 +386,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ISO-03 success criterion: two agents (distinct `ToolContext`s,
-    /// each with its own `FileStateTracker`) both read the same file,
-    /// then race a `write` via `tokio::join!`. The process-wide path
-    /// lock serializes them, so exactly one succeeds; the other's
-    /// fingerprint is now stale (the first writer changed the file
-    /// while it held the lock) and it is refused. The final content is
-    /// the winner's.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_writers_one_succeeds_one_refused() {
-        let dir = tmp();
-        std::fs::write(dir.join("f.txt"), "original\n").unwrap();
-
-        let ctx_a = ToolContext::new(dir.clone());
-        let ctx_b = ToolContext::new(dir.clone());
-
-        crate::tool::read::ReadTool
-            .execute(json!({"path": "f.txt"}), &ctx_a)
-            .await
-            .unwrap();
-        crate::tool::read::ReadTool
-            .execute(json!({"path": "f.txt"}), &ctx_b)
-            .await
-            .unwrap();
-
-        let write_a = WriteTool.execute(json!({"path": "f.txt", "content": "from a"}), &ctx_a);
-        let write_b = WriteTool.execute(json!({"path": "f.txt", "content": "from b"}), &ctx_b);
-
-        let (ra, rb) = tokio::join!(write_a, write_b);
-
-        let outcomes = [ra.is_ok(), rb.is_ok()];
-        assert_eq!(
-            outcomes.iter().filter(|ok| **ok).count(),
-            1,
-            "exactly one of the two racing writers must succeed: {outcomes:?}"
-        );
-
-        let final_content = std::fs::read_to_string(dir.join("f.txt")).unwrap();
-        let expected = if ra.is_ok() { "from a" } else { "from b" };
-        assert_eq!(final_content, expected);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[tokio::test]
     async fn missing_path_arg_is_error() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = WriteTool.execute(json!({"content": "x"}), &ctx).await;
         assert!(matches!(r, Err(ToolError::InvalidArgs(_))));
         let _ = std::fs::remove_dir_all(&dir);

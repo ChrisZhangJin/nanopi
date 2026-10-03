@@ -1,28 +1,25 @@
 ---
 gsd_state_version: 1.0
 milestone: v0.13.0
-milestone_name: milestone
-status: executing
-last_updated: "2026-10-03T07:36:41.081Z"
-last_activity: 2026-10-03
+milestone_name: Orchestrator & Dynamic Subagents
+status: planning
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 6
-  completed_plans: 5
-  percent: 0
+  total_plans: 0
+  completed_plans: 0
+last_updated: "2026-10-03T00:00:00.000Z"
+last_activity: "2026-10-03 — Milestone v0.13.0 started"
 ---
 
 # Project State
 
 ## Current Position
 
-Phase: 1 of 6 (In-process runtime) — in progress
-Plan: 5 of 6 complete (In-process subagent dispatcher: Agent::build_fresh + tokio::spawn replacing the child-process runtime; panic audit of the subagent execution path)
-Status: Ready to execute
-Last activity: 2026-10-03
-
-Note: this line previously read "completed_plans: 4" before 01-04 actually ran — that count was incorrect at the time (only 01-01..01-03 were done, i.e. 3/6). It is correct now that 01-04 has, in fact, completed.
+Phase: 1 of 6 (In-process runtime) — ready to plan
+Plan: —
+Status: Ready to plan — all 6 phases have CONTEXT.md (discussed 2026-10-03)
+Last activity: 2026-10-03 — Roadmap for v0.13.0 created (6 phases, 39/39 requirements mapped)
 
 ---
 
@@ -299,18 +296,3 @@ pinned by wall-clock tests.
 | 260907-edb | Stage 2 of `docs/plugin-capabilities.md` — `host-set-context` behind a new `allow_context` grant, so a plugin can put attributed text in front of the model without deciding anything. The design problem worth remembering: `compose_system_prompt` runs ONCE at Agent construction while a plugin contributes later, so injecting there captures nothing. `Agent` now holds `system_base` and `context.system` is DERIVED per turn from base + rendered blocks — nothing appends to it, so turns cannot stack, and re-deriving the base by stripping a suffix was rejected because it makes correctness depend on a string search over attacker-controlled text. The refresh sits before `maybe_compact` so `estimate_chars` counts the contribution's real cost. `plugin_context.rs` is deliberately NOT feature-gated, following `subscriber.rs`, which is what keeps `loop_.rs` free of `cfg(feature = "wasm")` and the non-wasm prompt byte-identical. One plan decision was overridden: the disclosure line must not spend from the plugin's own `MAX_NOTIFY_PER_TURN`, because `notify.rs` drops lines once the budget is gone — a plugin could emit ten lines of noise and then rewrite the agent's instructions undisclosed. Separate counter, bidirectionally isolated. Also folds in the `deny_unknown_fields` on `ExtensionConfig` deferred from stage 1, so a typo'd grant is now a load error instead of parsing and granting nothing in silence | 2026-09-07 | `04069fa`…`3ca242f` | [260907-edb-plugin-context-contribution-stage-2-of-d](./quick/260907-edb-plugin-context-contribution-stage-2-of-d/) |
 | 260907-i8f | Stage 3 of `docs/plugin-capabilities.md` — `host-call-tool`, the last and sharpest import: a plugin can run nanopi's own built-in tools behind a per-tool `allow_tools` grant (empty denies everything; a name that is not a built-in is a LOAD ERROR naming the valid ones; `bash` in the list gets the escalated `[Extensions]` warning because it walks past `allow_fs`'s cwd confinement and `url_allowlist`'s per-host approval). Executed through ONE path plus a `ToolCallOrigin` flag rather than a second narrower path — the codebase's own history (`b90b27f`, `87a81b4`) is what argues against two paths for one situation — and the flag decides exactly three things: no `SessionEntry` (a `tool_call` the model never emitted is the shape that made sessions unresumable until `f70e5cc`), no `AgentEvent`, and a 30s deadline. The deadline wraps `tool.execute` ONLY, not `run_one_tool`, so `tool_execution_end` still fires after a timeout — wrapping the function would have manufactured a second instance of the unbalanced-hook-pair defect `87a81b4` in order to bound a timeout. Two design decisions worth remembering: the spec's prescribed `Arc<ToolRegistry>` in `PluginState` is NOT implementable (the registry is still being built while `load_all` runs, `EventSubscribers` does not exist yet, and the `AgentEvent` sender is per-turn), so the seam is a process-wide installed dispatch refreshed once per `run_turn`, following `notify::install_sink`; and plugins may call built-ins only, which is not permission tidiness but the deadlock fix — `execute_tool` takes a blocking lock unlike `handle_event`'s `try_lock`, so two mutually-granted plugins would hang, and built-ins-only removes the cycle by construction rather than by cycle detection. Also builds the grants pipe stages 1 and 2 deferred: `/tools` now shows a `Plugin grants` row per loaded plugin, and a plugin granted nothing still gets one reading `no grants`, because "installed, powerless" and "not installed" must not look identical | 2026-09-07 | `07464d0`…`5fa5acb` | [260907-i8f-plugin-tool-calls-stage-3-of-docs-plugin](./quick/260907-i8f-plugin-tool-calls-stage-3-of-docs-plugin/) |
 | 260907-r3k | Stage 4 of `docs/plugin-capabilities.md`, the last import — `host-send-user-message` behind `allow_send_message`: a plugin can start or steer a turn with text of its own, always echoed verbatim and attributed. This is the ONLY grant that spends the user's money, so it warns at startup ALONE, unlike the `allow_network` pairs — the `allow_context`-alone precedent does not apply because that grant is only sharp in combination. Three things worth remembering. (1) **§2.4's two mandated rules do not bound the loop they are aimed at, and implementing them made that plain**: a `turn_end` subscriber sending once per turn satisfies both forever, because each new turn's origin is a NEW turn and each message is consumed before the next. Hence a third bound, `MAX_PLUGIN_TURNS_PER_SESSION = 20`, per plugin, announced, surviving a guest trap so trapping is not how a plugin buys another twenty turns; recorded in the spec as a stage-4 addition rather than backdated. (2) **The spec asked for the echo BEFORE the send and the code does the opposite on purpose** — `b90b27f` is the bug where echoing first printed `[steer] …` and then discarded the text when the receiver died. Ordering is unobservable anyway; what the user needs is a biconditional (no send without an echo, no echo without a send), which is pinned as one countable partition — `echoes + overflow == accepted sends`, disjoint — rather than as two anecdotes. The spec was amended, not quietly diverged from. (3) The plan's "install at both Agent build sites" is NOT implementable and would have broken headless: the Agent never holds a steer *sender* (`run_turn` takes `steer_rx`, `build.rs` has no `SteerMessage`), so an Agent-side install could only publish an empty sink — redundant in the TUI and, in `-p`, exactly the silent no-op invariant 9 forbids. The per-turn refresh lives at `KeyAction::StartTurn`, the one turn boundary the TUI already has. Rule 1 clears at HAND-OFF, not on return, or it is decorative; rule 2 is per plugin, not global, or the audit-plus-rules pair silences itself. Of 12 reversions, 11 red at once and one — deleting the per-turn sink install — passed all 781 tests, because the call site needs a live `Term` to reach; strengthened with a deliberately brittle source-reading test | 2026-09-07 | `1fd55f4`…`e9931ce` | [260907-r3k-plugin-send-user-message-stage-4-of-do](./quick/260907-r3k-plugin-send-user-message-stage-4-of-do/) |
-
-## Decisions
-
-- [Phase ?]: Agent gets 5 flat fields rather than a bundled sub-struct
-- [Phase ?]: Only ToolExecutionStart routes a hook Ask outcome through the permission broker (D-13); other hooks treat Ask as Allow
-- [01-04]: Mid-stream turn cancellation now sets `stop_reason = Some(Cancelled)` to match the pre-iteration cancel check, so callers inspecting `stop_reason` after a successful `run_turn` (e.g. the subagent dispatcher) see cancellation correctly
-- [01-04]: Provider constructors fall back to `reqwest::Client::new()` instead of panicking on a TLS-backend-only build failure, since every subagent spawn builds its own Provider via `provider_factory` (D-11/T-01-12); not generalized to a `Result`-returning constructor across all call sites, which would be an architectural change outside this plan's scope
-- [01-04]: `run_item` checks the registry template before resolving the agent name, so "subagent runtime not initialised" is reported deterministically ahead of "unknown agent"
-- [Phase ?]: [01-05]: ActionId::StopAllSubagents defaults to ctrl+x; permission prompt is polled from the 120ms ticker rather than a new select! arm on PermissionBroker's Notify
-
-## Performance Metrics
-
-| Phase | Plan | Duration | Notes |
-|-------|------|----------|-------|
-| Phase 01 P05 | 55min | 2 tasks | 4 files |

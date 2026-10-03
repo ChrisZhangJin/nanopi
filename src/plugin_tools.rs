@@ -222,12 +222,6 @@ pub fn call_blocking(plugin: &str, name: &str, args_json: &str) -> String {
                     crate::agent::loop_::ToolCallOrigin::Plugin {
                         deadline: PLUGIN_TOOL_DEADLINE,
                     },
-                    None,
-                    std::sync::Arc::new(
-                        crate::agent::subagent_registry::SubagentRegistry::standalone(),
-                    ),
-                    std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
-                    None,
                 )
                 .await;
                 // `plugin` is carried for attribution only; the
@@ -463,10 +457,6 @@ mod tests {
             crate::agent::loop_::ToolCallOrigin::Plugin {
                 deadline: PLUGIN_TOOL_DEADLINE,
             },
-        None,
-        std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-        std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
-        None,
         )
         .await;
         assert!(!outcome.is_error, "{}", outcome.content);
@@ -503,10 +493,6 @@ mod tests {
             Default::default(),
             tx,
             crate::agent::loop_::ToolCallOrigin::Model,
-        None,
-        std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-        std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
-        None,
         )
         .await;
         assert!(rx.try_recv().is_ok(), "the model path is unchanged");
@@ -557,10 +543,6 @@ mod tests {
                 } else {
                     crate::agent::loop_::ToolCallOrigin::Model
                 },
-            None,
-            std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-            std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
-            None,
             )
             .await;
             assert!(
@@ -609,10 +591,6 @@ mod tests {
             crate::agent::loop_::ToolCallOrigin::Plugin {
                 deadline: std::time::Duration::from_millis(300),
             },
-        None,
-        std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-        std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
-        None,
         )
         .await;
         assert!(outcome.is_error, "a timeout is a failed call: {}", outcome.content);

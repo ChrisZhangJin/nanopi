@@ -11,8 +11,5 @@ pub mod hook;
 pub mod loop_;
 pub mod permission;
 pub mod prompt_override;
-#[cfg(test)]
-mod subagent_e2e_tests;
-pub mod subagent_registry;
 pub mod system_prompt;
 pub mod thinking;

@@ -368,11 +368,6 @@ impl Agent {
             // why injecting inside `compose_system_prompt` would
             // capture nothing.
             system_base: Some(prompt.clone()),
-            agent_id: None,
-            limits: None,
-            stop_reason: None,
-            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
             context: Context {
                 system: Some(prompt),
                 messages: Vec::new(),
@@ -1252,11 +1247,6 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: PromptOverrides::default(),
             system_base: None,
-            agent_id: None,
-            limits: None,
-            stop_reason: None,
-            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         };
         a.set_system_base(base.to_string());
         a

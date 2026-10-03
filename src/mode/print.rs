@@ -3,7 +3,6 @@
 //! See `docs/v0.5-research.md` §5 for the design.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -164,18 +163,10 @@ pub async fn run_print_mode(
     // to defaults quietly instead of double-reporting.
     let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
 
-    // Subagent runtime (D-04/D-14): one registry for this process, a
-    // SpawnTemplate so subagents inherit the parent's provider/model/
-    // base_url/api_key, and a Deny-mode broker — `-p` has no way to ask,
-    // so queued permission requests follow the existing non-interactive
-    // deny rule (D-14) rather than hanging.
-    let subagent_registry = std::sync::Arc::new(
-        crate::agent::subagent_registry::SubagentRegistry::new(cfg_for_build.subagent.clone()),
-    );
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
-    let mut agent = if let Some(session::SessionChoice::Resume(_)) = &choice {
+    let agent = if let Some(session::SessionChoice::Resume(_)) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
         let diags = a.hydrate_resumed(
@@ -216,42 +207,6 @@ pub async fn run_print_mode(
         print_skill_diagnostics(&diags);
         a
     };
-
-    {
-        let api_kind_captured = api_kind;
-        let cfg_provider_captured = cfg_provider.clone();
-        let base_url_captured = base_url.to_string();
-        let api_key_captured = api_key.to_string();
-        let inline_think_tags_captured = inline_think_tags;
-        let provider_factory: Arc<dyn Fn(&str) -> Box<dyn crate::agent::loop_::Provider> + Send + Sync> =
-            Arc::new(move |m: &str| {
-                crate::provider::build(
-                    api_kind_captured,
-                    &base_url_captured,
-                    &api_key_captured,
-                    m,
-                    Some(crate::vendor::pick_vendor(
-                        cfg_provider_captured.as_deref(),
-                        Some(&base_url_captured),
-                        m,
-                    )),
-                    inline_think_tags_captured,
-                )
-            });
-        subagent_registry.set_template(crate::agent::subagent_registry::SpawnTemplate {
-            cwd: cwd.clone(),
-            model: model.to_string(),
-            base_url: base_url.to_string(),
-            api_key: api_key.to_string(),
-            hooks: agent.hooks.clone(),
-            permission: agent.permission.clone(),
-            tool_exec_mode: cfg_for_build.tool_exec_mode,
-            tool_exec_overrides: cfg_for_build.tool_exec_overrides.clone(),
-            provider_factory,
-        });
-    }
-    // Deny broker is the default (D-14); `-p` never calls set_interactive().
-    agent.subagents = subagent_registry;
 
     // Fire session_start hooks before the first turn.
     agent.fire_session_start("startup").await;

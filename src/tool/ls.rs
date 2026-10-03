@@ -123,7 +123,7 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "b").unwrap();
         std::fs::write(dir.join("a.txt"), "a").unwrap();
         std::fs::create_dir(dir.join("subdir")).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = LsTool.execute(json!({}), &ctx).await.unwrap();
         let lines: Vec<&str> = out.content.lines().collect();
         assert_eq!(lines, vec!["subdir/", "a.txt", "b.txt"]);
@@ -135,7 +135,7 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join(".hidden"), "").unwrap();
         std::fs::write(dir.join("visible.txt"), "").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = LsTool.execute(json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("visible.txt"));
         assert!(!out.content.contains(".hidden"));
@@ -152,7 +152,7 @@ mod tests {
         let cwd = tmp();
         let other = tmp();
         std::fs::write(other.join("marker.txt"), "").unwrap();
-        let ctx = ToolContext::new(cwd.clone());
+        let ctx = ToolContext { cwd: cwd.clone() };
         let out = LsTool
             .execute(json!({"path": other.display().to_string()}), &ctx)
             .await
@@ -166,7 +166,7 @@ mod tests {
     async fn errors_on_non_directory() {
         let dir = tmp();
         std::fs::write(dir.join("file.txt"), "x").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = LsTool.execute(json!({"path": "file.txt"}), &ctx).await;
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);

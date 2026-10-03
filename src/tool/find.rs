@@ -167,7 +167,7 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "").unwrap();
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub").join("c.rs"), "").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = FindTool
             .execute(json!({"pattern": "\\.rs$"}), &ctx)
             .await
@@ -186,7 +186,7 @@ mod tests {
         std::fs::create_dir(dir.join("target")).unwrap();
         std::fs::write(dir.join("target").join("junk.rs"), "").unwrap();
         std::fs::write(dir.join("keep.rs"), "").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = FindTool
             .execute(json!({"pattern": "\\.rs$"}), &ctx)
             .await
@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_regex_is_error() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = FindTool.execute(json!({"pattern": "["}), &ctx).await;
         assert!(matches!(r, Err(ToolError::InvalidArgs(_))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -209,7 +209,7 @@ mod tests {
     async fn all_true_includes_dotfiles() {
         let dir = tmp();
         std::fs::write(dir.join(".hidden.rs"), "").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = FindTool
             .execute(json!({"pattern": "\\.rs$", "all": true}), &ctx)
             .await

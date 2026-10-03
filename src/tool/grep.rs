@@ -481,7 +481,7 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join("a.txt"), "hello world\nfoo bar\nHELLO again\n").unwrap();
         std::fs::write(dir.join("b.txt"), "nothing here\n").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = GrepTool
             .execute(json!({"pattern": "hello"}), &ctx)
             .await
@@ -497,7 +497,7 @@ mod tests {
     async fn case_insensitive_matches_both() {
         let dir = tmp();
         std::fs::write(dir.join("a.txt"), "hello\nHELLO\n").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = GrepTool
             .execute(json!({"pattern": "hello", "case_insensitive": true}), &ctx)
             .await
@@ -513,7 +513,7 @@ mod tests {
         // NUL byte in first 4KB → treated as binary.
         std::fs::write(dir.join("bin.dat"), b"hello\x00world").unwrap();
         std::fs::write(dir.join("txt.txt"), "hello world").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = GrepTool
             .execute(json!({"pattern": "hello"}), &ctx)
             .await
@@ -526,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_regex_is_error() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = GrepTool.execute(json!({"pattern": "["}), &ctx).await;
         assert!(matches!(r, Err(ToolError::InvalidArgs(_))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -565,7 +565,7 @@ mod tests {
         // be flipped by an env var mid-test. Calling the two search
         // functions directly is what makes a differential test possible
         // at all.
-        let ctx = ToolContext::new(dir.to_path_buf());
+        let ctx = ToolContext { cwd: dir.to_path_buf() };
         let pattern = args["pattern"].as_str().unwrap();
         let ci = args["case_insensitive"].as_bool().unwrap_or(false);
         let all = args["all"].as_bool().unwrap_or(false);
@@ -767,7 +767,7 @@ mod tests {
     async fn single_file_target() {
         let dir = tmp();
         std::fs::write(dir.join("single.txt"), "foo\nbar\n").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = GrepTool
             .execute(json!({"pattern": "bar", "path": "single.txt"}), &ctx)
             .await

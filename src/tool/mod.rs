@@ -10,7 +10,6 @@
 
 pub mod bash;
 pub mod edit;
-pub mod file_state;
 pub mod find;
 pub mod grep;
 pub mod ls;
@@ -26,11 +25,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 
 use crate::agent::context::ToolSpec;
-use crate::agent::subagent_registry::SubagentRegistry;
-use crate::tool::file_state::FileStateTracker;
 
 /// Resolve a model-supplied path for a *mutating* tool, refusing
 /// anything that lands outside `cwd`.
@@ -308,37 +304,10 @@ pub struct ToolOutput {
 }
 
 /// Context passed to every tool execution. Holds the session's cwd so
-/// tools resolve relative paths against the right root, plus (v0.13.0,
-/// Phase 1) the subagent registry, the calling agent's id, its turn's
-/// cancel token, and its file-state tracker (D-01, ISO-03).
+/// tools resolve relative paths against the right root.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
-    /// Always present — `ToolContext::new` fills in a `standalone()`
-    /// registry for call sites with no real subagent run behind them,
-    /// so nothing here needs an `Option` unwrap.
-    pub registry: Arc<SubagentRegistry>,
-    /// `None` for the main agent; `Some("a1")` etc. for a subagent.
-    pub agent_id: Option<String>,
-    /// This call's turn-level cancel token, if any.
-    pub turn_cancel: Option<CancellationToken>,
-    /// Per-agent read/write staleness tracker (ISO-03).
-    pub file_state: Arc<FileStateTracker>,
-}
-
-impl ToolContext {
-    /// Build a context for the main agent (or any call site with no
-    /// real subagent run behind it): a standalone registry, no agent
-    /// id, no turn cancel token, and a fresh file-state tracker.
-    pub fn new(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            registry: Arc::new(SubagentRegistry::standalone()),
-            agent_id: None,
-            turn_cancel: None,
-            file_state: Arc::new(FileStateTracker::default()),
-        }
-    }
 }
 
 /// Where a registered tool came from.
@@ -614,45 +583,7 @@ impl ToolRegistry {
         }
         Ok(filtered)
     }
-
-    /// Build the registry a subagent gets (D-10/D-17): the standard
-    /// built-in set, minus every control-plane tool a subagent must
-    /// never hold, minus every WASM-plugin-sourced tool.
-    ///
-    /// Enforced here, at construction, rather than by hiding these
-    /// tools from the subagent's prompt — a name a subagent can still
-    /// resolve by guessing is not actually denied. Filtering the final
-    /// built set (rather than hand-building a shorter list) means a new
-    /// built-in that lands in `standard()` tomorrow is automatically
-    /// subject to the same deny-list check, with no second place to
-    /// remember to update.
-    ///
-    /// No WASM tools for subagents (D-17): every `ToolSource::Plugin`
-    /// entry is stripped regardless of name, since `standard()` itself
-    /// never registers one — this only matters for callers that build
-    /// on top of a registry a plugin has already extended.
-    pub fn for_subagent() -> Self {
-        let full = Self::standard();
-        let mut filtered = Self::new();
-        for (name, tool) in full.tools {
-            if SUBAGENT_DENIED_TOOLS.contains(&name.as_str()) {
-                continue;
-            }
-            if matches!(tool.source(), ToolSource::Plugin { .. }) {
-                continue;
-            }
-            filtered.tools.insert(name, tool);
-        }
-        filtered
-    }
 }
-
-/// Tools a subagent must never be able to call (D-10): the
-/// control-plane surface that lets an agent spawn/signal/stop/enumerate
-/// other agents. Granting these to a subagent would let it recursively
-/// spawn its own subagents (uncontrolled fan-out) or interfere with
-/// agents it does not own.
-pub const SUBAGENT_DENIED_TOOLS: &[&str] = &["subagent", "send_message", "stop", "list"];
 
 #[cfg(test)]
 mod tests {
@@ -1216,69 +1147,11 @@ mod tests {
     #[tokio::test]
     async fn tool_execute_returns_content() {
         let tool = EchoTool;
-        let ctx = ToolContext::new(PathBuf::from("/tmp"));
+        let ctx = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+        };
         let out = tool.execute(json!({"text":"hi"}), &ctx).await.unwrap();
         assert_eq!(out.content, "hi");
         assert!(!out.is_error);
-    }
-
-    /// D-10: a subagent's registry must never carry any of the
-    /// control-plane tools, and must still carry every ordinary
-    /// built-in a subagent legitimately needs (read/write/edit/bash/
-    /// grep/find/ls).
-    #[test]
-    fn subagent_registry_denies_control_tools() {
-        let r = ToolRegistry::for_subagent();
-        let names = r.names();
-        for denied in SUBAGENT_DENIED_TOOLS {
-            assert!(
-                !names.contains(&denied.to_string()),
-                "for_subagent() must not carry {denied:?}, got {names:?}"
-            );
-        }
-        for allowed in ["read", "write", "edit", "bash", "grep", "find", "ls"] {
-            assert!(
-                names.contains(&allowed.to_string()),
-                "for_subagent() must still carry {allowed:?}, got {names:?}"
-            );
-        }
-    }
-
-    /// D-17: no WASM/plugin-sourced tool may reach a subagent, even if
-    /// the registry it is filtered from already has plugin tools
-    /// registered into it.
-    #[test]
-    fn subagent_registry_denies_plugin_tools() {
-        struct FakePlugin;
-        #[async_trait]
-        impl Tool for FakePlugin {
-            fn spec(&self) -> ToolSpec {
-                ToolSpec {
-                    name: "fake_plugin_tool".into(),
-                    description: "d".into(),
-                    parameters: json!({}),
-                }
-            }
-            async fn execute(
-                &self,
-                _args: Value,
-                _ctx: &ToolContext,
-            ) -> Result<ToolOutput, ToolError> {
-                unreachable!()
-            }
-            fn source(&self) -> ToolSource {
-                ToolSource::Plugin {
-                    name: "fake".into(),
-                    path: "fake.wasm".into(),
-                }
-            }
-        }
-        let mut r = ToolRegistry::standard();
-        r.register_external(Arc::new(FakePlugin)).unwrap();
-        // `for_subagent()` always rebuilds from `standard()` — this
-        // test only asserts the invariant that no Plugin-sourced tool
-        // ever makes it through, independent of how it was filtered.
-        let filtered = ToolRegistry::for_subagent();
-        assert!(!filtered.names().contains(&"fake_plugin_tool".to_string()));
     }
 }

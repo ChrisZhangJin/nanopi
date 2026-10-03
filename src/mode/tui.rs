@@ -477,7 +477,7 @@ pub async fn run_tui_mode(
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};
     let skill_load_for_rebuilds = skill_load.clone();
     let prompt_overrides_for_rebuilds = prompt_overrides.clone();
-    let mut agent: Agent = if let SessionChoice::Resume(_) = &choice {
+    let agent: Agent = if let SessionChoice::Resume(_) = &choice {
         let mut a = Agent::load_session(&session_path, &cwd)
             .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
         let diags = a.hydrate_resumed(
@@ -518,52 +518,6 @@ pub async fn run_tui_mode(
         print_skill_diagnostics(&diags);
         a
     };
-
-    // D-01/D-04/D-06/D-13: one subagent registry for this process,
-    // built from `[subagent]` config. Interactive from the start (the
-    // TUI can always answer), with a SpawnTemplate inheriting the
-    // parent's provider/model/base_url/api_key — see
-    // `install_subagent_runtime` for the shape every later rebuild
-    // (model swap, `/new`, `/fork`, `/resume`, `/import`) reinstalls.
-    let subagent_registry = Arc::new(
-        crate::agent::subagent_registry::SubagentRegistry::new(cfg_for_build.subagent.clone()),
-    );
-    subagent_registry.permissions().set_interactive();
-    {
-        let base_url_captured = base_url.to_string();
-        let api_key_captured = api_key.to_string();
-        let api_kind_captured = api_kind;
-        let cfg_provider_captured = cfg_provider.clone();
-        let inline_think_tags_captured = inline_think_tags;
-        let provider_factory: Arc<
-            dyn Fn(&str) -> Box<dyn crate::agent::loop_::Provider> + Send + Sync,
-        > = Arc::new(move |m: &str| {
-            crate::provider::build(
-                api_kind_captured,
-                &base_url_captured,
-                &api_key_captured,
-                m,
-                Some(crate::vendor::pick_vendor(
-                    cfg_provider_captured.as_deref(),
-                    Some(&base_url_captured),
-                    m,
-                )),
-                inline_think_tags_captured,
-            )
-        });
-        subagent_registry.set_template(crate::agent::subagent_registry::SpawnTemplate {
-            cwd: cwd.clone(),
-            model: model.to_string(),
-            base_url: base_url.to_string(),
-            api_key: api_key.to_string(),
-            hooks: agent.hooks.clone(),
-            permission: agent.permission.clone(),
-            tool_exec_mode: cfg_for_build.tool_exec_mode,
-            tool_exec_overrides: cfg_for_build.tool_exec_overrides.clone(),
-            provider_factory,
-        });
-    }
-    agent.subagents = subagent_registry.clone();
 
     let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
 
@@ -619,7 +573,6 @@ pub async fn run_tui_mode(
     // later pick_vendor() (model swap, /new, /fork) reads it from there,
     // and it used to sit at None forever, silently ignoring the field.
     app.cfg_provider = cfg_provider.clone();
-    app.subagents = subagent_registry;
     app.max_replay_entries = cfg_for_build
         .max_replay_entries
         .unwrap_or(DEFAULT_MAX_REPLAY_ENTRIES);
@@ -968,18 +921,6 @@ struct App {
     /// `summarize_task`.
     command_task:
         Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
-    /// D-01/D-04/D-06/D-13: the process-wide subagent registry. Set to
-    /// a real `SubagentConfig`-backed registry right after `App::new`;
-    /// every rebuilt `Agent` (model swap, `/new`, `/fork`, `/resume`,
-    /// `/import`) shares this same instance via
-    /// `install_subagent_runtime`, so `stop_all()` and the permission
-    /// queue are process-wide, not per-agent.
-    subagents: Arc<crate::agent::subagent_registry::SubagentRegistry>,
-    /// Oldest queued subagent permission request, refreshed each tick
-    /// from `subagents.permissions().front()` (D-13). `Some` suspends
-    /// normal input handling: y/n answers it, Esc denies it without
-    /// also cancelling the running turn.
-    pending_permission: Option<crate::agent::subagent_registry::PermissionRequest>,
 }
 
 impl App {
@@ -1045,8 +986,6 @@ impl App {
             subscriptions_cache: Vec::new(),
             plugin_grants_cache: Vec::new(),
             command_task: None,
-            subagents: Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-            pending_permission: None,
         }
     }
 }
@@ -1260,11 +1199,6 @@ enum KeyAction {
         word: String,
         suggestion: Option<String>,
     },
-    /// Ctrl+X (D-06): cancel every running subagent via
-    /// `SubagentRegistry::stop_all()`. Works while the main turn is
-    /// streaming — unlike `CancelTurn`, this never touches the main
-    /// turn's own cancel token.
-    StopAllSubagents,
 }
 
 /// Dispatch one key event. Palette (if open) claims navigation keys
@@ -1272,34 +1206,6 @@ enum KeyAction {
 /// handled, the palette's open/closed state is re-synced against the
 /// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
-    // D-13 interim permission prompt — highest priority while shown.
-    // Only y/n/Esc are meaningful; everything else is swallowed so the
-    // input box cannot be edited mid-prompt. Esc here denies the
-    // request without touching the running turn's cancel token (that
-    // is ToolCancel's job, bound separately below).
-    if let Some(req) = app.pending_permission.take() {
-        match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.subagents.permissions().answer_front(true);
-                app.status_note = None;
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.subagents.permissions().answer_front(false);
-                app.status_note = None;
-            }
-            _ => {
-                // Not an answer — put it back and ignore the key.
-                app.pending_permission = Some(req);
-            }
-        }
-        return KeyAction::Nothing;
-    }
-    // Ctrl+X (configurable, D-06) — cancel every running subagent. Must
-    // work even mid-turn, so it is checked ahead of every modal/picker
-    // branch below (none of which should ever swallow it).
-    if app.bindings.matches(crate::keys::ActionId::StopAllSubagents, k) {
-        return KeyAction::StopAllSubagents;
-    }
     if let Some(action) = app.capture_key_for {
         if k.code == KeyCode::Esc {
             app.capture_key_for = None;
@@ -1977,21 +1883,6 @@ async fn run_app(
                         app.command_task = Some(task);
                     }
                 }
-                // D-13 interim permission prompt: surface the oldest
-                // queued subagent permission request, one at a time
-                // (FIFO) — `front()` never changes which request it
-                // returns until `answer_front` pops it, so it is safe
-                // to poll every tick rather than racing the broker's
-                // internal `Notify`. The main agent's own `ask` outcome
-                // (01-03) arrives through this same broker labelled
-                // "main", so there is never a second competing prompt.
-                if app.pending_permission.is_none() {
-                    if let Some(req) = app.subagents.permissions().front() {
-                        app.status_note =
-                            Some(format!("[{}] wants to run: {}  (y/n)", req.agent_id, req.summary));
-                        app.pending_permission = Some(req);
-                    }
-                }
                 // `note!` lines — plugin `host-log`, provider retry
                 // notices, hook diagnostics, `/new`'s config warnings.
                 // While the TUI is up `note!` queues instead of writing
@@ -2236,19 +2127,6 @@ async fn handle_action(
                 app.turn_was_cancelled = true;
             }
         }
-        KeyAction::StopAllSubagents => {
-            let n = app.subagents.live_count();
-            app.subagents.stop_all();
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    format!("[stopped {n} subagent{}]", if n == 1 { "" } else { "s" }),
-                    Style::default()
-                        .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
-                )]),
-            )?;
-        }
         KeyAction::ExpandLastTool => {
             // Only expand once per source. Priority: tool result first
             // (matches historical behavior), otherwise the last skill
@@ -2402,7 +2280,6 @@ async fn handle_action(
                 a.provider = new_provider;
                 a.model = new_model.clone();
                 app.model = new_model.clone();
-                install_subagent_runtime(app, a);
                 insert_line(
                     term,
                     Line::from(vec![Span::styled(
@@ -2470,8 +2347,6 @@ async fn handle_action(
                 extensions: cfg_now.extensions,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
-            let mut new_agent = new_agent;
-            install_subagent_runtime(app, &mut new_agent);
             swap_agent_with_reason(agent_slot, new_agent, "new").await;
             app.session_id = new_header.id.clone();
             app.usage = crate::event::Usage::default();
@@ -2631,7 +2506,6 @@ async fn handle_action(
                 &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
-            install_subagent_runtime(app, &mut new_agent);
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &path);
             swap_agent_with_reason(agent_slot, new_agent, "resume").await;
@@ -3079,7 +2953,6 @@ async fn handle_action(
                 &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
-            install_subagent_runtime(app, &mut new_agent);
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &dest);
             swap_agent_with_reason(agent_slot, new_agent, "import").await;
@@ -3796,51 +3669,6 @@ async fn recv_optional(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<Ag
 /// newly-installed incoming agent. Holding the mutex guard across both
 /// `await`s is correct here: this all runs on one task, and the hook
 /// subprocess has no path back into `agent_slot`.
-/// Install (or refresh) the process-wide subagent runtime on `agent`
-/// (D-04): rebuild the `SpawnTemplate` from `agent`'s current
-/// cwd/model/base_url/api_key/hooks/permission/tool_exec settings, with
-/// a `provider_factory` that wraps `crate::provider::build` the same
-/// way every other follow-up Provider in this file is built, then point
-/// `agent.subagents` at `app.subagents` so stop-all and the permission
-/// queue are shared process-wide rather than per-agent. Called after
-/// every `build_fresh` / `hydrate_resumed` / model swap.
-fn install_subagent_runtime(app: &App, agent: &mut Agent) {
-    let api_kind = app.api_kind;
-    let cfg_provider = app.cfg_provider.clone();
-    let inline_think_tags = app.inline_think_tags;
-    let base_url = agent.base_url.clone();
-    let api_key = agent.api_key.clone();
-    let provider_factory: Arc<
-        dyn Fn(&str) -> Box<dyn crate::agent::loop_::Provider> + Send + Sync,
-    > = Arc::new(move |m: &str| {
-        crate::provider::build(
-            api_kind,
-            &base_url,
-            &api_key,
-            m,
-            Some(crate::vendor::pick_vendor(
-                cfg_provider.as_deref(),
-                Some(&base_url),
-                m,
-            )),
-            inline_think_tags,
-        )
-    });
-    app.subagents
-        .set_template(crate::agent::subagent_registry::SpawnTemplate {
-            cwd: agent.cwd.clone(),
-            model: agent.model.clone(),
-            base_url: agent.base_url.clone(),
-            api_key: agent.api_key.clone(),
-            hooks: agent.hooks.clone(),
-            permission: agent.permission.clone(),
-            tool_exec_mode: agent.tool_exec_mode,
-            tool_exec_overrides: agent.tool_exec_overrides.clone(),
-            provider_factory,
-        });
-    agent.subagents = app.subagents.clone();
-}
-
 async fn swap_agent_with_reason(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     incoming_agent: Agent,
@@ -3942,7 +3770,6 @@ async fn execute_fork(
         &app.extensions,
     );
     crate::agent::build::print_skill_diagnostics(&diags);
-    install_subagent_runtime(app, &mut new_agent);
     let new_session_id = new_header.id;
 
     swap_agent_with_reason(agent_slot, new_agent, "fork").await;
@@ -6259,11 +6086,6 @@ mod tests {
             event_subscribers: Default::default(),
             prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
             system_base: None,
-            agent_id: None,
-            limits: None,
-            stop_reason: None,
-            subagents: std::sync::Arc::new(crate::agent::subagent_registry::SubagentRegistry::standalone()),
-            file_state: std::sync::Arc::new(crate::tool::file_state::FileStateTracker::default()),
         }
     }
 
@@ -6398,59 +6220,6 @@ mod tests {
             Vec::new(),
             std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
         )
-    }
-
-    #[test]
-    fn ctrl_x_yields_stop_all_subagents_action() {
-        let mut app = mkapp();
-        let action = interpret_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::CONTROL),
-        );
-        assert!(matches!(action, KeyAction::StopAllSubagents));
-    }
-
-    #[test]
-    fn pending_permission_prompt_intercepts_y_and_answers_front() {
-        let mut app = mkapp();
-        app.subagents.permissions().set_interactive();
-        let broker = Arc::clone(&app.subagents);
-        let handle = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let req_handle = handle.spawn(async move {
-            broker
-                .permissions()
-                .request(
-                    crate::agent::subagent_registry::PermissionRequest {
-                        agent_id: "a1".into(),
-                        summary: "run rm -rf".into(),
-                    },
-                    &tokio_util::sync::CancellationToken::new(),
-                )
-                .await
-        });
-        handle.block_on(async { tokio::task::yield_now().await });
-        app.pending_permission = app.subagents.permissions().front();
-        assert!(app.pending_permission.is_some());
-
-        let action = interpret_key(&mut app, KeyEvent::new(KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE));
-        assert!(matches!(action, KeyAction::Nothing));
-        assert!(app.pending_permission.is_none());
-        assert!(handle.block_on(req_handle).unwrap());
-    }
-
-    #[test]
-    fn pending_permission_prompt_ignores_unrelated_keys() {
-        let mut app = mkapp();
-        app.pending_permission = Some(crate::agent::subagent_registry::PermissionRequest {
-            agent_id: "a1".into(),
-            summary: "run rm -rf".into(),
-        });
-        let action = interpret_key(&mut app, KeyEvent::new(KeyCode::Char('q'), crossterm::event::KeyModifiers::NONE));
-        assert!(matches!(action, KeyAction::Nothing));
-        assert!(app.pending_permission.is_some(), "an unrelated key must not dismiss the prompt");
     }
 
     fn seed_input(app: &mut App, text: &str) {

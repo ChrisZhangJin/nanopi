@@ -19,7 +19,6 @@ pub enum ActionId {
     NewlineInInput,
     OpenSlashPalette,
     OpenSettings,
-    StopAllSubagents,
 }
 
 impl ActionId {
@@ -31,7 +30,6 @@ impl ActionId {
             ActionId::NewlineInInput,
             ActionId::OpenSlashPalette,
             ActionId::OpenSettings,
-            ActionId::StopAllSubagents,
         ]
     }
 
@@ -43,7 +41,6 @@ impl ActionId {
             ActionId::NewlineInInput => "Insert newline in input",
             ActionId::OpenSlashPalette => "Open slash-command palette",
             ActionId::OpenSettings => "Open settings menu",
-            ActionId::StopAllSubagents => "Stop all subagents",
         }
     }
 }
@@ -179,10 +176,6 @@ impl KeyBindings {
         );
         // OpenSettings has NO default binding — only reachable via the
         // `/settings` slash command.
-        map.insert(
-            ActionId::StopAllSubagents,
-            KeySpec { code: KeyCode::Char('x'), mods: KeyModifiers::CONTROL },
-        );
         Self { map }
     }
 
@@ -347,19 +340,6 @@ mod tests {
             KeySpec { code: KeyCode::BackTab, mods: KeyModifiers::NONE },
         );
         assert_eq!(prev, Some(ActionId::ThinkingCycle));
-    }
-
-    #[test]
-    fn default_bindings_stop_all_subagents_ctrl_x() {
-        let kb = KeyBindings::default();
-        assert!(kb.matches(
-            ActionId::StopAllSubagents,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-        ));
-        assert!(!kb.matches(
-            ActionId::StopAllSubagents,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-        ));
     }
 
     #[test]

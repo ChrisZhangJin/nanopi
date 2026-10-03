@@ -48,17 +48,9 @@ impl AnthropicProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
-            // `client_builder().build()` only fails on TLS backend
-            // initialization errors, which do not depend on any
-            // per-request input (D-11/T-01-12): a provider is
-            // constructed fresh for every in-process subagent dispatch,
-            // so a panic here would take down the whole batch over a
-            // condition no caller can act on. Fall back to
-            // `reqwest::Client::new()` (the same defaults minus our
-            // custom builder tweaks) rather than aborting the process.
             client: crate::net::client_builder()
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("build reqwest client"),
             vendor: None,
         }
     }
@@ -185,31 +177,18 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> serde_json::Value 
                 // the model ever saw the results. A single tool call per
                 // turn never tripped it, so it only shows up once two
                 // tools land in one batch.
-                // The guard above already proved `prev["content"]` is a
-                // JSON array, so `as_array_mut()` is infallible here —
-                // but T-01-12 says a subagent-reachable path should
-                // never bet a panic on that staying true forever (e.g.
-                // a future refactor of the guard). Fall through to the
-                // same "start a fresh user turn" behavior as the `_`
-                // arm instead of unwrapping.
-                let appended = match messages.last_mut() {
+                match messages.last_mut() {
                     Some(prev)
                         if prev["role"] == "user"
                             && prev["content"].is_array()
                             && prev["content"][0]["type"] == "tool_result" =>
                     {
-                        match prev["content"].as_array_mut() {
-                            Some(arr) => {
-                                arr.push(block.clone());
-                                true
-                            }
-                            None => false,
-                        }
+                        prev["content"]
+                            .as_array_mut()
+                            .expect("checked is_array above")
+                            .push(block);
                     }
-                    _ => false,
-                };
-                if !appended {
-                    messages.push(json!({"role": "user", "content": [block]}));
+                    _ => messages.push(json!({"role": "user", "content": [block]})),
                 }
             }
         }

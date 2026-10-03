@@ -129,15 +129,6 @@ impl Tool for ReadTool {
         let raw = std::fs::read(&abs)
             .map_err(|e| ToolError::Execution(format!("cannot read {}: {e}", abs.display())))?;
 
-        // Record this read's fingerprint (mtime + content hash) so a
-        // later write/edit by this agent can detect a stale read
-        // (ISO-03, D-15). Recording never fails the read itself — a
-        // failure here only means a later staleness check cannot see
-        // this read, not that the read failed.
-        if let Some(key) = crate::tool::file_state::canonical_key(&ctx.cwd, path_str) {
-            ctx.file_state.record(&key, &raw);
-        }
-
         if let Some(media_type) = crate::util::image_detect::detect_media_type(&raw) {
             if raw.len() > MAX_IMAGE_RAW_BYTES {
                 return Err(ToolError::Execution(format!(
@@ -245,7 +236,7 @@ mod tests {
     async fn reads_full_file() {
         let dir = tmp();
         std::fs::write(dir.join("hello.txt"), "line1\nline2\nline3\n").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = ReadTool
             .execute(json!({"path": "hello.txt"}), &ctx)
             .await
@@ -263,7 +254,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(dir.join("lines.txt"), &body).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         // offset=2 (0-indexed → start at line3), limit=3 → lines 3,4,5
         let out = ReadTool
             .execute(json!({"path": "lines.txt", "offset": 2, "limit": 3}), &ctx)
@@ -287,7 +278,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(dir.join("big.txt"), &body).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = ReadTool
             .execute(json!({"path": "big.txt"}), &ctx)
             .await
@@ -321,7 +312,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(dir.join("wide.txt"), &body).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = ReadTool
             .execute(json!({"path": "wide.txt"}), &ctx)
             .await
@@ -341,7 +332,7 @@ mod tests {
     async fn small_file_is_not_truncated() {
         let dir = tmp();
         std::fs::write(dir.join("small.txt"), "a\nb\nc\n").unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = ReadTool
             .execute(json!({"path": "small.txt"}), &ctx)
             .await
@@ -357,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn missing_file_is_error() {
         let dir = tmp();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = ReadTool.execute(json!({"path": "nope.txt"}), &ctx).await;
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -373,7 +364,7 @@ mod tests {
         png_bytes.extend_from_slice(b"IHDR");
         png_bytes.extend_from_slice(&[0; 13]); // fake IHDR body
         std::fs::write(dir.join("pic.png"), &png_bytes).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let out = ReadTool
             .execute(json!({"path": "pic.png"}), &ctx)
             .await
@@ -394,7 +385,7 @@ mod tests {
         let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0];
         jpg.extend_from_slice(&vec![0u8; 4_000_000]);
         std::fs::write(dir.join("huge.jpg"), &jpg).unwrap();
-        let ctx = ToolContext::new(dir.clone());
+        let ctx = ToolContext { cwd: dir.clone() };
         let r = ReadTool.execute(json!({"path": "huge.jpg"}), &ctx).await;
         assert!(r.is_err());
         let msg = format!("{:?}", r.err().unwrap());
@@ -412,7 +403,7 @@ mod tests {
         let other = tmp();
         let outside = other.join("skill.md");
         std::fs::write(&outside, "---\nname: x\n---\nbody\n").unwrap();
-        let ctx = ToolContext::new(cwd.clone());
+        let ctx = ToolContext { cwd: cwd.clone() };
         let out = ReadTool
             .execute(json!({"path": outside.display().to_string()}), &ctx)
             .await
