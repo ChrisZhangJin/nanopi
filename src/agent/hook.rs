@@ -283,6 +283,9 @@ fn build_hook_input(
         arguments: arguments.clone(),
         cwd: Some(cwd.display().to_string()),
         session_id: session_id.map(|s| s.to_string()),
+        agent_id: std::env::var("NANOPI_AGENT_ID")
+            .ok()
+            .filter(|s| !s.is_empty()),
     }
 }
 
@@ -425,6 +428,11 @@ pub struct HookInput {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Subagent id, present only when this process runs as a child
+    /// (`NANOPI_AGENT_ID` set). Omitted otherwise so the main agent's
+    /// payload stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Outcome of running one hook.
@@ -1365,6 +1373,7 @@ mod tests {
             arguments: json!({"command": "ls"}),
             cwd: Some("/tmp".into()),
             session_id: None,
+            agent_id: None,
         };
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
         assert_eq!(out, HookOutcome::Allow);
@@ -1385,6 +1394,7 @@ mod tests {
             arguments: json!({}),
             cwd: None,
             session_id: None,
+            agent_id: None,
         };
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
         match out {
@@ -1408,6 +1418,7 @@ mod tests {
             arguments: json!({}),
             cwd: None,
             session_id: None,
+            agent_id: None,
         };
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
         match out {
@@ -1837,6 +1848,28 @@ fn input_event_round_trips() {
     assert_eq!(back, v);
 }
 
+#[test]
+fn hook_input_agent_id_serialization() {
+    let mut input = HookInput {
+        event: HookEvent::Input,
+        tool_name: None,
+        tool_call_id: None,
+        arguments: serde_json::Value::Null,
+        cwd: None,
+        session_id: Some("s".into()),
+        agent_id: None,
+    };
+    let without = serde_json::to_string(&input).unwrap();
+    assert!(!without.contains("agent_id"), "got {without}");
+    assert_eq!(
+        without,
+        r#"{"event":"input","arguments":null,"session_id":"s"}"#
+    );
+    input.agent_id = Some("a1".into());
+    let with = serde_json::to_string(&input).unwrap();
+    assert!(with.contains(r#""agent_id":"a1""#), "got {with}");
+}
+
 /// `Input` hooks don't have a tool_name, but the input
 /// payload still has a `prompt` field carrying the user's text.
 #[test]
@@ -1848,6 +1881,7 @@ fn input_hook_input_has_event_field() {
         arguments: serde_json::Value::String("hi".into()),
         cwd: None,
         session_id: None,
+        agent_id: None,
     };
     let s = serde_json::to_string(&input).unwrap();
     assert!(s.contains("\"event\":\"input\""), "got {s}");

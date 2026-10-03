@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod branch_summary;
+pub mod brief;
 pub mod build;
 pub mod compact;
 pub mod context;
