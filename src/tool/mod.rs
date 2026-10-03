@@ -10,6 +10,7 @@
 
 pub mod bash;
 pub mod edit;
+pub mod file_state;
 pub mod find;
 pub mod grep;
 pub mod ls;
