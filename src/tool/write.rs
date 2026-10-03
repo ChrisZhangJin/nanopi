@@ -406,6 +406,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ISO-03 success criterion: two agents (distinct `ToolContext`s,
+    /// each with its own `FileStateTracker`) both read the same file,
+    /// then race a `write` via `tokio::join!`. The process-wide path
+    /// lock serializes them, so exactly one succeeds; the other's
+    /// fingerprint is now stale (the first writer changed the file
+    /// while it held the lock) and it is refused. The final content is
+    /// the winner's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_writers_one_succeeds_one_refused() {
+        let dir = tmp();
+        std::fs::write(dir.join("f.txt"), "original\n").unwrap();
+
+        let ctx_a = ToolContext::new(dir.clone());
+        let ctx_b = ToolContext::new(dir.clone());
+
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx_a)
+            .await
+            .unwrap();
+        crate::tool::read::ReadTool
+            .execute(json!({"path": "f.txt"}), &ctx_b)
+            .await
+            .unwrap();
+
+        let write_a = WriteTool.execute(json!({"path": "f.txt", "content": "from a"}), &ctx_a);
+        let write_b = WriteTool.execute(json!({"path": "f.txt", "content": "from b"}), &ctx_b);
+
+        let (ra, rb) = tokio::join!(write_a, write_b);
+
+        let outcomes = [ra.is_ok(), rb.is_ok()];
+        assert_eq!(
+            outcomes.iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one of the two racing writers must succeed: {outcomes:?}"
+        );
+
+        let final_content = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        let expected = if ra.is_ok() { "from a" } else { "from b" };
+        assert_eq!(final_content, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn missing_path_arg_is_error() {
         let dir = tmp();
