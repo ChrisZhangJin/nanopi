@@ -574,7 +574,7 @@ impl ToolRegistry {
         r.register(Arc::new(grep::GrepTool));
         r.register(Arc::new(find::FindTool));
         r.register(Arc::new(ls::LsTool));
-        r.register(Arc::new(subagent::SubagentTool));
+        r.register(Arc::new(subagent::SubagentTool::new()));
         r
     }
 

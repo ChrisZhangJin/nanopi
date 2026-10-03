@@ -444,6 +444,22 @@ async fn main() -> ExitCode {
         }
     }
 
+    // Subagent supervision (01-05): one registry per run, and the
+    // resolved provider settings every child inherits (D-01).
+    nanopi::subagent_registry::set_global(nanopi::subagent_registry::SubagentRegistry::new(
+        &cfg.subagent,
+    ));
+    nanopi::tool::subagent::set_launch_spec(nanopi::tool::subagent::ChildLaunchSpec {
+        model: Some(model.clone()),
+        base_url: Some(base_url.clone()),
+        api_kind: api_kind_raw.map(str::to_string),
+        api_key: Some(api_key.clone()),
+        trust: Some(project_trusted),
+        max_turns: cfg.subagent.max_turns,
+        token_budget: cfg.subagent.token_budget,
+        timeout: std::time::Duration::from_secs(cfg.subagent.timeout_secs),
+    });
+
     // The TUI needs a real terminal. `-p` is the explicit non-interactive
     // mode, but a piped invocation (`echo "..." | nanopi`) implies the
     // same thing — before, that case fell through to the rustyline mode;
@@ -545,6 +561,10 @@ async fn main() -> ExitCode {
         .await
     };
 
+    // Never leave a running child behind on exit.
+    if let Some(reg) = nanopi::subagent_registry::global() {
+        reg.kill_all();
+    }
     match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
