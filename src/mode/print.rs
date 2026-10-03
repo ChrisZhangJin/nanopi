@@ -297,6 +297,11 @@ pub async fn run_print_mode(
         );
     }
 
+    // Child limits bound the whole run, including the brief self-check
+    // turns (CR-01), not each `run_turn` call.
+    if child.brief.is_some() || child.max_turns.is_some() || child.token_budget.is_some() {
+        agent.set_run_scoped_limits(true);
+    }
     if let Some(n) = child.max_turns {
         agent.set_max_turns(n);
     }

@@ -81,11 +81,25 @@ pub struct TurnLimits {
     pub max_turns: u32,
     pub token_budget: Option<u64>,
     last_limit_hit: Option<&'static str>,
+    /// When set, `max_turns` / `token_budget` bound the whole run
+    /// (every `run_turn` call combined) instead of each call (CR-01).
+    run_scoped: bool,
+    /// Tokens used so far across `run_turn` calls (run-scoped mode).
+    run_tokens: u64,
+    /// LLM iterations used so far across `run_turn` calls (run-scoped mode).
+    run_turns: u32,
 }
 
 impl Default for TurnLimits {
     fn default() -> Self {
-        Self { max_turns: 50, token_budget: None, last_limit_hit: None }
+        Self {
+            max_turns: 50,
+            token_budget: None,
+            last_limit_hit: None,
+            run_scoped: false,
+            run_tokens: 0,
+            run_turns: 0,
+        }
     }
 }
 
@@ -755,6 +769,14 @@ impl Agent {
         self.limits.token_budget = budget;
     }
 
+    /// Make `max_turns` / `token_budget` apply to the whole run (all
+    /// `run_turn` calls combined) rather than resetting per call. Used
+    /// by `-p` child runs, whose brief self-check calls `run_turn`
+    /// several times under one budget.
+    pub fn set_run_scoped_limits(&mut self, on: bool) {
+        self.limits.run_scoped = on;
+    }
+
     /// Which limit ended the most recent turn: `"max_turns"`,
     /// `"token_budget"`, or `None` if it ended normally.
     pub fn last_limit_hit(&self) -> Option<&'static str> {
@@ -1092,10 +1114,26 @@ impl Agent {
         // giving up the safety belt. Bumping this alone is not a fix
         // for a stuck-looking session; see the fix below to
         // SessionEntry::Message content that also went out in v0.9.1.
-        let max_turns = self.limits.max_turns.max(1);
+        let run_scoped = self.limits.run_scoped;
         let token_budget = self.limits.token_budget;
-        let mut turn_tokens: u64 = 0;
+        // Run-scoped mode: start from what earlier calls already used.
+        let mut turn_tokens: u64 = if run_scoped { self.limits.run_tokens } else { 0 };
+        let max_turns = if run_scoped {
+            self.limits.max_turns.max(1).saturating_sub(self.limits.run_turns)
+        } else {
+            self.limits.max_turns.max(1)
+        };
         self.limits.last_limit_hit = None;
+        if run_scoped {
+            if max_turns == 0 {
+                self.limits.last_limit_hit = Some("max_turns");
+                return Ok(String::new());
+            }
+            if token_budget.is_some_and(|b| turn_tokens >= b) {
+                self.limits.last_limit_hit = Some("token_budget");
+                return Ok(String::new());
+            }
+        }
 
         // Tripwire for "stuck retrying the same failing tool_call" —
         // observed in the wild with minimax-M3 through an OpenAI-compat
@@ -1120,6 +1158,9 @@ impl Agent {
         let mut follow_up_queue: Vec<String> = Vec::new();
 
         for iteration_idx in 0..max_turns {
+            if run_scoped {
+                self.limits.run_turns = self.limits.run_turns.saturating_add(1);
+            }
             // If a cancel token was provided, bail before starting a new
             // LLM turn. The user's accumulated context is preserved.
             if let Some(ct) = cancel.as_ref() {
@@ -1443,9 +1484,12 @@ impl Agent {
                 .usage_total
                 .cache_write_tokens
                 .saturating_add(usage.cache_write_tokens);
-            turn_tokens = turn_tokens
-                .saturating_add(u64::from(usage.input_tokens))
+            let call_tokens = u64::from(usage.input_tokens)
                 .saturating_add(u64::from(usage.output_tokens));
+            turn_tokens = turn_tokens.saturating_add(call_tokens);
+            if run_scoped {
+                self.limits.run_tokens = self.limits.run_tokens.saturating_add(call_tokens);
+            }
 
             // Snapshot had_tool_calls before the match — `calls` is moved
             // inside the ToolCalls arm, so the TurnEnd hook below needs
@@ -5607,6 +5651,36 @@ mod tests {
         agent.set_token_budget(None);
         agent.set_max_turns(1);
         let _ = run_limited(&mut agent).await;
+        assert_eq!(agent.last_limit_hit(), Some("max_turns"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CR-01 regression: in run-scoped mode the budget and turn cap
+    /// cover every `run_turn` call combined, so repeated calls (the
+    /// brief self-check loop) cannot each spend a fresh allowance.
+    #[tokio::test]
+    async fn run_scoped_limits_span_run_turn_calls() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut agent, calls, dir) = limit_agent(20);
+        agent.set_run_scoped_limits(true);
+        agent.set_token_budget(Some(30));
+        let _ = run_limited(&mut agent).await;
+        assert_eq!(calls.load(SeqCst), 2);
+        assert_eq!(agent.last_limit_hit(), Some("token_budget"));
+        // A further call must not reset the budget.
+        let r = run_limited(&mut agent).await;
+        assert!(r.is_ok());
+        assert_eq!(calls.load(SeqCst), 2, "no extra LLM calls after budget spent");
+        assert_eq!(agent.last_limit_hit(), Some("token_budget"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut agent, calls, dir) = limit_agent(0);
+        agent.set_run_scoped_limits(true);
+        agent.set_max_turns(3);
+        let _ = run_limited(&mut agent).await;
+        assert_eq!(calls.load(SeqCst), 3);
+        let _ = run_limited(&mut agent).await;
+        assert_eq!(calls.load(SeqCst), 3, "max_turns covers the whole run");
         assert_eq!(agent.last_limit_hit(), Some("max_turns"));
         let _ = std::fs::remove_dir_all(&dir);
     }
