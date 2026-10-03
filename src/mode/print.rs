@@ -315,10 +315,20 @@ pub async fn run_print_mode(
     // `--brief` (RT-09): the brief file is the task; a positional
     // message, if any, follows it.
     let brief_path = child.brief.clone();
+    // WR-05: the brief is read once; the same content seeds both the
+    // task text and the first watcher's amendment baseline.
+    let mut brief_content: Option<String> = None;
     let task = match &brief_path {
         Some(p) => match std::fs::read_to_string(p) {
-            Ok(b) if message.trim().is_empty() => b,
-            Ok(b) => format!("{b}\n\n{message}"),
+            Ok(b) => {
+                let t = if message.trim().is_empty() {
+                    b.clone()
+                } else {
+                    format!("{b}\n\n{message}")
+                };
+                brief_content = Some(b);
+                t
+            }
             // WR-01: an unreadable brief is fatal — never run an empty task.
             Err(e) => {
                 let reason = format!("cannot read brief {}: {e}", p.display());
@@ -356,7 +366,10 @@ pub async fn run_print_mode(
         let mut agent = agent; // move
         let brief_path = brief_path.clone();
         tokio::spawn(async move {
-            let steer = brief_path.as_ref().map(|p| start_brief_watch(p));
+            let steer = match (brief_path.as_ref(), brief_content.as_deref()) {
+                (Some(p), Some(c)) => Some(start_brief_watch(p, c)),
+                _ => None,
+            };
             let mut r = agent.run_turn(task.as_str(), &tx, None, steer).await;
             let mut limit = agent.last_limit_hit();
             let mut checklist_reply: Option<String> = None;
@@ -367,11 +380,12 @@ pub async fn run_print_mode(
                     if r.is_err() || limit.is_some() {
                         break;
                     }
+                    // One read feeds both the prompt and the watcher
+                    // baseline, so no amendment falls between them (WR-05).
                     let current = std::fs::read_to_string(p).unwrap_or_default();
                     let prompt = self_check_prompt(&current);
-                    r = agent
-                        .run_turn(prompt.as_str(), &tx, None, Some(start_brief_watch(p)))
-                        .await;
+                    let steer = start_brief_watch(p, &current);
+                    r = agent.run_turn(prompt.as_str(), &tx, None, Some(steer)).await;
                     limit = agent.last_limit_hit();
                     match &r {
                         Ok(text) => {
@@ -496,10 +510,14 @@ const BRIEF_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 const SELF_CHECK_TURNS: usize = 2;
 
 /// Start an amendment watcher for one `run_turn`; the watcher exits when
-/// the returned receiver is dropped at the end of that turn.
-fn start_brief_watch(p: &std::path::Path) -> mpsc::Receiver<crate::event::SteerMessage> {
-    let content = std::fs::read_to_string(p).unwrap_or_default();
-    let last = crate::agent::brief::next_amendment_number(&content).saturating_sub(1);
+/// the returned receiver is dropped at the end of that turn. `content`
+/// must be the exact brief text already shown to the model, so the
+/// baseline matches what was delivered (WR-05).
+fn start_brief_watch(
+    p: &std::path::Path,
+    content: &str,
+) -> mpsc::Receiver<crate::event::SteerMessage> {
+    let last = crate::agent::brief::next_amendment_number(content).saturating_sub(1);
     let (stx, srx) = mpsc::channel(8);
     crate::mode::brief_watch::spawn_brief_watcher(p.to_path_buf(), last, stx, BRIEF_POLL);
     srx
