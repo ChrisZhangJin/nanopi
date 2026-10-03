@@ -26,7 +26,7 @@ owner decisions made on 2026-10-03.
   without the subagent/control tools). A global cap limits how many
   child processes are alive at once.
 
-- [ ] **RT-06**: Each subagent has a turn limit and a token budget,
+- [x] **RT-06**: Each subagent has a turn limit and a token budget,
   passed to the child on its command line, with configurable defaults.
   When it hits either, it stops and reports partial work.
 
@@ -39,7 +39,7 @@ owner decisions made on 2026-10-03.
   produces unparseable output is reported as a failed agent with its
   error text; nanopi keeps running.
 
-- [ ] **RT-09**: The child works from a brief file. While it runs, the
+- [x] **RT-09**: The child works from a brief file. While it runs, the
   orchestrator may only append `## Amendment N` sections to the brief;
   the child checks the brief between turns and injects new amendments
   as steering messages. Before finishing, the child re-reads the brief
@@ -196,10 +196,10 @@ owner decisions made on 2026-10-03.
 | RT-03 | Phase 1 | Pending |
 | RT-04 | Phase 1 | Pending |
 | RT-05 | Phase 1 | Pending |
-| RT-06 | Phase 1 | Pending |
+| RT-06 | Phase 1 | Complete |
 | RT-07 | Phase 1 | Pending |
 | RT-08 | Phase 1 | Pending |
-| RT-09 | Phase 1 | Pending |
+| RT-09 | Phase 1 | Complete |
 | ISO-03 | Phase 1 | Complete |
 | ARC-01 | Phase 2 | Pending |
 | ARC-02 | Phase 2 | Pending |
