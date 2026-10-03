@@ -907,14 +907,17 @@ async fn spawn_and_collect_with(
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
     let mut out_truncated = false;
+    // Wait for the leader to exit WITHOUT reaping it (WR-03): the zombie
+    // keeps the pgid reserved, so the group sweep below cannot hit an
+    // unrelated group that reused the id.
     let waited = tokio::time::timeout(timeout, async {
-        let (t, _, status) = tokio::join!(
+        let (t, _, exited) = tokio::join!(
             drain_head(stdout, &mut out_buf, STDOUT_CAP),
             drain_tail(stderr, &mut err_buf, STDERR_TAIL),
-            child.wait()
+            wait_exited(&mut child, pid)
         );
         out_truncated = t;
-        status
+        exited
     })
     .await;
 
@@ -930,10 +933,18 @@ async fn spawn_and_collect_with(
             );
         }
         Ok(Err(e)) => return failed_output(&format!("waiting for subagent: {e}"), &stderr_tail),
-        Ok(Ok(s)) => s,
+        Ok(Ok(())) => {
+            // Leader exited but is not yet reaped: sweep stray
+            // grandchildren while the zombie still owns the pgid, then reap.
+            drop(guard);
+            match child.wait().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return failed_output(&format!("waiting for subagent: {e}"), &stderr_tail)
+                }
+            }
+        }
     };
-    // Reaped normally; still sweep the group for stray grandchildren.
-    drop(guard);
 
     if !status.success() {
         #[cfg(unix)]
@@ -974,6 +985,38 @@ async fn spawn_and_collect_with(
         Err(e) => return failed_output(&format!("unparseable output: {e}"), &stderr_tail),
     };
     envelope_output(env, &stderr_tail)
+}
+
+/// Resolve once the child has exited. On unix this uses
+/// `waitid(WNOWAIT)` so the child is left as a zombie (not reaped) and
+/// its pid/pgid cannot be reused until `child.wait()` is called.
+async fn wait_exited(child: &mut tokio::process::Child, pid: Option<u32>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        return tokio::task::spawn_blocking(move || loop {
+            // SAFETY: zeroed siginfo_t is a valid out-parameter for waitid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if r == 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+    }
+    let _ = pid;
+    child.wait().await.map(|_| ())
 }
 
 /// Map a parsed child envelope to the tool result.
@@ -1394,6 +1437,34 @@ mod tests {
         let out = spawn_and_collect(sh("echo garbage; exit 1"), Duration::from_secs(5)).await;
         assert!(out.is_error);
         assert!(out.content.contains("exit code 1"), "{}", out.content);
+    }
+
+    /// WR-03: the group sweep runs before the leader is reaped, and still
+    /// kills a detached grandchild after a normal exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_exit_sweeps_grandchild_before_reap() {
+        let dir = std::env::temp_dir().join(format!("nanopi-sa-sw-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("pid");
+        let ok = r#"{"session_id":"s","model":"m","finish_reason":"stop","duration_ms":1,"usage":{},"messages":[{"role":"assistant","content":"hi"}],"status":"completed"}"#;
+        let script = format!(
+            "sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {}; echo '{ok}'",
+            f.display()
+        );
+        let out = spawn_and_collect(sh(&script), Duration::from_secs(10)).await;
+        assert!(!out.is_error, "{}", out.content);
+        let pid: i32 = std::fs::read_to_string(&f).unwrap().trim().parse().unwrap();
+        let mut dead = false;
+        for _ in 0..50 {
+            if pid_dead(pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(dead, "grandchild {pid} survived the post-exit sweep");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
