@@ -155,7 +155,14 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
   3. Each subagent writes its own session transcript; the parent session file contains only the tool call and its result.
   4. A subagent that hits its turn limit, token budget, provider error, or tries to spawn a subagent ends as a reported failure/partial result while nanopi keeps running; the global live-agent cap is enforced.
   5. Two agents editing the same file: the second edit is refused because the file changed since it was read; a permission request from a subagent is queued and the subagent waits for a decision.
-**Plans**: TBD
+**Plans**: 6 plans
+Plans:
+- [ ] 01-01-PLAN.md — [subagent] config, SubagentRegistry + PermissionBroker, FileStateTracker, widened ToolContext
+- [ ] 01-02-PLAN.md — ISO-03 stale-write guard in read/write/edit
+- [ ] 01-03-PLAN.md — agent loop limits/stop reason, hook agent_id + ask, subagent deny-list
+- [ ] 01-04-PLAN.md — in-process subagent dispatcher (old runtime removed) + panic audit
+- [ ] 01-05-PLAN.md — TUI/print wiring: Ctrl+X stop-all, inline permission prompt, -p deny
+- [ ] 01-06-PLAN.md — end-to-end success-criteria tests + human check
 **Research flags**: needs research — WASM extensions shared across agents, `panic = "abort"` audit, file-state design, shared 429 backoff.
 **Interim (owner decision 2026-10-03)**: until Phase 5 ships the strip approval surface (UI-03), queued subagent permission requests are answered through a simple inline confirmation prompt in the TUI, labelled with the requesting agent's id. Phase 5 replaces it.
 
