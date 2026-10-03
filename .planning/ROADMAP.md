@@ -144,7 +144,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 
 | Phase | Name | Goal | Requirements | Depends on |
 |-------|------|------|--------------|------------|
-| 1 | Child-process runtime | 3/7 | In Progress|  |
+| 1 | Child-process runtime | 4/7 | In Progress|  |
 | 2 | Archive & lifecycle | Every subagent leaves a durable `.md` trail | ARC-01..ARC-05 | 1 |
 | 3 | Dynamic subagents | The model dispatches by describing the task | DYN-01..DYN-05 | 1, 2 |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
@@ -178,7 +178,7 @@ Plans:
 - [x] 01-01-PLAN.md — ISO-03 cross-process stale-write guard + atomic writes
 - [x] 01-02-PLAN.md — loop turn/token limits, hook agent_id, brief text model
 - [x] 01-03-PLAN.md — SubagentRegistry, caps, process-group ChildGuard, [subagent] config
-- [ ] 01-04-PLAN.md — child `-p` flags, session file, recursion strip, PDEATHSIG, envelope status
+- [x] 01-04-PLAN.md — child `-p` flags, session file, recursion strip, PDEATHSIG, envelope status
 - [ ] 01-05-PLAN.md — parent supervisor: brief, registry, inherited provider, failure mapping
 - [ ] 01-06-PLAN.md — brief watcher amendments, self-check, report.md checklist
 - [ ] 01-07-PLAN.md — exit-path kill_all, docs, end-to-end success-criteria tests
