@@ -152,11 +152,83 @@ struct Args {
     /// (`pi/packages/coding-agent/src/cli/args.ts:121`; `main.ts:367`).
     #[arg(long = "no-session")]
     no_session: bool,
+
+    /// Write this run's transcript to exactly this file (created, or
+    /// resumed if it exists). Never touches the cwd's active-session
+    /// pointer. Used by the parent when launching a subagent child.
+    #[arg(
+        long = "session-file",
+        value_name = "PATH",
+        conflicts_with_all = ["session_id", "continue_session", "fork_id", "no_session", "exact_session_id"]
+    )]
+    session_file: Option<PathBuf>,
+
+    /// Stop after N model turns in this run (status `limit_reached`).
+    #[arg(long = "max-turns", value_name = "N")]
+    max_turns: Option<u32>,
+
+    /// Stop once this run has used K input+output tokens.
+    #[arg(long = "token-budget", value_name = "N")]
+    token_budget: Option<u64>,
+
+    /// Brief file for a subagent child. Its presence marks agent mode.
+    #[arg(long = "brief", value_name = "PATH")]
+    brief: Option<PathBuf>,
+}
+
+/// Agent (child) mode: launched by a parent nanopi as a subagent.
+fn is_agent_mode(args: &Args) -> bool {
+    args.brief.is_some() || std::env::var_os("NANOPI_AGENT_ID").is_some()
+}
+
+/// Tie a child's lifetime to its parent (D-12, T-01-10). On Linux the
+/// kernel delivers SIGKILL when the parent dies; the getppid check
+/// closes the race where the parent died before prctl ran. Returns
+/// false if the parent is already gone.
+fn install_parent_death_signal() -> bool {
+    let expected: Option<i32> = std::env::var("NANOPI_PARENT_PID")
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
+    if let Some(pid) = expected {
+        // SAFETY: getppid has no preconditions.
+        let ppid = unsafe { libc::getppid() };
+        if ppid != pid {
+            return false;
+        }
+    }
+    true
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+
+    let agent_mode = is_agent_mode(&args);
+    if agent_mode && !install_parent_death_signal() {
+        eprintln!("nanopi: parent process is gone; exiting");
+        return ExitCode::from(1);
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if agent_mode && std::env::var_os("NANOPI_PARENT_PID").is_some() {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if unsafe { libc::getppid() } == 1 {
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -430,6 +502,14 @@ async fn main() -> ExitCode {
             cfg.inline_think_tags,
             args.tools.clone(),
             args.no_session,
+            print::ChildOptions {
+                session_file: args.session_file.clone(),
+                max_turns: args.max_turns,
+                token_budget: args.token_budget,
+                brief: args.brief.clone(),
+                agent_id: std::env::var("NANOPI_AGENT_ID").ok(),
+                agent_mode,
+            },
         )
         .await
     } else {
@@ -496,4 +576,54 @@ fn is_init_subcommand(args: &Args) -> bool {
 /// wrapper over [`nanopi::paths::expand_home`], which takes a `&str`.
 fn expand_tilde(p: &std::path::Path) -> PathBuf {
     nanopi::paths::expand_home(&p.to_string_lossy())
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    #[test]
+    fn args_parse_child_flags() {
+        let a = Args::try_parse_from([
+            "nanopi",
+            "-p",
+            "--output",
+            "json",
+            "--brief",
+            "/b.md",
+            "--session-file",
+            "/t.jsonl",
+            "--tools",
+            "read,grep",
+            "--max-turns",
+            "3",
+            "--token-budget",
+            "1000",
+            "hi",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.session_file.as_deref(),
+            Some(std::path::Path::new("/t.jsonl"))
+        );
+        assert_eq!(a.brief.as_deref(), Some(std::path::Path::new("/b.md")));
+        assert_eq!(a.max_turns, Some(3));
+        assert_eq!(a.token_budget, Some(1000));
+        assert_eq!(a.tools, vec!["read", "grep"]);
+        assert!(is_agent_mode(&a));
+    }
+
+    #[test]
+    fn args_session_file_conflicts_with_session_selectors() {
+        for extra in [
+            &["--session", "x"][..],
+            &["--continue"][..],
+            &["--fork", "x"][..],
+            &["--no-session"][..],
+        ] {
+            let mut v = vec!["nanopi", "-p", "--session-file", "/t.jsonl"];
+            v.extend_from_slice(extra);
+            assert!(Args::try_parse_from(v).is_err(), "{extra:?} should conflict");
+        }
+    }
 }

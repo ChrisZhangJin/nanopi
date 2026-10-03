@@ -25,7 +25,7 @@ pub enum OutputFormat {
 }
 
 /// JSON envelope returned at the end of `-p --output json` mode.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct JsonEnvelope {
     pub session_id: String,
     pub model: String,
@@ -33,6 +33,38 @@ pub struct JsonEnvelope {
     pub duration_ms: u64,
     pub usage: Value,
     pub messages: Vec<Value>,
+    /// `completed` | `limit_reached` | `failed`. Absent on old readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// `max_turns` | `token_budget` when `status == limit_reached`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// The `--brief` path (the child's report lives there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<String>,
+    /// `NANOPI_AGENT_ID` when running as a subagent child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Error text when `status == failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Child-side (`subagent` process) options for print mode.
+#[derive(Debug, Clone, Default)]
+pub struct ChildOptions {
+    /// `--session-file`: exact transcript path; never the active session.
+    pub session_file: Option<PathBuf>,
+    /// `--max-turns`.
+    pub max_turns: Option<u32>,
+    /// `--token-budget`.
+    pub token_budget: Option<u64>,
+    /// `--brief`.
+    pub brief: Option<PathBuf>,
+    /// `NANOPI_AGENT_ID`.
+    pub agent_id: Option<String>,
+    /// Running as a child: `subagent` is never registered (D-05).
+    pub agent_mode: bool,
 }
 
 pub async fn run_print_mode(
@@ -66,6 +98,7 @@ pub async fn run_print_mode(
     // `~/.nanopi/sessions/` and this run never becomes the cwd's active
     // session. Mirrors PI's `SessionManager.inMemory` (`main.ts:367`).
     no_session: bool,
+    child: ChildOptions,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
 
@@ -77,8 +110,26 @@ pub async fn run_print_mode(
     // Resolve which session to use. For an ephemeral run there is nothing
     // to resolve — `--no-session` is incompatible with the resume flags
     // (rejected in main.rs) — so we go straight to a temp-file session.
+    // `--session-file` (clap rejects it alongside every other selector):
+    // open or create the transcript at that exact path.
+    let session_file = match &child.session_file {
+        Some(p) => Some((
+            p.clone(),
+            session::open_or_create_at(p, &cwd, model, base_url)
+                .map_err(|e| anyhow::anyhow!("open session file {}: {e}", p.display()))?,
+        )),
+        None => None,
+    };
+
     let choice = if no_session {
         None
+    } else if let Some((p, (_, resumed))) = &session_file {
+        Some(if *resumed {
+            session::SessionChoice::Resume(p.clone())
+        } else {
+            // Fresh file already created above; handled specially below.
+            session::SessionChoice::New
+        })
     } else {
         // --fork > --session > --continue > new.
         Some(
@@ -106,8 +157,11 @@ pub async fn run_print_mode(
                 .map_err(|e| anyhow::anyhow!("read resumed session: {e}"))?;
             (p.clone(), h)
         }
-        Some(session::SessionChoice::New) => session::new_session(&cwd, model, base_url)
-            .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
+        Some(session::SessionChoice::New) => match &session_file {
+            Some((p, (h, _))) => (p.clone(), h.clone()),
+            None => session::new_session(&cwd, model, base_url)
+                .map_err(|e| anyhow::anyhow!("create session: {e}"))?,
+        },
         Some(session::SessionChoice::NewWithId(id)) => {
             // PI warns here too — a typo'd --session-id silently starting
             // a fresh conversation instead of resuming is worth a line on
@@ -123,7 +177,9 @@ pub async fn run_print_mode(
 
     // Register this cwd's active session pointer (used by next --continue).
     // Skipped for ephemeral runs — they must leave no trace.
-    if !no_session {
+    // Also skipped for `--session-file`: a child's transcript must never
+    // become the cwd's active session (research anti-pattern).
+    if !no_session && session_file.is_none() {
         let _ = session::set_active_session(&cwd, &session_path);
     }
 
@@ -153,8 +209,26 @@ pub async fn run_print_mode(
     // event key, which has always been fatal.
     let hooks = settings::load_settings(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let registry = ToolRegistry::standard_with_allowlist(&tools_allow)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // `--tools`: built-in names restrict the standard set; any other
+    // name may be a WASM plugin tool, resolved once extensions load
+    // (D-14). Unlisted plugin tools are never registered.
+    let (builtin_allow, _, plugin_candidates) =
+        crate::tool::split_tool_allowlist(&tools_allow, &[]);
+    let mut registry = if tools_allow.is_empty() {
+        ToolRegistry::standard()
+    } else if builtin_allow.is_empty() {
+        ToolRegistry::new()
+    } else {
+        ToolRegistry::standard_with_allowlist(&builtin_allow).map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+    if !tools_allow.is_empty() {
+        registry.set_plugin_allowlist(&plugin_candidates);
+    }
+    // Depth 1 (D-05): a child never gets the subagent tool, even if the
+    // parent listed it.
+    if child.agent_mode {
+        registry.remove("subagent");
+    }
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` live in config.toml,
     // which isn't threaded through this function's parameter list.
@@ -207,6 +281,28 @@ pub async fn run_print_mode(
         print_skill_diagnostics(&diags);
         a
     };
+    let mut agent = agent;
+
+    // Any `--tools` name that is neither built-in nor a loaded plugin
+    // tool is a hard error, same as before plugins were allowed.
+    let loaded_plugins = agent.registry.plugin_tool_names();
+    let (_, _, unknown) = crate::tool::split_tool_allowlist(&plugin_candidates, &loaded_plugins);
+    if !unknown.is_empty() {
+        let mut valid = ToolRegistry::standard().names();
+        valid.extend(loaded_plugins);
+        anyhow::bail!(
+            "unknown tool {:?} in --tools; valid tools: {}",
+            unknown[0],
+            valid.join(", ")
+        );
+    }
+
+    if let Some(n) = child.max_turns {
+        agent.set_max_turns(n);
+    }
+    if child.token_budget.is_some() {
+        agent.set_token_budget(child.token_budget);
+    }
 
     // Fire session_start hooks before the first turn.
     agent.fire_session_start("startup").await;
@@ -217,10 +313,11 @@ pub async fn run_print_mode(
         let mut agent = agent; // move
         tokio::spawn(async move {
             let r = agent.run_turn(message_owned.as_str(), &tx, None, None).await;
+            let limit = agent.last_limit_hit();
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
             agent.fire_session_shutdown("quit").await;
-            r
+            (r, limit)
         })
     };
 
@@ -248,7 +345,21 @@ pub async fn run_print_mode(
     if let Some(mut s) = spinner.take() {
         s.stop().await;
     }
-    let final_text = agent_task.await??;
+    let (turn_result, limit_hit) = agent_task.await?;
+    // Text mode keeps the old behavior (error -> exit 1 via main). JSON
+    // mode reports the failure in-band so the parent can parse it.
+    let turn_error = match turn_result {
+        Ok(_) => None,
+        Err(e) if output == OutputFormat::Json => Some(e.to_string()),
+        Err(e) => return Err(e.into()),
+    };
+    let status = if turn_error.is_some() {
+        "failed"
+    } else if limit_hit.is_some() {
+        "limit_reached"
+    } else {
+        "completed"
+    };
 
     let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -274,10 +385,15 @@ pub async fn run_print_mode(
                 usage: json!({}),
                 // Read entries back BEFORE the ephemeral file is deleted.
                 messages: collect_messages(&session_path)?,
+                status: Some(status.to_string()),
+                limit: limit_hit.map(str::to_string),
+                report_path: child.brief.as_ref().map(|p| p.display().to_string()),
+                agent_id: child.agent_id.clone(),
+                error: turn_error.clone(),
             };
             let s = serde_json::to_string(&envelope)?;
             println!("{s}");
-            Ok(0)
+            Ok(if turn_error.is_some() { 1 } else { 0 })
         }
     };
 
@@ -287,10 +403,7 @@ pub async fn run_print_mode(
         let _ = std::fs::remove_file(&session_path);
     }
 
-    result.map(|code| {
-        let _ = final_text; // silence unused warning if json branch
-        code
-    })
+    result
 }
 
 /// Read back all SessionEntries from a session file and present the

@@ -681,6 +681,7 @@ mod tests {
                 json!({"role": "user", "content": "again"}),
                 json!({"role": "assistant", "content": "final answer"}),
             ],
+            ..Default::default()
         };
         assert_eq!(final_assistant_text(&env), "final answer");
     }
@@ -694,6 +695,7 @@ mod tests {
             duration_ms: 0,
             usage: json!({}),
             messages: vec![json!({"role": "user", "content": "hi"})],
+            ..Default::default()
         };
         assert_eq!(final_assistant_text(&env), "");
     }

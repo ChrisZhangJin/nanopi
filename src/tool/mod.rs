@@ -379,6 +379,10 @@ pub enum ExecutionMode {
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    /// `--tools` restriction on plugin tools (D-14). `None` = every
+    /// plugin tool registers; `Some(set)` = only plugin tools whose
+    /// name is in the set are accepted by `register_external`.
+    plugin_allow: Option<std::collections::HashSet<String>>,
 }
 
 impl ToolRegistry {
@@ -407,8 +411,40 @@ impl ToolRegistry {
         if self.tools.contains_key(&name) {
             return Err(name);
         }
+        if let Some(allow) = &self.plugin_allow {
+            // Not listed in `--tools`: quietly not registered. This is a
+            // restriction the caller asked for, not a collision.
+            if !allow.contains(&name) && !allow.contains(&name.to_ascii_lowercase()) {
+                return Ok(());
+            }
+        }
         self.tools.insert(name, tool);
         Ok(())
+    }
+
+    /// Restrict which plugin tools `register_external` will accept.
+    /// Must be set before extensions load.
+    pub fn set_plugin_allowlist(&mut self, names: &[String]) {
+        self.plugin_allow = Some(names.iter().map(|n| n.to_ascii_lowercase()).collect());
+    }
+
+    /// Remove one tool by exact name. Only ever used to *narrow* the
+    /// toolset (e.g. stripping `subagent` from a child agent, D-05);
+    /// returns whether something was removed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
+    /// Names of every registered plugin-supplied tool, sorted.
+    pub fn plugin_tool_names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|(_, t)| matches!(t.source(), ToolSource::Plugin { .. }))
+            .map(|(n, _)| n.clone())
+            .collect();
+        n.sort();
+        n
     }
 
     /// Remove every tool supplied by one plugin. Returns the names
@@ -586,10 +622,69 @@ impl ToolRegistry {
     }
 }
 
+/// Split a `--tools` list into `(builtin, plugin, unknown)` (D-14).
+///
+/// Built-ins are matched via [`ToolRegistry::canonical_name`] against
+/// `standard()`; anything else is matched case-insensitively against
+/// `plugin_names` (the loaded plugin tool names). Pure so the routing
+/// is unit-testable without loading WASM.
+pub fn split_tool_allowlist(
+    names: &[String],
+    plugin_names: &[String],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let std = ToolRegistry::standard();
+    let (mut builtin, mut plugin, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
+    for n in names {
+        let n = n.trim();
+        if n.is_empty() {
+            continue;
+        }
+        if let Some(c) = std.canonical_name(n) {
+            builtin.push(c);
+        } else if let Some(p) = plugin_names.iter().find(|p| p.eq_ignore_ascii_case(n)) {
+            plugin.push(p.clone());
+        } else {
+            unknown.push(n.to_string());
+        }
+    }
+    (builtin, plugin, unknown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn split_tool_allowlist_routes_builtin_plugin_unknown() {
+        let names: Vec<String> = ["read", "Bash_tool", "my_wasm_tool", "nope"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (b, p, u) = split_tool_allowlist(&names, &["my_wasm_tool".to_string()]);
+        assert_eq!(b, vec!["read", "bash"]);
+        assert_eq!(p, vec!["my_wasm_tool"]);
+        assert_eq!(u, vec!["nope"]);
+        let (b, p, u) = split_tool_allowlist(&names, &[]);
+        assert_eq!(b.len(), 2);
+        assert!(p.is_empty());
+        assert_eq!(u, vec!["my_wasm_tool", "nope"]);
+    }
+
+    #[test]
+    fn plugin_allowlist_skips_unlisted_external_tools_and_remove_narrows() {
+        let mut r = ToolRegistry::new();
+        r.set_plugin_allowlist(&["other".to_string()]);
+        r.register_external(Arc::new(EchoTool)).unwrap();
+        assert!(
+            r.get("echo").is_none(),
+            "unlisted plugin tool must not register"
+        );
+        let mut r = ToolRegistry::standard();
+        assert!(r.remove("subagent"));
+        assert!(r.get("subagent").is_none());
+        assert!(!r.remove("subagent"));
+    }
 
     struct EchoTool;
     #[async_trait]

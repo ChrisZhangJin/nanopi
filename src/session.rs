@@ -326,6 +326,49 @@ pub fn new_ephemeral_session(
     Ok((path, header))
 }
 
+/// Open the session at exactly `path`, creating it (with a fresh
+/// header) if it does not exist or is empty. Backs the child-side
+/// `--session-file`: the parent picks where a subagent's transcript
+/// lives, and the child never touches the cwd's active-session pointer.
+///
+/// Returns the header and `true` when an existing transcript was
+/// resumed (so the caller hydrates history from it).
+pub fn open_or_create_at(
+    path: &Path,
+    cwd: &Path,
+    model: &str,
+    base_url: &str,
+) -> Result<(SessionHeader, bool), SessionError> {
+    let existing = std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if existing {
+        let (h, _entries) = read_session(path)?;
+        return Ok((h, true));
+    }
+    let id = uuid::v7().to_string();
+    let header = SessionHeader {
+        id: id.clone(),
+        parent_id: None,
+        cwd: cwd.to_path_buf(),
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        name: None,
+    };
+    let entry = SessionEntry::Header {
+        version: 2,
+        id,
+        parent_id: None,
+        timestamp: time::now_iso8601(),
+        cwd: cwd.display().to_string(),
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        name: None,
+    };
+    append_entry(path, &entry)?;
+    Ok((header, false))
+}
+
 /// Append one entry to a session file. Each entry is one line.
 pub fn append_entry(path: &Path, entry: &SessionEntry) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
