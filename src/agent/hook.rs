@@ -275,6 +275,7 @@ fn build_hook_input(
     arguments: &Value,
     cwd: &std::path::Path,
     session_id: Option<&str>,
+    agent_id: Option<&str>,
 ) -> HookInput {
     HookInput {
         event,
@@ -283,6 +284,7 @@ fn build_hook_input(
         arguments: arguments.clone(),
         cwd: Some(cwd.display().to_string()),
         session_id: session_id.map(|s| s.to_string()),
+        agent_id: agent_id.map(|s| s.to_string()),
     }
 }
 
@@ -298,6 +300,7 @@ pub fn event_payload_json(
     arguments: &Value,
     cwd: &std::path::Path,
     session_id: Option<&str>,
+    agent_id: Option<&str>,
 ) -> String {
     serde_json::to_string(&build_hook_input(
         event,
@@ -306,6 +309,7 @@ pub fn event_payload_json(
         arguments,
         cwd,
         session_id,
+        agent_id,
     ))
     .expect("serialize HookInput")
 }
@@ -425,6 +429,12 @@ pub struct HookInput {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// D-16: the subagent's short id ("a3") when this call belongs to a
+    /// subagent; absent (not merely null) for the main agent, so an
+    /// existing hook script that does not know this field still sees
+    /// the same JSON shape it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Outcome of running one hook.
@@ -437,6 +447,14 @@ pub enum HookOutcome {
     /// Hook returned a JSON `updated_input` — replace the tool's args.
     Transform {
         new_arguments: Value,
+    },
+    /// RT-07 / post-planning decision (2026-10-03): `{"decision":"ask"}`
+    /// routes the call through the shared `PermissionBroker` instead of
+    /// deciding outright. Does not short-circuit `run_hooks` the way
+    /// Block does — later hooks still run, and a later Block still
+    /// wins over an earlier Ask.
+    Ask {
+        reason: String,
     },
 }
 
@@ -682,6 +700,18 @@ fn parse_json_decision(stdout: &str) -> Option<HookOutcome> {
         return Some(HookOutcome::Block { reason });
     }
 
+    // `decision: "ask"` — RT-07's trigger. Checked before `updated_input`
+    // so a hook that asks (optionally alongside a rewrite) is not
+    // silently reinterpreted as a Transform.
+    if decision == Some("ask") {
+        let reason = v
+            .get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("hook requested permission")
+            .to_string();
+        return Some(HookOutcome::Ask { reason });
+    }
+
     // `updated_input` (object) → Transform, whether `decision` is
     // "allow", omitted, or unrecognized. v0.9.1 fix: the previous
     // parser only handled "allow" / "block" strings and threw away
@@ -720,8 +750,14 @@ pub async fn run_hooks(
     arguments: Value,
     cwd: &std::path::Path,
     session_id: Option<&str>,
+    agent_id: Option<&str>,
 ) -> (HookOutcome, Option<Value>) {
     let mut current_args = arguments;
+    // D-16 / RT-07: an Ask does not short-circuit the chain the way Block
+    // does — remember the first one and keep running every remaining
+    // hook, so a later Block still wins. Returned only if nothing ever
+    // blocked.
+    let mut pending_ask: Option<String> = None;
     for h in hooks {
         if h.kind != "command" {
             continue; // only "command" type in v0.5
@@ -736,6 +772,7 @@ pub async fn run_hooks(
             &current_args,
             cwd,
             session_id,
+            agent_id,
         );
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
@@ -747,6 +784,9 @@ pub async fn run_hooks(
         if let Some(s) = session_id {
             env.insert("NANOPI_SESSION_ID".into(), s.into());
         }
+        if let Some(a) = agent_id {
+            env.insert("NANOPI_AGENT_ID".into(), a.into());
+        }
         match run_hook(h, &input, &env).await {
             Ok(HookOutcome::Allow) => {}
             Ok(HookOutcome::Block { reason }) => {
@@ -754,6 +794,11 @@ pub async fn run_hooks(
             }
             Ok(HookOutcome::Transform { new_arguments }) => {
                 current_args = new_arguments;
+            }
+            Ok(HookOutcome::Ask { reason }) => {
+                if pending_ask.is_none() {
+                    pending_ask = Some(reason);
+                }
             }
             Err(e) => {
                 // Hook crashed — fail open (allow). Documented in
@@ -771,6 +816,9 @@ pub async fn run_hooks(
                 );
             }
         }
+    }
+    if let Some(reason) = pending_ask {
+        return (HookOutcome::Ask { reason }, Some(current_args));
     }
     (HookOutcome::Allow, Some(current_args))
 }
@@ -818,7 +866,7 @@ pub async fn run_session_hooks(
         if !matcher_matches(&h.matcher, subject) {
             continue;
         }
-        let input = build_hook_input(event, None, None, &arguments, cwd, Some(session_id));
+        let input = build_hook_input(event, None, None, &arguments, cwd, Some(session_id), None);
         let mut env = HashMap::new();
         env.insert("NANOPI_EVENT".into(), event.env_var().into());
         env.insert("NANOPI_SESSION_ID".into(), session_id.into());
@@ -857,12 +905,26 @@ pub(crate) fn report_advisory(
 /// which folds errors into `Allow` itself and hands back one outcome
 /// for the whole chain.
 pub(crate) fn report_advisory_outcome(event: HookEvent, outcome: HookOutcome) {
-    if let HookOutcome::Block { reason } = outcome {
-        crate::note!(
-            "nanopi: {} hook asked to block; ignored (advisory event) \
-             [reason={reason}]",
-            event.env_var()
-        );
+    match outcome {
+        HookOutcome::Block { reason } => {
+            crate::note!(
+                "nanopi: {} hook asked to block; ignored (advisory event) \
+                 [reason={reason}]",
+                event.env_var()
+            );
+        }
+        // Ask has no permission broker to route through for an advisory
+        // event (no tool call, nothing to gate) — treated as Allow, but
+        // still worth a line so it is not silently indistinguishable
+        // from a hook that never asked.
+        HookOutcome::Ask { reason } => {
+            crate::note!(
+                "nanopi: {} hook asked for permission; treated as allow \
+                 (advisory event) [reason={reason}]",
+                event.env_var()
+            );
+        }
+        HookOutcome::Allow | HookOutcome::Transform { .. } => {}
     }
 }
 
@@ -946,6 +1008,7 @@ mod tests {
                 &json!({"command": "echo hi"}),
                 std::path::Path::new("/tmp"),
                 None,
+                None,
             );
             let out = run_hook(&hook, &input, &HashMap::new())
                 .await
@@ -974,6 +1037,7 @@ mod tests {
             None,
             &json!({"command": "echo hi"}),
             std::path::Path::new("/tmp"),
+            None,
             None,
         );
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
@@ -1254,6 +1318,30 @@ mod tests {
         assert_eq!(parse_json_decision(s), Some(HookOutcome::Allow));
     }
 
+    /// RT-07: `{"decision":"ask"}` parses to `HookOutcome::Ask`.
+    #[test]
+    fn parse_json_decision_ask() {
+        let s = r#"{"decision":"ask","reason":"x"}"#;
+        match parse_json_decision(s) {
+            Some(HookOutcome::Ask { reason }) => assert_eq!(reason, "x"),
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    /// `block` still wins even when both `ask` and `updated_input` would
+    /// otherwise apply — exercised through `run_hooks`'s aggregation
+    /// below (`ask_then_block_yields_block`), this is the single-hook
+    /// parse-level half of the same guarantee: a hook author cannot
+    /// accidentally downgrade a block into an ask by misordering keys.
+    #[test]
+    fn parse_json_decision_ask_without_reason_has_a_default() {
+        let s = r#"{"decision":"ask"}"#;
+        match parse_json_decision(s) {
+            Some(HookOutcome::Ask { reason }) => assert!(!reason.is_empty()),
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_json_decision_block() {
         let s = r#"{"decision":"block","reason":"nope"}"#;
@@ -1365,6 +1453,7 @@ mod tests {
             arguments: json!({"command": "ls"}),
             cwd: Some("/tmp".into()),
             session_id: None,
+            agent_id: None,
         };
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
         assert_eq!(out, HookOutcome::Allow);
@@ -1385,6 +1474,7 @@ mod tests {
             arguments: json!({}),
             cwd: None,
             session_id: None,
+            agent_id: None,
         };
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
         match out {
@@ -1408,6 +1498,7 @@ mod tests {
             arguments: json!({}),
             cwd: None,
             session_id: None,
+            agent_id: None,
         };
         let out = run_hook(&hook, &input, &HashMap::new()).await.unwrap();
         match out {
@@ -1646,7 +1737,9 @@ mod tests {
             &json!({"command": "ls"}),
             cwd,
             Some("sess-1"),
+            Some("a3"),
         );
+        assert!(json.contains("\"agent_id\":\"a3\""), "got {json}");
         let back: HookInput = serde_json::from_str(&json).unwrap();
         assert_eq!(back.event, HookEvent::ToolExecutionStart);
         assert_eq!(back.tool_name.as_deref(), Some("bash"));
@@ -1654,6 +1747,24 @@ mod tests {
         assert_eq!(back.arguments, json!({"command": "ls"}));
         assert_eq!(back.cwd.as_deref(), Some("/tmp/proj"));
         assert_eq!(back.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(back.agent_id.as_deref(), Some("a3"));
+    }
+
+    /// agent_id absent (not `null`) when `None` — an existing hook
+    /// script that does not know this key still sees the same shape.
+    #[test]
+    fn event_payload_json_omits_agent_id_key_when_none() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        let json = event_payload_json(
+            HookEvent::ToolExecutionStart,
+            Some("bash"),
+            Some("call-1"),
+            &json!({"command": "ls"}),
+            cwd,
+            Some("sess-1"),
+            None,
+        );
+        assert!(!json.contains("agent_id"), "got {json}");
     }
 
     /// §4.1's byte-identity promise, exercised end-to-end for
@@ -1709,6 +1820,7 @@ mod tests {
             json!({"command": "echo ORIGINAL"}),
             &dir,
             None,
+            None,
         )
         .await;
 
@@ -1720,6 +1832,102 @@ mod tests {
             "the LAST hook's rewrite must win, having seen the first's"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RT-07 / D-16: an Ask does not short-circuit `run_hooks` — later
+    /// hooks still run, and a later Block still beats an earlier Ask.
+    #[tokio::test]
+    async fn ask_then_block_yields_block() {
+        let dir = std::env::temp_dir().join(format!("nanopi-ask-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask_script = dir.join("ask.sh");
+        std::fs::write(
+            &ask_script,
+            "#!/bin/sh\ncat > /dev/null\necho '{\"decision\":\"ask\",\"reason\":\"checking\"}'\n",
+        )
+        .unwrap();
+        let block_script = dir.join("block.sh");
+        std::fs::write(
+            &block_script,
+            "#!/bin/sh\ncat > /dev/null\necho '{\"decision\":\"block\",\"reason\":\"nope\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [&ask_script, &block_script] {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let hooks = vec![
+            HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: ask_script.display().to_string(),
+                timeout: 4000,
+            },
+            HookConfig {
+                matcher: "*".into(),
+                kind: "command".into(),
+                command: block_script.display().to_string(),
+                timeout: 4000,
+            },
+        ];
+        let (outcome, _) = run_hooks(
+            &hooks,
+            HookEvent::ToolExecutionStart,
+            "bash",
+            None,
+            json!({"command": "echo hi"}),
+            &dir,
+            None,
+            Some("a1"),
+        )
+        .await;
+        assert_eq!(outcome, HookOutcome::Block { reason: "nope".into() });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An Ask with no later Block is returned as the final outcome.
+    #[tokio::test]
+    async fn ask_alone_yields_ask() {
+        let dir = std::env::temp_dir().join(format!("nanopi-ask2-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask_script = dir.join("ask.sh");
+        std::fs::write(
+            &ask_script,
+            "#!/bin/sh\ncat > /dev/null\necho '{\"decision\":\"ask\",\"reason\":\"checking\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ask_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let hooks = vec![HookConfig {
+            matcher: "*".into(),
+            kind: "command".into(),
+            command: ask_script.display().to_string(),
+            timeout: 4000,
+        }];
+        let (outcome, _) = run_hooks(
+            &hooks,
+            HookEvent::ToolExecutionStart,
+            "bash",
+            None,
+            json!({"command": "echo hi"}),
+            &dir,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Ask {
+                reason: "checking".into()
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1743,6 +1951,7 @@ mod tests {
             arguments.clone(),
             cwd,
             Some("sess-byte-identity"),
+            None,
         )
         .await;
         let dumped = std::fs::read_to_string(&marker)
@@ -1755,6 +1964,7 @@ mod tests {
             &arguments,
             cwd,
             Some("sess-byte-identity"),
+            None,
         );
         assert_eq!(
             dumped.trim_end_matches('\n'),
@@ -1799,6 +2009,7 @@ mod tests {
             &arguments,
             cwd,
             Some("sess-byte-identity-2"),
+            None,
         );
         assert_eq!(
             dumped.trim_end_matches('\n'),
@@ -1848,6 +2059,7 @@ fn input_hook_input_has_event_field() {
         arguments: serde_json::Value::String("hi".into()),
         cwd: None,
         session_id: None,
+        agent_id: None,
     };
     let s = serde_json::to_string(&input).unwrap();
     assert!(s.contains("\"event\":\"input\""), "got {s}");
