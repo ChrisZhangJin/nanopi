@@ -11,15 +11,15 @@ owner decisions made on 2026-10-03.
   process. A crash, panic, stack overflow or OOM in a subagent never
   affects the main nanopi process.
 
-- [ ] **RT-02**: Every child process is tracked by the orchestrator
+- [x] **RT-02**: Every child process is tracked by the orchestrator
   (id, pid, state) and is killed when it is stopped, when its parent
   turn is cancelled, or when nanopi exits. No orphaned processes.
 
-- [ ] **RT-03**: Subagents are controlled only by the orchestrator
+- [x] **RT-03**: Subagents are controlled only by the orchestrator
   (main agent) through tools. The user never stops, answers or messages
   a subagent directly; they talk only to the orchestrator.
 
-- [ ] **RT-04**: Each subagent has its own session transcript in its
+- [x] **RT-04**: Each subagent has its own session transcript in its
   agent directory, and nothing leaks into the parent session.
 
 - [x] **RT-05**: Subagents cannot spawn subagents (the child is started
@@ -192,9 +192,9 @@ owner decisions made on 2026-10-03.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | RT-01 | Phase 1 | Complete |
-| RT-02 | Phase 1 | Pending |
-| RT-03 | Phase 1 | Pending |
-| RT-04 | Phase 1 | Pending |
+| RT-02 | Phase 1 | Complete |
+| RT-03 | Phase 1 | Complete |
+| RT-04 | Phase 1 | Complete |
 | RT-05 | Phase 1 | Complete |
 | RT-06 | Phase 1 | Complete |
 | RT-07 | Phase 1 | Complete |
