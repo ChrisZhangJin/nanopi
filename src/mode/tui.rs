@@ -4404,6 +4404,40 @@ fn reload_extensions_clause(
     }
 }
 
+/// Pulled out of `handle_reload` for testability (ORC-02 / WR-01):
+/// `ToolRegistry::orchestrator()` is deliberately a closed list so
+/// `write`/`edit`/`bash` can never leak in. A plugin tool registered
+/// straight into the LIVE registry by a `/reload` while orchestrator mode
+/// is active would be callable from orchestrator mode, defeating that
+/// guarantee. Apply the reload to the SAVED pre-orchestrator registry
+/// instead, leaving the live restricted registry untouched, so the
+/// reloaded plugin tools reappear when the user toggles orchestrator mode
+/// back off.
+fn reload_extensions_guarded(
+    app: &mut App,
+    a: &mut Agent,
+    exts: &[crate::config::ExtensionConfig],
+) -> crate::agent::build::ExtensionReloadReport {
+    if app.orchestrator {
+        let mut saved = app
+            .saved_registry
+            .take()
+            .unwrap_or_else(|| a.registry.clone());
+        std::mem::swap(&mut a.registry, &mut saved);
+        let report = a.reload_extensions(exts);
+        std::mem::swap(&mut a.registry, &mut saved);
+        app.saved_registry = Some(saved);
+        // `reload_extensions` set `context.tools` and the plugin dispatch
+        // from the registry that was swapped in (the saved one) — reset
+        // both to the restricted registry that is actually live.
+        a.context.tools = a.registry.all_specs();
+        a.install_plugin_dispatch();
+        report
+    } else {
+        a.reload_extensions(exts)
+    }
+}
+
 async fn handle_reload(
     term: &mut Term,
     app: &mut App,
@@ -4464,7 +4498,7 @@ async fn handle_reload(
             // as it is after the reload, or a plugin tool added by this
             // very reload would be registered and unmentioned.
             if let Some(ref exts) = extensions {
-                ext_report = Some(a.reload_extensions(exts));
+                ext_report = Some(reload_extensions_guarded(app, a, exts));
             }
             let tool_names = a.registry.names();
             // Through `set_system_base`, not a direct assignment to
@@ -8222,6 +8256,67 @@ mod tests {
             before_entry.map(|e| e.state),
             after_entry.map(|e| e.state),
             "toggling orchestrator mode must never touch AgentRegistry"
+        );
+    }
+
+    #[test]
+    fn reload_extensions_guarded_leaves_restricted_registry_live_and_updates_saved() {
+        // WR-01: `/reload`'s extension step must not register plugin
+        // tools straight into the orchestrator-restricted (closed-list)
+        // registry. Simulate the guarded path and assert the live
+        // registry is still exactly `ToolRegistry::orchestrator()` names
+        // afterward, and `saved_registry` (what "off" restores) is kept
+        // up to date rather than dropped.
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-wr01", HooksConfig::default());
+        let original_names = {
+            let mut n = agent.registry.names();
+            n.sort();
+            n
+        };
+
+        let mut app = mkapp();
+        apply_orchestrator_mode(&mut app, &mut agent, true);
+        assert!(app.saved_registry.is_some());
+
+        let report = reload_extensions_guarded(&mut app, &mut agent, &[]);
+        // No wasm feature / no extensions configured here, so nothing
+        // loads — the point is the registry swap-and-restore bookkeeping,
+        // not actual plugin loading (that is covered by `agent_spawn.rs`
+        // integration tests with the `wasm` feature).
+        let _ = report;
+
+        let mut live_names = agent.registry.names();
+        live_names.sort();
+        assert_eq!(
+            live_names,
+            vec![
+                "agent",
+                "find",
+                "grep",
+                "list_agents",
+                "read",
+                "send_message",
+                "stop_agent",
+            ],
+            "the live registry must stay the orchestrator closed list after a guarded reload"
+        );
+        let mut tool_spec_names: Vec<String> =
+            agent.context.tools.iter().map(|s| s.name.clone()).collect();
+        tool_spec_names.sort();
+        assert_eq!(
+            tool_spec_names, live_names,
+            "context.tools must be resynced to the restricted registry, not the saved one"
+        );
+
+        // Toggling off must restore the saved registry (updated by the
+        // guarded reload), not the orchestrator-restricted one.
+        apply_orchestrator_mode(&mut app, &mut agent, false);
+        let mut restored_names = agent.registry.names();
+        restored_names.sort();
+        assert_eq!(
+            restored_names, original_names,
+            "saved_registry must still round-trip back to the pre-orchestrator set"
         );
     }
 
