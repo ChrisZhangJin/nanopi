@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -50,6 +50,22 @@ impl AgentState {
             AgentState::Interrupted => "interrupted",
         }
     }
+
+    /// Inverse of [`as_str`](Self::as_str): parse an on-disk state token
+    /// (CTL-06 `adopt_from_disk`). `None` for anything unrecognized
+    /// (including the accepted-but-never-set `waiting_permission`).
+    pub fn from_disk_str(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(AgentState::Queued),
+            "running" => Some(AgentState::Running),
+            "done" => Some(AgentState::Completed),
+            "limit_reached" => Some(AgentState::LimitReached),
+            "failed" => Some(AgentState::Failed),
+            "stopped" => Some(AgentState::Stopped),
+            "interrupted" => Some(AgentState::Interrupted),
+            _ => None,
+        }
+    }
 }
 
 /// One tracked child.
@@ -87,6 +103,15 @@ pub struct AgentRegistry {
     /// Wakes a consumer when a report is pushed. Only wakes — the text
     /// itself is pulled via `take_reports` so batching holds.
     notify_sink: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Set once `reserve` (or `adopt_from_disk`) has scanned an existing
+    /// run dir on disk to seed `counter` past any on-disk ids (CTL-06):
+    /// a joining process must never mint an id that collides with one
+    /// already on disk.
+    seeded: AtomicBool,
+    /// Set once this process has written `run.pid` for its run dir
+    /// (CTL-06 T-04-06-05): written exactly once, whether the run dir is
+    /// new or joined via `NANOPI_RUN_ID`.
+    run_pid_written: AtomicBool,
 }
 
 impl std::fmt::Debug for AgentRegistry {
@@ -99,9 +124,21 @@ impl std::fmt::Debug for AgentRegistry {
 }
 
 impl AgentRegistry {
+    /// `run_id` is this process's own fresh id unless `NANOPI_RUN_ID` is
+    /// set and shape-valid, in which case this process joins that run
+    /// instead (CTL-06, D-05: "also works for agents from an earlier
+    /// nanopi process in the same run").
     pub fn new(cfg: &AgentConfig) -> Arc<Self> {
+        let run_id = Self::run_id_from_env_value(std::env::var("NANOPI_RUN_ID").ok().as_deref())
+            .unwrap_or_else(archive::new_run_id);
+        Self::with_run_id(cfg, run_id)
+    }
+
+    /// Build a registry bound to an explicit `run_id` (tests, and `new`'s
+    /// env-join path).
+    pub fn with_run_id(cfg: &AgentConfig, run_id: String) -> Arc<Self> {
         Arc::new(Self {
-            run_id: archive::new_run_id(),
+            run_id,
             counter: AtomicU64::new(0),
             entries: Mutex::new(Vec::new()),
             max_live: cfg.max_live,
@@ -109,7 +146,28 @@ impl AgentRegistry {
             background: Mutex::new(HashMap::new()),
             reports: Mutex::new(Vec::new()),
             notify_sink: Mutex::new(None),
+            seeded: AtomicBool::new(false),
+            run_pid_written: AtomicBool::new(false),
         })
+    }
+
+    /// Validate a candidate `NANOPI_RUN_ID` value (pure, env-mutation-free
+    /// so it's directly unit-testable): `Some` only when shape-valid per
+    /// `archive::is_run_id_shaped` (T-04-06-02 path-traversal mitigation —
+    /// a malformed value is never trusted as a directory component).
+    /// A non-empty, rejected value logs a debug note without echoing more
+    /// than 64 chars of it back.
+    pub fn run_id_from_env_value(v: Option<&str>) -> Option<String> {
+        let v = v?.trim();
+        if v.is_empty() {
+            return None;
+        }
+        if archive::is_run_id_shaped(v) {
+            return Some(v.to_string());
+        }
+        let shown: String = v.chars().take(64).collect();
+        crate::note!("nanopi: debug: ignoring malformed NANOPI_RUN_ID: {shown:?}");
+        None
     }
 
     fn bg_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Background>> {
@@ -248,6 +306,12 @@ impl AgentRegistry {
 
     /// Reserve a live slot: allocates the next id (`a1`, `a2`, ...) and
     /// creates `<agents_root>/<run_id>/<id>/` (mode 0700 on unix).
+    ///
+    /// On-disk aware (CTL-06): the first call seeds `counter` from the
+    /// largest valid agent id already on disk under the run dir, so a
+    /// process that joined an existing run (via `NANOPI_RUN_ID`) never
+    /// mints an id that collides with one dispatched by an earlier
+    /// process in the same run.
     pub fn reserve(&self, agents_root: &Path) -> Result<(String, PathBuf), String> {
         let mut entries = self.lock();
         let live = entries.iter().filter(|e| !e.state.is_terminal()).count();
@@ -257,17 +321,13 @@ impl AgentRegistry {
                 self.max_live
             ));
         }
+        let run_dir = agents_root.join(&self.run_id);
+        self.seed_counter_from_disk(&run_dir);
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!("a{n}");
-        let run_dir = agents_root.join(&self.run_id);
-        let run_dir_is_new = !run_dir.exists();
         let dir = run_dir.join(&id);
         create_private_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        if run_dir_is_new {
-            if let Err(e) = archive::write_run_pid(&run_dir) {
-                crate::note!("nanopi: debug: write_run_pid({}): {e}", run_dir.display());
-            }
-        }
+        self.write_run_pid_once(&run_dir);
         entries.push(AgentEntry {
             id: id.clone(),
             pid: None,
@@ -276,6 +336,105 @@ impl AgentRegistry {
             dir: dir.clone(),
         });
         Ok((id, dir))
+    }
+
+    /// Scan `run_dir`'s existing subdirs once and `fetch_max` the id
+    /// counter past the largest valid agent id found. No-op if `run_dir`
+    /// doesn't exist yet or this has already run once for this registry.
+    fn seed_counter_from_disk(&self, run_dir: &Path) {
+        if self.seeded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(run_dir) else {
+            return;
+        };
+        let mut max_n = 0u64;
+        for e in rd.filter_map(|e| e.ok()) {
+            if let Some(name) = e.file_name().to_str() {
+                if let Some(n) = valid_agent_id(name) {
+                    max_n = max_n.max(n);
+                }
+            }
+        }
+        self.counter.fetch_max(max_n, Ordering::SeqCst);
+    }
+
+    /// Write `run_dir/run.pid` exactly once per registry (first caller —
+    /// `reserve` or `adopt_from_disk` — wins), so a process that only
+    /// adopts (never reserves) still marks a joined run live (T-04-06-05).
+    fn write_run_pid_once(&self, run_dir: &Path) {
+        if self.run_pid_written.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = archive::write_run_pid(run_dir) {
+            crate::note!("nanopi: debug: write_run_pid({}): {e}", run_dir.display());
+        }
+    }
+
+    /// Reconstruct an `AgentEntry` for a finished agent dispatched by an
+    /// earlier process in this same run (CTL-06/D-05):
+    /// `agents_root/<run_id>/<id>/brief.md` (falling back to
+    /// `report.md`'s front matter for `state` if brief.md lacks it) must
+    /// show a terminal, non-`Interrupted` state. Idempotent: an id
+    /// already tracked in memory is returned unchanged, no disk access.
+    ///
+    /// `id` must match `a[1-9][0-9]{0,18}` (or bare `a0`, i.e. `valid_agent_id`)
+    /// before any path is built from it (T-04-06-01): this is the only
+    /// path through which a model-supplied string reaches a filesystem
+    /// path here, so validation happens first and unconditionally.
+    pub fn adopt_from_disk(&self, agents_root: &Path, id: &str) -> Result<AgentEntry, String> {
+        if let Some(e) = self.lock().iter().find(|e| e.id == id) {
+            return Ok(e.clone());
+        }
+        let Some(n) = valid_agent_id(id) else {
+            return Err(format!("no such agent: {id}"));
+        };
+        let run_dir = agents_root.join(&self.run_id);
+        let dir = run_dir.join(id);
+        let Ok(brief) = std::fs::read_to_string(dir.join("brief.md")) else {
+            return Err(format!("no such agent: {id}"));
+        };
+        if crate::agent::brief::front_matter_get(&brief, "id").as_deref() != Some(id) {
+            return Err(format!("no such agent: {id}"));
+        }
+        let state_str = crate::agent::brief::front_matter_get(&brief, "state").or_else(|| {
+            std::fs::read_to_string(dir.join("report.md"))
+                .ok()
+                .and_then(|r| crate::agent::brief::front_matter_get(&r, "state"))
+        });
+        let Some(state_str) = state_str else {
+            return Err(format!("no such agent: {id}"));
+        };
+        let Some(state) = AgentState::from_disk_str(&state_str) else {
+            return Err(format!("no such agent: {id}"));
+        };
+        if !state.is_terminal() || state == AgentState::Interrupted {
+            return Err(format!("agent {id} is not continuable (state: {state_str})"));
+        }
+
+        let entry = {
+            let mut entries = self.lock();
+            if let Some(e) = entries.iter().find(|e| e.id == id) {
+                e.clone()
+            } else {
+                let e = AgentEntry {
+                    id: id.to_string(),
+                    pid: None,
+                    state,
+                    started: Instant::now(),
+                    dir: dir.clone(),
+                };
+                entries.push(e.clone());
+                e
+            }
+        };
+        // Full disk scan (not just this id): a joined run dir may already
+        // hold other on-disk ids (e.g. a1..a3) that were never adopted —
+        // `reserve` must still never reuse any of them.
+        self.seed_counter_from_disk(&run_dir);
+        self.counter.fetch_max(n, Ordering::SeqCst);
+        self.write_run_pid_once(&run_dir);
+        Ok(entry)
     }
 
     /// Wait for a concurrency permit; hold it while the child runs.
@@ -322,6 +481,23 @@ impl AgentRegistry {
             }
         }
     }
+}
+
+/// Parse a registry agent id (`a` + 1-19 ASCII digits, no leading zero)
+/// into its numeric suffix. `None` for anything else, including path
+/// traversal attempts like `"../x"`, `"a1/../a2"`, bare `"a"`, or a
+/// non-`a`-prefixed name (T-04-06-01): the only place a model-supplied
+/// id is turned into a path component, so this must reject before any
+/// `Path::join`.
+fn valid_agent_id(id: &str) -> Option<u64> {
+    let rest = id.strip_prefix('a')?;
+    if rest.is_empty() || rest.len() > 19 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if rest.len() > 1 && rest.as_bytes()[0] == b'0' {
+        return None;
+    }
+    rest.parse::<u64>().ok()
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -607,6 +783,181 @@ mod tests {
             .snapshot()
             .iter()
             .all(|e| e.state == AgentState::Stopped));
+    }
+
+    // --- CTL-06 gap closure (plan 04-06) ---
+
+    fn write_brief_state(dir: &Path, id: &str, state: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let brief = crate::agent::brief::render_brief_with_meta(
+            &crate::agent::brief::BriefSpec::default(),
+            &crate::agent::brief::BriefMeta {
+                id: id.into(),
+                state: state.into(),
+                started: "2026-01-01T00:00:00Z".into(),
+                parent: "run".into(),
+                label: None,
+                worktree: None,
+                branch: None,
+            },
+        );
+        std::fs::write(dir.join("brief.md"), brief).unwrap();
+    }
+
+    #[test]
+    fn with_run_id_uses_exact_string() {
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "20261004-101010-deadbeef".to_string());
+        assert_eq!(reg.run_id(), "20261004-101010-deadbeef");
+    }
+
+    #[test]
+    fn run_id_from_env_value_accepts_shaped_rejects_garbage() {
+        assert_eq!(
+            AgentRegistry::run_id_from_env_value(Some("20261004-101010-deadbeef")),
+            Some("20261004-101010-deadbeef".to_string())
+        );
+        assert_eq!(AgentRegistry::run_id_from_env_value(Some("garbage")), None);
+        assert_eq!(AgentRegistry::run_id_from_env_value(Some("")), None);
+        assert_eq!(AgentRegistry::run_id_from_env_value(Some("   ")), None);
+        assert_eq!(AgentRegistry::run_id_from_env_value(None), None);
+        assert_eq!(
+            AgentRegistry::run_id_from_env_value(Some("../../etc/passwd")),
+            None
+        );
+    }
+
+    #[test]
+    fn adopt_from_disk_reconstructs_terminal_entry_then_reactivate_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1");
+        write_brief_state(&run_dir.join("a1"), "a1", "done");
+
+        let entry = reg.adopt_from_disk(tmp.path(), "a1").unwrap();
+        assert_eq!(entry.id, "a1");
+        assert_eq!(entry.state, AgentState::Completed);
+        assert_eq!(entry.pid, None);
+        assert_eq!(entry.dir, run_dir.join("a1"));
+
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, "a1");
+
+        reg.reactivate("a1").unwrap();
+    }
+
+    #[test]
+    fn adopt_from_disk_rejects_non_terminal_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1");
+        for (id, state) in [("a1", "running"), ("a2", "queued"), ("a3", "interrupted")] {
+            write_brief_state(&run_dir.join(id), id, state);
+            let err = reg.adopt_from_disk(tmp.path(), id).unwrap_err();
+            assert!(err.contains("not continuable"), "{err}");
+            assert!(err.contains(state), "{err}");
+            assert!(reg.snapshot().iter().all(|e| e.id != id), "must not insert {id}");
+        }
+    }
+
+    #[test]
+    fn adopt_from_disk_missing_or_malformed_is_no_such_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1");
+
+        // missing dir entirely
+        assert_eq!(
+            reg.adopt_from_disk(tmp.path(), "a9").unwrap_err(),
+            "no such agent: a9"
+        );
+
+        // dir exists, no brief.md
+        std::fs::create_dir_all(run_dir.join("a8")).unwrap();
+        assert_eq!(
+            reg.adopt_from_disk(tmp.path(), "a8").unwrap_err(),
+            "no such agent: a8"
+        );
+
+        // brief.md without front matter
+        std::fs::create_dir_all(run_dir.join("a7")).unwrap();
+        std::fs::write(run_dir.join("a7").join("brief.md"), "no front matter here").unwrap();
+        assert_eq!(
+            reg.adopt_from_disk(tmp.path(), "a7").unwrap_err(),
+            "no such agent: a7"
+        );
+
+        // front-matter id mismatch (brief for a6 claims to be a5)
+        write_brief_state(&run_dir.join("a6"), "a5", "done");
+        assert_eq!(
+            reg.adopt_from_disk(tmp.path(), "a6").unwrap_err(),
+            "no such agent: a6"
+        );
+
+        assert!(reg.snapshot().is_empty());
+    }
+
+    #[test]
+    fn adopt_from_disk_rejects_path_traversal_shaped_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        for bad in ["../x", "a", "b1", "a1/../a2", "", "a01", "a-1"] {
+            let err = reg.adopt_from_disk(tmp.path(), bad).unwrap_err();
+            assert_eq!(err, format!("no such agent: {bad}"), "id={bad:?}");
+        }
+    }
+
+    #[test]
+    fn adopt_from_disk_is_idempotent_for_already_tracked_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1");
+        write_brief_state(&run_dir.join("a1"), "a1", "done");
+
+        let e1 = reg.adopt_from_disk(tmp.path(), "a1").unwrap();
+        let e2 = reg.adopt_from_disk(tmp.path(), "a1").unwrap();
+        assert_eq!(e1.id, e2.id);
+        assert_eq!(reg.snapshot().len(), 1, "no duplicate insert");
+    }
+
+    #[test]
+    fn reserve_after_adopt_never_reuses_on_disk_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1");
+        write_brief_state(&run_dir.join("a1"), "a1", "done");
+        write_brief_state(&run_dir.join("a2"), "a2", "done");
+        write_brief_state(&run_dir.join("a3"), "a3", "done");
+
+        reg.adopt_from_disk(tmp.path(), "a3").unwrap();
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        assert_eq!(id, "a4", "must skip every on-disk id, not just the adopted one");
+    }
+
+    #[test]
+    fn reserve_seeds_from_joined_run_dir_without_any_adopt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1");
+        write_brief_state(&run_dir.join("a1"), "a1", "done");
+        write_brief_state(&run_dir.join("a2"), "a2", "running");
+
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        assert_eq!(id, "a3");
+    }
+
+    #[test]
+    fn adopt_from_disk_falls_back_to_report_state_when_brief_lacks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::with_run_id(&cfg(8, 4), "run1".to_string());
+        let run_dir = tmp.path().join("run1").join("a1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // brief.md has the id but no state (legacy-shaped front matter).
+        std::fs::write(run_dir.join("brief.md"), "---\nid: a1\n---\ntask\n").unwrap();
+        std::fs::write(run_dir.join("report.md"), "---\nstate: done\n---\nreport body\n").unwrap();
+
+        let entry = reg.adopt_from_disk(tmp.path(), "a1").unwrap();
+        assert_eq!(entry.state, AgentState::Completed);
     }
 
     #[test]

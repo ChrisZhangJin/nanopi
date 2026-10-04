@@ -1334,6 +1334,9 @@ fn prepare_run(
             agent.model.as_deref(),
         ))
         .envs(build_child_env(&l.spec, &id))
+        // CTL-06 T-04-06-04: a child never joins its parent's run — if it
+        // did, it could mint ids colliding with its own parent's.
+        .env_remove("NANOPI_RUN_ID")
         .current_dir(&child_cwd);
 
     Ok(PreparedRun {
@@ -1526,6 +1529,8 @@ pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -
     command
         .args(build_child_args(&l.spec, dir, &[], None))
         .envs(build_child_env(&l.spec, id))
+        // CTL-06 T-04-06-04: see the same env_remove in prepare_run.
+        .env_remove("NANOPI_RUN_ID")
         .current_dir(cwd);
     PreparedRun {
         id: id.to_string(),
@@ -1917,6 +1922,44 @@ fn envelope_output(env: JsonEnvelope, stderr_tail: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_run_and_prepare_continue_strip_nanopi_run_id_from_child_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&crate::config::AgentConfig::default());
+        let l = Launcher {
+            registry: reg,
+            spec: ChildLaunchSpec::default(),
+            program: ChildProgram {
+                program: PathBuf::from("true"),
+                leading_args: Vec::new(),
+            },
+        };
+        let agent = crate::agent::agents::AgentConfig {
+            name: "scout".into(),
+            description: "d".into(),
+            tools: Some(vec![]),
+            model: None,
+            system_prompt: String::new(),
+            source: crate::agent::agents::AgentSource::User,
+            file_path: PathBuf::from("/nonexistent/scout.md"),
+        };
+        let prepared = prepare_run(&l, &agent, "task", tmp.path(), None, None).unwrap();
+        let envs: Vec<_> = prepared.command.as_std().get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| *k == "NANOPI_RUN_ID" && v.is_none()),
+            "{envs:?}"
+        );
+
+        let dir = tmp.path().join("a1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let continued = prepare_continue(&l, "a1", &dir, tmp.path());
+        let envs2: Vec<_> = continued.command.as_std().get_envs().collect();
+        assert!(
+            envs2.iter().any(|(k, v)| *k == "NANOPI_RUN_ID" && v.is_none()),
+            "{envs2:?}"
+        );
+    }
 
     #[test]
     fn cap_report_leaves_small_report_unchanged() {

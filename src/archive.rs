@@ -320,8 +320,10 @@ pub fn ensure_gitignore(cwd: &Path) -> io::Result<bool> {
 
 /// True if `name` has the `YYYYMMDD-HHMMSS-<8 hex>` shape produced by
 /// [`new_run_id`]. Used to scope deletion candidates to run dirs only
-/// (T-02-14): anything else under `agents_root` is left alone.
-fn is_run_id_shaped(name: &str) -> bool {
+/// (T-02-14): anything else under `agents_root` is left alone. Also used
+/// (CTL-06) to validate a caller-supplied `NANOPI_RUN_ID` before a process
+/// may join an existing run with it.
+pub fn is_run_id_shaped(name: &str) -> bool {
     let parts: Vec<&str> = name.splitn(3, '-').collect();
     parts.len() == 3
         && parts[0].len() == 8

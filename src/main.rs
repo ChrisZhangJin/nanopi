@@ -481,7 +481,9 @@ async fn main() -> ExitCode {
     }
 
     // Agent supervision (01-05): one registry per run, and the
-    // resolved provider settings every child inherits (D-01).
+    // resolved provider settings every child inherits (D-01). `new`
+    // honors NANOPI_RUN_ID, so a second nanopi process can join an
+    // existing run instead of always minting a fresh one (CTL-06).
     let agent_registry = nanopi::agent_registry::AgentRegistry::new(&cfg.agent);
     nanopi::agent_registry::set_global(agent_registry.clone());
 
