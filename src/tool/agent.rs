@@ -21,9 +21,10 @@
 //! a group on cancel or timeout. Child faults are always in-band
 //! (`status: failed`), never `Err`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,8 +34,9 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::agent::agents::{discover_agents, AgentConfig, AgentScope, AgentSource};
-use crate::agent::brief::{render_brief, BriefSpec};
+use crate::agent::brief::{render_brief_with_meta, render_report, BriefMeta, BriefSpec, ReportMeta};
 use crate::agent::context::ToolSpec;
+use crate::archive;
 use crate::mode::print::JsonEnvelope;
 use crate::agent_registry::{self, AgentState, ChildGuard, AgentRegistry};
 use crate::tool::{ExecutionMode, Tool, ToolContext, ToolError, ToolOutput};
@@ -639,14 +641,73 @@ const REPORT_CAP: usize = 64 * 1024;
 struct StateGuard<'a> {
     reg: &'a AgentRegistry,
     id: String,
+    dir: PathBuf,
     done: bool,
 }
 
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
         if !self.done {
+            ensure_report(&self.dir, &self.id, AgentState::Stopped, "stopped by parent");
             self.reg.set_state(&self.id, AgentState::Stopped);
         }
+    }
+}
+
+/// cwds that have already had `.nanopi/agents/` registered in
+/// `.gitignore` this process (D-07; one attempt per cwd is enough).
+fn gitignored_cwds() -> &'static Mutex<HashSet<PathBuf>> {
+    static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn ensure_gitignore_once(cwd: &Path) {
+    let mut seen = gitignored_cwds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.insert(cwd.to_path_buf()) {
+        if let Err(e) = archive::ensure_gitignore(cwd) {
+            eprintln!("nanopi: debug: ensure_gitignore({}): {e}", cwd.display());
+        }
+    }
+}
+
+/// D-04: if the child left no `report.md` (killed, crashed, stopped,
+/// timed out), write one atomically so the parent always has something
+/// to return / show. Never overwrites an existing report.
+fn ensure_report(dir: &Path, id: &str, state: AgentState, error_text: &str) {
+    let report = dir.join("report.md");
+    if report.exists() {
+        return;
+    }
+    let ended = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let summary = if error_text.trim().is_empty() {
+        "agent ended without a report".to_string()
+    } else {
+        error_text.to_string()
+    };
+    let body = render_report(
+        &ReportMeta {
+            id: id.to_string(),
+            state: state.as_str().to_string(),
+            ended,
+            turns: None,
+            tokens: None,
+            worktree: None,
+            branch: None,
+        },
+        &summary,
+        &[],
+        &[summary.clone()],
+        &[],
+    );
+    // Pre-create at 0600 so the atomic rename preserves perms.
+    if let Err(e) = write_private(&report, "") {
+        eprintln!("nanopi: debug: precreate report({}): {e}", report.display());
+        return;
+    }
+    if let Err(e) = crate::tool::file_state::atomic_write(&report, body.as_bytes()) {
+        eprintln!("nanopi: debug: ensure_report({}): {e}", report.display());
     }
 }
 
@@ -663,14 +724,18 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 /// One tracked, capped, briefed child dispatch. Always in-band.
 pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Path) -> ToolOutput {
     let reg = &*l.registry;
+    // D-07: register .nanopi/agents/ in the project .gitignore before the
+    // first archive directory is created, once per cwd per process.
+    ensure_gitignore_once(cwd);
     // D-03: agent dir exists before spawn; max_live enforced here.
-    let (id, dir) = match reg.reserve(&cwd.join(".nanopi").join("agents")) {
+    let (id, dir) = match reg.reserve(&crate::paths::project_agents_dir(cwd)) {
         Ok(v) => v,
         Err(e) => return soft_error(format!("Cannot start agent {:?}: {e}", agent.name)),
     };
     let mut sg = StateGuard {
         reg,
         id: id.clone(),
+        dir: dir.clone(),
         done: false,
     };
     let tools = agent.tools.clone().unwrap_or_default();
@@ -679,16 +744,31 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
     } else {
         Some(agent.system_prompt.clone())
     };
-    let brief = render_brief(&BriefSpec {
-        task: task.to_string(),
-        role,
-        tools: tools.clone(),
-        model: agent.model.clone().or_else(|| l.spec.model.clone()),
-    });
+    let started = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let brief = render_brief_with_meta(
+        &BriefSpec {
+            task: task.to_string(),
+            role,
+            tools: tools.clone(),
+            model: agent.model.clone().or_else(|| l.spec.model.clone()),
+        },
+        &BriefMeta {
+            id: id.clone(),
+            state: "queued".to_string(),
+            started,
+            parent: reg.run_id().to_string(),
+        },
+    );
     if let Err(e) = write_private(&dir.join("brief.md"), &brief) {
+        ensure_report(&dir, &id, AgentState::Failed, &format!("cannot write brief: {e}"));
         reg.set_state(&id, AgentState::Failed);
         sg.done = true;
         return failed_output(&format!("cannot write brief: {e}"), "");
+    }
+    if let Some(run_dir) = dir.parent() {
+        if let Err(e) = archive::regenerate_index(run_dir) {
+            eprintln!("nanopi: debug: regenerate_index({}): {e}", run_dir.display());
+        }
     }
 
     // Beyond max_concurrency: queue here (state stays Queued).
@@ -715,6 +795,19 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
         .and_then(|v| v.as_str())
         .unwrap_or("failed")
         .to_string();
+    let state = match status.as_str() {
+        "completed" => AgentState::Completed,
+        "limit_reached" => AgentState::LimitReached,
+        _ => AgentState::Failed,
+    };
+    // D-04: the child may have died without writing report.md (killed,
+    // crashed, timed out) — guarantee one exists before reading it back.
+    let error_text = if out.is_error {
+        out.content.clone()
+    } else {
+        String::new()
+    };
+    ensure_report(&dir, &id, state, &error_text);
 
     let report = dir.join("report.md");
     if let Ok(text) = std::fs::read_to_string(&report) {
@@ -749,11 +842,6 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
         m["agent_dir"] = json!(dir.to_string_lossy());
     }
 
-    let state = match status.as_str() {
-        "completed" => AgentState::Completed,
-        "limit_reached" => AgentState::LimitReached,
-        _ => AgentState::Failed,
-    };
     reg.set_state(&id, state);
     sg.done = true;
     out
@@ -1739,6 +1827,81 @@ mod tests {
                 AgentState::LimitReached
             ]
         );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_report_written_when_child_leaves_none() {
+        let cwd = tmp("fallback");
+        let script = "exit 3";
+        let l = launcher(script, 8, 4);
+        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        assert!(out.is_error);
+        let dir = cwd
+            .join(".nanopi/agents")
+            .join(l.registry.run_id())
+            .join("a1");
+        let report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert_eq!(
+            crate::agent::brief::front_matter_get(&report, "state").as_deref(),
+            Some("failed")
+        );
+        assert!(out.content.contains(&report) || out.content.contains("report.md"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_report_not_overwritten_when_child_writes_one() {
+        let cwd = tmp("fallback-keep");
+        let script = format!(
+            "echo MINE > \"$(dirname \"$4\")/report.md\"; echo '{OK_ENV}'"
+        );
+        let l = launcher(&script, 8, 4);
+        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        assert!(!out.is_error);
+        let dir = cwd
+            .join(".nanopi/agents")
+            .join(l.registry.run_id())
+            .join("a1");
+        let report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(report.contains("MINE"), "{report}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brief_front_matter_and_index_after_dispatch() {
+        let cwd = tmp("frontmatter");
+        let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
+        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        assert!(!out.is_error, "{}", out.content);
+        let run_dir = cwd.join(".nanopi/agents").join(l.registry.run_id());
+        let brief = std::fs::read_to_string(run_dir.join("a1").join("brief.md")).unwrap();
+        assert_eq!(
+            crate::agent::brief::front_matter_get(&brief, "state").as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            crate::agent::brief::front_matter_get(&brief, "parent").as_deref(),
+            Some(l.registry.run_id())
+        );
+        let index = std::fs::read_to_string(run_dir.join("index.md")).unwrap();
+        assert!(index.contains("a1"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_registers_gitignore_entry() {
+        let cwd = tmp("gitignore");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
+        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        assert!(!out.is_error, "{}", out.content);
+        let gi = std::fs::read_to_string(cwd.join(".gitignore")).unwrap_or_default();
+        assert!(gi.contains(".nanopi/agents"), "{gi}");
         let _ = std::fs::remove_dir_all(&cwd);
     }
 }
