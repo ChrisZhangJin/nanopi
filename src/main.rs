@@ -470,9 +470,27 @@ async fn main() -> ExitCode {
 
     // Agent supervision (01-05): one registry per run, and the
     // resolved provider settings every child inherits (D-01).
-    nanopi::agent_registry::set_global(nanopi::agent_registry::AgentRegistry::new(
-        &cfg.agent,
-    ));
+    let agent_registry = nanopi::agent_registry::AgentRegistry::new(&cfg.agent);
+    nanopi::agent_registry::set_global(agent_registry.clone());
+
+    // D-06/D-09: before any dispatch, mark stale non-terminal agents from
+    // previous runs interrupted and prune runs older than
+    // archive_keep_days. Best-effort — archive IO errors never abort
+    // startup (T-02-18), and both functions return early if the agents
+    // root doesn't exist yet.
+    {
+        let agents_root = nanopi::paths::project_agents_dir(&cwd);
+        let run_id = agent_registry.run_id();
+        if let Err(e) = nanopi::archive::mark_interrupted(&agents_root, run_id) {
+            eprintln!("nanopi: debug: mark_interrupted({}): {e}", agents_root.display());
+        }
+        if let Err(e) =
+            nanopi::archive::auto_prune(&agents_root, run_id, cfg.agent.archive_keep_days)
+        {
+            eprintln!("nanopi: debug: auto_prune({}): {e}", agents_root.display());
+        }
+    }
+
     nanopi::tool::agent::set_launch_spec(nanopi::tool::agent::ChildLaunchSpec {
         model: Some(model.clone()),
         base_url: Some(base_url.clone()),
