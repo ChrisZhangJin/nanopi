@@ -333,6 +333,7 @@ mod tests {
                 state: "queued".into(),
                 started: "2024-01-01T00:00:00Z".into(),
                 parent: reg.run_id().to_string(),
+                label: None,
             },
         );
         std::fs::write(dir.join("brief.md"), brief).unwrap();

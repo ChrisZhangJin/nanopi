@@ -761,6 +761,7 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
             state: "queued".to_string(),
             started,
             parent: reg.run_id().to_string(),
+            label: None,
         },
     );
     if let Err(e) = write_private(&dir.join("brief.md"), &brief) {

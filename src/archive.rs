@@ -542,6 +542,7 @@ mod tests {
             state: state.into(),
             started: "2026-10-04T10:00:00+08:00".into(),
             parent: "run".into(),
+            label: None,
         };
         std::fs::write(dir.join("brief.md"), render_brief_with_meta(&spec, &meta)).unwrap();
     }
