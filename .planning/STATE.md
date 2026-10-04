@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: verifying
-last_updated: "2026-10-04T07:51:52.838Z"
+last_updated: "2026-10-04T08:21:27.092Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 14
-  completed_plans: 14
+  total_plans: 17
+  completed_plans: 15
   percent: 33
 ---
 
@@ -17,9 +17,9 @@ progress:
 
 ## Current Position
 
-Phase: 02 (archive-lifecycle) — EXECUTING
-Plan: 7 of 7
-Status: Phase complete — ready for verification
+Phase: 03 (dynamic-subagents) — EXECUTING
+Plan: 1 of 3
+Status: 03-01 complete — general_purpose AgentConfig, models::model_vendor, brief label landed; 03-02 (dispatcher composition) next
 Last activity: 2026-10-04
 
 ---
@@ -311,6 +311,7 @@ pinned by wall-clock tests.
 | Phase 02 P05 | 25min | 2 tasks | 2 files |
 | Phase 02 P06 | 35min | 3 tasks | 3 files |
 | Phase 02 P07 | 25min | 2 tasks | 3 files |
+| Phase 03 P01 | 20min | 2 tasks | 6 files |
 
 ## Decisions
 
@@ -325,3 +326,6 @@ pinned by wall-clock tests.
 - [Phase ?]: [Phase 02]: AgentState::as_str() keeps Rust variant names, only the on-disk string changes (Completed -> done)
 - [Phase ?]: [Phase 02]: ensure_report runs from both run_single's normal return and StateGuard::drop so no exit path can skip a report.md
 - [Phase ?]: [Phase 02]: /agents clean (D-10/ARC-05) wired via parse_agents_args + CleanAgents/AgentsUsage, mirroring the /name dispatch pattern; added agents to command::RESERVED_COMMAND_NAMES to keep the palette-sync guard passing
+- [Phase 03]: AgentConfig::general_purpose() uses AgentSource::User (not Project) — built-in prompt is as trusted as a user file, so the project trust gate never applies to it
+- [Phase 03]: models::model_vendor() and context_window() share one private lookup() so the two can never disagree on which prefix matched
+- [Phase 03]: BriefMeta.label passes through the existing fm_value sanitizer, inheriting T-02-01 injection resistance for free; all four construction sites get label: None in 03-01 since none rebuild meta from parsed front matter (03-02 wires the real value at src/tool/agent.rs run_single)
