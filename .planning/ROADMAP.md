@@ -145,14 +145,14 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | Phase | Name | Goal | Requirements | Depends on |
 |-------|------|------|--------------|------------|
 | 1 | Child-process runtime | 7/7 | Complete   | 2026-10-03 |
-| 2 | Archive & lifecycle | 6/7 | In Progress|  |
+| 2 | Archive & lifecycle | 7/7 | Complete   | 2026-10-04 |
 | 3 | Dynamic agents | The model dispatches by describing the task | DYN-01..DYN-05 | 1, 2 |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
 | 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
 
 - [x] **Phase 1: Child-process runtime** - isolated `nanopi -p` children, process tracking/kill, caps, brief-file amendments and final self-check (completed 2026-10-03)
-- [ ] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup
+- [x] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup (completed 2026-10-04)
 - [ ] **Phase 3: Dynamic agents** - optional agent name, inline role/tools/model, capped report
 - [ ] **Phase 4: Background launch & control** - background ids, amend/stop/list/continue, report injection, print-mode drain, worktrees
 - [ ] **Phase 5: TUI agents strip** - collapsible, display-only bottom strip with states
@@ -222,7 +222,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 02-07-PLAN.md — /agents clean command + integration tests
+- [x] 02-07-PLAN.md — /agents clean command + integration tests
 
 **Research flags**: standard patterns.
 

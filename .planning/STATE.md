@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
-status: executing
-last_updated: "2026-10-04T07:46:32.947Z"
+status: verifying
+last_updated: "2026-10-04T07:51:52.838Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 14
-  completed_plans: 13
-  percent: 17
+  completed_plans: 14
+  percent: 33
 ---
 
 # Project State
@@ -19,7 +19,7 @@ progress:
 
 Phase: 02 (archive-lifecycle) — EXECUTING
 Plan: 7 of 7
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-10-04
 
 ---
@@ -310,6 +310,7 @@ pinned by wall-clock tests.
 | Phase 02 P04 | 25min | 1 tasks | 2 files |
 | Phase 02 P05 | 25min | 2 tasks | 2 files |
 | Phase 02 P06 | 35min | 3 tasks | 3 files |
+| Phase 02 P07 | 25min | 2 tasks | 3 files |
 
 ## Decisions
 
@@ -323,3 +324,4 @@ pinned by wall-clock tests.
 - [Phase 02]: archive_keep_days=0 is a valid sentinel disabling auto-prune, excluded from validate_agent's zero-cap rejection list
 - [Phase ?]: [Phase 02]: AgentState::as_str() keeps Rust variant names, only the on-disk string changes (Completed -> done)
 - [Phase ?]: [Phase 02]: ensure_report runs from both run_single's normal return and StateGuard::drop so no exit path can skip a report.md
+- [Phase ?]: [Phase 02]: /agents clean (D-10/ARC-05) wired via parse_agents_args + CleanAgents/AgentsUsage, mirroring the /name dispatch pattern; added agents to command::RESERVED_COMMAND_NAMES to keep the palette-sync guard passing
