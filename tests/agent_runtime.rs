@@ -678,10 +678,23 @@ fn sc6_cross_process_stale_write() {
     );
 }
 
-// ── SC6 (roadmap #6): no agent controls in the TUI ──
-
+// ── SC6 (roadmap #6): no agent *control* actions in the TUI ──
+//
+// Phase 5 added a display-only `ToggleAgentsStrip` action (Ctrl+G) that
+// shows/hides a read-only agents strip; it has no stop/approve/deny/message
+// capability (CONTEXT.md revision 2026-10-03: "display-only, no approve/deny,
+// stop or message actions"). This test still guards against any *other*
+// agent-control keybinding being added.
 #[test]
 fn sc_no_agent_ui_controls() {
     let keys = include_str!("../src/keys.rs");
-    assert!(!keys.to_lowercase().contains("agent"));
+    let lower = keys.to_lowercase();
+    for line in lower.lines() {
+        if line.contains("agent") {
+            assert!(
+                line.contains("toggleagentsstrip") || line.contains("toggle_agents_strip"),
+                "unexpected agent-related keybinding line: {line}"
+            );
+        }
+    }
 }
