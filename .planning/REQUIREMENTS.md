@@ -129,7 +129,7 @@ owner decisions made on 2026-10-03.
   state (running / waiting for approval / done / failed / stopped /
   interrupted) and elapsed time.
 
-- [ ] **UI-02**: The user can expand and collapse the strip with a
+- [x] **UI-02**: The user can expand and collapse the strip with a
   shortcut (default **Ctrl+G**, if it is free in `keys.rs`). The
   expanded view shows each agent's latest activity and its report path.
 
@@ -221,7 +221,7 @@ owner decisions made on 2026-10-03.
 | ISO-01 | Phase 4 | Complete |
 | ISO-02 | Phase 4 | Complete |
 | UI-01 | Phase 5 | Complete |
-| UI-02 | Phase 5 | Pending |
+| UI-02 | Phase 5 | Complete |
 | UI-03 | Phase 5 | Complete |
 | UI-04 | Phase 5 | Complete |
 | ORC-01 | Phase 6 | Pending |
