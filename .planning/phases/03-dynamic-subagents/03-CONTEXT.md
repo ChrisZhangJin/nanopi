@@ -83,3 +83,8 @@ The `select_mode` and `parse_items` pure helpers and their tests can be
 extended rather than rewritten.
 
 </code_context>
+
+## Addendum (2026-10-04, planning)
+
+- D-05 interpretation: nanopi has a single active provider, so inline `model` is validated against that provider's vendor only; other-vendor models are rejected with a clear error. Custom endpoints (vendor "fallback") skip the vendor check. Flagged to the user for override.
+- Built-in default agent name: `"general-purpose"`.

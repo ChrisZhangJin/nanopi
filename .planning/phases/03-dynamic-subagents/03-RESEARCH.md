@@ -496,7 +496,7 @@ replaces, Phase 1/2 machinery.
 | A2 | The built-in general-purpose agent's trust level should be treated identically to a user-level agent file (`AgentSource::User`), not requiring the `AgentSource::Project` trust gate. `[ASSUMED]` — reasonable by analogy (a built-in prompt ships with the binary, trusted by definition, same tier as a user's own `~/.nanopi/agents/*.md`), but not explicitly stated in CONTEXT.md. | Pattern 1 | Low risk: worst case is a one-line `match` arm correction if the planner/owner disagrees; does not block implementation since the alternative (a new `AgentSource::BuiltIn` variant, always trusted) is a trivial swap. |
 | A3 | D-04's "deny-list from Phase 1 D-10" is assumed to refer to the *structural* fact that `agent`/`subagent` is always excluded in agent-mode children (`src/mode/print.rs:230` `registry.remove("agent")` when `child.agent_mode`), since no literal `SUBAGENT_DENIED_TOOLS`/`AGENT_DENIED_TOOLS` constant exists in the current (child-process) codebase — that constant belonged to the **superseded in-process design** (`phases/01-child-process-runtime/superseded-inprocess/`) and was not carried forward when the runtime was rewritten as child-process-based. `[ASSUMED]` | Pattern 3 (validate_tools) | If wrong, the planner might look for a `DENIED_TOOLS` constant that no longer exists and either reintroduce dead code or miss that the deny-list is now enforced via `registry.remove("agent")` plus (this phase's new) parent-side rejection of `"agent"` in an inline `tools` list. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **D-05 cross-vendor validation: what does "a provider is configured
    for that vendor" mean in a single-provider config system?**
@@ -539,6 +539,8 @@ replaces, Phase 1/2 machinery.
      `AgentConfig.name` for the built-in default — it's user-visible in
      parallel/chain output sections and in registry diagnostics, so an
      empty string there would look like a bug.
+
+> **Resolutions (2026-10-04, autonomous run):** Q1 RESOLVED — same-vendor-only validation against the single active provider (custom "fallback" endpoints skip the vendor check); flagged to the user for override. Q2 RESOLVED — built-in agent name is `"general-purpose"`.
 
 ## Validation Architecture
 
