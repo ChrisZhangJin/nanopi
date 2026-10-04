@@ -576,6 +576,33 @@ fn sc5_amendment_and_checklist() {
     );
 }
 
+// ── Regression: the child's final answer reaches the parent, not just
+// the self-check checklist ──
+
+#[test]
+fn final_answer_reaches_parent_above_checklist() {
+    let sb = Sandbox::new("answer");
+    sb.agent("scout", "read, ls");
+    let answer = "FINAL-ANSWER-SRC-SUMMARY: src holds the agent loop";
+    let (port, _log) = spawn_server(handler(
+        serde_json::json!({"agent":"scout","task":"summarise src"}),
+        move |req: &str| {
+            if req.contains("FINAL-ANSWER-SRC-SUMMARY") {
+                // Self-check turn (answer is in history): checklist only.
+                text("- [x] summarise src")
+            } else {
+                text(answer)
+            }
+        },
+    ));
+    let (out, v) = sb.run(port, "dispatch answer");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let tools = tool_texts(&v).join("\n");
+    let a = tools.find("FINAL-ANSWER-SRC-SUMMARY").unwrap_or_else(|| panic!("answer lost: {tools}"));
+    let c = tools.find("- [x] summarise src").unwrap_or_else(|| panic!("no checklist: {tools}"));
+    assert!(a < c, "answer must precede checklist: {tools}");
+}
+
 // ── SC6: cross-process stale write ──
 
 #[test]

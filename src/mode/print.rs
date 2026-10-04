@@ -372,6 +372,9 @@ pub async fn run_print_mode(
             };
             let mut r = agent.run_turn(task.as_str(), &tx, None, steer).await;
             let mut limit = agent.last_limit_hit();
+            // The task's final answer. Self-check turns below overwrite
+            // `r`, so keep it for the report summary.
+            let answer: Option<String> = r.as_ref().ok().cloned();
             let mut checklist_reply: Option<String> = None;
             // Bounded self-check (D-11, T-01-16): at most
             // SELF_CHECK_TURNS extra turns, none after a limit or error.
@@ -401,7 +404,7 @@ pub async fn run_print_mode(
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
             agent.fire_session_shutdown("quit").await;
-            (r, limit, checklist_reply)
+            (r, limit, checklist_reply, answer)
         })
     };
 
@@ -429,7 +432,7 @@ pub async fn run_print_mode(
     if let Some(mut s) = spinner.take() {
         s.stop().await;
     }
-    let (turn_result, limit_hit, checklist_reply) = agent_task.await?;
+    let (turn_result, limit_hit, checklist_reply, answer) = agent_task.await?;
     let status = if turn_result.is_err() {
         "failed"
     } else if limit_hit.is_some() {
@@ -440,10 +443,7 @@ pub async fn run_print_mode(
     // report.md on every exit path (D-11). Best effort.
     let report_path = brief_path.as_deref().map(|p| {
         let rp = report_path_for(p);
-        let summary = match &turn_result {
-            Ok(t) => t.clone(),
-            Err(e) => format!("error: {e}"),
-        };
+        let summary = report_summary(answer.as_deref(), &turn_result);
         let items = checklist_items(checklist_reply.as_deref(), status);
         let body = crate::agent::brief::render_report(status, &summary, &items);
         if let Err(e) = write_private(&rp, &body) {
@@ -578,6 +578,17 @@ fn checklist_items(reply: Option<&str>, status: &str) -> Vec<crate::agent::brief
         }]
     } else {
         items
+    }
+}
+
+/// Summary section of `report.md`: the child's final answer to the task
+/// (not the self-check checklist reply), plus the error if the run failed.
+fn report_summary<E: std::fmt::Display>(answer: Option<&str>, turn: &Result<String, E>) -> String {
+    match (answer, turn) {
+        (Some(a), Ok(_)) => a.to_string(),
+        (Some(a), Err(e)) => format!("{a}\n\nerror: {e}"),
+        (None, Ok(t)) => t.clone(),
+        (None, Err(e)) => format!("error: {e}"),
     }
 }
 
@@ -719,5 +730,30 @@ mod spinner_tests {
         ] {
             assert!(!stops_spinner(&ev), "should NOT stop the spinner: {ev:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod report_summary_tests {
+    use super::report_summary;
+
+    #[test]
+    fn report_summary_keeps_final_answer_not_checklist_reply() {
+        let last: Result<String, String> = Ok("- [x] item".into());
+        assert_eq!(report_summary(Some("THE ANSWER"), &last), "THE ANSWER");
+        let failed: Result<String, String> = Err("boom".into());
+        let s = report_summary(Some("THE ANSWER"), &failed);
+        assert!(s.contains("THE ANSWER") && s.contains("error: boom"), "{s}");
+        assert_eq!(report_summary(None, &failed), "error: boom");
+    }
+
+    #[test]
+    fn rendered_report_has_answer_above_checklist() {
+        use crate::agent::brief::{render_report, ChecklistItem};
+        let items = vec![ChecklistItem { label: "item".into(), done: true, note: String::new() }];
+        let r = render_report("completed", &report_summary(Some("THE ANSWER"), &Ok::<_, String>("- [x] item".into())), &items);
+        let a = r.find("THE ANSWER").unwrap();
+        let c = r.find("- [x] item").unwrap();
+        assert!(a < c, "{r}");
     }
 }

@@ -307,4 +307,6 @@ pinned by wall-clock tests.
 
 ## Decisions
 
+- [Phase 1]: tool renamed subagent→agent per user, 2026-10-04 (config `[agent]`, AgentTool/AgentRegistry, supersedes Phase 3 D-01)
+- [Phase 1]: report.md Summary now holds the child's final task answer (self-check turns no longer overwrite it), so the parent's tool result shows answer above checklist
 - [Phase ?]: ISO-03: process-global FileStateTracker, len+hash stale check, shared guarded_write
