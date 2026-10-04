@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: verifying
-last_updated: "2026-10-04T17:14:07.564Z"
+last_updated: "2026-10-04T17:27:26.523Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 30
-  completed_plans: 27
+  completed_plans: 28
   percent: 83
 ---
 
@@ -17,9 +17,9 @@ progress:
 
 ## Current Position
 
-Phase: 05 (tui-agents-strip) — COMPLETE
-Plan: 3 of 3 complete (05-01, 05-02, 05-03 all done)
-Status: Phase complete — ready for verification
+Phase: 06 (orchestrator-mode) — IN PROGRESS
+Plan: 2 of 4 complete (06-01, 06-02 done; 06-03, 06-04 remaining)
+Status: 06-02 executed and verified (full suite green)
 Last activity: 2026-10-04
 
 ---
@@ -323,6 +323,7 @@ pinned by wall-clock tests.
 | Phase 05 P02 | 25min | 2 tasks | 4 files |
 | Phase 05 P03 | 45min | 2 tasks | 1 files |
 | Phase 06 P01 | 35min | 2 tasks | 4 files |
+| Phase 06 P02 | 40min | - tasks | - files |
 
 ## Decisions
 
@@ -355,3 +356,5 @@ pinned by wall-clock tests.
 - [Phase ?]: D-04 deviation (pre-approved): Ctrl+G expanded view prints the per-agent detail block into scrollback instead of growing a 40%-of-screen live pane, because ratatui 0.29's pinned Viewport::Inline cannot grow the dock per frame.
 - [Phase 06]: compose_system_prompt delegates to compose_system_prompt_mode(.., false) so all existing callers stay untouched (ORC-04)
 - [Phase 06]: ToolRegistry::orchestrator() is hand-registered, never derived from standard()/standard_with_control() by filtering (T-06-01)
+- [Phase ?]: [Phase 06]: ToolRegistry already derives Clone, so apply_orchestrator_mode stashes a clone of the live registry rather than rebuilding from tools_allow
+- [Phase ?]: [Phase 06]: added orchestrator to command::RESERVED_COMMAND_NAMES so a WASM plugin cannot shadow the new /orchestrator built-in

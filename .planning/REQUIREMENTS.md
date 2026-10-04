@@ -142,7 +142,7 @@ owner decisions made on 2026-10-03.
 
 ### Orchestrator mode (ORC)
 
-- [ ] **ORC-01**: The user can turn orchestrator mode on and off from
+- [x] **ORC-01**: The user can turn orchestrator mode on and off from
   the TUI with `/orchestrator`. It is also available as the config key
   `experimental.orchestrator`. It is off by default.
 
@@ -157,7 +157,7 @@ owner decisions made on 2026-10-03.
 - [x] **ORC-04**: When orchestrator mode is off, the prompts and tool
   specs are byte-identical to v0.12.
 
-- [ ] **ORC-05**: The status line shows when orchestrator mode is
+- [x] **ORC-05**: The status line shows when orchestrator mode is
   active.
 
 ### Quality (QA)
@@ -224,11 +224,11 @@ owner decisions made on 2026-10-03.
 | UI-02 | Phase 5 | Complete |
 | UI-03 | Phase 5 | Complete |
 | UI-04 | Phase 5 | Complete |
-| ORC-01 | Phase 6 | Pending |
+| ORC-01 | Phase 6 | Complete |
 | ORC-02 | Phase 6 | Complete |
 | ORC-03 | Phase 6 | Complete |
 | ORC-04 | Phase 6 | Complete |
-| ORC-05 | Phase 6 | Pending |
+| ORC-05 | Phase 6 | Complete |
 | QA-01 | Phase 6 | Pending |
 | QA-02 | Phase 6 | Pending |
 
