@@ -81,7 +81,7 @@ owner decisions made on 2026-10-03.
   report starts a new turn; if it is streaming, the report is queued as
   a follow-up.
 
-- [ ] **CTL-06**: The model can continue a finished agent with a new
+- [x] **CTL-06**: The model can continue a finished agent with a new
   message: a new `nanopi -p` is started on the same session, so the
   agent keeps its previous context.
 
@@ -216,7 +216,7 @@ owner decisions made on 2026-10-03.
 | CTL-03 | Phase 4 | Complete |
 | CTL-04 | Phase 4 | Complete |
 | CTL-05 | Phase 4 | Complete |
-| CTL-06 | Phase 4 | Pending |
+| CTL-06 | Phase 4 | Complete |
 | CTL-07 | Phase 4 | Complete |
 | ISO-01 | Phase 4 | Complete |
 | ISO-02 | Phase 4 | Complete |
