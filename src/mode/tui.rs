@@ -470,8 +470,15 @@ pub async fn run_tui_mode(
         )),
         inline_think_tags,
     );
-    let registry = ToolRegistry::standard_with_allowlist(&tools_allow)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // TUI is always the top-level, interactive process (never a spawned
+    // child): wire up CTL-02/03/04/06's main-process-only control tools
+    // (only meaningful with the unrestricted default set).
+    let registry = if tools_allow.is_empty() {
+        ToolRegistry::standard_with_control()
+    } else {
+        ToolRegistry::standard_with_allowlist(&tools_allow)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.

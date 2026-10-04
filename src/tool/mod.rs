@@ -16,6 +16,7 @@ pub mod grep;
 pub mod ls;
 pub mod read;
 pub mod agent;
+pub mod agent_ctl;
 pub mod write;
 
 use std::collections::HashMap;
@@ -575,6 +576,18 @@ impl ToolRegistry {
         r.register(Arc::new(find::FindTool));
         r.register(Arc::new(ls::LsTool));
         r.register(Arc::new(agent::AgentTool::new()));
+        r
+    }
+
+    /// `standard()` plus the main-process-only agent control tools
+    /// (CTL-02/03/04/06): `list_agents`, `stop_agent`, `send_message`.
+    /// Never used to build a child's registry (T-04-06) — children are
+    /// always built from `standard()`/`standard_with_allowlist()`.
+    pub fn standard_with_control() -> Self {
+        let mut r = Self::standard();
+        r.register(Arc::new(agent_ctl::ListAgentsTool::new()));
+        r.register(Arc::new(agent_ctl::StopAgentTool::new()));
+        r.register(Arc::new(agent_ctl::SendMessageTool::new()));
         r
     }
 

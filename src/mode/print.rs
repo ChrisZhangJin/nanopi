@@ -215,7 +215,11 @@ pub async fn run_print_mode(
     let (builtin_allow, _, plugin_candidates) =
         crate::tool::split_tool_allowlist(&tools_allow, &[]);
     let mut registry = if tools_allow.is_empty() {
-        ToolRegistry::standard()
+        if child.agent_mode {
+            ToolRegistry::standard()
+        } else {
+            ToolRegistry::standard_with_control()
+        }
     } else if builtin_allow.is_empty() {
         ToolRegistry::new()
     } else {
@@ -225,9 +229,14 @@ pub async fn run_print_mode(
         registry.set_plugin_allowlist(&plugin_candidates);
     }
     // Depth 1 (D-05): a child never gets the agent tool, even if the
-    // parent listed it.
+    // parent listed it. CTL control tools (T-04-06) are stripped the
+    // same way — belt and suspenders on top of them never being in
+    // `standard()`/`standard_with_allowlist()` to begin with.
     if child.agent_mode {
         registry.remove("agent");
+        for t in crate::tool::agent::CONTROL_TOOLS {
+            registry.remove(t);
+        }
     }
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` live in config.toml,

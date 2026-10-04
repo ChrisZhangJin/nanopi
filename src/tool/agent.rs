@@ -650,6 +650,11 @@ fn apply_inline_overrides(
 /// own registry in `mode::print`). Checked case-insensitively.
 const DENIED_TOOLS: &[&str] = &["agent", "subagent"];
 
+/// Main-process-only control tools (CTL-02/03/04): never valid as an
+/// inline `tools` override and never passed to a child's `--tools`
+/// (T-04-06). Checked case-insensitively, same as [`DENIED_TOOLS`].
+pub(crate) const CONTROL_TOOLS: &[&str] = &["send_message", "stop_agent", "list_agents"];
+
 /// Canonicalize and validate an inline `tools` override before spawn
 /// (D-04). Rejects deny-listed names (`agent`/`subagent`, elevation of
 /// privilege) and unknown names, listing the allowed set. Returns the
@@ -927,6 +932,15 @@ pub fn build_child_args(
     tools: &[String],
     agent_model: Option<&str>,
 ) -> Vec<String> {
+    // T-04-06: a control tool name can never reach a child, however it
+    // got into `tools` (defense in depth on top of `validate_tools`,
+    // which already rejects it as "unknown" since `standard()` never
+    // registers these).
+    let tools: Vec<&str> = tools
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !CONTROL_TOOLS.iter().any(|c| c.eq_ignore_ascii_case(t)))
+        .collect();
     let mut a: Vec<String> = vec![
         "-p".into(),
         "--output".into(),
@@ -1327,6 +1341,72 @@ pub(crate) fn spawn_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) 
         metadata: Some(json!({"agent_id": id, "agent_dir": archive_path})),
         images: Vec::new(),
     }
+}
+
+/// Build the child command to continue a finished agent (CTL-06): same
+/// id and dir, same `--session-file` transcript (which auto-resumes —
+/// `session::open_or_create_at`), brief.md re-read as the task (it now
+/// carries the amendment appended by the caller). Pure apart from
+/// reading `l`'s resolved spec/program.
+pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -> PreparedRun {
+    let mut command = l.program.command();
+    command
+        .args(build_child_args(&l.spec, dir, &[], None))
+        .envs(build_child_env(&l.spec, id))
+        .current_dir(cwd);
+    PreparedRun {
+        id: id.to_string(),
+        dir: dir.to_path_buf(),
+        command,
+        timeout: l.spec.timeout,
+    }
+}
+
+/// Continue a finished agent in the background under the same id
+/// (CTL-06/D-05). Unlike [`spawn_background`], the previous `report.md`
+/// (if any) is preserved: the new run's report is appended after a
+/// `## Continued` marker rather than overwriting it.
+pub(crate) fn spawn_continue_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) {
+    let id = prepared.id.clone();
+    let dir = prepared.dir.clone();
+    let prev_report = std::fs::read_to_string(dir.join("report.md")).ok();
+
+    let token = CancellationToken::new();
+    let reg_task = Arc::clone(reg);
+    let token_task = token.clone();
+    let id_task = id.clone();
+    let dir_task = dir.clone();
+
+    let handle = tokio::spawn(async move {
+        let reg_ref = &*reg_task;
+        let final_state = tokio::select! {
+            biased;
+            _ = token_task.cancelled() => AgentState::Stopped,
+            out = run_body(reg_ref, prepared) => {
+                let _ = out;
+                reg_ref
+                    .snapshot()
+                    .into_iter()
+                    .find(|e| e.id == id_task)
+                    .map(|e| e.state)
+                    .unwrap_or(AgentState::Failed)
+            }
+        };
+        let report_path = dir_task.join("report.md");
+        if let Some(prev) = prev_report {
+            if let Ok(new_text) = std::fs::read_to_string(&report_path) {
+                let merged = format!("{prev}\n\n## Continued\n\n{new_text}");
+                if let Err(e) = crate::tool::file_state::atomic_write(&report_path, merged.as_bytes()) {
+                    crate::note!("nanopi: debug: merge continued report({}): {e}", report_path.display());
+                }
+            }
+        }
+        let text = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let capped = cap_report(text, &report_path);
+        reg_task.push_report(&id_task, final_state, &capped);
+    });
+
+    reg.track_background(&id, handle, token);
 }
 
 /// Max bytes of child stdout retained (T-01-11). A larger envelope is
