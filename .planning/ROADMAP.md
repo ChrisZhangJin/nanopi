@@ -145,7 +145,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | Phase | Name | Goal | Requirements | Depends on |
 |-------|------|------|--------------|------------|
 | 1 | Child-process runtime | 7/7 | Complete   | 2026-10-03 |
-| 2 | Archive & lifecycle | 4/7 | In Progress|  |
+| 2 | Archive & lifecycle | 5/7 | In Progress|  |
 | 3 | Dynamic agents | The model dispatches by describing the task | DYN-01..DYN-05 | 1, 2 |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
 | 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
@@ -214,7 +214,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 02-05-PLAN.md — archive_keep_days, auto-prune, clean_runs
+- [x] 02-05-PLAN.md — archive_keep_days, auto-prune, clean_runs
 
 **Wave 4** *(blocked on Wave 3 completion)*
 

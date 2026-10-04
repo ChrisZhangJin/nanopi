@@ -104,7 +104,7 @@ owner decisions made on 2026-10-03.
 - [x] **ARC-04**: Agents that were still running when nanopi exited
   are marked `interrupted` on the next start; they are not re-run.
 
-- [ ] **ARC-05**: The user can clean up the archive with one command,
+- [x] **ARC-05**: The user can clean up the archive with one command,
   for example `/agents clean`. It can keep the most recent N runs or
   remove everything.
 
@@ -205,7 +205,7 @@ owner decisions made on 2026-10-03.
 | ARC-02 | Phase 2 | Complete |
 | ARC-03 | Phase 2 | Complete |
 | ARC-04 | Phase 2 | Complete |
-| ARC-05 | Phase 2 | Pending |
+| ARC-05 | Phase 2 | Complete |
 | DYN-01 | Phase 3 | Pending |
 | DYN-02 | Phase 3 | Pending |
 | DYN-03 | Phase 3 | Pending |
