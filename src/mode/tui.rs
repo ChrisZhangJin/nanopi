@@ -2012,7 +2012,7 @@ fn apply_orchestrator_mode(app: &mut App, agent: &mut Agent, on: bool) {
         // silent no-op otherwise: nothing in the registry/prompt changes and
         // there is no error, no log line. Surface it so the CR-02 symptom
         // (if it ever recurs) is visible rather than swallowed.
-        eprintln!(
+        crate::note!(
             "nanopi: /orchestrator off requested with no saved registry to restore \
              (mode was already off for this agent)"
         );
