@@ -67,15 +67,15 @@ owner decisions made on 2026-10-03.
 - [x] **CTL-01**: The model can launch an agent in the background and
   keep working; every agent has an id.
 
-- [ ] **CTL-02**: The model can amend a running agent's task by
+- [x] **CTL-02**: The model can amend a running agent's task by
   appending to its brief file (RT-09). The child picks it up between
   turns, never in the middle of a tool call. If the child has already
   finished, the amendment is handled by continuing it (CTL-06).
 
-- [ ] **CTL-03**: The model can stop a running agent, and the
+- [x] **CTL-03**: The model can stop a running agent, and the
   agent reports its partial work.
 
-- [ ] **CTL-04**: The model can list agents with their status.
+- [x] **CTL-04**: The model can list agents with their status.
 - [x] **CTL-05**: A finished background agent's report is delivered
   to the main agent automatically. If the main agent is idle, the
   report starts a new turn; if it is streaming, the report is queued as
@@ -212,9 +212,9 @@ owner decisions made on 2026-10-03.
 | DYN-04 | Phase 3 | Complete |
 | DYN-05 | Phase 3 | Complete |
 | CTL-01 | Phase 4 | Complete |
-| CTL-02 | Phase 4 | Pending |
-| CTL-03 | Phase 4 | Pending |
-| CTL-04 | Phase 4 | Pending |
+| CTL-02 | Phase 4 | Complete |
+| CTL-03 | Phase 4 | Complete |
+| CTL-04 | Phase 4 | Complete |
 | CTL-05 | Phase 4 | Complete |
 | CTL-06 | Phase 4 | Pending |
 | CTL-07 | Phase 4 | Pending |
