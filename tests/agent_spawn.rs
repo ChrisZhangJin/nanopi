@@ -13,6 +13,7 @@ use nanopi::tool::{Tool, ToolContext};
 use nanopi::tool::agent::{
     build_child_args, build_child_env, run_single, ChildLaunchSpec, ChildProgram, AgentTool,
 };
+use nanopi::tool::agent_ctl::SendMessageTool;
 
 /// Serve the same SSE body to every request (copied from print_mode_e2e).
 fn spawn_sse_server(chunks: Vec<String>) -> u16 {
@@ -208,5 +209,98 @@ async fn background_dispatch_does_not_block_caller() {
         batch.contains("[agent a1 finished:"),
         "outbox entry missing: {batch}"
     );
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// CTL-06/D-05: `send_message` to a finished agent re-runs it under the
+/// same id and dir; the previous report.md is kept, with the new run's
+/// report appended after a `## Continued` marker.
+#[tokio::test]
+async fn continue_finished_agent_same_id() {
+    let port = spawn_sse_server(vec![delta("- [x] task — FIRST-ANSWER"), finish("stop")]);
+    let cwd = std::env::temp_dir().join(format!("nanopi-agent-continue-{port}"));
+    let _ = std::fs::remove_dir_all(&cwd);
+    let home = cwd.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let spec = ChildLaunchSpec {
+        model: Some("fake-model".into()),
+        base_url: Some(format!("http://127.0.0.1:{port}")),
+        api_kind: Some("openai".into()),
+        api_key: Some("not-a-real-key".into()),
+        trust: Some(false),
+        timeout: std::time::Duration::from_secs(60),
+        ..ChildLaunchSpec::default()
+    };
+    let program = ChildProgram {
+        program: PathBuf::from("env"),
+        leading_args: vec![
+            format!("HOME={}", home.display()),
+            format!("NANOPI_HOME={}", home.join(".nanopi").display()),
+            env!("CARGO_BIN_EXE_nanopi").to_string(),
+        ],
+    };
+    let reg = AgentRegistry::new(&AgentLimits::default());
+    let tool = AgentTool::with_parts(reg.clone(), spec, program);
+    let agent = AgentConfig {
+        name: "scout".into(),
+        description: "test agent".into(),
+        tools: Some(vec!["read".into()]),
+        model: None,
+        system_prompt: "You are a scout.".into(),
+        source: AgentSource::User,
+        file_path: PathBuf::from("/nonexistent/scout.md"),
+    };
+
+    let out = run_single(&tool.launcher(), &agent, "FIRST-TASK", &cwd, None).await;
+    assert!(!out.is_error, "first run failed: {}", out.content);
+    let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
+    let first_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+    assert!(!first_report.trim().is_empty());
+
+    // Second run's SSE response is served by a fresh listener on a new
+    // port (the first listener only answered one request shape).
+    let port2 = spawn_sse_server(vec![delta("- [x] task — SECOND-ANSWER"), finish("stop")]);
+
+    let ctl_tool = SendMessageTool::with_registry(reg.clone());
+    let ctx = ToolContext { cwd: cwd.clone() };
+    let args = serde_json::json!({"id": "a1", "message": "do more, hit the new port"});
+    // Point this agent's next run at port2 by rewriting the spec baked
+    // into the shared Launcher (re-create the tool with the new port).
+    let spec2 = ChildLaunchSpec {
+        model: Some("fake-model".into()),
+        base_url: Some(format!("http://127.0.0.1:{port2}")),
+        api_kind: Some("openai".into()),
+        api_key: Some("not-a-real-key".into()),
+        trust: Some(false),
+        timeout: std::time::Duration::from_secs(60),
+        ..ChildLaunchSpec::default()
+    };
+    nanopi::tool::agent::set_launch_spec(spec2);
+
+    let out = ctl_tool.execute(args, &ctx).await.expect("send_message");
+    assert!(!out.is_error, "{}", out.content);
+    let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+    assert_eq!(v["delivered"], "continuing");
+
+    reg.wait_background().await;
+
+    let brief = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+    assert!(brief.contains("## Amendment 1"), "{brief}");
+    assert!(brief.contains("do more, hit the new port"), "{brief}");
+
+    let final_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+    assert!(
+        final_report.contains("## Continued"),
+        "missing continuation marker: {final_report}"
+    );
+    assert!(
+        final_report.contains(first_report.trim()),
+        "previous report lost: {final_report}"
+    );
+
+    let batch = reg.take_reports().expect("continuation outbox entry");
+    assert!(batch.contains("[agent a1 finished:"), "{batch}");
+
     let _ = std::fs::remove_dir_all(&cwd);
 }

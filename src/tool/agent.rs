@@ -2446,6 +2446,25 @@ mod tests {
         assert!(!a.iter().any(|x| x == "--tools"));
     }
 
+    /// T-04-06: control tool names are stripped from `--tools` even if
+    /// they somehow end up in the `tools` slice (e.g. a bypassed
+    /// `validate_tools`), since a child must never obtain them.
+    #[test]
+    fn build_child_args_strips_control_tools() {
+        let dir = Path::new("/tmp/agents/run/a1");
+        let a = build_child_args(
+            &spec_fixture(),
+            dir,
+            &["read".into(), "send_message".into(), "stop_agent".into(), "list_agents".into()],
+            None,
+        );
+        let j = a.join(" ");
+        assert!(j.contains("--tools read"), "{j}");
+        for denied in ["send_message", "stop_agent", "list_agents"] {
+            assert!(!j.contains(denied), "control tool leaked: {denied} in {j}");
+        }
+    }
+
     #[test]
     fn no_key_in_argv() {
         let a = build_child_args(&spec_fixture(), Path::new("/d"), &[], None);
