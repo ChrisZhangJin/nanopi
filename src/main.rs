@@ -500,6 +500,7 @@ async fn main() -> ExitCode {
         max_turns: cfg.agent.max_turns,
         token_budget: cfg.agent.token_budget,
         timeout: std::time::Duration::from_secs(cfg.agent.timeout_secs),
+        vendor: Some(startup_vendor.id().to_string()),
     });
 
     // The TUI needs a real terminal. `-p` is the explicit non-interactive

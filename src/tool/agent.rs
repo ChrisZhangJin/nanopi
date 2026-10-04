@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::agent::agents::{discover_agents, AgentConfig, AgentScope, AgentSource};
+use crate::agent::agents::{discover_agents, AgentConfig, AgentScope, AgentSource, GENERAL_PURPOSE_NAME};
 use crate::agent::brief::{render_brief_with_meta, render_report, BriefMeta, BriefSpec, ReportMeta};
 use crate::agent::context::ToolSpec;
 use crate::archive;
@@ -55,6 +55,11 @@ pub struct ChildLaunchSpec {
     pub max_turns: u32,
     pub token_budget: u64,
     pub timeout: Duration,
+    /// The active provider's vendor id (`vendor::Vendor::id()`), used by
+    /// [`validate_model`] to reject inline model overrides from a
+    /// different vendor (D-05). `None`/`"fallback"` means "accept any
+    /// registry-known model" (custom endpoint, catalogue doesn't apply).
+    pub vendor: Option<String>,
 }
 
 impl Default for ChildLaunchSpec {
@@ -69,6 +74,7 @@ impl Default for ChildLaunchSpec {
             max_turns: c.max_turns,
             token_budget: c.token_budget,
             timeout: Duration::from_secs(c.timeout_secs),
+            vendor: None,
         }
     }
 }
@@ -157,11 +163,19 @@ enum Mode {
 
 /// One unit of work in a `parallel`/`chain` batch (also models the
 /// single-mode call after parsing).
+///
+/// `agent: None` dispatches the built-in general-purpose agent
+/// (DYN-01). `role`/`tools`/`model`/`description` are inline
+/// overrides applied on top of the resolved agent (DYN-02).
 #[derive(Debug, Clone)]
 struct AgentItem {
-    agent: String,
+    agent: Option<String>,
     task: String,
     cwd: Option<String>,
+    role: Option<String>,
+    tools: Option<Vec<String>>,
+    model: Option<String>,
+    description: Option<String>,
 }
 
 /// Decide which mode the arguments select, enforcing exactly-one-of
@@ -186,6 +200,80 @@ fn substitute_previous(task: &str, previous: &str) -> String {
     task.replace("{previous}", previous)
 }
 
+/// Prefix an error-message key with `prefix` (`tasks[0]` etc.), or
+/// leave it bare when `prefix` is empty (single-mode top-level args).
+fn errkey(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// Read an optional string field, erroring if present but not a string.
+fn opt_str_field(it: &Value, prefix: &str, key: &str) -> Result<Option<String>, String> {
+    match it.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("`{}` must be a string", errkey(prefix, key))),
+    }
+}
+
+/// Parse one dispatch item's shape, shared by `parse_items` (`prefix`
+/// = `tasks[i]`/`chain[i]`) and the Single branch of `execute()`
+/// (`prefix` empty, reading the top-level args object) — D-01.
+fn parse_item(it: &Value, prefix: &str) -> Result<AgentItem, String> {
+    let agent = opt_str_field(it, prefix, "agent")?;
+    let task = it
+        .get("task")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("`{}` must be a string", errkey(prefix, "task")))?
+        .to_string();
+    let cwd = opt_str_field(it, prefix, "cwd")?;
+    let role = opt_str_field(it, prefix, "role")?;
+    let model = opt_str_field(it, prefix, "model")?;
+    let description = opt_str_field(it, prefix, "description")?;
+    let tools = match it.get("tools") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(arr)) => {
+            if arr.is_empty() {
+                return Err(format!(
+                    "`{}` must list at least one tool; omit it to allow all tools",
+                    errkey(prefix, "tools")
+                ));
+            }
+            let mut v = Vec::with_capacity(arr.len());
+            for x in arr {
+                match x.as_str() {
+                    Some(s) => v.push(s.to_string()),
+                    None => {
+                        return Err(format!(
+                            "`{}` must be an array of strings",
+                            errkey(prefix, "tools")
+                        ))
+                    }
+                }
+            }
+            Some(v)
+        }
+        Some(_) => {
+            return Err(format!(
+                "`{}` must be an array of strings",
+                errkey(prefix, "tools")
+            ))
+        }
+    };
+    Ok(AgentItem {
+        agent,
+        task,
+        cwd,
+        role,
+        tools,
+        model,
+        description,
+    })
+}
+
 /// Parse a `tasks`/`chain` array into concrete items, validating each
 /// entry's shape. `field` names the array for error messages.
 fn parse_items(value: &Value, field: &str) -> Result<Vec<AgentItem>, String> {
@@ -194,18 +282,7 @@ fn parse_items(value: &Value, field: &str) -> Result<Vec<AgentItem>, String> {
         .ok_or_else(|| format!("`{field}` must be an array"))?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, it) in arr.iter().enumerate() {
-        let agent = it
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("`{field}[{i}].agent` must be a string"))?
-            .to_string();
-        let task = it
-            .get("task")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("`{field}[{i}].task` must be a string"))?
-            .to_string();
-        let cwd = it.get("cwd").and_then(|v| v.as_str()).map(String::from);
-        out.push(AgentItem { agent, task, cwd });
+        out.push(parse_item(it, &format!("{field}[{i}]"))?);
     }
     Ok(out)
 }
@@ -443,16 +520,10 @@ impl Tool for AgentTool {
 
         match mode {
             Mode::Single => {
-                let agent_name = args
-                    .get("agent")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::InvalidArgs("agent must be a string".into()))?;
-                let task = args
-                    .get("task")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::InvalidArgs("task must be a string".into()))?;
-                let run_cwd = resolve_cwd(&ctx.cwd, args.get("cwd").and_then(|v| v.as_str()));
-                Ok(run_item(&l, agent_name, task, scope, &run_cwd).await)
+                let item = parse_item(&args, "").map_err(ToolError::InvalidArgs)?;
+                let run_cwd = resolve_cwd(&ctx.cwd, item.cwd.as_deref());
+                let task = item.task.clone();
+                Ok(run_item(&l, &item, &task, scope, &run_cwd).await)
             }
             Mode::Parallel => {
                 let items = parse_items(&args["tasks"], "tasks").map_err(ToolError::InvalidArgs)?;
@@ -472,19 +543,174 @@ impl Tool for AgentTool {
     }
 }
 
-/// Resolve an agent by name under `scope` at `run_cwd`, applying the
-/// project-trust gate, then run it. Every failure is in-band.
+/// Resolve `agent_name` (or the built-in general-purpose agent when
+/// `None`, DYN-01) under `scope` at `run_cwd`, applying the
+/// project-trust gate for named agents. Every failure is in-band.
+fn resolve_agent_config(
+    agent_name: Option<&str>,
+    scope: AgentScope,
+    run_cwd: &Path,
+) -> Result<AgentConfig, ToolOutput> {
+    match agent_name {
+        Some(name) => resolve_agent(name, scope, run_cwd),
+        None => Ok(AgentConfig::general_purpose()),
+    }
+}
+
+/// Apply inline `role`/`tools`/`model` overrides on top of a resolved
+/// `base` agent config (DYN-02). Per D-01/D-03: on the built-in
+/// general-purpose agent a `role` is appended after the base prompt
+/// (blank-line separated); on a named agent file it replaces the
+/// system prompt outright. `tools`/`model` always replace. Absent
+/// fields leave the corresponding value untouched. Pure.
+fn apply_inline_overrides(
+    base: AgentConfig,
+    is_builtin: bool,
+    role: Option<&str>,
+    tools: Option<Vec<String>>,
+    model: Option<&str>,
+) -> AgentConfig {
+    let mut cfg = base;
+    if let Some(role) = role {
+        if is_builtin {
+            cfg.system_prompt = if cfg.system_prompt.trim().is_empty() {
+                role.to_string()
+            } else {
+                format!("{}\n\n{role}", cfg.system_prompt)
+            };
+        } else {
+            cfg.system_prompt = role.to_string();
+        }
+    }
+    if let Some(tools) = tools {
+        cfg.tools = Some(tools);
+    }
+    if let Some(model) = model {
+        cfg.model = Some(model.to_string());
+    }
+    cfg
+}
+
+/// Tool names that are never allowed in an inline `tools` override,
+/// regardless of what `ToolRegistry::standard()` reports (T-03-03
+/// deny-list always wins; mirrors the deny applied to a spawned child's
+/// own registry in `mode::print`). Checked case-insensitively.
+const DENIED_TOOLS: &[&str] = &["agent", "subagent"];
+
+/// Canonicalize and validate an inline `tools` override before spawn
+/// (D-04). Rejects deny-listed names (`agent`/`subagent`, elevation of
+/// privilege) and unknown names, listing the allowed set. Returns the
+/// canonical names, deduplicated in input order. Pure.
+fn validate_tools(tools: &[String]) -> Result<Vec<String>, String> {
+    let registry = crate::tool::ToolRegistry::standard();
+    let allowed: Vec<String> = registry
+        .names()
+        .into_iter()
+        .filter(|n| !DENIED_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(n)))
+        .collect();
+    let mut bad: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for t in tools {
+        if DENIED_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(t)) {
+            bad.push(t.clone());
+            continue;
+        }
+        match registry.canonical_name(t) {
+            Some(canonical) => {
+                if !out.contains(&canonical) {
+                    out.push(canonical);
+                }
+            }
+            None => bad.push(t.clone()),
+        }
+    }
+    if !bad.is_empty() {
+        return Err(format!(
+            "unknown or denied tool(s): {}. Allowed tools: {}",
+            bad.join(", "),
+            allowed.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+/// Validate an inline `model` override before spawn (D-05 safe
+/// default): the parent's own configured model is always accepted
+/// (case-insensitive); otherwise the model must be a known id served by
+/// the active provider's vendor. With no active vendor (custom
+/// endpoint) or the `fallback` vendor, any registry-known model is
+/// accepted since there is no catalogue to check cross-vendor against.
+///
+/// Assumption: nanopi config is single-provider, so "a provider
+/// configured for that vendor" can only be the one currently active —
+/// there is no multi-provider routing to fall back to.
+fn validate_model(
+    model: &str,
+    parent_model: Option<&str>,
+    parent_vendor: Option<&str>,
+) -> Result<(), String> {
+    if let Some(pm) = parent_model {
+        if pm.eq_ignore_ascii_case(model) {
+            return Ok(());
+        }
+    }
+    let Some(model_vendor) = crate::models::model_vendor(model) else {
+        let ids: Vec<&str> = parent_vendor
+            .map(crate::models::models_for_vendor)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        let vendor_label = parent_vendor.unwrap_or("unknown");
+        return Err(format!(
+            "unknown model {model:?}. Models available from the active provider ({vendor_label}): {}",
+            ids.join(", ")
+        ));
+    };
+    match parent_vendor {
+        Some(p) if p != "fallback" && !p.eq_ignore_ascii_case(model_vendor) => Err(format!(
+            "model {model:?} belongs to vendor {model_vendor}, but only the active provider \
+             ({p}) is configured; cross-vendor agents need a configured provider for that vendor"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Resolve + override + validate + run one dispatch item. Every
+/// failure is in-band (no spawn occurs on a validation failure).
 async fn run_item(
     l: &Launcher,
-    agent_name: &str,
+    item: &AgentItem,
     task: &str,
     scope: AgentScope,
     run_cwd: &Path,
 ) -> ToolOutput {
-    match resolve_agent(agent_name, scope, run_cwd) {
-        Ok(agent) => run_single(l, &agent, task, run_cwd).await,
-        Err(soft) => soft,
+    let is_builtin = item.agent.is_none();
+    let base = match resolve_agent_config(item.agent.as_deref(), scope, run_cwd) {
+        Ok(agent) => agent,
+        Err(soft) => return soft,
+    };
+    let mut cfg = apply_inline_overrides(
+        base,
+        is_builtin,
+        item.role.as_deref(),
+        item.tools.clone(),
+        item.model.as_deref(),
+    );
+    // Pre-spawn validation (D-04/D-05): only for inline overrides — an
+    // agent file's own tools/model are unchanged behaviour (DYN-03).
+    if item.tools.is_some() {
+        match validate_tools(cfg.tools.as_deref().unwrap_or_default()) {
+            Ok(canonical) => cfg.tools = Some(canonical),
+            Err(e) => return soft_error(e),
+        }
     }
+    if let Some(model) = &item.model {
+        if let Err(e) = validate_model(model, l.spec.model.as_deref(), l.spec.vendor.as_deref()) {
+            return soft_error(e);
+        }
+    }
+    run_single(l, &cfg, task, run_cwd, item.description.as_deref()).await
 }
 
 /// Discover + trust-gate a single agent. On failure returns a
@@ -546,8 +772,13 @@ async fn run_parallel(
     let futs = items.into_iter().map(|item| {
         let run_cwd = resolve_cwd(base_cwd, item.cwd.as_deref());
         async move {
-            let out = run_item(l, &item.agent, &item.task, scope, &run_cwd).await;
-            (item.agent, out)
+            let display = item
+                .agent
+                .clone()
+                .unwrap_or_else(|| GENERAL_PURPOSE_NAME.to_string());
+            let task = item.task.clone();
+            let out = run_item(l, &item, &task, scope, &run_cwd).await;
+            (display, out)
         }
     });
     let results: Vec<(String, ToolOutput)> = join_all(futs).await;
@@ -567,10 +798,14 @@ async fn run_chain(
     for (i, item) in items.into_iter().enumerate() {
         let task = substitute_previous(&item.task, &previous);
         let run_cwd = resolve_cwd(base_cwd, item.cwd.as_deref());
-        let out = run_item(l, &item.agent, &task, scope, &run_cwd).await;
+        let display = item
+            .agent
+            .clone()
+            .unwrap_or_else(|| GENERAL_PURPOSE_NAME.to_string());
+        let out = run_item(l, &item, &task, scope, &run_cwd).await;
         let failed = out.is_error;
         previous = out.content.clone();
-        steps.push((item.agent, out));
+        steps.push((display, out));
         if failed {
             return format_chain(&steps, Some(i));
         }
@@ -726,7 +961,13 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// One tracked, capped, briefed child dispatch. Always in-band.
-pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Path) -> ToolOutput {
+pub async fn run_single(
+    l: &Launcher,
+    agent: &AgentConfig,
+    task: &str,
+    cwd: &Path,
+    label: Option<&str>,
+) -> ToolOutput {
     let reg = &*l.registry;
     // D-07: register .nanopi/agents/ in the project .gitignore before the
     // first archive directory is created, once per cwd per process.
@@ -761,7 +1002,7 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
             state: "queued".to_string(),
             started,
             parent: reg.run_id().to_string(),
-            label: None,
+            label: label.map(str::to_string),
         },
     );
     if let Err(e) = write_private(&dir.join("brief.md"), &brief) {
@@ -1275,8 +1516,147 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].cwd.as_deref(), Some("sub"));
         assert!(parse_items(&json!({}), "tasks").is_err());
-        assert!(parse_items(&json!([{"task": "t"}]), "tasks").is_err());
+        // `agent` is optional (DYN-01): a bare `{task}` item is valid and
+        // resolves to the built-in general-purpose agent downstream.
+        let items = parse_items(&json!([{"task": "t"}]), "tasks").unwrap();
+        assert_eq!(items[0].agent, None);
+        // `task` is still required.
         assert!(parse_items(&json!([{"agent": "a"}]), "tasks").is_err());
+    }
+
+    #[test]
+    fn parse_item_rejects_non_string_optional_fields() {
+        let err = parse_item(&json!({"task": "t", "agent": 1}), "tasks[0]").unwrap_err();
+        assert_eq!(err, "`tasks[0].agent` must be a string");
+        let err = parse_item(&json!({"task": "t", "role": 1}), "tasks[0]").unwrap_err();
+        assert_eq!(err, "`tasks[0].role` must be a string");
+        let err = parse_item(&json!({"task": "t", "model": 1}), "tasks[0]").unwrap_err();
+        assert_eq!(err, "`tasks[0].model` must be a string");
+        let err = parse_item(&json!({"task": "t", "description": 1}), "tasks[0]").unwrap_err();
+        assert_eq!(err, "`tasks[0].description` must be a string");
+        let err = parse_item(&json!({"task": "t", "tools": "read"}), "tasks[0]").unwrap_err();
+        assert_eq!(err, "`tasks[0].tools` must be an array of strings");
+        let err = parse_item(&json!({"task": "t", "tools": [1]}), "tasks[0]").unwrap_err();
+        assert_eq!(err, "`tasks[0].tools` must be an array of strings");
+        let err = parse_item(&json!({"task": "t", "tools": []}), "tasks[0]").unwrap_err();
+        assert_eq!(
+            err,
+            "`tasks[0].tools` must list at least one tool; omit it to allow all tools"
+        );
+        // single-mode: no prefix.
+        let err = parse_item(&json!({"task": "t", "agent": 1}), "").unwrap_err();
+        assert_eq!(err, "`agent` must be a string");
+    }
+
+    #[test]
+    fn single_mode_call_with_only_task_has_no_agent() {
+        let item = parse_item(&json!({"task": "do it"}), "").unwrap();
+        assert_eq!(item.agent, None);
+        assert_eq!(item.task, "do it");
+    }
+
+    #[test]
+    fn resolve_agent_config_none_is_general_purpose() {
+        let dir = std::env::temp_dir();
+        let cfg = resolve_agent_config(None, AgentScope::Project, &dir).unwrap();
+        assert_eq!(cfg.name, crate::agent::agents::GENERAL_PURPOSE_NAME);
+    }
+
+    #[test]
+    fn resolve_agent_config_unknown_name_is_soft_error() {
+        let dir = std::env::temp_dir();
+        let out =
+            resolve_agent_config(Some("__definitely_not_an_agent__"), AgentScope::Project, &dir)
+                .unwrap_err();
+        assert!(out.is_error);
+        assert!(out.content.contains("Unknown agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_inline_overrides_role_appends_on_builtin_replaces_on_named() {
+        let builtin = AgentConfig::general_purpose();
+        let out = apply_inline_overrides(builtin.clone(), true, Some("extra role"), None, None);
+        assert!(out.system_prompt.starts_with(&builtin.system_prompt));
+        assert!(out.system_prompt.ends_with("extra role"));
+        assert!(out.system_prompt.contains("\n\nextra role"));
+
+        let named = agent_fixture();
+        let out = apply_inline_overrides(named, false, Some("new role"), None, None);
+        assert_eq!(out.system_prompt, "new role");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_inline_overrides_tools_and_model_always_replace() {
+        let named = agent_fixture();
+        let out = apply_inline_overrides(
+            named,
+            false,
+            None,
+            Some(vec!["bash".into()]),
+            Some("some-model"),
+        );
+        assert_eq!(out.tools, Some(vec!["bash".to_string()]));
+        assert_eq!(out.model.as_deref(), Some("some-model"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_inline_overrides_absent_fields_untouched() {
+        let named = agent_fixture();
+        let out = apply_inline_overrides(named.clone(), false, None, None, None);
+        assert_eq!(out.system_prompt, named.system_prompt);
+        assert_eq!(out.tools, named.tools);
+        assert_eq!(out.model, named.model);
+    }
+
+    #[test]
+    fn validate_tools_canonicalizes_and_dedupes() {
+        let out = validate_tools(&["read".into(), "GREP".into(), "Bash_tool".into()]).unwrap();
+        assert_eq!(out, vec!["read".to_string(), "grep".to_string(), "bash".to_string()]);
+    }
+
+    #[test]
+    fn validate_tools_rejects_unknown_and_lists_allowed() {
+        let err = validate_tools(&["read".into(), "nope".into()]).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(!err.contains("\"agent\""), "{err}");
+        // "agent" tool must not appear in the allowed list.
+        let allowed_part = err.split("Allowed tools: ").nth(1).unwrap();
+        assert!(!allowed_part.split(", ").any(|n| n == "agent"), "{err}");
+    }
+
+    #[test]
+    fn validate_tools_denies_agent_and_subagent() {
+        assert!(validate_tools(&["agent".into()]).is_err());
+        assert!(validate_tools(&["subagent".into()]).is_err());
+        assert!(validate_tools(&["AGENT".into()]).is_err());
+    }
+
+    #[test]
+    fn validate_model_parent_model_always_ok() {
+        assert!(validate_model("some-weird-model", Some("some-weird-model"), Some("anthropic")).is_ok());
+    }
+
+    #[test]
+    fn validate_model_known_model_same_vendor_ok_other_vendor_errors() {
+        assert!(validate_model("claude-opus-4-7", Some("other"), Some("anthropic")).is_ok());
+        let err = validate_model("claude-opus-4-7", Some("other"), Some("deepseek")).unwrap_err();
+        assert!(err.contains("anthropic"), "{err}");
+        assert!(err.contains("deepseek"), "{err}");
+    }
+
+    #[test]
+    fn validate_model_unknown_id_lists_vendor_models() {
+        let err = validate_model("no-such-model-xyz", Some("other"), Some("anthropic")).unwrap_err();
+        assert!(err.contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn validate_model_no_or_fallback_vendor_accepts_any_known_model() {
+        assert!(validate_model("claude-opus-4-7", Some("other"), None).is_ok());
+        assert!(validate_model("claude-opus-4-7", Some("other"), Some("fallback")).is_ok());
     }
 
     #[tokio::test]
@@ -1351,9 +1731,13 @@ mod tests {
         let out = run_parallel(
             &AgentTool::new().launcher(),
             vec![AgentItem {
-                agent: "__definitely_not_an_agent__".into(),
+                agent: Some("__definitely_not_an_agent__".into()),
                 task: "x".into(),
                 cwd: None,
+                role: None,
+                tools: None,
+                model: None,
+                description: None,
             }],
             AgentScope::Project,
             &dir,
@@ -1371,9 +1755,13 @@ mod tests {
         let out = run_chain(
             &AgentTool::new().launcher(),
             vec![AgentItem {
-                agent: "__definitely_not_an_agent__".into(),
+                agent: Some("__definitely_not_an_agent__".into()),
                 task: "x".into(),
                 cwd: None,
+                role: None,
+                tools: None,
+                model: None,
+                description: None,
             }],
             AgentScope::Project,
             &dir,
@@ -1740,7 +2128,7 @@ mod tests {
             "[ -f \"$4\" ] || exit 7; [ \"$NANOPI_AGENT_ID\" = a1 ] || exit 8; echo '{OK_ENV}'"
         );
         let l = launcher(&script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "find the thing", &cwd).await;
+        let out = run_single(&l, &agent_fixture(), "find the thing", &cwd, None).await;
         assert!(!out.is_error, "{}", out.content);
         let dir = cwd
             .join(".nanopi/agents")
@@ -1774,7 +2162,7 @@ mod tests {
         let cwd = tmp("live");
         let l = launcher(&format!("echo '{OK_ENV}'"), 1, 4);
         l.registry.reserve(&cwd.join(".nanopi/agents")).unwrap(); // one live entry
-        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
         assert!(out.is_error);
         assert!(
             out.content.contains("agent limit reached"),
@@ -1791,7 +2179,7 @@ mod tests {
         let l = launcher(&format!("sleep 0.4; echo '{OK_ENV}'"), 8, 1);
         let a = agent_fixture();
         let t0 = std::time::Instant::now();
-        let (x, y) = tokio::join!(run_single(&l, &a, "1", &cwd), run_single(&l, &a, "2", &cwd));
+        let (x, y) = tokio::join!(run_single(&l, &a, "1", &cwd, None), run_single(&l, &a, "2", &cwd, None));
         assert!(!x.is_error && !y.is_error);
         assert!(
             t0.elapsed() >= Duration::from_millis(800),
@@ -1811,9 +2199,9 @@ mod tests {
         );
         let l = launcher(&script, 8, 4);
         let a = agent_fixture();
-        let f = run_single(&l, &a, "t", &cwd).await;
+        let f = run_single(&l, &a, "t", &cwd, None).await;
         assert!(f.is_error);
-        let ok = run_single(&l, &a, "t", &cwd).await;
+        let ok = run_single(&l, &a, "t", &cwd, None).await;
         assert!(!ok.is_error);
         assert!(ok.content.contains("REPORT-BODY"), "{}", ok.content);
         let rp = ok.metadata.as_ref().unwrap()["report_path"]
@@ -1821,7 +2209,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rp.ends_with("/a2/report.md"), "{rp}");
-        let lr = run_single(&l, &a, "t", &cwd).await;
+        let lr = run_single(&l, &a, "t", &cwd, None).await;
         assert!(!lr.is_error);
         let st: Vec<AgentState> = l.registry.snapshot().iter().map(|e| e.state).collect();
         assert_eq!(
@@ -1841,7 +2229,7 @@ mod tests {
         let cwd = tmp("fallback");
         let script = "exit 3";
         let l = launcher(script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
         assert!(out.is_error);
         let dir = cwd
             .join(".nanopi/agents")
@@ -1864,7 +2252,7 @@ mod tests {
             "echo MINE > \"$(dirname \"$4\")/report.md\"; echo '{OK_ENV}'"
         );
         let l = launcher(&script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
         assert!(!out.is_error);
         let dir = cwd
             .join(".nanopi/agents")
@@ -1880,7 +2268,7 @@ mod tests {
     async fn brief_front_matter_and_index_after_dispatch() {
         let cwd = tmp("frontmatter");
         let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
         assert!(!out.is_error, "{}", out.content);
         let run_dir = cwd.join(".nanopi/agents").join(l.registry.run_id());
         let brief = std::fs::read_to_string(run_dir.join("a1").join("brief.md")).unwrap();
@@ -1903,10 +2291,48 @@ mod tests {
         let cwd = tmp("gitignore");
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
         let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
         assert!(!out.is_error, "{}", out.content);
         let gi = std::fs::read_to_string(cwd.join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".nanopi/agents"), "{gi}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// D-04/D-05: a dispatch whose inline `tools`/`model` fail validation
+    /// is rejected in-band before any spawn — no agent dir is reserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_inline_override_fails_before_spawn() {
+        let cwd = tmp("novspawn");
+        let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
+        let item = AgentItem {
+            agent: None,
+            task: "t".into(),
+            cwd: None,
+            role: None,
+            tools: Some(vec!["nope".into()]),
+            model: None,
+            description: None,
+        };
+        let out = run_item(&l, &item, &item.task, AgentScope::Project, &cwd).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("unknown or denied tool"), "{}", out.content);
+        let run_dir = cwd.join(".nanopi/agents").join(l.registry.run_id());
+        assert!(!run_dir.exists(), "no agent dir should have been reserved");
+
+        let item = AgentItem {
+            agent: None,
+            task: "t".into(),
+            cwd: None,
+            role: None,
+            tools: None,
+            model: Some("no-such-model-xyz".into()),
+            description: None,
+        };
+        let out = run_item(&l, &item, &item.task, AgentScope::Project, &cwd).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("unknown model"), "{}", out.content);
+        assert!(!run_dir.exists(), "no agent dir should have been reserved");
         let _ = std::fs::remove_dir_all(&cwd);
     }
 }
