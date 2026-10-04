@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
-status: executing
-last_updated: "2026-10-04T17:39:14.337Z"
-last_activity: 2026-10-04
+status: Awaiting next milestone
+last_updated: "2026-10-04T18:13:43.429Z"
+last_activity: 2026-10-04 — Milestone v0.13.0 completed and archived
 progress:
   total_phases: 6
   completed_phases: 6
@@ -17,61 +17,46 @@ progress:
 
 ## Current Position
 
-Phase: 06 (orchestrator-mode) — COMPLETE
-Plan: 4 of 4 complete (06-01, 06-02, 06-03, 06-04 all done)
-Status: Milestone v0.13.0 complete
-Last activity: 2026-10-04
+Phase: Milestone v0.13.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-10-04 — Milestone v0.13.0 completed and archived
 
----
+## Project Reference
 
-*Everything below is the accumulated context from v0.12.x, kept as-is.*
+See: .planning/PROJECT.md (updated 2026-10-04)
 
-Last activity: 2026-09-08 — **the manual test plan was actually run.**
-All 64 rows are filled from a live-model session; the plan's
-known-defect list went from "empty" to "empty again, and this time
-somebody checked". Six defects came out of it, all fixed with
-reversion-verified regression tests.
+**Core value:** A capable coding agent that fits in a tiny static binary and runs anywhere.
+**Current focus:** Planning next milestone (v0.13.0 shipped 2026-10-04, tag `v0.13.0`, not pushed)
 
-**Read this first if you are deciding whether to release:** one of the
-six was not cosmetic. `T4.4` exposed that **every parallel tool batch of
-two or more tools failed** on the Anthropic transport, after the tools
-had already run — cards drawn, side effects done, then the turn died
-before the model saw a single result (`2e386ef`). It hid behind a row
-whose own assertion passed and two automated tests that could not see
-it. If v0.12.0 had shipped on 2026-09-07 as "ready-to-release", that
-would have gone out.
+## Deferred Items
 
-The other lesson is about where the defects were: **four of the six were
-in front of working code, not in it.** The `ThinkingChange` writer was
-correct and unreachable (dead default keybinding, plus a capability
-allowlist that omitted Claude 5). The matcher validator was correct and
-its error was swallowed at both call sites. A manual pass finds this
-class; a unit test sitting next to the correct code cannot.
+Items acknowledged and deferred at milestone close on 2026-10-04:
 
-Three things are worth carrying forward more than the feature list:
+| Category | Item | Status |
+|----------|------|--------|
+| verification | Phase 01: 01-VERIFICATION.md | human_needed |
+| verification | Phase 04: 04-VERIFICATION.md | human_needed |
+| verification | Phase 05: 05-VERIFICATION.md | human_needed |
+| verification | Phase 06: 06-VERIFICATION.md | human_needed |
+| quick_task | 260819-ayr-add-a-first-run-wizard-to-nanopi-console | unknown |
+| quick_task | 260825-kft-add-system-prompt-append-system-prompt-c | unknown |
+| quick_task | 260828-extend-shell-hook-events | missing |
+| quick_task | 260828-l4d-finish-gated-host-http-get-capability-fo | unknown |
+| quick_task | 260828-steer-followup-injection | missing |
+| quick_task | 260828-wasm-plugin-system | missing |
+| quick_task | 260902-m0z-rename-hook-events-pi-names | unknown |
+| quick_task | 260902-nms-wasm-event-subscribers | unknown |
+| quick_task | 260903-l1s-inline-think-tags | unknown |
+| quick_task | 260907-d87-plugin-outbound-surface-stage-1-of-docs- | unknown |
+| quick_task | 260907-i8f-plugin-tool-calls-stage-3-of-docs-plugin | unknown |
+| quick_task | 260907-r3k-plugin-send-user-message-stage-4-of-do | unknown |
 
-- **`ModelChange` had a reader, a replay path, an `/export` renderer and
-  a roundtrip test — and no writer, since the session format existed.**
-  It survived because the only test naming it asserted that the variant
-  serializes, which it always did. Its five checks were bare
-  `matches!(entry, Variant { .. });` STATEMENTS: the macro returns a
-  bool, the `;` discarded it, so the test asserted nothing at all.
-  Confirmed by rewriting one to the wrong variant and watching it pass.
-  When a variant looks unused, check for a writer, not just a reader.
-
-- **The flaky suite was two defects, not one**, which is why partial
-  fixes kept not working. A poisoning cascade made failures illegible
-  (one real failure reported as 13-14); a restore-on-the-happy-path-only
-  leak was the race itself. Recovering from the poisoned mutex did
-  nothing about the leak.
-
-- **Two spec claims were disproved by implementing them**, and the specs
-  were amended rather than quietly diverged from: `§Required tests`
-  demanded an echo-before-send ordering that recreates `b90b27f`, and
-  §2.4's two "mandatory" loop-guard rules do not bound the loop they
-  target (a `turn_end` subscriber satisfies both forever).
+Tech debt (accepted): see `.planning/milestones/v0.13.0-MILESTONE-AUDIT.md`.
 
 ## Current Focus
+
+*Historical (v0.12.x) context below, kept as-is.*
 
 **v0.12.0 is feature-complete, manually tested, and version-bumped.
 What remains is not development.**
@@ -363,3 +348,7 @@ pinned by wall-clock tests.
 - [Phase ?]: D-01: print mode reads experimental.orchestrator only to print a stderr note; never branches registry/prompt construction on it
 - [Phase 06]: QA-02 baseline for Cargo.toml diff is 5ec258f (v0.12.1 bump), the last commit before phase 1's first plan commit
 - [Phase 06]: unicode-width 0.2 is the only new direct Cargo.toml dependency this milestone; already transitive via ratatui, promoted for CJK-aware input wrap math
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd:new-milestone
