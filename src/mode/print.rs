@@ -404,7 +404,11 @@ pub async fn run_print_mode(
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
             agent.fire_session_shutdown("quit").await;
-            (r, limit, checklist_reply, answer)
+            let turns = agent.turn_count;
+            let tokens = (agent.usage_total.input_tokens as u64)
+                + (agent.usage_total.output_tokens as u64);
+            let files_changed = files_changed_from(&agent.context.messages);
+            (r, limit, checklist_reply, answer, turns, tokens, files_changed)
         })
     };
 
@@ -432,7 +436,8 @@ pub async fn run_print_mode(
     if let Some(mut s) = spinner.take() {
         s.stop().await;
     }
-    let (turn_result, limit_hit, checklist_reply, answer) = agent_task.await?;
+    let (turn_result, limit_hit, checklist_reply, answer, turns, tokens, files_changed) =
+        agent_task.await?;
     let status = if turn_result.is_err() {
         "failed"
     } else if limit_hit.is_some() {
@@ -445,17 +450,40 @@ pub async fn run_print_mode(
         let rp = report_path_for(p);
         let summary = report_summary(answer.as_deref(), &turn_result);
         let items = checklist_items(checklist_reply.as_deref(), status);
+        let mut open_issues: Vec<String> = items
+            .iter()
+            .filter(|i| !i.done)
+            .map(|i| {
+                if i.note.is_empty() {
+                    i.label.clone()
+                } else {
+                    format!("{} — {}", i.label, i.note)
+                }
+            })
+            .collect();
+        if let Err(e) = &turn_result {
+            open_issues.push(e.to_string());
+        }
         let report_meta = crate::agent::brief::ReportMeta {
-            id: header.id.clone(),
-            state: status.to_string(),
+            id: child
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "(unknown)".to_string()),
+            state: report_state(status).to_string(),
             ended: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-            turns: None,
-            tokens: None,
+            turns: Some(turns),
+            tokens: Some(tokens),
             worktree: None,
             branch: None,
         };
-        let body = crate::agent::brief::render_report(&report_meta, &summary, &[], &[], &items);
-        if let Err(e) = write_private(&rp, &body) {
+        let body = crate::agent::brief::render_report(
+            &report_meta,
+            &summary,
+            &files_changed,
+            &open_issues,
+            &items,
+        );
+        if let Err(e) = write_report_durable(&rp, &body) {
             eprintln!("nanopi: cannot write report {}: {e}", rp.display());
         }
         rp
@@ -621,6 +649,78 @@ fn write_private(path: &std::path::Path, body: &str) -> std::io::Result<()> {
     opts.open(path)?.write_all(body.as_bytes())
 }
 
+/// D-05 state names for report.md front-matter: `completed` -> `done`,
+/// everything else passes through unchanged.
+fn report_state(status: &str) -> &str {
+    match status {
+        "completed" => "done",
+        other => other,
+    }
+}
+
+/// Sorted, deduplicated `path` arguments of every `write`/`edit` tool call
+/// found in the agent's own message history (RT-09 "files the child wrote
+/// or edited").
+fn files_changed_from(messages: &[crate::agent::context::ContextMessage]) -> Vec<String> {
+    use crate::agent::context::{AssistantBlock, ContextMessage};
+    let mut out: Vec<String> = Vec::new();
+    for m in messages {
+        if let ContextMessage::Assistant { content } = m {
+            for block in content {
+                if let AssistantBlock::ToolCall { call } = block {
+                    if call.name == "write" || call.name == "edit" {
+                        if let Some(p) = call.arguments.get("path").and_then(|v| v.as_str()) {
+                            out.push(p.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// D-04: write report.md durably. The file is pre-created at 0o600 (if it
+/// does not already exist) so `atomic_write`'s rename preserves that mode
+/// on the final file, then the primary writer runs. On failure a plain
+/// (non-atomic) write is attempted as a last resort so a report is never
+/// silently lost (RESEARCH Pitfall 5); only the fallback's error, if any,
+/// is returned.
+fn write_report_durable(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    write_report_with(path, body, |p, b| {
+        crate::tool::file_state::atomic_write(p, b.as_bytes())
+    })
+}
+
+fn write_report_with(
+    path: &std::path::Path,
+    body: &str,
+    primary: impl Fn(&std::path::Path, &str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if !path.exists() {
+        // Pre-create at 0o600 so atomic_write's rename-over copies that
+        // mode onto the final file instead of leaving it world-readable.
+        if let Err(e) = write_private(path, "") {
+            eprintln!(
+                "nanopi: cannot pre-create report {} at 0o600: {e}",
+                path.display()
+            );
+        }
+    }
+    match primary(path, body) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!(
+                "nanopi: durable report write failed for {}: {e}; falling back to plain write",
+                path.display()
+            );
+            write_private(path, body)
+        }
+    }
+}
+
 /// Read back all SessionEntries from a session file and present the
 /// user/assistant messages in the JSON envelope.
 fn collect_messages(session_path: &std::path::Path) -> Result<Vec<Value>> {
@@ -773,5 +873,89 @@ mod report_summary_tests {
         let a = r.find("THE ANSWER").unwrap();
         let c = r.find("- [x] item").unwrap();
         assert!(a < c, "{r}");
+    }
+}
+
+#[cfg(test)]
+mod durable_report_tests {
+    use super::{files_changed_from, report_state, write_report_durable, write_report_with};
+    use crate::agent::context::{AssistantBlock, ContentBlock, ContextMessage, ToolCallBlock};
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "nanopi-report-durable-{}-{}",
+            std::process::id(),
+            crate::util::uuid::v7()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn report_state_maps_completed_to_done_and_passes_through_others() {
+        assert_eq!(report_state("completed"), "done");
+        assert_eq!(report_state("limit_reached"), "limit_reached");
+        assert_eq!(report_state("failed"), "failed");
+    }
+
+    #[test]
+    fn files_changed_from_collects_sorted_unique_write_and_edit_paths() {
+        let call = |name: &str, path: &str| ContextMessage::Assistant {
+            content: vec![AssistantBlock::ToolCall {
+                call: ToolCallBlock {
+                    id: "c".into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({"path": path}),
+                },
+            }],
+        };
+        let messages = vec![
+            call("write", "b.txt"),
+            call("edit", "a.txt"),
+            call("write", "a.txt"),
+            call("read", "c.txt"),
+            ContextMessage::User {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+        ];
+        assert_eq!(
+            files_changed_from(&messages),
+            vec!["a.txt".to_string(), "b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn write_report_durable_creates_file_at_0o600_with_no_temp_files_left() {
+        let dir = tmp_dir();
+        let p = dir.join("report.md");
+        write_report_durable(&p, "body").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "body");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_report_with_falls_back_to_plain_write_when_primary_fails_and_returns_only_fallback_error() {
+        let dir = tmp_dir();
+        let p = dir.join("report.md");
+        let result = write_report_with(&p, "fallback body", |_, _| {
+            Err(std::io::Error::other("primary writer injected failure"))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "fallback body");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

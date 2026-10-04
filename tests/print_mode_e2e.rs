@@ -1255,3 +1255,30 @@ fn brief_report_on_limit_has_no_self_check() {
     assert!(r.contains("- [ ] checklist missing"), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn brief_report_completed_has_done_state_and_numeric_turns() {
+    let reply = vec![delta("content", "- [x] write code — done"), finish("stop")];
+    let (port, _log) = spawn_recording_server(vec![
+        vec![delta("content", "ANSWER"), finish("stop")],
+        reply,
+    ]);
+    let dir = fresh_dir("briefdonestate", port);
+    let b = write_brief(&dir, "t");
+    let (status, v, stderr) = run_child(&dir, port, &["--brief", b.to_str().unwrap()], &[]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(v["status"], "completed", "{v}");
+    let rp = b.parent().unwrap().join("report.md");
+    let r = std::fs::read_to_string(&rp).expect("report.md");
+    assert!(r.contains("state: done"), "{r}");
+    let turns_line = r
+        .lines()
+        .find(|l| l.starts_with("turns: "))
+        .expect("turns front-matter line");
+    let turns_val = turns_line.trim_start_matches("turns: ").trim();
+    assert!(
+        turns_val.parse::<u32>().is_ok(),
+        "turns must be numeric: {turns_val}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
