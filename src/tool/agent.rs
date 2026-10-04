@@ -1064,7 +1064,36 @@ impl Drop for StateGuard<'_> {
         if !self.done {
             ensure_report(&self.dir, &self.id, AgentState::Stopped, "stopped by parent");
             if let Some(wt) = self.worktree.take() {
-                finish_worktree_and_record(&self.dir, &self.id, &wt);
+                let dir = self.dir.clone();
+                let id = self.id.clone();
+                // WR-01: this `drop` runs synchronously on whatever tokio
+                // worker thread is polling the cancelled/dropped future
+                // (it is a plain `Drop::drop`, which cannot `.await`).
+                // Calling the blocking `finish_worktree_and_record`
+                // (several `git` subprocess calls) directly here would
+                // block that worker — and, in the worst case, every
+                // other task scheduled on it — for as long as those `git`
+                // commands take. Hand it to the blocking-task pool
+                // instead so only a dedicated blocking thread pays that
+                // cost; `run_body`'s own normal-exit path already does
+                // the same via `spawn_blocking`, so this just makes the
+                // cancelled path match it rather than special-casing a
+                // synchronous call. Fire-and-forget: nothing here needs
+                // to observe completion (callers that care — e.g.
+                // `wait_background()` — already poll `report.md`/state
+                // for the terminal outcome instead of relying on this
+                // drop having finished by the time it returns).
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn_blocking(move || {
+                        finish_worktree_and_record(&dir, &id, &wt);
+                    });
+                } else {
+                    // No runtime available (e.g. dropped outside any
+                    // tokio context, such as a plain unit test) — fall
+                    // back to the old synchronous behavior rather than
+                    // silently losing the worktree.
+                    finish_worktree_and_record(&dir, &id, &wt);
+                }
             }
             self.reg.set_state(&self.id, AgentState::Stopped);
         }
@@ -1073,9 +1102,10 @@ impl Drop for StateGuard<'_> {
 
 /// ISO-02: run `worktree::finish` (D-09..D-11), append its outcome line
 /// to `report.md`, and record `worktree_outcome:` in `brief.md`'s front
-/// matter. Blocking (shells out to `git`); callers on the async path
-/// run this via `spawn_blocking`, the `StateGuard::drop` path (sync by
-/// construction) calls it directly.
+/// matter. Blocking (shells out to `git`); every caller — the normal
+/// `run_body` exit path and `StateGuard::drop`'s cancelled-dispatch path
+/// alike (WR-01) — runs this via `spawn_blocking` so it never blocks a
+/// tokio worker thread directly.
 fn finish_worktree_and_record(dir: &Path, id: &str, wt: &crate::worktree::Worktree) {
     let outcome = crate::worktree::finish(wt, id);
     let line = wt.report_line(&outcome);
@@ -3131,9 +3161,10 @@ mod tests {
         handle.abort();
         let _ = handle.await;
 
-        // StateGuard::drop ran synchronously inside the aborted task;
-        // give the (already-completed, blocking) finish a moment in case
-        // of any scheduling slack, then assert the outcome landed.
+        // StateGuard::drop hands the blocking worktree finish off to
+        // `spawn_blocking` (WR-01) rather than running it synchronously,
+        // so give it a moment to complete on the blocking pool, then
+        // assert the outcome landed.
         let dir = repo
             .join(".nanopi/agents")
             .join(l.registry.run_id())
