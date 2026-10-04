@@ -1169,10 +1169,21 @@ fn ensure_gitignore_entry(root: &Path, entry: &str) {
     let path = root.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let bare = entry.trim_end_matches('/');
-    if existing
-        .lines()
-        .any(|l| matches!(l.trim(), e if e == entry || e == bare || e == format!("/{entry}") || e == format!("/{bare}")))
-    {
+    if existing.lines().any(|l| {
+        let l = l.trim();
+        if matches!(l, e if e == entry || e == bare || e == format!("/{entry}") || e == format!("/{bare}"))
+        {
+            return true;
+        }
+        // WR-03: a broader existing entry that is a prefix directory of
+        // `entry` already covers it (e.g. `.nanopi/` already ignores
+        // `.nanopi/worktrees/`) — don't append a more specific redundant
+        // line on top of it. Normalize the existing line the same way
+        // (strip a leading `/` anchor and any trailing `/`) before the
+        // prefix check.
+        let l_bare = l.strip_prefix('/').unwrap_or(l).trim_end_matches('/');
+        !l_bare.is_empty() && bare.starts_with(l_bare) && bare[l_bare.len()..].starts_with('/')
+    }) {
         return;
     }
     let mut opts = std::fs::OpenOptions::new();
@@ -3013,6 +3024,34 @@ mod tests {
         let gi = std::fs::read_to_string(cwd.join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".nanopi/agents"), "{gi}");
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// WR-03: a broader existing ignore line (e.g. `.nanopi/`) already
+    /// covers a more specific entry (`.nanopi/worktrees/`) — don't
+    /// append a redundant, more-specific line on top of it.
+    #[test]
+    fn ensure_gitignore_entry_skips_when_prefix_dir_already_ignored() {
+        let dir = tmp("gitignore-prefix");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), ".nanopi/\n").unwrap();
+        ensure_gitignore_entry(&dir, ".nanopi/worktrees/");
+        let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(gi, ".nanopi/\n", "should not append a redundant entry: {gi}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sibling directories must not false-positive on a naive prefix
+    /// check (e.g. `.nanopi-old/` must not be treated as covering
+    /// `.nanopi/worktrees/`).
+    #[test]
+    fn ensure_gitignore_entry_does_not_false_positive_on_sibling_prefix() {
+        let dir = tmp("gitignore-sibling");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), ".nanopi-old/\n").unwrap();
+        ensure_gitignore_entry(&dir, ".nanopi/worktrees/");
+        let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(gi.contains(".nanopi/worktrees/"), "{gi}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// D-04/D-05: a dispatch whose inline `tools`/`model` fail validation
