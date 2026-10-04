@@ -217,4 +217,44 @@ mod tests {
         assert!(out.content.contains(".hidden.rs"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn agents_archive_hidden_even_with_all_true() {
+        let dir = tmp();
+        let agents_dir = dir.join(".nanopi").join("agents").join("r").join("a1");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("brief.md"), "secret").unwrap();
+        let skills_dir = dir.join(".nanopi").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("x.md"), "ok").unwrap();
+
+        let ctx = ToolContext { cwd: dir.clone() };
+        let out = FindTool
+            .execute(json!({"pattern": "\\.md$", "all": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.content.contains("brief.md"));
+        assert!(out.content.contains("x.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agents_archive_base_returns_empty() {
+        let dir = tmp();
+        let agents_dir = dir.join(".nanopi").join("agents").join("r").join("a1");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("brief.md"), "secret").unwrap();
+
+        let ctx = ToolContext { cwd: dir.clone() };
+        let base = dir.join(".nanopi").join("agents");
+        let out = FindTool
+            .execute(
+                json!({"pattern": ".*", "all": true, "path": base.to_string_lossy()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

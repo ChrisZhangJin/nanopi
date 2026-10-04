@@ -142,6 +142,14 @@ pub fn user_agents_dir() -> Option<PathBuf> {
     nanopi_home().map(|h| h.join("agents"))
 }
 
+/// Project-scope agents (archive) root inside a given cwd (D-01: the single
+/// definition of the archive root). Built-in search tools (`grep`, `find`)
+/// must exclude this path unconditionally, even with `all=true` (D-08) —
+/// agents must not search other agents' briefs/reports/transcripts.
+pub fn project_agents_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".nanopi").join("agents")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
