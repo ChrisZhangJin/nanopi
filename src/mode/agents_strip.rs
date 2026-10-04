@@ -428,10 +428,10 @@ fn elapsed_secs_for(info: &AgentInfo, now: Instant) -> u64 {
 /// dropping activity first and then description as the width shrinks
 /// below 60/30 columns (D-08). The id, glyph and elapsed time are always
 /// present. Never exceeds `width` display columns (CJK-safe).
-fn agent_line(info: &AgentInfo, width: usize, use_activity: bool) -> String {
+fn agent_line(info: &AgentInfo, width: usize, use_activity: bool, now: Instant) -> String {
     let glyph = glyph_for(info.state);
     let id = format!("#{}", info.id);
-    let elapsed = format_elapsed(elapsed_secs_for(info, Instant::now()));
+    let elapsed = format_elapsed(elapsed_secs_for(info, now));
 
     let text_slot = if use_activity {
         info.activity.last().cloned().unwrap_or_default()
@@ -489,10 +489,10 @@ fn header_text(n: usize, opts: &StripOpts) -> String {
 /// Per-agent expanded detail lines (D-04): the agent line, up to 3
 /// activity lines, "turns N · tokens M" when known, "worktree <path>
 /// (<branch>)" when present, "report <dir>/report.md".
-pub fn expanded_detail_lines(view: &AgentsView, width: usize) -> Vec<String> {
+pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> Vec<String> {
     let mut out = Vec::new();
     for info in ordered_agents(view) {
-        out.push(agent_line(info, width, false));
+        out.push(agent_line(info, width, false, now));
         for act in &info.activity {
             out.push(truncate_to_width(&format!("  {act}"), width));
         }
@@ -540,7 +540,7 @@ pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: 
         }
         match row {
             StripRow::Agent(info) => {
-                let line = agent_line(info, width, opts.expanded);
+                let line = agent_line(info, width, opts.expanded, opts.now);
                 buf.set_string(area.x, y, &line, style_for_state(info.state));
             }
             StripRow::More { count, running } => {
@@ -722,7 +722,7 @@ mod tests {
         .unwrap();
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
-        let line = agent_line(&view.agents()[0], 80, false);
+        let line = agent_line(&view.agents()[0], 80, false, now);
         assert!(line.contains("●"));
         assert!(line.contains("#a"));
         assert!(line.contains("do the thing"));
@@ -742,10 +742,10 @@ mod tests {
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
         let info = &view.agents()[0];
 
-        let at_50 = agent_line(info, 50, true);
+        let at_50 = agent_line(info, 50, true, now);
         assert!(display_width(&at_50) <= 50);
 
-        let at_30 = agent_line(info, 30, false);
+        let at_30 = agent_line(info, 30, false, now);
         assert!(display_width(&at_30) <= 30);
         assert!(at_30.contains("#a"));
     }
@@ -762,7 +762,7 @@ mod tests {
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
         for w in [80usize, 50, 30, 20] {
-            let line = agent_line(&view.agents()[0], w, false);
+            let line = agent_line(&view.agents()[0], w, false, now);
             assert!(display_width(&line) <= w, "width {w}: {line:?} ({})", display_width(&line));
         }
     }
@@ -906,6 +906,53 @@ mod tests {
     }
 
     #[test]
+    fn agent_line_elapsed_is_pinned_to_opts_now_not_wall_clock() {
+        // WR-01 regression: `agent_line`/`draw_agents_strip` must derive the
+        // elapsed-seconds column from the caller-supplied `now`, not from a
+        // fresh `Instant::now()` call, so output is a pure function of
+        // (view, opts) as the module doc promises (UI-04).
+        let started = Instant::now();
+        let d1 = tmp_dir();
+        let mut view = AgentsView::new();
+        view.refresh(&[entry("a", AgentState::Running, started, d1.path().to_path_buf())], started);
+        let info = &view.agents()[0];
+
+        let now_a = started + Duration::from_secs(5);
+        let line_a = agent_line(info, 80, false, now_a);
+        let line_a_again = agent_line(info, 80, false, now_a);
+        assert_eq!(line_a, line_a_again, "same `now` must yield identical output");
+
+        let now_b = started + Duration::from_secs(65);
+        let line_b = agent_line(info, 80, false, now_b);
+        assert_ne!(line_a, line_b, "different `now` must change the elapsed column");
+        assert!(line_a.contains("5s"), "{line_a:?}");
+        assert!(line_b.contains("1m05s"), "{line_b:?}");
+
+        // Sleeping real wall-clock time between two calls with the SAME
+        // `now` must not change the output (catches direct
+        // `Instant::now()` calls inside `agent_line`).
+        let before_sleep = agent_line(info, 80, false, now_a);
+        std::thread::sleep(Duration::from_millis(20));
+        let after_sleep = agent_line(info, 80, false, now_a);
+        assert_eq!(before_sleep, after_sleep);
+    }
+
+    #[test]
+    fn expanded_detail_lines_elapsed_uses_passed_now() {
+        let started = Instant::now();
+        let d1 = tmp_dir();
+        let mut view = AgentsView::new();
+        view.refresh(&[entry("a", AgentState::Running, started, d1.path().to_path_buf())], started);
+
+        let now_a = started + Duration::from_secs(10);
+        let lines_a = expanded_detail_lines(&view, 80, now_a);
+        let now_b = started + Duration::from_secs(70);
+        let lines_b = expanded_detail_lines(&view, 80, now_b);
+        assert!(lines_a[0].contains("10s"), "{:?}", lines_a[0]);
+        assert!(lines_b[0].contains("1m10s"), "{:?}", lines_b[0]);
+    }
+
+    #[test]
     fn draw_works_with_nonexistent_dir() {
         let now = Instant::now();
         let mut view = AgentsView::new();
@@ -938,7 +985,7 @@ mod tests {
         .unwrap();
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Completed, now, d1.path().to_path_buf())], now);
-        let lines = expanded_detail_lines(&view, 80);
+        let lines = expanded_detail_lines(&view, 80, now);
         assert!(lines.iter().any(|l| l.contains("turns 3") && l.contains("tokens 1200")));
         assert!(lines.iter().any(|l| l.contains("worktree /tmp/wt (feature/x)")));
         assert!(lines.iter().any(|l| l.contains("report") && l.contains("report.md")));

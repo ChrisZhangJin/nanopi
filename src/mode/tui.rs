@@ -5347,7 +5347,7 @@ fn wrap_input_lines(
 /// refresh`) building the lines Ctrl+G inserts into scrollback: per-agent
 /// activity, turns/tokens, worktree/branch and the report path (D-04).
 fn agents_detail_block(app: &App, width: usize) -> Vec<String> {
-    agents_strip::expanded_detail_lines(&app.agents_view, width)
+    agents_strip::expanded_detail_lines(&app.agents_view, width, std::time::Instant::now())
 }
 
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
