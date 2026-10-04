@@ -4,12 +4,15 @@
 //! `max_live` hard cap and the `max_concurrency` semaphore, and provides
 //! [`ChildGuard`], which SIGKILLs a child's whole process group on drop.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::archive;
 use crate::config::AgentConfig;
@@ -59,14 +62,40 @@ pub struct AgentEntry {
     pub dir: PathBuf,
 }
 
+/// A tracked background dispatch: the task driving it and the token
+/// that cancels it (`stop`/`stop_all`).
+struct Background {
+    handle: JoinHandle<()>,
+    token: CancellationToken,
+}
+
 /// Registry of all children spawned in this nanopi run.
-#[derive(Debug)]
 pub struct AgentRegistry {
     run_id: String,
     counter: AtomicU64,
     entries: Mutex<Vec<AgentEntry>>,
     max_live: usize,
     semaphore: Arc<Semaphore>,
+    /// Background dispatches tracked by id (CTL-01). Kept out of
+    /// `AgentEntry` so the entry stays `Clone`.
+    background: Mutex<HashMap<String, Background>>,
+    /// Finished-background reports awaiting injection (CTL-05). Each
+    /// entry is already `[agent aN finished: <state>] <capped report>`;
+    /// `take_reports` joins and clears them as ONE batched string
+    /// (D-06).
+    reports: Mutex<Vec<String>>,
+    /// Wakes a consumer when a report is pushed. Only wakes — the text
+    /// itself is pulled via `take_reports` so batching holds.
+    notify_sink: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for AgentRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRegistry")
+            .field("run_id", &self.run_id)
+            .field("max_live", &self.max_live)
+            .finish()
+    }
 }
 
 impl AgentRegistry {
@@ -77,7 +106,127 @@ impl AgentRegistry {
             entries: Mutex::new(Vec::new()),
             max_live: cfg.max_live,
             semaphore: Arc::new(Semaphore::new(cfg.max_concurrency.max(1))),
+            background: Mutex::new(HashMap::new()),
+            reports: Mutex::new(Vec::new()),
+            notify_sink: Mutex::new(None),
         })
+    }
+
+    fn bg_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Background>> {
+        self.background.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reports_lock(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.reports.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register a background dispatch's task + cancellation token
+    /// (CTL-01). Called by `spawn_background` right after
+    /// `tokio::spawn`, without awaiting the handle.
+    pub fn track_background(&self, id: &str, handle: JoinHandle<()>, token: CancellationToken) {
+        self.bg_lock()
+            .insert(id.to_string(), Background { handle, token });
+    }
+
+    /// Cancel `id`'s background run and kill its process group.
+    /// `Err` for an unknown id or one already terminal.
+    pub fn stop(&self, id: &str) -> Result<(), String> {
+        let pid = {
+            let entries = self.lock();
+            let Some(e) = entries.iter().find(|e| e.id == id) else {
+                return Err(format!("no such agent: {id}"));
+            };
+            if e.state.is_terminal() {
+                return Err(format!("agent {id} is already {}", e.state.as_str()));
+            }
+            e.pid
+        };
+        if let Some(bg) = self.bg_lock().get(id) {
+            bg.token.cancel();
+        }
+        if let Some(pid) = pid {
+            kill_group(pid);
+        }
+        Ok(())
+    }
+
+    /// Stop every non-terminal entry (re-snapshotted under the lock).
+    /// Returns the ids stopped. Races with agents that transition to
+    /// terminal between the snapshot and the stop call are an accepted
+    /// gap (research A3).
+    pub fn stop_all(&self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .lock()
+            .iter()
+            .filter(|e| !e.state.is_terminal())
+            .map(|e| e.id.clone())
+            .collect();
+        ids.into_iter().filter(|id| self.stop(id).is_ok()).collect()
+    }
+
+    /// Move a terminal entry back to `Queued` in place (same dir), so it
+    /// can be re-dispatched under the same id. `Err` for an unknown or
+    /// non-terminal id.
+    pub fn reactivate(&self, id: &str) -> Result<(), String> {
+        let mut entries = self.lock();
+        let Some(e) = entries.iter_mut().find(|e| e.id == id) else {
+            return Err(format!("no such agent: {id}"));
+        };
+        if !e.state.is_terminal() {
+            return Err(format!("agent {id} is not terminal ({})", e.state.as_str()));
+        }
+        e.state = AgentState::Queued;
+        e.pid = None;
+        Ok(())
+    }
+
+    /// Queue a finished-background report (D-06). `capped` must already
+    /// be through `cap_report`. Wakes the installed sink exactly once.
+    pub fn push_report(&self, id: &str, state: AgentState, capped: &str) {
+        let entry = format!("[agent {id} finished: {}] {capped}", state.as_str());
+        self.reports_lock().push(entry);
+        if let Some(sink) = self.notify_sink.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            sink();
+        }
+    }
+
+    /// Drain every pending report as ONE blank-line-joined string
+    /// (D-06 batching). `None` when nothing is pending.
+    pub fn take_reports(&self) -> Option<String> {
+        let mut reports = self.reports_lock();
+        if reports.is_empty() {
+            return None;
+        }
+        let joined = reports.join("\n\n");
+        reports.clear();
+        Some(joined)
+    }
+
+    pub fn has_pending_reports(&self) -> bool {
+        !self.reports_lock().is_empty()
+    }
+
+    /// Install the sink that wakes a consumer when a report arrives.
+    /// Modelled on `plugin_send`'s installed-sink pattern.
+    pub fn install_report_sink(&self, sink: Box<dyn Fn() + Send + Sync>) {
+        *self.notify_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    /// Await every tracked background task, including ones registered
+    /// while this call is running (loops until the map stays empty).
+    pub async fn wait_background(&self) {
+        loop {
+            let handles: Vec<JoinHandle<()>> = {
+                let mut bg = self.bg_lock();
+                bg.drain().map(|(_, b)| b.handle).collect()
+            };
+            if handles.is_empty() {
+                break;
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        }
     }
 
     /// Run directory name (D-01: `YYYYMMDD-HHMMSS-<8 hex>`) shared by every
@@ -456,5 +605,147 @@ mod tests {
         let reg = AgentRegistry::new(&cfg(8, 4));
         set_global(Arc::clone(&reg));
         assert!(global().is_some());
+    }
+
+    #[tokio::test]
+    async fn push_report_batches_into_one_string_then_drains() {
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        reg.push_report("a1", AgentState::Completed, "first report");
+        reg.push_report("a2", AgentState::Failed, "second report");
+        let batch = reg.take_reports().expect("one batched string");
+        assert!(batch.contains("[agent a1 finished: done] first report"));
+        assert!(batch.contains("[agent a2 finished: failed] second report"));
+        assert!(reg.take_reports().is_none(), "drained, so None next time");
+    }
+
+    #[test]
+    fn push_report_notifies_sink_once_per_push() {
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let count = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::clone(&count);
+        reg.install_report_sink(Box::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }));
+        reg.push_report("a1", AgentState::Completed, "r1");
+        reg.push_report("a2", AgentState::Completed, "r2");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reactivate_moves_terminal_entry_back_to_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let (id, dir) = reg.reserve(tmp.path()).unwrap();
+        reg.set_state(&id, AgentState::Completed);
+        reg.reactivate(&id).unwrap();
+        let snap = reg.snapshot();
+        let e = snap.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.state, AgentState::Queued);
+        assert_eq!(e.dir, dir, "reactivated in place, same dir");
+    }
+
+    #[test]
+    fn reactivate_rejects_unknown_or_non_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        assert!(reg.reactivate("a1").is_err(), "unknown id");
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        assert!(reg.reactivate(&id).is_err(), "still Queued, non-terminal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_cancels_token_and_kills_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        let pf = tmp.path().join("pid");
+        let child = spawn_group(&pf);
+        let sleep_pid = read_pid(&pf);
+        reg.set_pid(&id, child.id());
+        reg.set_state(&id, AgentState::Running);
+
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        let handle = tokio::spawn(async move {
+            t2.cancelled().await;
+        });
+        reg.track_background(&id, handle, token.clone());
+
+        reg.stop(&id).unwrap();
+        assert!(token.is_cancelled(), "stop must cancel the token");
+        assert!(wait_gone(sleep_pid as i32), "stop must kill the group");
+
+        let mut child = child;
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn stop_rejects_unknown_or_terminal_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        assert!(reg.stop("a1").is_err(), "unknown id");
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        reg.set_state(&id, AgentState::Completed);
+        assert!(reg.stop(&id).is_err(), "already terminal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_all_stops_every_non_terminal_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let mut pids = Vec::new();
+        for i in 0..2 {
+            let (id, _) = reg.reserve(tmp.path()).unwrap();
+            let pf = tmp.path().join(format!("pid{i}"));
+            let child = spawn_group(&pf);
+            let sleep_pid = read_pid(&pf);
+            reg.set_pid(&id, child.id());
+            reg.set_state(&id, AgentState::Running);
+            let token = CancellationToken::new();
+            let t2 = token.clone();
+            let handle = tokio::spawn(async move {
+                t2.cancelled().await;
+            });
+            reg.track_background(&id, handle, token);
+            pids.push((child, sleep_pid));
+        }
+        let stopped = reg.stop_all();
+        assert_eq!(stopped.len(), 2);
+        for (mut child, sleep_pid) in pids {
+            assert!(wait_gone(sleep_pid as i32));
+            let _ = child.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_background_awaits_tracked_and_newly_registered_handles() {
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let ran = Arc::new(AtomicU64::new(0));
+        let r2 = Arc::clone(&ran);
+        let token1 = CancellationToken::new();
+        let h1 = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            r2.fetch_add(1, Ordering::SeqCst);
+        });
+        reg.track_background("a1", h1, token1);
+
+        // Register a second handle slightly later, from another task, to
+        // exercise the "registered during the wait" guarantee.
+        let reg2 = Arc::clone(&reg);
+        let r3 = Arc::clone(&ran);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let token2 = CancellationToken::new();
+            let h2 = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                r3.fetch_add(1, Ordering::SeqCst);
+            });
+            reg2.track_background("a2", h2, token2);
+        });
+
+        reg.wait_background().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 2, "both handles must be awaited");
     }
 }
