@@ -238,7 +238,12 @@ Plans:
   3. Existing predefined agent files and single / parallel / chain modes behave as in v0.12.
   4. The parent receives a capped summary, never the full child transcript.
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — general-purpose AgentConfig, models::model_vendor, brief label
+- [ ] 03-02-PLAN.md — optional agent + inline role/tools/model/description, pre-spawn validation
+- [ ] 03-03-PLAN.md — 8 KB parent report cap, schema + delegation guidance, regression gate
 **Research flags**: standard patterns.
 
 ### Phase 4: Background launch & control
