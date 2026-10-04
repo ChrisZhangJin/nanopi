@@ -591,6 +591,39 @@ impl ToolRegistry {
         r
     }
 
+    /// Restricted tool set for orchestrator mode (ORC-02).
+    ///
+    /// Hand-registered rather than derived from `standard()` /
+    /// `standard_with_control()` by filtering: deriving-and-filtering
+    /// would silently inherit any future addition to those sets, which
+    /// is exactly the privilege-escalation path T-06-01 exists to rule
+    /// out. This constructor must never reference
+    /// `agent::CONTROL_TOOLS` / `DENIED_TOOLS` for the same reason — it
+    /// is its own closed list.
+    ///
+    /// Registers exactly: `read`, `grep`, `find`, `agent`,
+    /// `list_agents`, `stop_agent`, `send_message`.
+    ///
+    /// `write`, `edit`, and `bash` are absent by design — orchestrator
+    /// mode plans and dispatches; it does not touch files or a shell
+    /// itself.
+    ///
+    /// `ls` is deliberately excluded too — D-03 and ROADMAP SC#2 both
+    /// enumerate the orchestrator tool set without it (research open
+    /// question 1, conservative resolution); adding it later is a
+    /// one-line change.
+    pub fn orchestrator() -> Self {
+        let mut r = Self::new();
+        r.register(Arc::new(read::ReadTool));
+        r.register(Arc::new(grep::GrepTool));
+        r.register(Arc::new(find::FindTool));
+        r.register(Arc::new(agent::AgentTool::new()));
+        r.register(Arc::new(agent_ctl::ListAgentsTool::new()));
+        r.register(Arc::new(agent_ctl::StopAgentTool::new()));
+        r.register(Arc::new(agent_ctl::SendMessageTool::new()));
+        r
+    }
+
     /// Build the standard registry, then — if `allow` is non-empty —
     /// retain only the named built-in tools. Mirrors PI's `--tools
     /// a,b,c` allowlist (`pi/packages/coding-agent/src/cli/args.ts`).
@@ -1268,6 +1301,30 @@ mod tests {
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         let actual = serde_json::to_string(&specs).unwrap();
         assert_eq!(actual, BASELINE_STANDARD_WITH_CONTROL_SPECS);
+    }
+
+    /// ORC-02/ORC-04: `write`, `edit`, `bash`, `ls` must all be absent;
+    /// exactly the 7 documented tools remain.
+    #[test]
+    fn orchestrator_registry_excludes_write_edit_bash() {
+        let r = ToolRegistry::orchestrator();
+        assert_eq!(
+            r.names(),
+            vec![
+                "agent",
+                "find",
+                "grep",
+                "list_agents",
+                "read",
+                "send_message",
+                "stop_agent",
+            ]
+        );
+        assert!(r.get("write").is_none());
+        assert!(r.get("edit").is_none());
+        assert!(r.get("bash").is_none());
+        assert!(r.get("ls").is_none());
+        assert_eq!(r.all_specs().len(), 7);
     }
 
     #[tokio::test]
