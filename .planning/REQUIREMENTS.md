@@ -110,11 +110,11 @@ owner decisions made on 2026-10-03.
 
 ### Isolation (ISO)
 
-- [ ] **ISO-01**: An agent that writes code can run in its own git
+- [x] **ISO-01**: An agent that writes code can run in its own git
   worktree, either opt-in per dispatch or by default for parallel
   writers. The report includes the worktree path and branch.
 
-- [ ] **ISO-02**: Worktrees with no changes are removed automatically;
+- [x] **ISO-02**: Worktrees with no changes are removed automatically;
   worktrees with changes are kept and listed.
 
 - [x] **ISO-03**: An edit is refused if the file was changed by another
@@ -218,8 +218,8 @@ owner decisions made on 2026-10-03.
 | CTL-05 | Phase 4 | Complete |
 | CTL-06 | Phase 4 | Pending |
 | CTL-07 | Phase 4 | Pending |
-| ISO-01 | Phase 4 | Pending |
-| ISO-02 | Phase 4 | Pending |
+| ISO-01 | Phase 4 | Complete |
+| ISO-02 | Phase 4 | Complete |
 | UI-01 | Phase 5 | Pending |
 | UI-02 | Phase 5 | Pending |
 | UI-03 | Phase 5 | Pending |

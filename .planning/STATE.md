@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-10-04T09:01:04.553Z"
+last_updated: "2026-10-04T09:07:10.964Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 22
-  completed_plans: 18
+  completed_plans: 19
   percent: 50
 ---
 
@@ -18,8 +18,8 @@ progress:
 ## Current Position
 
 Phase: 04 (background-control) — IN PROGRESS
-Plan: 1 of 5 complete
-Status: Executing
+Plan: 2 of 5 complete
+Status: Ready to execute
 Last activity: 2026-10-04
 
 ---
@@ -315,6 +315,7 @@ pinned by wall-clock tests.
 | Phase 03 P02 | 25min | 2 tasks | 2 files |
 | Phase 03 P03 | 20min | 2 tasks | 1 files |
 | Phase 04 P01 | 45min | 2 tasks | 4 files |
+| Phase 04 P02 | 25min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -335,3 +336,4 @@ pinned by wall-clock tests.
 - [Phase ?]: Tasks 1+2 committed as one atomic commit since Task 2 extends the same run_item function Task 1 wrote
 - [Phase 03]: PARENT_REPORT_CAP 8 KiB via pure cap_report(); schema required narrowed to ["task"] on tasks/chain items; agent/role/tools/model/description documented top-level and per-item (D-01/D-06/D-07)
 - [Phase ?]: [Phase 04]: stop()/stop_all() kill the process group directly via the registry's own pid bookkeeping; spawn_background's cancelled branch relies on StateGuard's existing drop handler (ensure_report + set_state Stopped) rather than duplicating it
+- [Phase 04]: worktree::finish auto-commits outstanding changes as 'nanopi agent <id>' before deciding removal vs merge; unchanged = empty porcelain AND 0 commits ahead of base (Addendum 3)
