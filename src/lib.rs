@@ -40,6 +40,7 @@ pub mod archive;
 pub mod subscriber;
 pub mod trust;
 pub mod wizard;
+pub mod worktree;
 
 pub mod agent;
 pub mod mode;
