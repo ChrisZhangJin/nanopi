@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-10-04T07:30:33.187Z"
+last_updated: "2026-10-04T07:35:09.348Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 10
+  completed_plans: 11
   percent: 17
 ---
 
@@ -18,7 +18,7 @@ progress:
 ## Current Position
 
 Phase: 02 (archive-lifecycle) — EXECUTING
-Plan: 4 of 7
+Plan: 5 of 7
 Status: Ready to execute
 Last activity: 2026-10-04
 
@@ -307,6 +307,7 @@ pinned by wall-clock tests.
 | Phase 02 P01 | 12min | 2 tasks | 2 files |
 | Phase 02 P02 | 25min | 2 tasks | 3 files |
 | Phase 02 P03 | 20min | 2 tasks | 2 files |
+| Phase 02 P04 | 25min | 1 tasks | 2 files |
 
 ## Decisions
 
@@ -316,3 +317,4 @@ pinned by wall-clock tests.
 - [Phase 02]: fm_value sanitizer collapses newlines/caps 120 chars so no front-matter value can forge a key line (T-02-01)
 - [Phase 02]: project_agents_dir(cwd) is the single archive-root definition (D-01); grep/find exclude it unconditionally outside the all-flag branch (D-08)
 - [Phase 02]: archive.rs new_run_id uses last 8 hex chars of UUIDv7 (not first 8, timestamp-derived) for the random suffix
+- [Phase 02]: report.md pre-created at 0o600 before atomic_write so rename preserves perms; report_state maps completed->done (D-05)
