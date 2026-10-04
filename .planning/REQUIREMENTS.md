@@ -98,7 +98,7 @@ owner decisions made on 2026-10-03.
 - [x] **ARC-02**: `report.md` is written before the result is returned
   to the parent, so a report cannot be lost.
 
-- [ ] **ARC-03**: `.nanopi/agents/` is added to `.gitignore`
+- [x] **ARC-03**: `.nanopi/agents/` is added to `.gitignore`
   automatically and is excluded from the agents' own searches.
 
 - [ ] **ARC-04**: Agents that were still running when nanopi exited
@@ -203,7 +203,7 @@ owner decisions made on 2026-10-03.
 | ISO-03 | Phase 1 | Complete |
 | ARC-01 | Phase 2 | Complete |
 | ARC-02 | Phase 2 | Complete |
-| ARC-03 | Phase 2 | Pending |
+| ARC-03 | Phase 2 | Complete |
 | ARC-04 | Phase 2 | Pending |
 | ARC-05 | Phase 2 | Pending |
 | DYN-01 | Phase 3 | Pending |
