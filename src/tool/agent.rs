@@ -934,7 +934,8 @@ fn cap_report(text: String, report_path: &Path) -> String {
     let mut capped = text;
     capped.truncate(cut);
     capped.push_str(&format!(
-        "\n…(report truncated at 8 KB; full report: {})",
+        "\n…(report truncated at {} KiB; full report: {})",
+        PARENT_REPORT_CAP / 1024,
         report_path.display()
     ));
     capped
