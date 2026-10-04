@@ -2772,7 +2772,17 @@ async fn handle_action(
             let current = crate::agent_registry::global()
                 .map(|r| r.run_id().to_string())
                 .unwrap_or_default();
-            match crate::archive::clean_runs(&root, &current, mode) {
+            // WR-01: clean_runs does synchronous, potentially unbounded
+            // filesystem walking + deletion; run it off the TUI event-loop
+            // task so a large archive doesn't freeze input/redraws.
+            let clean_result = tokio::task::spawn_blocking(move || {
+                crate::archive::clean_runs(&root, &current, mode)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!("clean task panicked: {e}")))
+            });
+            match clean_result {
                 Ok(report) => {
                     insert_line(
                         term,
