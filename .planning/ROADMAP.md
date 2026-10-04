@@ -147,7 +147,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | 1 | Child-process runtime | 7/7 | Complete   | 2026-10-03 |
 | 2 | Archive & lifecycle | 7/7 | Complete   | 2026-10-04 |
 | 3 | Dynamic agents | 3/3 | Complete   | 2026-10-04 |
-| 4 | Background launch & control | 5/5 | Complete   | 2026-10-04 |
+| 4 | Background launch & control | 6/6 | Complete   | 2026-10-04 |
 | 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
 

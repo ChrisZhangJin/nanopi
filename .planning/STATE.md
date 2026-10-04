@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
-status: executing
-last_updated: "2026-10-04T09:58:06.535Z"
+status: verifying
+last_updated: "2026-10-04T10:58:04.286Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 22
-  completed_plans: 22
+  total_plans: 23
+  completed_plans: 23
   percent: 67
 ---
 
@@ -17,9 +17,9 @@ progress:
 
 ## Current Position
 
-Phase: 04 (background-control) — IN PROGRESS
-Plan: 5 of 5 complete
-Status: Ready to execute
+Phase: 04 (background-control) — COMPLETE
+Plan: 6 of 6 complete
+Status: Phase complete — ready for verification
 Last activity: 2026-10-04
 
 ---
@@ -318,6 +318,7 @@ pinned by wall-clock tests.
 | Phase 04 P02 | 25min | 2 tasks | 2 files |
 | Phase 04 P03 | 70min | 2 tasks | 6 files |
 | Phase 04 P04 | 180min | 2 tasks | 5 files |
+| Phase 04-background-control P06 | 150min | - tasks | - files |
 
 ## Decisions
 
@@ -344,3 +345,4 @@ pinned by wall-clock tests.
 - [Phase ?]: Background-agent reports ride the existing TUI follow-up path (idle pick + mid-turn SteerMessage::FollowUp with fallback slot) rather than a new channel
 - [Phase ?]: Narrowed main.rs outer signal handler to SIGTERM-only so print.rs's new Ctrl-C drain-window handling is reachable; Ctrl-C during the main turn no longer triggers outer kill_all (known bounded regression)
 - [Phase ?]: -p now awaits all background agents before exit, running at most one bounded extra main turn if reports arrived (D-07)
+- [Phase ?]: adopt_from_disk reuses the shared seed_counter_from_disk full-scan helper so reserve() never reuses an on-disk id after a partial adopt
