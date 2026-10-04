@@ -123,20 +123,37 @@ impl Tool for GrepTool {
         } else {
             base.parent().unwrap_or(Path::new(".")).to_path_buf()
         };
+        let agents_root = crate::paths::project_agents_dir(&ctx.cwd);
+        let agents_root = std::fs::canonicalize(&agents_root).unwrap_or(agents_root);
 
         let mut matches: Vec<String> = Vec::new();
         let mut truncated = false;
         let mut files_scanned = 0usize;
 
+        // D-08: the archive is excluded unconditionally, even when the
+        // caller explicitly points `path` inside `.nanopi/agents` —
+        // nothing to search, so skip both engines entirely.
+        let engine = if is_within_agents_root(&base, &agents_root) {
+            "builtin"
         // `re` is built above on BOTH paths and is what rejects a bad
         // pattern. Handing the pattern straight to rg would report an
         // invalid regex as a tool Execution error (rg exit code 2) rather
         // than InvalidArgs, and would accept rg-only syntax that the
         // built-in cannot parse — making the tool's accepted language
         // depend on whether ripgrep happens to be installed.
-        let engine = if let Some(rg) = ripgrep_path() {
-            match search_ripgrep(rg, pattern, &base, &root, ci, all, &mut matches, &mut truncated)
-                .await
+        } else if let Some(rg) = ripgrep_path() {
+            match search_ripgrep(
+                rg,
+                pattern,
+                &base,
+                &root,
+                ci,
+                all,
+                &agents_root,
+                &mut matches,
+                &mut truncated,
+            )
+            .await
             {
                 Ok(()) => "ripgrep",
                 // Falling back rather than surfacing the error: a broken
@@ -154,6 +171,7 @@ impl Tool for GrepTool {
                         &root,
                         &re,
                         all,
+                        &agents_root,
                         &mut matches,
                         &mut truncated,
                         &mut files_scanned,
@@ -167,6 +185,7 @@ impl Tool for GrepTool {
                 &root,
                 &re,
                 all,
+                &agents_root,
                 &mut matches,
                 &mut truncated,
                 &mut files_scanned,
@@ -221,7 +240,7 @@ fn ripgrep_path() -> Option<&'static Path> {
 /// the argument vector without needing rg installed — the flags ARE the
 /// compatibility contract, and a silent drop of `--no-config` or
 /// `--sort` would not show up in output on a clean machine.
-fn ripgrep_args(pattern: &str, target: &str, ci: bool, all: bool) -> Vec<String> {
+fn ripgrep_args(pattern: &str, target: &str, ci: bool, all: bool, agents_glob: Option<&str>) -> Vec<String> {
     let mut a: Vec<String> = [
         "--no-heading",
         "--line-number",
@@ -256,6 +275,14 @@ fn ripgrep_args(pattern: &str, target: &str, ci: bool, all: bool) -> Vec<String>
             a.push(format!("--glob=!{d}"));
         }
     }
+    // D-08: the archive exclusion is pushed UNCONDITIONALLY — outside the
+    // `all` branch above — so `.nanopi/agents` stays hidden even when the
+    // caller passes `all=true`. Anchored to the search root with a
+    // leading `/` so it does not also match a nested directory of the
+    // same name.
+    if let Some(g) = agents_glob {
+        a.push(format!("--glob=!/{g}"));
+    }
     // `-e` and `--` so a pattern or path starting with `-` is not read as
     // a flag. The built-in has no such hazard, and forgetting them here
     // would make `grep -foo` an error on one engine only.
@@ -274,6 +301,7 @@ async fn search_ripgrep(
     root: &Path,
     ci: bool,
     all: bool,
+    agents_root: &Path,
     out: &mut Vec<String>,
     truncated: &mut bool,
 ) -> Result<(), String> {
@@ -289,8 +317,16 @@ async fn search_ripgrep(
         ".".to_string()
     };
 
+    // D-08: only exclude when the archive root is actually inside the
+    // directory rg will search — if it isn't (e.g. a disjoint subtree
+    // target), there's nothing to exclude and no glob is needed.
+    let glob = agents_root
+        .strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+
     let mut child = tokio::process::Command::new(rg)
-        .args(ripgrep_args(pattern, &target, ci, all))
+        .args(ripgrep_args(pattern, &target, ci, all, glob.as_deref()))
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -345,12 +381,29 @@ async fn search_ripgrep(
     Ok(())
 }
 
+/// True if `path` equals or is nested inside `agents_root`, comparing both
+/// lexically (joined from the same cwd) and, when possible, canonicalized
+/// (to also catch a symlinked cwd). Independent of `all` — the archive
+/// must stay hidden under every flag combination (D-08).
+fn is_within_agents_root(path: &Path, agents_root: &Path) -> bool {
+    if path == agents_root || path.starts_with(agents_root) {
+        return true;
+    }
+    if let (Ok(p), Ok(a)) = (std::fs::canonicalize(path), std::fs::canonicalize(agents_root)) {
+        if p == a || p.starts_with(&a) {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search_builtin(
     base: &Path,
     root: &Path,
     re: &regex::Regex,
     all: bool,
+    agents_root: &Path,
     matches: &mut Vec<String>,
     truncated: &mut bool,
     files_scanned: &mut usize,
@@ -358,16 +411,28 @@ fn search_builtin(
     if base.is_file() {
         grep_file(root, base, re, matches, truncated, files_scanned);
     } else {
-        walk(root, base, re, all, 0, matches, truncated, files_scanned);
+        walk(
+            root,
+            base,
+            re,
+            all,
+            0,
+            agents_root,
+            matches,
+            truncated,
+            files_scanned,
+        );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     root: &Path,
     dir: &Path,
     re: &regex::Regex,
     all: bool,
     depth: usize,
+    agents_root: &Path,
     out: &mut Vec<String>,
     truncated: &mut bool,
     files_scanned: &mut usize,
@@ -384,6 +449,11 @@ fn walk(
         }
         let name = e.file_name().to_string_lossy().into_owned();
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let full = e.path();
+        // D-08: always skip the agents archive, regardless of `all`.
+        if is_within_agents_root(&full, agents_root) {
+            continue;
+        }
         if !all {
             if name.starts_with('.') {
                 continue;
@@ -392,7 +462,6 @@ fn walk(
                 continue;
             }
         }
-        let full = e.path();
         if is_dir {
             walk(
                 root,
@@ -400,6 +469,7 @@ fn walk(
                 re,
                 all,
                 depth + 1,
+                agents_root,
                 out,
                 truncated,
                 files_scanned,
@@ -584,10 +654,20 @@ mod tests {
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut scanned = 0usize;
+        let agents_root = crate::paths::project_agents_dir(&ctx.cwd);
+        let agents_root = std::fs::canonicalize(&agents_root).unwrap_or(agents_root);
         if rg {
             let path = crate::util::which::which("rg").expect("rg needed for this test");
             search_ripgrep(
-                &path, pattern, &base, &root, ci, all, &mut matches, &mut truncated,
+                &path,
+                pattern,
+                &base,
+                &root,
+                ci,
+                all,
+                &agents_root,
+                &mut matches,
+                &mut truncated,
             )
             .await
             .unwrap();
@@ -597,6 +677,7 @@ mod tests {
                 &root,
                 &re,
                 all,
+                &agents_root,
                 &mut matches,
                 &mut truncated,
                 &mut scanned,
@@ -736,7 +817,7 @@ mod tests {
     /// where rg is not installed.
     #[test]
     fn compat_flags_are_present() {
-        let a = ripgrep_args("pat", ".", false, false);
+        let a = ripgrep_args("pat", ".", false, false, None);
         for required in [
             "--no-config",
             "--no-unicode",
@@ -758,9 +839,58 @@ mod tests {
         assert!(a.contains(&"-e".to_string()));
         assert!(a.contains(&"--".to_string()));
         // `all: true` swaps the globs for --hidden.
-        let all = ripgrep_args("pat", ".", false, true);
+        let all = ripgrep_args("pat", ".", false, true, None);
         assert!(all.contains(&"--hidden".to_string()));
         assert!(!all.iter().any(|x| x.starts_with("--glob=")));
+        // D-08: the agents-archive glob is pushed unconditionally, even
+        // with all=true.
+        let all_with_agents = ripgrep_args("pat", ".", false, true, Some(".nanopi/agents"));
+        assert!(all_with_agents.contains(&"--glob=!/.nanopi/agents".to_string()));
+    }
+
+    /// D-08: covers both the fallback builtin walk and the rg-args glob,
+    /// and asserts an explicit path inside the archive returns nothing.
+    #[tokio::test]
+    async fn agents_archive_hidden_even_with_all_true() {
+        let dir = tmp();
+        let agents_dir = dir.join(".nanopi").join("agents").join("r").join("a1");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("brief.md"), "secret-token hello").unwrap();
+        let skills_dir = dir.join(".nanopi").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("x.md"), "hello").unwrap();
+
+        // Fallback builtin walk, all=true.
+        let ctx = ToolContext { cwd: dir.clone() };
+        let out = GrepTool
+            .execute(json!({"pattern": "hello", "all": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.content.contains("brief.md"), "got: {}", out.content);
+        assert!(out.content.contains("x.md"), "got: {}", out.content);
+
+        // Explicit path inside the archive returns nothing.
+        let archive_path = dir.join(".nanopi").join("agents");
+        let out2 = GrepTool
+            .execute(
+                json!({"pattern": "secret", "all": true, "path": archive_path.to_string_lossy()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out2.content, "");
+
+        // ripgrep_args glob covers the archive root unconditionally.
+        let agents_root = crate::paths::project_agents_dir(&dir);
+        let glob = agents_root
+            .strip_prefix(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let a = ripgrep_args("hello", ".", false, true, Some(&glob));
+        assert!(a.contains(&format!("--glob=!/{glob}")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
