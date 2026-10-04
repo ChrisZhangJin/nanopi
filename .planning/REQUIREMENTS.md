@@ -146,15 +146,15 @@ owner decisions made on 2026-10-03.
   the TUI with `/orchestrator`. It is also available as the config key
   `experimental.orchestrator`. It is off by default.
 
-- [ ] **ORC-02**: In orchestrator mode, the main agent's tools are
+- [x] **ORC-02**: In orchestrator mode, the main agent's tools are
   limited to: read / grep / glob, dispatch, amend, stop, list and
   continue. The write, edit and bash tools are not registered.
 
-- [ ] **ORC-03**: The orchestrator's system prompt tells it to
+- [x] **ORC-03**: The orchestrator's system prompt tells it to
   analyse, split the work, dispatch agents, monitor them, and
   synthesise their reports for the user.
 
-- [ ] **ORC-04**: When orchestrator mode is off, the prompts and tool
+- [x] **ORC-04**: When orchestrator mode is off, the prompts and tool
   specs are byte-identical to v0.12.
 
 - [ ] **ORC-05**: The status line shows when orchestrator mode is
@@ -225,9 +225,9 @@ owner decisions made on 2026-10-03.
 | UI-03 | Phase 5 | Complete |
 | UI-04 | Phase 5 | Complete |
 | ORC-01 | Phase 6 | Pending |
-| ORC-02 | Phase 6 | Pending |
-| ORC-03 | Phase 6 | Pending |
-| ORC-04 | Phase 6 | Pending |
+| ORC-02 | Phase 6 | Complete |
+| ORC-03 | Phase 6 | Complete |
+| ORC-04 | Phase 6 | Complete |
 | ORC-05 | Phase 6 | Pending |
 | QA-01 | Phase 6 | Pending |
 | QA-02 | Phase 6 | Pending |

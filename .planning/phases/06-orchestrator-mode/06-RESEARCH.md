@@ -383,7 +383,7 @@ No external "state of the art" shift applies — this is internal-only wiring. T
 
 **If this table is empty:** N/A — see rows above.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Should `ls` be included in the orchestrator toolset?**
    - What we know: D-03 (CONTEXT.md) and ROADMAP.md's Phase 6 success criteria #2 both enumerate the toolset without `ls`.

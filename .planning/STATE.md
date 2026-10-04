@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
-status: executing
-last_updated: "2026-10-04T16:38:11.935Z"
+status: verifying
+last_updated: "2026-10-04T17:14:07.564Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 26
-  completed_plans: 26
+  total_plans: 30
+  completed_plans: 27
   percent: 83
 ---
 
@@ -19,7 +19,7 @@ progress:
 
 Phase: 05 (tui-agents-strip) — COMPLETE
 Plan: 3 of 3 complete (05-01, 05-02, 05-03 all done)
-Status: Ready for phase 06
+Status: Phase complete — ready for verification
 Last activity: 2026-10-04
 
 ---
@@ -322,6 +322,7 @@ pinned by wall-clock tests.
 | Phase 05-tui-agents-strip P01 | 35min | 1 tasks | 2 files |
 | Phase 05 P02 | 25min | 2 tasks | 4 files |
 | Phase 05 P03 | 45min | 2 tasks | 1 files |
+| Phase 06 P01 | 35min | 2 tasks | 4 files |
 
 ## Decisions
 
@@ -352,3 +353,5 @@ pinned by wall-clock tests.
 - [Phase 05]: agents_strip collapse rule: >3 agents shows the first 2 in D-02 order and folds the rest into one "+K more (R running)" row; ordered_agents (uncapped) and collapsed_rows (capped at 3) are separate primitives so ordering and the cap are independently testable
 - [Phase 05]: ActionId::ToggleAgentsStrip (Ctrl+G default) registered in keys.rs + settings_toml.rs; sc_no_agent_ui_controls narrowed to permit only this display-only toggle
 - [Phase ?]: D-04 deviation (pre-approved): Ctrl+G expanded view prints the per-agent detail block into scrollback instead of growing a 40%-of-screen live pane, because ratatui 0.29's pinned Viewport::Inline cannot grow the dock per frame.
+- [Phase 06]: compose_system_prompt delegates to compose_system_prompt_mode(.., false) so all existing callers stay untouched (ORC-04)
+- [Phase 06]: ToolRegistry::orchestrator() is hand-registered, never derived from standard()/standard_with_control() by filtering (T-06-01)

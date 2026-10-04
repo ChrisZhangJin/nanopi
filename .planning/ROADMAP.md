@@ -149,7 +149,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | 3 | Dynamic agents | 3/3 | Complete   | 2026-10-04 |
 | 4 | Background launch & control | 6/6 | Complete   | 2026-10-04 |
 | 5 | TUI agents strip | 3/3 | Complete   | 2026-10-04 |
-| 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
+| 6 | Orchestrator mode | 1/4 | In Progress|  |
 
 - [x] **Phase 1: Child-process runtime** - isolated `nanopi -p` children, process tracking/kill, caps, brief-file amendments and final self-check (completed 2026-10-03)
 - [x] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup (completed 2026-10-04)
@@ -311,10 +311,11 @@ Plans:
 **Plans**: 4 plans
 Plans:
 
-- [ ] 06-01-PLAN.md — orchestrator registry, coordinator prompt, mode-aware composer, config key, ORC-04 snapshots
+- [x] 06-01-PLAN.md — orchestrator registry, coordinator prompt, mode-aware composer, config key, ORC-04 snapshots
 - [ ] 06-02-PLAN.md — TUI /orchestrator toggle, in-place swap, rebuild sites, status-line segment
 - [ ] 06-03-PLAN.md — print mode ignores key with one-line stderr note (real-binary tests)
 - [ ] 06-04-PLAN.md — consolidated v0.13 manual test plan (incl. Ctrl+G), agents.md, binary size gate
+
 **UI hint**: yes
 
 ## Notes
