@@ -1544,3 +1544,147 @@ fn print_mode_ctrl_c_stops_all_background_agents() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// CTL-06 gap closure (plan 04-06), end to end: a SECOND real `nanopi -p`
+/// process, started after the first has exited, continues an agent the
+/// FIRST process dispatched and finished — joined via `NANOPI_RUN_ID`.
+///
+/// This is the genuine two-process case the unit/integration tests in
+/// `agent_registry.rs`/`agent_spawn.rs` cannot exercise: those stay
+/// in-process, so `send_message`'s background continuation always
+/// launches via `current_exe()` (the TEST binary). Here both "processes"
+/// are the real `nanopi` binary, so the child the second process spawns
+/// to continue `a1` is the real binary too — the only place the full
+/// path (join → disk adoption → reactivate → prepare_continue → spawn)
+/// is provably correct end to end.
+#[test]
+fn continue_agent_from_earlier_print_process() {
+    let run_id = "20261004-120000-0badf00d";
+    let port = spawn_sse_server_seq(vec![
+        // req0: process 1's main turn — dispatch a FOREGROUND agent (no
+        // `background: true`): the dispatch blocks until the child
+        // finishes, so by the time process 1 exits, a1 is terminal on
+        // disk.
+        vec![
+            tool_call_delta(
+                0,
+                "call_a",
+                "agent",
+                &serde_json::json!({"task": "FIRST-TASK"}).to_string(),
+            ),
+            finish("tool_calls"),
+        ],
+        // req1 and req2: one is consumed by a1's own single turn, the
+        // other by process 1's own follow-up turn once the tool result
+        // is back in-band. Order between the two is not guaranteed, so
+        // both carry the same FIRST-ANSWER text.
+        vec![delta("content", "FIRST-ANSWER"), finish("stop")],
+        vec![delta("content", "FIRST-ANSWER"), finish("stop")],
+        // req3: process 2's main turn — continue a1.
+        vec![
+            tool_call_delta(
+                0,
+                "call_b",
+                "send_message",
+                &serde_json::json!({"id": "a1", "message": "CONTINUE-MSG"}).to_string(),
+            ),
+            finish("tool_calls"),
+        ],
+        // req4 and req5: one for a1's continued turn, one for process
+        // 2's own follow-up once the (in-band) send_message result is
+        // back.
+        vec![delta("content", "SECOND-ANSWER"), finish("stop")],
+        vec![delta("content", "SECOND-ANSWER"), finish("stop")],
+    ]);
+
+    let dir = fresh_dir("ctl06-join", port);
+
+    // Process 1: dispatch and finish a1.
+    let (status1, v1, stderr1) =
+        run_child(&dir, port, &["start"], &[("NANOPI_RUN_ID", run_id)]);
+    assert!(status1.success(), "process 1 failed: {stderr1}\n{v1}");
+    assert_eq!(v1["status"], "completed", "{v1}");
+
+    let agents_root = dir.join(".nanopi/agents");
+    let a1_dir = agents_root.join(run_id).join("a1");
+    let report_path = a1_dir.join("report.md");
+    assert!(
+        report_path.is_file(),
+        "a1's report.md must exist after process 1 exits; agents_root={}",
+        agents_root.display()
+    );
+    let report_before = std::fs::read_to_string(&report_path).expect("read report.md");
+    assert!(
+        report_before.contains("state: done")
+            || report_before.contains("state: failed")
+            || report_before.contains("state: stopped")
+            || report_before.contains("state: limit_reached"),
+        "a1 must be terminal on disk before process 2 starts: {report_before}"
+    );
+
+    let brief_path = a1_dir.join("brief.md");
+    assert!(brief_path.is_file(), "a1's brief.md must exist");
+
+    // Process 2: a brand-new `nanopi` process, same run id, continues a1
+    // via `send_message` — this is the CTL-06 gap: a1 is not in this
+    // process's in-memory registry, only on disk.
+    let (status2, v2, stderr2) =
+        run_child(&dir, port, &["continue"], &[("NANOPI_RUN_ID", run_id)]);
+    assert!(status2.success(), "process 2 failed: {stderr2}\n{v2}");
+    assert_eq!(v2["status"], "completed", "{v2}");
+
+    let out2 = v2.to_string();
+    assert!(
+        !out2.to_lowercase().contains("no such agent"),
+        "process 2 must find a1 via disk adoption, not report it missing: {out2}"
+    );
+
+    let brief_after = std::fs::read_to_string(&brief_path).expect("read brief.md");
+    assert!(
+        brief_after.contains("## Amendment 1"),
+        "brief.md must record the continuation amendment: {brief_after}"
+    );
+    assert!(
+        brief_after.contains("CONTINUE-MSG"),
+        "brief.md must carry the continuation message: {brief_after}"
+    );
+
+    let report_after = std::fs::read_to_string(&report_path).expect("read report.md");
+    assert!(
+        report_after.contains("## Continued"),
+        "report.md must carry the continuation marker: {report_after}"
+    );
+    assert!(
+        report_after.contains("SECOND-ANSWER"),
+        "report.md must carry the continued child's own answer: {report_after}"
+    );
+    assert!(
+        report_after.contains(report_before.trim()) || report_before.trim().is_empty(),
+        "report.md must preserve the original report: before={report_before:?} after={report_after:?}"
+    );
+
+    // No new agent id was minted for the continuation — it reused a1.
+    let a2_dir = agents_root.join(run_id).join("a2");
+    assert!(
+        !a2_dir.exists(),
+        "continuing a1 must not mint a2: {}",
+        a2_dir.display()
+    );
+
+    // Both processes must join the same run dir, not mint a second one
+    // — the strongest available signal (short of process-level env
+    // inspection) that neither process's children leaked NANOPI_RUN_ID
+    // into a context that would mint sibling runs.
+    let run_dirs: Vec<_> = std::fs::read_dir(&agents_root)
+        .expect("agents root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        run_dirs,
+        vec![run_id.to_string()],
+        "both processes must join the same run dir, not mint a second one: {run_dirs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
