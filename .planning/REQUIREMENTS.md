@@ -162,10 +162,10 @@ owner decisions made on 2026-10-03.
 
 ### Quality (QA)
 
-- [ ] **QA-01**: Each new control (amend, stop, continue, expand,
+- [x] **QA-01**: Each new control (amend, stop, continue, expand,
   toggle, clean) has a row in the manual end-to-end test plan.
 
-- [ ] **QA-02**: The release binary grows by no more than about
+- [x] **QA-02**: The release binary grows by no more than about
   150 KB, and no new crates are added unless justified.
 
 ## Future Requirements (deferred)
@@ -229,7 +229,7 @@ owner decisions made on 2026-10-03.
 | ORC-03 | Phase 6 | Complete |
 | ORC-04 | Phase 6 | Complete |
 | ORC-05 | Phase 6 | Complete |
-| QA-01 | Phase 6 | Pending |
-| QA-02 | Phase 6 | Pending |
+| QA-01 | Phase 6 | Complete |
+| QA-02 | Phase 6 | Complete |
 
 Coverage: 39/39 v1 requirements mapped, no orphans, no duplicates.

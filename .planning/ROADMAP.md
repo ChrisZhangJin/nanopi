@@ -149,14 +149,14 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | 3 | Dynamic agents | 3/3 | Complete   | 2026-10-04 |
 | 4 | Background launch & control | 6/6 | Complete   | 2026-10-04 |
 | 5 | TUI agents strip | 3/3 | Complete   | 2026-10-04 |
-| 6 | Orchestrator mode | 3/4 | In Progress|  |
+| 6 | Orchestrator mode | 4/4 | Complete   | 2026-10-04 |
 
 - [x] **Phase 1: Child-process runtime** - isolated `nanopi -p` children, process tracking/kill, caps, brief-file amendments and final self-check (completed 2026-10-03)
 - [x] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup (completed 2026-10-04)
 - [x] **Phase 3: Dynamic agents** - optional agent name, inline role/tools/model, capped report (completed 2026-10-04)
 - [x] **Phase 4: Background launch & control** - background ids, amend/stop/list/continue, report injection, print-mode drain, worktrees (completed 2026-10-04)
 - [x] **Phase 5: TUI agents strip** - collapsible, display-only bottom strip with states (completed 2026-10-04)
-- [ ] **Phase 6: Orchestrator mode** - `/orchestrator` toggle, restricted tools, coordinator prompt, release gates
+- [x] **Phase 6: Orchestrator mode** - `/orchestrator` toggle, restricted tools, coordinator prompt, release gates (completed 2026-10-04)
 
 ### Phase 1: Child-process runtime
 
@@ -314,7 +314,7 @@ Plans:
 - [x] 06-01-PLAN.md — orchestrator registry, coordinator prompt, mode-aware composer, config key, ORC-04 snapshots
 - [x] 06-02-PLAN.md — TUI /orchestrator toggle, in-place swap, rebuild sites, status-line segment
 - [x] 06-03-PLAN.md — print mode ignores key with one-line stderr note (real-binary tests)
-- [ ] 06-04-PLAN.md — consolidated v0.13 manual test plan (incl. Ctrl+G), agents.md, binary size gate
+- [x] 06-04-PLAN.md — consolidated v0.13 manual test plan (incl. Ctrl+G), agents.md, binary size gate
 
 **UI hint**: yes
 
