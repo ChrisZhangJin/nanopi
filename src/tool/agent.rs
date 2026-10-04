@@ -694,17 +694,25 @@ fn validate_model(
         }
     }
     let Some(model_vendor) = crate::models::model_vendor(model) else {
-        let ids: Vec<&str> = parent_vendor
-            .map(crate::models::models_for_vendor)
-            .unwrap_or_default()
-            .iter()
-            .map(|m| m.id)
-            .collect();
-        let vendor_label = parent_vendor.unwrap_or("unknown");
-        return Err(format!(
-            "unknown model {model:?}. Models available from the active provider ({vendor_label}): {}",
-            ids.join(", ")
-        ));
+        // When there's no active vendor, or it's the `fallback`/custom
+        // vendor, there is no catalogue to suggest from — phrase the
+        // error without implying a (vendor-scoped, but actually empty)
+        // suggestion list exists.
+        return match parent_vendor {
+            None | Some("fallback") => Err(format!(
+                "unknown model {model:?}; it is not in nanopi's model catalogue"
+            )),
+            Some(p) => {
+                let ids: Vec<&str> = crate::models::models_for_vendor(p)
+                    .iter()
+                    .map(|m| m.id)
+                    .collect();
+                Err(format!(
+                    "unknown model {model:?}. Models available from the active provider ({p}): {}",
+                    ids.join(", ")
+                ))
+            }
+        };
     };
     match parent_vendor {
         Some(p) if p != "fallback" && !p.eq_ignore_ascii_case(model_vendor) => Err(format!(
