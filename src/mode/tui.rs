@@ -2103,6 +2103,7 @@ async fn run_app(
                     app.agents_view.refresh(&reg.snapshot(), std::time::Instant::now());
                 }
                 let became_empty = !was_empty && app.agents_view.is_empty();
+                reset_strip_expanded_on_became_empty(app, became_empty);
                 // Redraw when there's a live counter to update, the strip
                 // has agents to show, or the strip just emptied out (so
                 // it disappears instead of leaving a stale last frame).
@@ -5350,6 +5351,18 @@ fn agents_detail_block(app: &App, width: usize) -> Vec<String> {
     agents_strip::expanded_detail_lines(&app.agents_view, width, std::time::Instant::now())
 }
 
+/// WR-02: once all agents finish and `app.agents_view` empties out, clear
+/// `agents_strip_expanded` so a later, unrelated run's strip always starts
+/// collapsed (Ctrl+G is documented as the only way to expand it, per D-05).
+/// Without this, an expand left over from a previous run would leak into
+/// the next agent's first appearance and immediately dump a detail block
+/// into scrollback with no user action.
+fn reset_strip_expanded_on_became_empty(app: &mut App, became_empty: bool) {
+    if became_empty {
+        app.agents_strip_expanded = false;
+    }
+}
+
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // Is a dropdown overlay open? When one is, it claims the top 4 rows
     // and the input box collapses to a single content line. When none is
@@ -7775,6 +7788,23 @@ mod tests {
         if !app.agents_view.is_empty() {
             app.agents_strip_expanded = !app.agents_strip_expanded;
         }
+    }
+
+    #[test]
+    fn strip_expanded_resets_when_agents_view_becomes_empty() {
+        // WR-02 regression: expanding the strip, then letting all agents
+        // age out of the view, must clear the expand flag so the strip
+        // starts collapsed the next time any agent appears.
+        let mut app = mkapp();
+        app.agents_strip_expanded = true;
+        reset_strip_expanded_on_became_empty(&mut app, true);
+        assert!(!app.agents_strip_expanded, "became_empty=true must clear the expand flag");
+
+        // Sanity: when the view did NOT become empty, the flag is untouched.
+        let mut app2 = mkapp();
+        app2.agents_strip_expanded = true;
+        reset_strip_expanded_on_became_empty(&mut app2, false);
+        assert!(app2.agents_strip_expanded, "became_empty=false must not touch the expand flag");
     }
 
     #[test]
