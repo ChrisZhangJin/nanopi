@@ -199,7 +199,16 @@ Plans:
   4. After killing nanopi mid-run, the next start marks those agents `interrupted` without re-running them.
   5. `/agents clean` keeps the most recent N runs or removes all.
 
-**Plans**: TBD
+**Plans**: 7 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — brief.md/report.md front-matter, timestamped amendments
+- [ ] 02-02-PLAN.md — project_agents_dir + grep/find archive exclusion
+- [ ] 02-03-PLAN.md — src/archive.rs: run id, durable state, index.md, interrupted scan, .gitignore
+- [ ] 02-04-PLAN.md — durable child report.md with turns/tokens/files changed
+- [ ] 02-05-PLAN.md — archive_keep_days, auto-prune, clean_runs
+- [ ] 02-06-PLAN.md — wire registry, dispatch, fallback report, startup scan/prune
+- [ ] 02-07-PLAN.md — /agents clean command + integration tests
 **Research flags**: standard patterns.
 
 ### Phase 3: Dynamic agents
