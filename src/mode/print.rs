@@ -451,6 +451,18 @@ pub async fn run_print_mode(
             let mut extra_reports_appendix: Option<String> = None;
             if let Some(reg) = crate::agent_registry::global() {
                 if reg.has_background() {
+                    // `ctrl_c_task`'s own `stop_all()` call (fired the
+                    // instant Ctrl-C arrives) can race a dispatch that
+                    // registers in the registry moments later — if Ctrl-C
+                    // lands between the tool call starting and the entry
+                    // being registered, that first `stop_all()` finds
+                    // nothing and is a no-op. Re-issue it here, now that
+                    // `has_background()` is true, to close that window:
+                    // if the flag is already set, this agent was always
+                    // meant to be stopped.
+                    if ctrl_c_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                        reg.stop_all();
+                    }
                     reg.wait_background().await;
                     if ctrl_c_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
                         interrupted = true;
@@ -469,6 +481,13 @@ pub async fn run_print_mode(
                                 }
                             }
                             limit = limit.or_else(|| agent.last_limit_hit());
+                            // Same re-issue as above: the extra turn may
+                            // have just registered a fresh background
+                            // dispatch that a Ctrl-C from *before* this
+                            // turn started never got to stop.
+                            if ctrl_c_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                                reg.stop_all();
+                            }
                             reg.wait_background().await;
                             if ctrl_c_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
                                 interrupted = true;
