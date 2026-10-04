@@ -150,6 +150,26 @@ pub fn project_agents_dir(cwd: &Path) -> PathBuf {
     cwd.join(".nanopi").join("agents")
 }
 
+/// True if `path` equals or is nested inside `agents_root`, comparing both
+/// lexically (joined from the same cwd) and, when possible, canonicalized
+/// (to also catch a symlinked cwd). Independent of `all` — the archive
+/// must stay hidden under every flag combination (D-08).
+///
+/// Shared by `tool::find` and `tool::grep` (WR-03): this check is
+/// security-relevant, so there must be exactly one copy to fix if a
+/// canonicalization edge case or bypass is ever found.
+pub fn is_within_agents_root(path: &Path, agents_root: &Path) -> bool {
+    if path == agents_root || path.starts_with(agents_root) {
+        return true;
+    }
+    if let (Ok(p), Ok(a)) = (std::fs::canonicalize(path), std::fs::canonicalize(agents_root)) {
+        if p == a || p.starts_with(&a) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

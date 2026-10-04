@@ -381,21 +381,7 @@ async fn search_ripgrep(
     Ok(())
 }
 
-/// True if `path` equals or is nested inside `agents_root`, comparing both
-/// lexically (joined from the same cwd) and, when possible, canonicalized
-/// (to also catch a symlinked cwd). Independent of `all` — the archive
-/// must stay hidden under every flag combination (D-08).
-fn is_within_agents_root(path: &Path, agents_root: &Path) -> bool {
-    if path == agents_root || path.starts_with(agents_root) {
-        return true;
-    }
-    if let (Ok(p), Ok(a)) = (std::fs::canonicalize(path), std::fs::canonicalize(agents_root)) {
-        if p == a || p.starts_with(&a) {
-            return true;
-        }
-    }
-    false
-}
+use crate::paths::is_within_agents_root;
 
 #[allow(clippy::too_many_arguments)]
 fn search_builtin(
