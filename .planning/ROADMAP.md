@@ -147,14 +147,14 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | 1 | Child-process runtime | 7/7 | Complete   | 2026-10-03 |
 | 2 | Archive & lifecycle | 7/7 | Complete   | 2026-10-04 |
 | 3 | Dynamic agents | 3/3 | Complete   | 2026-10-04 |
-| 4 | Background launch & control | 4/5 | In Progress|  |
+| 4 | Background launch & control | 5/5 | Complete   | 2026-10-04 |
 | 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
 
 - [x] **Phase 1: Child-process runtime** - isolated `nanopi -p` children, process tracking/kill, caps, brief-file amendments and final self-check (completed 2026-10-03)
 - [x] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup (completed 2026-10-04)
 - [x] **Phase 3: Dynamic agents** - optional agent name, inline role/tools/model, capped report (completed 2026-10-04)
-- [ ] **Phase 4: Background launch & control** - background ids, amend/stop/list/continue, report injection, print-mode drain, worktrees
+- [x] **Phase 4: Background launch & control** - background ids, amend/stop/list/continue, report injection, print-mode drain, worktrees (completed 2026-10-04)
 - [ ] **Phase 5: TUI agents strip** - collapsible, display-only bottom strip with states
 - [ ] **Phase 6: Orchestrator mode** - `/orchestrator` toggle, restricted tools, coordinator prompt, release gates
 
@@ -268,7 +268,7 @@ Plans:
 - [x] 04-02-PLAN.md — git worktree module (create, commit, cleanup, auto-merge/conflict)
 - [x] 04-03-PLAN.md — control tools: send_message (amend/continue), stop_agent, list_agents
 - [x] 04-04-PLAN.md — report injection (TUI follow-up path) + print-mode drain with Ctrl-C stop_all
-- [ ] 04-05-PLAN.md — worktree isolation wired into dispatch
+- [x] 04-05-PLAN.md — worktree isolation wired into dispatch
 
 **Research flags**: needs research — report injection path and print-mode exit.
 
