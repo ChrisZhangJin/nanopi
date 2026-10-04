@@ -772,10 +772,30 @@ pub fn compose_system_prompt(
     no_context_files: bool,
     overrides: &PromptOverrides,
 ) -> String {
+    compose_system_prompt_mode(cwd, tool_names, skills, no_context_files, overrides, false)
+}
+
+/// Mode-aware variant of [`compose_system_prompt`] (ORC-03/ORC-04).
+///
+/// `orchestrator: false` reproduces `compose_system_prompt` exactly —
+/// every existing caller goes through that thin wrapper and is
+/// therefore untouched by construction. `orchestrator: true` swaps the
+/// base prompt for [`system_prompt::build_orchestrator`]; a custom
+/// prompt override still wins in both modes, since the user asked for
+/// specific wording either way.
+pub fn compose_system_prompt_mode(
+    cwd: &Path,
+    tool_names: &[String],
+    skills: &[Skill],
+    no_context_files: bool,
+    overrides: &PromptOverrides,
+    orchestrator: bool,
+) -> String {
     let resolved = overrides.resolve(cwd);
 
     let mut prompt = match resolved.custom {
         Some(text) => format!("{text}\n\nCurrent working directory: {}", cwd.display()),
+        None if orchestrator => crate::agent::system_prompt::build_orchestrator(cwd, tool_names),
         None => crate::agent::system_prompt::build(cwd, tool_names),
     };
 
@@ -847,6 +867,51 @@ mod tests {
         );
         let placeholder = prompt.replace(&cwd.display().to_string(), "{CWD}");
         assert_eq!(placeholder, BASELINE_DEFAULT_PROMPT);
+    }
+
+    #[test]
+    fn compose_mode_false_matches_compose() {
+        let cwd = tmpdir("mode-false");
+        let a = compose_system_prompt(&cwd, &tools(), &[], true, &PromptOverrides::default());
+        let b = compose_system_prompt_mode(
+            &cwd,
+            &tools(),
+            &[],
+            true,
+            &PromptOverrides::default(),
+            false,
+        );
+        assert_eq!(a, b);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn compose_mode_true_uses_orchestrator_prompt() {
+        let cwd = tmpdir("mode-true");
+        let names = vec!["read".to_string(), "agent".to_string()];
+        let base = crate::agent::system_prompt::build_orchestrator(&cwd, &names);
+        let composed = compose_system_prompt_mode(
+            &cwd,
+            &names,
+            &[],
+            true,
+            &PromptOverrides::default(),
+            true,
+        );
+        assert!(
+            composed.starts_with(&base),
+            "orchestrator mode must start with build_orchestrator's output"
+        );
+
+        // A custom prompt override still wins in orchestrator mode.
+        let overrides =
+            PromptOverrides::from_cli(Some("You are Bob".to_string()), vec![], true);
+        let composed_custom =
+            compose_system_prompt_mode(&cwd, &names, &[], true, &overrides, true);
+        assert!(composed_custom.starts_with("You are Bob"));
+        assert!(!composed_custom.contains("orchestrator mode"));
+
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     /// An empty `[[extensions]]` list must be a no-op in both feature

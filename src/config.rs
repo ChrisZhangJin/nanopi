@@ -164,6 +164,31 @@ pub struct Config {
     /// Child-process agent limits (`[agent]` section).
     #[serde(default)]
     pub agent: AgentConfig,
+
+    /// v0.13: feature flags still under evaluation (`[experimental]`
+    /// section).
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
+}
+
+/// `[experimental]` config: feature flags not yet promoted to a
+/// top-level, stable setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    /// Enables orchestrator mode (ORC-01..ORC-06): a restricted tool
+    /// registry plus a coordinator system prompt that plans and
+    /// delegates work to agents instead of editing files or running
+    /// shell commands directly.
+    ///
+    /// TUI only — print mode (`nanopi -p`) ignores this flag and emits
+    /// a one-line stderr note if it is set (D-01). Default `false`.
+    ///
+    /// ```toml
+    /// [experimental]
+    /// orchestrator = true
+    /// ```
+    pub orchestrator: bool,
 }
 
 /// `[agent]` config: caps for orchestrator-spawned `nanopi -p` children.
@@ -436,6 +461,7 @@ impl Config {
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
             agent: AgentConfig::default(),
+            experimental: ExperimentalConfig::default(),
         }
     }
 }
@@ -655,6 +681,12 @@ fn merge(a: Config, b: Config) -> Config {
         } else {
             a.agent
         },
+        // Section-level: project wins if it differs from defaults.
+        experimental: if b.experimental != ExperimentalConfig::default() {
+            b.experimental
+        } else {
+            a.experimental
+        },
     }
 }
 
@@ -822,6 +854,17 @@ mod tests {
         assert_eq!(c.base_url, None);
     }
 
+    /// ORC-01: the orchestrator feature flag defaults off and only
+    /// flips on with an explicit `[experimental] orchestrator = true`.
+    #[test]
+    fn experimental_orchestrator_defaults_false() {
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(!empty.experimental.orchestrator);
+
+        let on: Config = toml::from_str("[experimental]\norchestrator = true").unwrap();
+        assert!(on.experimental.orchestrator);
+    }
+
     #[test]
     fn missing_files_use_defaults() {
         let _h = crate::TempNanopiHome::new();
@@ -970,6 +1013,7 @@ command = "echo hi"
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
             agent: AgentConfig::default(),
+            experimental: ExperimentalConfig::default(),
         };
         let b = Config {
             model: None,
@@ -987,6 +1031,7 @@ command = "echo hi"
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
             agent: AgentConfig::default(),
+            experimental: ExperimentalConfig::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));
