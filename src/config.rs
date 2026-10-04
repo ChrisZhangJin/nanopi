@@ -180,6 +180,9 @@ pub struct AgentConfig {
     pub token_budget: u64,
     /// Per-child wall-clock timeout in seconds. Default 1800.
     pub timeout_secs: u64,
+    /// Auto-prune runs older than this many days at startup. Default 2;
+    /// 0 disables.
+    pub archive_keep_days: u64,
 }
 
 impl Default for AgentConfig {
@@ -190,6 +193,7 @@ impl Default for AgentConfig {
             max_turns: 50,
             token_budget: 300_000,
             timeout_secs: 1800,
+            archive_keep_days: 2,
         }
     }
 }
@@ -1113,8 +1117,18 @@ command = "/bin/true"
                 max_turns: 50,
                 token_budget: 300_000,
                 timeout_secs: 1800,
+                archive_keep_days: 2,
             }
         );
+    }
+
+    #[test]
+    fn agent_config_archive_keep_days_zero_is_valid() {
+        let c: Config = toml::from_str("[agent]\narchive_keep_days = 0\n").unwrap();
+        assert_eq!(c.agent.archive_keep_days, 0);
+        let tmp = TempDir::new();
+        tmp.write(".nanopi/config.toml", "[agent]\narchive_keep_days = 0\n");
+        assert!(load_config(tmp.path()).is_ok());
     }
 
     #[test]
