@@ -496,7 +496,7 @@ impl Tool for AgentTool {
                     },
                     "description": {
                         "type": "string",
-                        "description": "optional: 3-6 word label."
+                        "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."
                     },
                     "tasks": {
                         "type": "array",
@@ -510,7 +510,7 @@ impl Tool for AgentTool {
                                 "role": {"type": "string", "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."},
                                 "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
                                 "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
-                                "description": {"type": "string", "description": "optional: 3-6 word label."}
+                                "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."}
                             },
                             "required": ["task"]
                         }
@@ -527,7 +527,7 @@ impl Tool for AgentTool {
                                 "role": {"type": "string", "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."},
                                 "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
                                 "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
-                                "description": {"type": "string", "description": "optional: 3-6 word label."}
+                                "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."}
                             },
                             "required": ["task"]
                         }
