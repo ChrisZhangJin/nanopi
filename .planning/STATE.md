@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-10-04T09:22:30.055Z"
+last_updated: "2026-10-04T09:43:32.690Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 22
-  completed_plans: 20
+  completed_plans: 21
   percent: 50
 ---
 
@@ -18,7 +18,7 @@ progress:
 ## Current Position
 
 Phase: 04 (background-control) — IN PROGRESS
-Plan: 3 of 5 complete
+Plan: 4 of 5 complete
 Status: Ready to execute
 Last activity: 2026-10-04
 
@@ -317,6 +317,7 @@ pinned by wall-clock tests.
 | Phase 04 P01 | 45min | 2 tasks | 4 files |
 | Phase 04 P02 | 25min | 2 tasks | 2 files |
 | Phase 04 P03 | 70min | 2 tasks | 6 files |
+| Phase 04 P04 | 180min | 2 tasks | 5 files |
 
 ## Decisions
 
@@ -340,3 +341,6 @@ pinned by wall-clock tests.
 - [Phase 04]: worktree::finish auto-commits outstanding changes as 'nanopi agent <id>' before deciding removal vs merge; unchanged = empty porcelain AND 0 commits ahead of base (Addendum 3)
 - [Phase ?]: stop_agent waits on wait_background() (all tracked tasks) rather than a per-id handle
 - [Phase ?]: send_message continue does not adopt on-disk agents from an earlier process in the same run
+- [Phase ?]: Background-agent reports ride the existing TUI follow-up path (idle pick + mid-turn SteerMessage::FollowUp with fallback slot) rather than a new channel
+- [Phase ?]: Narrowed main.rs outer signal handler to SIGTERM-only so print.rs's new Ctrl-C drain-window handling is reachable; Ctrl-C during the main turn no longer triggers outer kill_all (known bounded regression)
+- [Phase ?]: -p now awaits all background agents before exit, running at most one bounded extra main turn if reports arrived (D-07)

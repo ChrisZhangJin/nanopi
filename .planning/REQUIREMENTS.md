@@ -85,7 +85,7 @@ owner decisions made on 2026-10-03.
   message: a new `nanopi -p` is started on the same session, so the
   agent keeps its previous context.
 
-- [ ] **CTL-07**: In print mode (`-p`), nanopi waits for background
+- [x] **CTL-07**: In print mode (`-p`), nanopi waits for background
   agents (or stops them) before exiting, so no task is left
   orphaned.
 
@@ -217,7 +217,7 @@ owner decisions made on 2026-10-03.
 | CTL-04 | Phase 4 | Complete |
 | CTL-05 | Phase 4 | Complete |
 | CTL-06 | Phase 4 | Pending |
-| CTL-07 | Phase 4 | Pending |
+| CTL-07 | Phase 4 | Complete |
 | ISO-01 | Phase 4 | Complete |
 | ISO-02 | Phase 4 | Complete |
 | UI-01 | Phase 5 | Pending |
