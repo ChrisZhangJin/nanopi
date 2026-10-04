@@ -130,17 +130,36 @@ the same keybindings/settings menu as every other action — see `src/keys.rs`.
 
 ### Manual test
 
-| 前提 Precondition | 步骤 Steps | 期望 Expected | 结果 Result |
-|---|---|---|---|
-| Model has access to the `agent` tool | Dispatch 1 agent, then dispatch 4+ more (background) in the same or a later turn | Strip appears between status line and input once the first agent starts; with 4+ agents, strip shows at most 3 rows plus a `+K more (R running)` row | ☐通过 ☐失败 |
-| Strip visible, collapsed | Press `Ctrl+G` | Strip expands: detail is printed to scrollback and in-dock rows keep showing latest activity | ☐通过 ☐失败 |
-| Strip expanded | Press `Ctrl+G` again, or `Esc` | Strip collapses back to the 1–3 line summary | ☐通过 ☐失败 |
-| An agent has finished (done) | Observe the strip after all agents finish | Strip remains visible showing `✓` for finished agents (does not vanish immediately) | ☐通过 ☐失败 |
-| Agents idle/no new activity | Watch the strip for several seconds | No flicker or redraw churn while idle (draws come from the existing tick, not per-event) | ☐通过 ☐失败 |
-| Input box focused, no modifier held | Type the letter `g` (no Ctrl) | `g` is inserted into the input as a normal character; the strip does not toggle | ☐通过 ☐失败 |
+See `docs/v0.13-manual-test-plan.md` for the consolidated manual E2E plan
+(QA-01), which includes this strip's Ctrl+G rows alongside orchestrator
+mode, worktree merge, and the dispatch/amend/stop/continue control flow.
 
-Phase 6 owns the consolidated manual test plan (QA-01); this table is the
-Ctrl+G row set it will collect into that plan.
+## Orchestrator mode
+
+An experimental, opt-in TUI mode (ORC-01..05) in which the main agent only
+analyses, splits work, delegates it via the `agent` tool, monitors agents,
+and synthesises their results — it never edits, writes, or runs shell
+commands itself.
+
+- **Toggle:** `/orchestrator` (bare = toggle, `/orchestrator on|off` sets it
+  explicitly, anything else prints `Usage: /orchestrator [on|off]` without
+  changing state). Toggling mid-session takes effect from the next turn and
+  never touches already-running agents.
+- **Config key:** `[experimental] orchestrator = false` (default) sets the
+  startup value. TUI only — print mode (`-p`) ignores it entirely and emits
+  one unconditional stderr line,
+  `note: experimental.orchestrator is set but ignored in print mode (-p)`,
+  when the key is set, so a scripted run is never silently restricted.
+- **Exact toolset:** `read`, `grep`, `find`, `agent`, `list_agents`,
+  `stop_agent`, `send_message` — seven tools, hand-registered (never derived
+  by filtering a broader set). `write`, `edit`, and `bash` are not
+  registered at all, not just discouraged; `ls` is intentionally excluded
+  too (a test asserts the exact name list).
+- **Off-mode guarantee:** with the mode off, the system prompt and tool
+  specs sent to the provider are byte-identical to the pre-orchestrator
+  (v0.12) behavior — pinned by a snapshot test.
+- **Status line:** shows `⎈ orchestrator` next to `think:`/`vendor:` while
+  the mode is on.
 
 ## Known gaps
 
