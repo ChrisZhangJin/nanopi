@@ -246,6 +246,19 @@ pub async fn run_print_mode(
     // to defaults quietly instead of double-reporting.
     let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
 
+    // D-01 (research open question 2, conservative resolution): print
+    // mode never restricts its tool registry or prompt based on
+    // `experimental.orchestrator` — a scripted `-p` run must never be
+    // silently limited to the orchestrator's 7-tool set (Pitfall 5).
+    // The flag is read here *only* to print this one-line note; it must
+    // never influence registry or prompt construction below. Children
+    // (`child.agent_mode`) never print this — they already know their
+    // own restricted shape and the note would be noise in captured
+    // output.
+    if !child.agent_mode && cfg_for_build.experimental.orchestrator {
+        eprintln!("note: experimental.orchestrator is set but ignored in print mode (-p)");
+    }
+
     // If we resumed an existing session, hydrate the Agent with its
     // history (so the model sees prior turns). Otherwise start fresh.
     use crate::agent::build::{print_skill_diagnostics, AgentBuildInputs};

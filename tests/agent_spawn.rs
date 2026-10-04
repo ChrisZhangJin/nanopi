@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::Command;
 
 use nanopi::agent::agents::{AgentConfig, AgentSource};
 use nanopi::config::AgentConfig as AgentLimits;
@@ -55,6 +56,68 @@ fn spawn_sse_server(chunks: Vec<String>) -> u16 {
         }
     });
     port
+}
+
+/// Like [`spawn_sse_server`], but serves a different response to each
+/// successive request, so a tool round can be scripted (write call,
+/// then the model's final answer). Mirrors `print_mode_e2e.rs`'s helper
+/// of the same name.
+fn spawn_sse_server_seq(responses: Vec<Vec<String>>) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let bodies: Vec<String> = responses
+        .iter()
+        .map(|chunks| {
+            let mut body = String::new();
+            for c in chunks {
+                body.push_str("data: ");
+                body.push_str(c);
+                body.push_str("\n\n");
+            }
+            body.push_str("data: [DONE]\n\n");
+            body
+        })
+        .collect();
+    std::thread::spawn(move || {
+        let mut n = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut req = vec![0u8; len];
+            let _ = stream.read_exact(&mut req);
+            let body = &bodies[n.min(bodies.len() - 1)];
+            n += 1;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// One streamed tool call, in the shape `WireToolCall` expects.
+fn tool_call_delta(index: u32, id: &str, name: &str, arguments: &str) -> String {
+    format!(
+        r#"{{"id":"x","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{index},"id":"{id}","type":"function","function":{{"name":"{name}","arguments":{}}}}}]}},"finish_reason":null}}]}}"#,
+        serde_json::Value::String(arguments.to_string())
+    )
 }
 
 fn delta(text: &str) -> String {
@@ -730,3 +793,109 @@ async fn worktree_merge_no_conflict_auto_merges_and_cleans_up_background() {
 // `prepare_run`/`run_body` (`pub(crate)`). See
 // `tool::agent::tests::worktree_merge_conflict_aborts_and_keeps_branch`
 // in src/tool/agent.rs for that scenario.
+
+// --- 06-03/D-01: print mode ignores orchestrator mode ---
+
+/// Run `nanopi -p` against the fake endpoint in a fresh cwd, optionally
+/// with `[experimental]\norchestrator = true` written to
+/// `.nanopi/config.toml` first. Returns (stdout, stderr), both with
+/// trailing newlines intact so "exactly one line" assertions are exact.
+fn run_p_capture(port: u16, orchestrator_config: bool, args: &[&str]) -> (String, String, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "nanopi-p-orchestrator-{port}-{}",
+        nanopi::util::uuid::v7()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".nanopi")).expect("cfg dir");
+    if orchestrator_config {
+        std::fs::write(
+            dir.join(".nanopi/config.toml"),
+            "[experimental]\norchestrator = true\n",
+        )
+        .expect("write config");
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(&dir)
+        .args(["-p", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-hooks", "--no-skills", "--no-context-files"])
+        .args(args)
+        .env("NANOPI_HOME", dir.join("home"))
+        .output()
+        .expect("run nanopi -p");
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        dir,
+    )
+}
+
+/// D-01/ORC-04: with `experimental.orchestrator = true` in config, `-p`
+/// prints exactly one stderr line naming the note; without the key, no
+/// such line appears at all.
+#[test]
+fn print_mode_warns_when_orchestrator_config_set() {
+    let port_on = spawn_sse_server(vec![delta("just the answer"), finish("stop")]);
+    let (_, stderr_on, dir_on) = run_p_capture(port_on, true, &["hi"]);
+    let note_lines: Vec<&str> = stderr_on
+        .lines()
+        .filter(|l| l.contains("experimental.orchestrator is set but ignored in print mode"))
+        .collect();
+    assert_eq!(
+        note_lines.len(),
+        1,
+        "expected exactly one note line, got: {stderr_on:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir_on);
+
+    let port_off = spawn_sse_server(vec![delta("just the answer"), finish("stop")]);
+    let (_, stderr_off, dir_off) = run_p_capture(port_off, false, &["hi"]);
+    assert!(
+        !stderr_off.contains("experimental.orchestrator"),
+        "note printed without the config key set: {stderr_off:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir_off);
+}
+
+/// D-01/ORC-01: `experimental.orchestrator = true` must never restrict
+/// print mode's registry — the real binary still has `write` available
+/// (not just `read`/`grep`/`find`, the orchestrator's restricted set).
+/// Proven by having the fake model actually call `write` and checking
+/// the file lands on disk, rather than inspecting the request body.
+#[test]
+fn print_mode_ignores_orchestrator_config() {
+    let port = spawn_sse_server_seq(vec![
+        vec![
+            tool_call_delta(
+                0,
+                "call_w",
+                "write",
+                r#"{"path":"proof.txt","content":"orchestrator mode ignored"}"#,
+            ),
+            finish("tool_calls"),
+        ],
+        vec![delta("wrote it"), finish("stop")],
+    ]);
+    let (stdout, stderr, dir) = run_p_capture(port, true, &["write the proof file"]);
+    assert!(
+        stderr.contains("experimental.orchestrator is set but ignored in print mode"),
+        "sanity: note should still fire: {stderr:?}"
+    );
+    assert!(
+        stdout.contains("wrote it"),
+        "turn did not complete: {stdout:?}"
+    );
+    let proof = dir.join("proof.txt");
+    assert!(
+        proof.is_file(),
+        "write tool was unavailable under experimental.orchestrator — print mode must not restrict its registry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&proof).unwrap(),
+        "orchestrator mode ignored"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
