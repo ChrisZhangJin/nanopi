@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use nanopi::agent::agents::{AgentConfig, AgentSource};
 use nanopi::config::AgentConfig as AgentLimits;
 use nanopi::agent_registry::{AgentState, AgentRegistry};
+use nanopi::tool::{Tool, ToolContext};
 use nanopi::tool::agent::{
     build_child_args, build_child_env, run_single, ChildLaunchSpec, ChildProgram, AgentTool,
 };
@@ -113,7 +114,7 @@ async fn spawn_real_child() {
         file_path: PathBuf::from("/nonexistent/scout.md"),
     };
 
-    let out = run_single(&tool.launcher(), &agent, "SPAWN-TASK", &cwd).await;
+    let out = run_single(&tool.launcher(), &agent, "SPAWN-TASK", &cwd, None).await;
     assert!(!out.is_error, "child failed: {}", out.content);
 
     let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
@@ -142,5 +143,70 @@ async fn spawn_real_child() {
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0].state, AgentState::Completed);
     assert!(snap[0].pid.is_some());
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// CTL-01/CTL-05: `background: true` returns immediately while the
+/// child is still live, then finishes in the background with a
+/// report.md and a batched outbox entry once `wait_background` drains.
+#[tokio::test]
+async fn background_dispatch_does_not_block_caller() {
+    let port = spawn_sse_server(vec![delta("- [x] task — BG-ANSWER"), finish("stop")]);
+    let cwd = std::env::temp_dir().join(format!("nanopi-agent-bg-{port}"));
+    let _ = std::fs::remove_dir_all(&cwd);
+    let home = cwd.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let spec = ChildLaunchSpec {
+        model: Some("fake-model".into()),
+        base_url: Some(format!("http://127.0.0.1:{port}")),
+        api_kind: Some("openai".into()),
+        api_key: Some("not-a-real-key".into()),
+        trust: Some(false),
+        timeout: std::time::Duration::from_secs(60),
+        ..ChildLaunchSpec::default()
+    };
+    let program = ChildProgram {
+        program: PathBuf::from("env"),
+        leading_args: vec![
+            format!("HOME={}", home.display()),
+            format!("NANOPI_HOME={}", home.join(".nanopi").display()),
+            env!("CARGO_BIN_EXE_nanopi").to_string(),
+        ],
+    };
+    let reg = AgentRegistry::new(&AgentLimits::default());
+    let tool = AgentTool::with_parts(reg.clone(), spec, program);
+
+    let ctx = ToolContext { cwd: cwd.clone() };
+    let args = serde_json::json!({"task": "BG-TASK", "background": true});
+    let out = tool.execute(args, &ctx).await.expect("in-band dispatch");
+    assert!(!out.is_error, "{}", out.content);
+    let v: serde_json::Value = serde_json::from_str(&out.content).expect("json envelope");
+    let id = v["id"].as_str().expect("id").to_string();
+    assert_eq!(id, "a1");
+    assert!(
+        matches!(v["state"].as_str(), Some("queued") | Some("running")),
+        "{v}"
+    );
+    assert!(v["archive_path"].as_str().unwrap().contains("a1"));
+
+    // The caller gets its turn back immediately: the entry is still
+    // non-terminal right after the call returns.
+    let snap = reg.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert!(!snap[0].state.is_terminal(), "must not block until done");
+
+    reg.wait_background().await;
+
+    let snap = reg.snapshot();
+    assert!(snap[0].state.is_terminal(), "{:?}", snap[0].state);
+    let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
+    assert!(dir.join("report.md").is_file());
+
+    let batch = reg.take_reports().expect("one pending report");
+    assert!(
+        batch.contains("[agent a1 finished:"),
+        "outbox entry missing: {batch}"
+    );
     let _ = std::fs::remove_dir_all(&cwd);
 }

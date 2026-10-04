@@ -26,6 +26,7 @@ fn write_brief(agent_dir: &std::path::Path, id: &str, state: &str, run_id: &str)
         state: state.into(),
         started: "2026-10-04T10:00:00+08:00".into(),
         parent: run_id.into(),
+        label: None,
     };
     std::fs::write(agent_dir.join("brief.md"), render_brief_with_meta(&spec, &meta)).unwrap();
 }

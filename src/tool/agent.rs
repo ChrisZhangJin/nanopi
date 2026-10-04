@@ -32,6 +32,7 @@ use futures_util::future::join_all;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::agents::{discover_agents, AgentConfig, AgentScope, AgentSource, GENERAL_PURPOSE_NAME};
 use crate::agent::brief::{render_brief_with_meta, render_report, BriefMeta, BriefSpec, ReportMeta};
@@ -540,6 +541,10 @@ impl Tool for AgentTool {
                     "cwd": {
                         "type": "string",
                         "description": "single mode: optional working directory for the agent process. Defaults to the current directory."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "single mode only: if true, return {id, state, archive_path} immediately and finish the agent in the background; its report is injected into your context once done. Default false."
                     }
                 }
             }),
@@ -549,14 +554,29 @@ impl Tool for AgentTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let scope = parse_scope(&args).map_err(ToolError::InvalidArgs)?;
         let mode = select_mode(&args).map_err(ToolError::InvalidArgs)?;
+        let background = match args.get("background") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(ToolError::InvalidArgs("`background` must be a boolean".into())),
+        };
         let l = self.launcher();
+
+        if background && mode != Mode::Single {
+            return Err(ToolError::InvalidArgs(
+                "`background` is only valid in single mode".into(),
+            ));
+        }
 
         match mode {
             Mode::Single => {
                 let item = parse_item(&args, "").map_err(ToolError::InvalidArgs)?;
                 let run_cwd = resolve_cwd(&ctx.cwd, item.cwd.as_deref());
                 let task = item.task.clone();
-                Ok(run_item(&l, &item, &task, scope, &run_cwd).await)
+                if background {
+                    Ok(run_item_background(&l, &item, &task, scope, &run_cwd))
+                } else {
+                    Ok(run_item(&l, &item, &task, scope, &run_cwd).await)
+                }
             }
             Mode::Parallel => {
                 let items = parse_items(&args["tasks"], "tasks").map_err(ToolError::InvalidArgs)?;
@@ -758,6 +778,45 @@ async fn run_item(
         }
     }
     run_single(l, &cfg, task, run_cwd, item.description.as_deref()).await
+}
+
+/// `background: true` counterpart to [`run_item`]: identical
+/// resolve/override/validate pipeline, then `prepare_run` +
+/// `spawn_background` instead of awaiting `run_single` (CTL-01).
+fn run_item_background(
+    l: &Launcher,
+    item: &AgentItem,
+    task: &str,
+    scope: AgentScope,
+    run_cwd: &Path,
+) -> ToolOutput {
+    let is_builtin = item.agent.is_none();
+    let base = match resolve_agent_config(item.agent.as_deref(), scope, run_cwd) {
+        Ok(agent) => agent,
+        Err(soft) => return soft,
+    };
+    let mut cfg = apply_inline_overrides(
+        base,
+        is_builtin,
+        item.role.as_deref(),
+        item.tools.clone(),
+        item.model.as_deref(),
+    );
+    if item.tools.is_some() {
+        match validate_tools(cfg.tools.as_deref().unwrap_or_default()) {
+            Ok(canonical) => cfg.tools = Some(canonical),
+            Err(e) => return soft_error(e),
+        }
+    }
+    if let Some(model) = &item.model {
+        if let Err(e) = validate_model(model, l.spec.model.as_deref(), l.spec.vendor.as_deref()) {
+            return soft_error(e);
+        }
+    }
+    match prepare_run(l, &cfg, task, run_cwd, item.description.as_deref()) {
+        Ok(prepared) => spawn_background(&l.registry, prepared),
+        Err(soft) => soft,
+    }
 }
 
 /// Discover + trust-gate a single agent. On failure returns a
@@ -1030,29 +1089,44 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One tracked, capped, briefed child dispatch. Always in-band.
-pub async fn run_single(
+/// Output of [`prepare_run`]: the synchronous half of a dispatch
+/// (reserve the slot, write `brief.md`, regenerate the index, build the
+/// child command) with nothing async yet started. `run_body` consumes
+/// it; `spawn_background` moves it into a `tokio::spawn`'d task.
+pub(crate) struct PreparedRun {
+    id: String,
+    dir: PathBuf,
+    command: Command,
+    timeout: Duration,
+}
+
+impl PreparedRun {
+    /// `.nanopi/agents/<run>/<id>/`, for `{id, state, archive_path}`.
+    fn archive_path(&self) -> String {
+        self.dir.to_string_lossy().into_owned()
+    }
+}
+
+/// The synchronous prepare step shared by `run_single` and
+/// `spawn_background` (CTL-01): reserve the slot, write `brief.md`,
+/// regenerate the run index, build the child command. `Err` carries an
+/// already-terminal `ToolOutput` (reserve failed, or brief-write failed
+/// and the entry was marked `Failed`) — no spawn occurs either way.
+fn prepare_run(
     l: &Launcher,
     agent: &AgentConfig,
     task: &str,
     cwd: &Path,
     label: Option<&str>,
-) -> ToolOutput {
+) -> Result<PreparedRun, ToolOutput> {
     let reg = &*l.registry;
     // D-07: register .nanopi/agents/ in the project .gitignore before the
     // first archive directory is created, once per cwd per process.
     ensure_gitignore_once(cwd);
     // D-03: agent dir exists before spawn; max_live enforced here.
-    let (id, dir) = match reg.reserve(&crate::paths::project_agents_dir(cwd)) {
-        Ok(v) => v,
-        Err(e) => return soft_error(format!("Cannot start agent {:?}: {e}", agent.name)),
-    };
-    let mut sg = StateGuard {
-        reg,
-        id: id.clone(),
-        dir: dir.clone(),
-        done: false,
-    };
+    let (id, dir) = reg
+        .reserve(&crate::paths::project_agents_dir(cwd))
+        .map_err(|e| soft_error(format!("Cannot start agent {:?}: {e}", agent.name)))?;
     let tools = agent.tools.clone().unwrap_or_default();
     let role = if agent.system_prompt.trim().is_empty() {
         (!agent.description.trim().is_empty()).then(|| agent.description.clone())
@@ -1078,18 +1152,13 @@ pub async fn run_single(
     if let Err(e) = write_private(&dir.join("brief.md"), &brief) {
         ensure_report(&dir, &id, AgentState::Failed, &format!("cannot write brief: {e}"));
         reg.set_state(&id, AgentState::Failed);
-        sg.done = true;
-        return failed_output(&format!("cannot write brief: {e}"), "");
+        return Err(failed_output(&format!("cannot write brief: {e}"), ""));
     }
     if let Some(run_dir) = dir.parent() {
         if let Err(e) = archive::regenerate_index(run_dir) {
             crate::note!("nanopi: debug: regenerate_index({}): {e}", run_dir.display());
         }
     }
-
-    // Beyond max_concurrency: queue here (state stays Queued).
-    let _permit = reg.acquire_run().await;
-    reg.set_state(&id, AgentState::Running);
 
     let mut command = l.program.command();
     command
@@ -1101,8 +1170,40 @@ pub async fn run_single(
         ))
         .envs(build_child_env(&l.spec, &id))
         .current_dir(cwd);
+
+    Ok(PreparedRun {
+        id,
+        dir,
+        command,
+        timeout: l.spec.timeout,
+    })
+}
+
+/// The async half of a dispatch: acquire the concurrency permit, run
+/// the child, cap and attach `report.md`, record the terminal state.
+/// Returns the same `ToolOutput` shape `run_single` has always
+/// returned. Shared by the foreground path and `spawn_background`'s
+/// spawned task.
+pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> ToolOutput {
+    let PreparedRun {
+        id,
+        dir,
+        command,
+        timeout,
+    } = prepared;
+    let mut sg = StateGuard {
+        reg,
+        id: id.clone(),
+        dir: dir.clone(),
+        done: false,
+    };
+
+    // Beyond max_concurrency: queue here (state stays Queued).
+    let _permit = reg.acquire_run().await;
+    reg.set_state(&id, AgentState::Running);
+
     let mut out =
-        spawn_and_collect_with(command, l.spec.timeout, |pid| reg.set_pid(&id, pid)).await;
+        spawn_and_collect_with(command, timeout, |pid| reg.set_pid(&id, pid)).await;
 
     let status = out
         .metadata
@@ -1153,6 +1254,79 @@ pub async fn run_single(
     reg.set_state(&id, state);
     sg.done = true;
     out
+}
+
+/// One tracked, capped, briefed child dispatch. Always in-band.
+pub async fn run_single(
+    l: &Launcher,
+    agent: &AgentConfig,
+    task: &str,
+    cwd: &Path,
+    label: Option<&str>,
+) -> ToolOutput {
+    match prepare_run(l, agent, task, cwd, label) {
+        Ok(prepared) => run_body(&l.registry, prepared).await,
+        Err(soft) => soft,
+    }
+}
+
+/// `background: true` dispatch (CTL-01/D-01): prepare synchronously,
+/// then hand `run_body` to `tokio::spawn` raced against a cancellation
+/// token, and return `{id, state, archive_path}` WITHOUT awaiting the
+/// task. When finished (normally or stopped), the capped report is
+/// pushed to the registry's outbox for later injection (CTL-05/D-06).
+pub(crate) fn spawn_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) -> ToolOutput {
+    let id = prepared.id.clone();
+    let archive_path = prepared.archive_path();
+    let dir = prepared.dir.clone();
+
+    let token = CancellationToken::new();
+    let reg_task = Arc::clone(reg);
+    let token_task = token.clone();
+    let id_task = id.clone();
+    let dir_task = dir.clone();
+
+    let handle = tokio::spawn(async move {
+        let reg_ref = &*reg_task;
+        let final_state = tokio::select! {
+            biased;
+            _ = token_task.cancelled() => {
+                // `run_body`'s `StateGuard` is dropped mid-flight by the
+                // cancellation of this branch's sibling, which already
+                // marks the entry Stopped and writes the partial report
+                // (ChildGuard in spawn_and_collect_with kills the group
+                // on drop too). Nothing left to do here but read it back.
+                AgentState::Stopped
+            }
+            out = run_body(reg_ref, prepared) => {
+                let _ = out;
+                reg_ref
+                    .snapshot()
+                    .into_iter()
+                    .find(|e| e.id == id_task)
+                    .map(|e| e.state)
+                    .unwrap_or(AgentState::Failed)
+            }
+        };
+        let report_path = dir_task.join("report.md");
+        let text = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let capped = cap_report(text, &report_path);
+        reg_task.push_report(&id_task, final_state, &capped);
+    });
+
+    reg.track_background(&id, handle, token);
+
+    ToolOutput {
+        content: json!({
+            "id": id,
+            "state": AgentState::Queued.as_str(),
+            "archive_path": archive_path,
+        })
+        .to_string(),
+        is_error: false,
+        metadata: Some(json!({"agent_id": id, "agent_dir": archive_path})),
+        images: Vec::new(),
+    }
 }
 
 /// Max bytes of child stdout retained (T-01-11). A larger envelope is
@@ -2291,6 +2465,62 @@ mod tests {
         }
         assert_eq!(l.registry.snapshot()[0].state, AgentState::Completed);
         assert!(l.registry.snapshot()[0].pid.is_some());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_dispatch_returns_immediately() {
+        let cwd = tmp("bg");
+        // Slow fake child: a synchronous await would take 5s.
+        let l = launcher(&format!("sleep 5; echo '{OK_ENV}'"), 8, 4);
+        let start = std::time::Instant::now();
+        let out = AgentTool::with_parts(
+            l.registry.clone(),
+            l.spec.clone(),
+            l.program.clone(),
+        )
+        .execute(
+            json!({"task": "slow task", "background": true}),
+            &ToolContext { cwd: cwd.clone() },
+        )
+        .await
+        .expect("in-band dispatch");
+        assert!(start.elapsed() < Duration::from_secs(2), "must not block on the child");
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["id"].as_str(), Some("a1"));
+        assert!(
+            matches!(v["state"].as_str(), Some("queued") | Some("running")),
+            "{v}"
+        );
+        assert!(v["archive_path"].as_str().unwrap().contains("a1"));
+        l.registry.wait_background().await;
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_rejected_outside_single_mode() {
+        let cwd = tmp("bg-reject");
+        let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
+        let tool = AgentTool::with_parts(
+            l.registry.clone(),
+            l.spec.clone(),
+            l.program.clone(),
+        );
+        let err = tool
+            .execute(
+                json!({"tasks": [{"task": "t1"}], "background": true}),
+                &ToolContext { cwd: cwd.clone() },
+            )
+            .await
+            .expect_err("background must be rejected outside single mode");
+        let msg = match err {
+            ToolError::InvalidArgs(m) => m,
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        };
+        assert!(msg.contains("single mode"), "{msg}");
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
