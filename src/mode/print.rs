@@ -410,6 +410,48 @@ pub async fn run_print_mode(
                     }
                 }
             }
+            // D-07: never exit with agents still running. Skipped
+            // entirely when none are tracked, so a `-p` run with zero
+            // background agents pays nothing extra (Addendum 2: no
+            // ctrl_c listener is installed for the ordinary main-turn
+            // case, only for this drain window).
+            let mut interrupted = false;
+            let mut extra_reports_appendix: Option<String> = None;
+            if let Some(reg) = crate::agent_registry::global() {
+                if reg.has_background() {
+                    tokio::select! {
+                        _ = reg.wait_background() => {}
+                        _ = tokio::signal::ctrl_c() => {
+                            // Ctrl-C during the drain: stop every
+                            // tracked agent, then await again so the
+                            // partial reports they write on the way
+                            // down are flushed (Pitfall 3) before this
+                            // process exits.
+                            reg.stop_all();
+                            reg.wait_background().await;
+                            interrupted = true;
+                        }
+                    }
+                    if !interrupted {
+                        if let Some(text) = reg.take_reports() {
+                            // Bounded to exactly one extra main turn
+                            // (T-04-09): whatever this turn itself
+                            // launches is awaited below but never given
+                            // a turn of its own — any further reports
+                            // are appended to report.md verbatim.
+                            let extra = agent.run_turn(text.as_str(), &tx, None, None).await;
+                            if r.is_ok() {
+                                if let Err(e) = extra {
+                                    r = Err(e);
+                                }
+                            }
+                            limit = limit.or_else(|| agent.last_limit_hit());
+                            reg.wait_background().await;
+                            extra_reports_appendix = reg.take_reports();
+                        }
+                    }
+                }
+            }
             // Fire session_end regardless of turn outcome so cleanup
             // hooks (e.g. flush metrics) always run.
             agent.fire_session_shutdown("quit").await;
@@ -417,7 +459,17 @@ pub async fn run_print_mode(
             let tokens = (agent.usage_total.input_tokens as u64)
                 + (agent.usage_total.output_tokens as u64);
             let files_changed = files_changed_from(&agent.context.messages);
-            (r, limit, checklist_reply, answer, turns, tokens, files_changed)
+            (
+                r,
+                limit,
+                checklist_reply,
+                answer,
+                turns,
+                tokens,
+                files_changed,
+                interrupted,
+                extra_reports_appendix,
+            )
         })
     };
 
@@ -445,9 +497,20 @@ pub async fn run_print_mode(
     if let Some(mut s) = spinner.take() {
         s.stop().await;
     }
-    let (turn_result, limit_hit, checklist_reply, answer, turns, tokens, files_changed) =
-        agent_task.await?;
-    let status = if turn_result.is_err() {
+    let (
+        turn_result,
+        limit_hit,
+        checklist_reply,
+        answer,
+        turns,
+        tokens,
+        files_changed,
+        interrupted,
+        extra_reports_appendix,
+    ) = agent_task.await?;
+    let status = if interrupted {
+        "interrupted"
+    } else if turn_result.is_err() {
         "failed"
     } else if limit_hit.is_some() {
         "limit_reached"
@@ -457,7 +520,13 @@ pub async fn run_print_mode(
     // report.md on every exit path (D-11). Best effort.
     let report_path = brief_path.as_deref().map(|p| {
         let rp = report_path_for(p);
-        let summary = report_summary(answer.as_deref(), &turn_result);
+        let mut summary = report_summary(answer.as_deref(), &turn_result);
+        // Anything a background agent launched by the one bounded
+        // extra turn (D-07) itself finished with — appended to the
+        // report body only, never given a turn of its own (T-04-09).
+        if let Some(extra) = extra_reports_appendix.as_deref() {
+            summary = format!("{summary}\n\n{extra}");
+        }
         let items = checklist_items(checklist_reply.as_deref(), status);
         let mut open_issues: Vec<String> = items
             .iter()
@@ -499,9 +568,14 @@ pub async fn run_print_mode(
     });
     // Text mode keeps the old behavior (error -> exit 1 via main). JSON
     // mode reports the failure in-band so the parent can parse it.
+    // Ctrl-C during the drain (`interrupted`) is reported the same way
+    // in both modes rather than bailing via `main`'s `?`, since the
+    // report has already been written above and this is a clean,
+    // expected exit path (D-07, Addendum 2), not a propagated error.
     let turn_error = match turn_result {
+        Ok(_) if interrupted => Some("interrupted by ctrl-c while waiting for background agents".to_string()),
         Ok(_) => None,
-        Err(e) if output == OutputFormat::Json => Some(e.to_string()),
+        Err(e) if output == OutputFormat::Json || interrupted => Some(e.to_string()),
         Err(e) => return Err(e.into()),
     };
 
@@ -518,7 +592,12 @@ pub async fn run_print_mode(
                     session_path.display()
                 );
             }
-            Ok(0)
+            if interrupted {
+                eprintln!("nanopi: interrupted — background agents stopped, report written");
+                Ok(130)
+            } else {
+                Ok(0)
+            }
         }
         OutputFormat::Json => {
             let envelope = JsonEnvelope {

@@ -1282,3 +1282,260 @@ fn brief_report_completed_has_done_state_and_numeric_turns() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 04-04 Task 2: print-mode drain loop with Ctrl-C stop_all (D-07)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Like [`spawn_sse_server_seq`], but response `delay_idx` sleeps for
+/// `delay` before writing — long enough that a Ctrl-C sent right after
+/// launch still lands while that request is outstanding.
+fn spawn_sse_server_seq_delayed(
+    responses: Vec<Vec<String>>,
+    delay_idx: usize,
+    delay: std::time::Duration,
+) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    let bodies: Vec<String> = responses
+        .iter()
+        .map(|chunks| {
+            let mut body = String::new();
+            for c in chunks {
+                body.push_str("data: ");
+                body.push_str(c);
+                body.push_str("\n\n");
+            }
+            body.push_str("data: [DONE]\n\n");
+            body
+        })
+        .collect();
+
+    std::thread::spawn(move || {
+        let mut n = 0usize;
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let this_idx = n.min(bodies.len() - 1);
+            if this_idx == delay_idx {
+                std::thread::sleep(delay);
+            }
+            let body = &bodies[this_idx];
+            n += 1;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    port
+}
+
+/// Script a main turn that dispatches one background `agent` call,
+/// followed by the main's own continuation, the background child's own
+/// turn, and (if the drain fires) one more main turn fed the batched
+/// report.
+fn background_dispatch_script() -> Vec<Vec<String>> {
+    vec![
+        // req0: main turn 1 — ask for a background agent.
+        vec![
+            tool_call_delta(
+                0,
+                "c1",
+                "agent",
+                &serde_json::json!({"task": "child task", "background": true}).to_string(),
+            ),
+            finish("tool_calls"),
+        ],
+        // req1: main turn 2 — the tool result came back in-band (the
+        // dispatch doesn't block), so this is a plain final answer.
+        vec![delta("content", "main done"), finish("stop")],
+        // req2: the background child's own single turn.
+        vec![delta("content", "child done"), finish("stop")],
+        // req3: the ONE extra main turn the drain starts once the
+        // report arrives (D-07).
+        vec![delta("content", "ack: child finished"), finish("stop")],
+    ]
+}
+
+fn spawn_p(dir: &std::path::Path, port: u16, args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_nanopi"))
+        .current_dir(dir)
+        .args(["-p", "--output", "json", "--base-url"])
+        .arg(format!("http://127.0.0.1:{port}"))
+        .args(["--model", "fake-model", "--api-key", "not-a-real-key"])
+        .args(["--no-hooks", "--no-skills", "--no-context-files"])
+        .args(args)
+        .env("HOME", dir.join("home"))
+        .env("NANOPI_HOME", dir.join("home/.nanopi"))
+        .env_remove("NANOPI_AGENT_ID")
+        .env_remove("NANOPI_PARENT_PID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nanopi -p")
+}
+
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    secs: u64,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            return s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("nanopi -p hung");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// `-p` awaits every background agent (JoinHandles) before printing the
+/// final result; its report.md exists once the drain is done.
+#[test]
+fn print_mode_waits_for_background_agent_before_exit() {
+    let port = spawn_sse_server_seq(background_dispatch_script());
+    let dir = fresh_dir("bgwait", port);
+    let (status, v, stderr) = run_child(&dir, port, &["do it"], &[]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(v["status"], "completed", "{v}");
+
+    // The background child's own report.md was written under this
+    // run's agent directory.
+    let agents_root = dir.join(".nanopi/agents");
+    let report = std::fs::read_dir(&agents_root)
+        .expect("agents root")
+        .filter_map(|e| e.ok())
+        .find_map(|run_dir| {
+            let p = run_dir.path().join("a1").join("report.md");
+            p.is_file().then_some(p)
+        });
+    assert!(
+        report.is_some(),
+        "background agent's report.md must exist after the drain; agents_root={}",
+        agents_root.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After the drain, exactly one extra main `run_turn` receives the
+/// batched `[agent .. finished: ..]` text — asserted by reading the
+/// extra turn's reply back out of the saved transcript.
+#[test]
+fn background_report_starts_new_turn_when_idle() {
+    let port = spawn_sse_server_seq(background_dispatch_script());
+    let dir = fresh_dir("bgfollowup", port);
+    let (status, v, stderr) = run_child(&dir, port, &["do it"], &[]);
+    assert!(status.success(), "{stderr}");
+    let msgs = v["messages"].as_array().expect("messages array");
+    let has_ack = msgs.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .map(|c| c.contains("ack: child finished"))
+            .unwrap_or(false)
+    });
+    assert!(has_ack, "the extra turn's reply must be in the transcript: {v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Zero background agents: the drain is skipped entirely and the
+/// output is identical to before.
+#[test]
+fn print_mode_zero_background_agents_behaves_as_before() {
+    let port = spawn_sse_server(vec![delta("content", "no agents here"), finish("stop")]);
+    let dir = fresh_dir("bgzero", port);
+    let (status, v, stderr) = run_child(&dir, port, &["hi"], &[]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(v["status"], "completed", "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ctrl-C during the drain stops every background agent and exits
+/// non-zero after writing its (partial) report — no indefinite hang
+/// waiting out the slow child.
+#[test]
+fn print_mode_ctrl_c_stops_all_background_agents() {
+    let mut script = background_dispatch_script();
+    // req2 (the child's turn) is made slow enough that the signal sent
+    // below is guaranteed to land while the drain is still waiting.
+    let port = spawn_sse_server_seq_delayed(
+        std::mem::take(&mut script),
+        2,
+        std::time::Duration::from_secs(5),
+    );
+    let dir = fresh_dir("bgctrlc", port);
+    std::fs::create_dir_all(dir.join("home")).expect("home dir");
+
+    let mut child = spawn_p(&dir, port, &["do it"]);
+    // Give the main turn + tool dispatch + child-process spawn time to
+    // get the background agent's own request in flight, well before
+    // its 5s-delayed response would otherwise arrive.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    // SAFETY: `child.id()` is a live pid owned by this process; SIGINT
+    // is the same signal Ctrl-C sends to a foreground process group
+    // leader.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let status = wait_with_deadline(&mut child, 20);
+    assert!(
+        !status.success(),
+        "an interrupted run must exit non-zero, got {status:?}"
+    );
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let stdout = strip_sgr(&stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+    assert_eq!(v["status"], "interrupted", "{v}");
+
+    // The background agent itself ends up stopped, not left running.
+    let agents_root = dir.join(".nanopi/agents");
+    let brief = std::fs::read_dir(&agents_root)
+        .expect("agents root")
+        .filter_map(|e| e.ok())
+        .find_map(|run_dir| {
+            let p = run_dir.path().join("a1").join("brief.md");
+            p.is_file().then_some(p)
+        })
+        .expect("the background agent's brief.md must exist");
+    let brief_text = std::fs::read_to_string(&brief).expect("read brief.md");
+    assert!(
+        brief_text.contains("state: stopped"),
+        "the background agent must end stopped, not left running: {brief_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

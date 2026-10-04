@@ -206,6 +206,13 @@ impl AgentRegistry {
         !self.reports_lock().is_empty()
     }
 
+    /// Whether any background task is currently tracked (D-07: `-p`
+    /// with zero background agents must skip the drain entirely rather
+    /// than pay for a no-op `select!` and an unused `ctrl_c` listener).
+    pub fn has_background(&self) -> bool {
+        !self.bg_lock().is_empty()
+    }
+
     /// Install the sink that wakes a consumer when a report arrives.
     /// Modelled on `plugin_send`'s installed-sink pattern.
     pub fn install_report_sink(&self, sink: Box<dyn Fn() + Send + Sync>) {

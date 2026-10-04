@@ -181,27 +181,39 @@ fn is_agent_mode(args: &Args) -> bool {
     args.brief.is_some() || std::env::var_os("NANOPI_AGENT_ID").is_some()
 }
 
-/// Resolve on SIGINT (-> 130) or SIGTERM (-> 143).
+/// Resolve on SIGTERM (-> 143) only.
+///
+/// SIGINT/Ctrl-C used to race here too (killing every agent child and
+/// exiting 130 the instant the signal arrived), but that ALWAYS won
+/// against `print_fut` finishing on its own — a whole-future race
+/// against a bare `ctrl_c().await` has no way to lose — which made
+/// `src/mode/print.rs`'s own drain-window `ctrl_c` handling (D-07,
+/// Addendum 2) unreachable: the outer race tore down `print_fut` before
+/// its internal `select!` ever got to run. `tokio::signal::ctrl_c()`
+/// fans a SIGINT out to every live listener, so `print::run_print_mode`
+/// now owns its own listener for the drain window and this function no
+/// longer competes for the same signal. SIGTERM keeps the old
+/// kill-everything-and-exit behavior; nothing inside `run_print_mode`
+/// listens for it.
 async fn wait_for_term_signal() -> i32 {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return 130;
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+                143
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => 130,
-            _ = term.recv() => 143,
+            // No terminate-signal support on this platform/kernel:
+            // nothing left to race against, so stay pending forever
+            // rather than falling back to the SIGINT race this
+            // function used to also run.
+            Err(_) => std::future::pending().await,
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        130
+        std::future::pending().await
     }
 }
 
