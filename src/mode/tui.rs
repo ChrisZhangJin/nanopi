@@ -2004,6 +2004,18 @@ fn apply_orchestrator_mode(app: &mut App, agent: &mut Agent, on: bool) {
         agent.registry = crate::tool::ToolRegistry::orchestrator();
     } else if let Some(saved) = app.saved_registry.take() {
         agent.registry = saved;
+    } else {
+        // `on = false` with no `saved_registry` to restore means orchestrator
+        // mode was never actually turned on for THIS agent (either it was
+        // genuinely already off, or a prior "on" toggle was lost mid-turn —
+        // see `try_apply_orchestrator_toggle`/CR-02). Either way this is a
+        // silent no-op otherwise: nothing in the registry/prompt changes and
+        // there is no error, no log line. Surface it so the CR-02 symptom
+        // (if it ever recurs) is visible rather than swallowed.
+        eprintln!(
+            "nanopi: /orchestrator off requested with no saved registry to restore \
+             (mode was already off for this agent)"
+        );
     }
     agent.context.tools = agent.registry.all_specs();
     let tool_names = agent.registry.names();
@@ -8437,6 +8449,28 @@ mod tests {
             base, non_orchestrator_base,
             "orchestrator-mode reload must not fall back to the plain template"
         );
+    }
+
+    #[test]
+    fn apply_orchestrator_mode_off_with_no_saved_registry_does_not_panic() {
+        // WR-02: calling "off" with no `saved_registry` to restore (e.g.
+        // orchestrator mode was never turned on for this Agent) must be a
+        // harmless no-op — not a panic, not a silent corruption of
+        // `context.tools`.
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-wr02", HooksConfig::default());
+        agent.context.tools = agent.registry.all_specs();
+        let before_names = agent.registry.names();
+
+        let mut app = mkapp();
+        assert!(app.saved_registry.is_none());
+        apply_orchestrator_mode(&mut app, &mut agent, false);
+
+        let mut after_names = agent.registry.names();
+        after_names.sort();
+        let mut before_sorted = before_names.clone();
+        before_sorted.sort();
+        assert_eq!(after_names, before_sorted, "registry must be left untouched");
     }
 
     #[test]
