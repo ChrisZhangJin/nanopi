@@ -287,10 +287,65 @@ pub struct ChecklistItem {
     pub note: String,
 }
 
-pub fn render_report(status: &str, summary: &str, items: &[ChecklistItem]) -> String {
+/// Front-matter metadata rendered ahead of a report body (D-03).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportMeta {
+    pub id: String,
+    pub state: String,
+    pub ended: String,
+    pub turns: Option<u32>,
+    pub tokens: Option<u64>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+}
+
+fn render_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)\n".to_string()
+    } else {
+        items
+            .iter()
+            .map(|i| format!("- {}\n", escape_body(i)))
+            .collect()
+    }
+}
+
+pub fn render_report(
+    meta: &ReportMeta,
+    summary: &str,
+    files_changed: &[String],
+    open_issues: &[String],
+    items: &[ChecklistItem],
+) -> String {
+    let turns = meta
+        .turns
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let tokens = meta
+        .tokens
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let mut fm = format!(
+        "---\nid: {}\nstate: {}\nended: {}\nturns: {}\ntokens: {}\n",
+        fm_value(&meta.id),
+        fm_value(&meta.state),
+        fm_value(&meta.ended),
+        fm_value(&turns),
+        fm_value(&tokens),
+    );
+    if let Some(w) = &meta.worktree {
+        fm.push_str(&format!("worktree: {}\n", fm_value(w)));
+    }
+    if let Some(b) = &meta.branch {
+        fm.push_str(&format!("branch: {}\n", fm_value(b)));
+    }
+    fm.push_str("---\n\n");
+
     let mut out = format!(
-        "# Report\n\n## Status\n\n{status}\n\n## Summary\n\n{}\n\n## Checklist\n\n",
-        summary.trim_end()
+        "{fm}# Report\n\n## Summary\n\n{}\n\n## Files changed\n\n{}\n## Open issues\n\n{}\n## Checklist\n\n",
+        escape_body(summary.trim_end()),
+        render_bullets(files_changed),
+        render_bullets(open_issues),
     );
     for it in items {
         let mark = if it.done { "x" } else { " " };

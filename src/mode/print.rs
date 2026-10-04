@@ -445,7 +445,16 @@ pub async fn run_print_mode(
         let rp = report_path_for(p);
         let summary = report_summary(answer.as_deref(), &turn_result);
         let items = checklist_items(checklist_reply.as_deref(), status);
-        let body = crate::agent::brief::render_report(status, &summary, &items);
+        let report_meta = crate::agent::brief::ReportMeta {
+            id: header.id.clone(),
+            state: status.to_string(),
+            ended: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            turns: None,
+            tokens: None,
+            worktree: None,
+            branch: None,
+        };
+        let body = crate::agent::brief::render_report(&report_meta, &summary, &[], &[], &items);
         if let Err(e) = write_private(&rp, &body) {
             eprintln!("nanopi: cannot write report {}: {e}", rp.display());
         }
@@ -749,9 +758,18 @@ mod report_summary_tests {
 
     #[test]
     fn rendered_report_has_answer_above_checklist() {
-        use crate::agent::brief::{render_report, ChecklistItem};
+        use crate::agent::brief::{render_report, ChecklistItem, ReportMeta};
         let items = vec![ChecklistItem { label: "item".into(), done: true, note: String::new() }];
-        let r = render_report("completed", &report_summary(Some("THE ANSWER"), &Ok::<_, String>("- [x] item".into())), &items);
+        let meta = ReportMeta {
+            id: "test".into(),
+            state: "completed".into(),
+            ended: "2026-10-04T10:00:00+08:00".into(),
+            turns: None,
+            tokens: None,
+            worktree: None,
+            branch: None,
+        };
+        let r = render_report(&meta, &report_summary(Some("THE ANSWER"), &Ok::<_, String>("- [x] item".into())), &[], &[], &items);
         let a = r.find("THE ANSWER").unwrap();
         let c = r.find("- [x] item").unwrap();
         assert!(a < c, "{r}");
