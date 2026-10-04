@@ -387,11 +387,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn report_meta() -> ReportMeta {
+        ReportMeta {
+            id: "a1".into(),
+            state: "done".into(),
+            ended: "2026-10-04T10:00:00+08:00".into(),
+            turns: Some(3),
+            tokens: Some(1200),
+            worktree: None,
+            branch: None,
+        }
+    }
+
     #[test]
     fn report_checklist() {
         let r = render_report(
-            "done",
+            &report_meta(),
             "all good",
+            &[],
+            &[],
             &[
                 ChecklistItem {
                     label: "a".into(),
@@ -408,6 +422,72 @@ mod tests {
         assert!(r.contains("## Checklist"));
         assert!(r.contains("- [x] a\n"));
         assert!(r.contains("- [ ] b — blocked\n"));
+    }
+
+    #[test]
+    fn report_front_matter_fields() {
+        let r = render_report(&report_meta(), "summary", &[], &[], &[]);
+        assert_eq!(front_matter_get(&r, "id"), Some("a1".to_string()));
+        assert_eq!(front_matter_get(&r, "state"), Some("done".to_string()));
+        assert_eq!(
+            front_matter_get(&r, "ended"),
+            Some("2026-10-04T10:00:00+08:00".to_string())
+        );
+        assert_eq!(front_matter_get(&r, "turns"), Some("3".to_string()));
+        assert_eq!(front_matter_get(&r, "tokens"), Some("1200".to_string()));
+        assert_eq!(front_matter_get(&r, "worktree"), None);
+        assert_eq!(front_matter_get(&r, "branch"), None);
+    }
+
+    #[test]
+    fn report_front_matter_unknown_turns_tokens() {
+        let mut m = report_meta();
+        m.turns = None;
+        m.tokens = None;
+        let r = render_report(&m, "summary", &[], &[], &[]);
+        assert_eq!(front_matter_get(&r, "turns"), Some("(unknown)".to_string()));
+        assert_eq!(front_matter_get(&r, "tokens"), Some("(unknown)".to_string()));
+    }
+
+    #[test]
+    fn report_front_matter_includes_worktree_branch_when_some() {
+        let mut m = report_meta();
+        m.worktree = Some("/tmp/wt".into());
+        m.branch = Some("feature/x".into());
+        let r = render_report(&m, "summary", &[], &[], &[]);
+        assert_eq!(front_matter_get(&r, "worktree"), Some("/tmp/wt".to_string()));
+        assert_eq!(front_matter_get(&r, "branch"), Some("feature/x".to_string()));
+    }
+
+    #[test]
+    fn report_section_order() {
+        let r = render_report(
+            &report_meta(),
+            "the summary",
+            &["src/a.rs".to_string()],
+            &["issue one".to_string()],
+            &[ChecklistItem {
+                label: "a".into(),
+                done: true,
+                note: String::new(),
+            }],
+        );
+        let s = r.find("## Summary").unwrap();
+        let f = r.find("## Files changed").unwrap();
+        let o = r.find("## Open issues").unwrap();
+        let c = r.find("## Checklist").unwrap();
+        assert!(s < f && f < o && o < c, "{r}");
+        assert!(r.contains("src/a.rs"));
+        assert!(r.contains("issue one"));
+    }
+
+    #[test]
+    fn report_section_order_empty_lists_say_none() {
+        let r = render_report(&report_meta(), "s", &[], &[], &[]);
+        let files_idx = r.find("## Files changed").unwrap();
+        let issues_idx = r.find("## Open issues").unwrap();
+        let files_section = &r[files_idx..issues_idx];
+        assert!(files_section.contains("(none)"));
     }
 
     fn meta() -> BriefMeta {
