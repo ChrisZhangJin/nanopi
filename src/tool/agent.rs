@@ -1,10 +1,10 @@
-//! `subagent` — delegate a task to a specialized agent in an isolated
+//! `agent` — delegate a task to a specialized agent in an isolated
 //! context window.
 //!
-//! Mirrors PI's subagent extension
-//! (`pi/examples/extensions/subagent/index.ts`), but in-tree as a
+//! Mirrors PI's agent extension
+//! (`pi/examples/extensions/agent/index.ts`), but in-tree as a
 //! built-in rather than a plugin: the WASM plugin path is bounded by
-//! `plugin_tools::PLUGIN_TOOL_DEADLINE` (30s), which a real subagent
+//! `plugin_tools::PLUGIN_TOOL_DEADLINE` (30s), which a real agent
 //! LLM run blows straight past.
 //!
 //! The mechanism is exactly PI's: spawn `nanopi` as a child process
@@ -13,7 +13,7 @@
 //! is a separate context window — that is the whole point.
 //!
 //! Modes: single, parallel, chain. Every dispatch is supervised:
-//! registered in [`SubagentRegistry`] (max_live cap, max_concurrency
+//! registered in [`AgentRegistry`] (max_live cap, max_concurrency
 //! queue), given an agent dir `.nanopi/agents/<run>/<id>/` holding
 //! `brief.md`, `transcript.jsonl` and the child's `report.md`, launched in
 //! its own process group with the parent's provider settings
@@ -36,7 +36,7 @@ use crate::agent::agents::{discover_agents, AgentConfig, AgentScope, AgentSource
 use crate::agent::brief::{render_brief, BriefSpec};
 use crate::agent::context::ToolSpec;
 use crate::mode::print::JsonEnvelope;
-use crate::subagent_registry::{self, AgentState, ChildGuard, SubagentRegistry};
+use crate::agent_registry::{self, AgentState, ChildGuard, AgentRegistry};
 use crate::tool::{ExecutionMode, Tool, ToolContext, ToolError, ToolOutput};
 
 /// Provider/limit settings a child inherits from its parent (D-01).
@@ -57,7 +57,7 @@ pub struct ChildLaunchSpec {
 
 impl Default for ChildLaunchSpec {
     fn default() -> Self {
-        let c = crate::config::SubagentConfig::default();
+        let c = crate::config::AgentConfig::default();
         Self {
             model: None,
             base_url: None,
@@ -78,25 +78,25 @@ pub fn set_launch_spec(spec: ChildLaunchSpec) {
     let _ = LAUNCH_SPEC.set(spec);
 }
 
-/// The `subagent` tool. Fields are overrides; unset ones resolve to the
+/// The `agent` tool. Fields are overrides; unset ones resolve to the
 /// process-wide registry / launch spec at execute time.
 #[derive(Default)]
-pub struct SubagentTool {
-    registry: Option<Arc<SubagentRegistry>>,
+pub struct AgentTool {
+    registry: Option<Arc<AgentRegistry>>,
     spec: Option<ChildLaunchSpec>,
     program: Option<ChildProgram>,
     /// Fallback registry when no global one was installed.
-    fallback: OnceLock<Arc<SubagentRegistry>>,
+    fallback: OnceLock<Arc<AgentRegistry>>,
 }
 
-impl SubagentTool {
+impl AgentTool {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Fully specified tool (tests, embedding).
     pub fn with_parts(
-        registry: Arc<SubagentRegistry>,
+        registry: Arc<AgentRegistry>,
         spec: ChildLaunchSpec,
         program: ChildProgram,
     ) -> Self {
@@ -112,11 +112,11 @@ impl SubagentTool {
         let registry = self
             .registry
             .clone()
-            .or_else(subagent_registry::global)
+            .or_else(agent_registry::global)
             .unwrap_or_else(|| {
                 self.fallback
                     .get_or_init(
-                        || SubagentRegistry::new(&crate::config::SubagentConfig::default()),
+                        || AgentRegistry::new(&crate::config::AgentConfig::default()),
                     )
                     .clone()
             });
@@ -135,12 +135,12 @@ impl SubagentTool {
 /// Everything one dispatch needs, resolved once per tool call.
 #[derive(Clone)]
 pub struct Launcher {
-    pub registry: Arc<SubagentRegistry>,
+    pub registry: Arc<AgentRegistry>,
     pub spec: ChildLaunchSpec,
     pub program: ChildProgram,
 }
 
-/// Hard cap on how many subagents a single `parallel` call may fan out
+/// Hard cap on how many agents a single `parallel` call may fan out
 /// to, mirroring PI's `MAX_PARALLEL_TASKS = 8`. Keeps a runaway model
 /// from spawning a fork bomb of `nanopi` processes.
 const MAX_TASKS: usize = 8;
@@ -156,7 +156,7 @@ enum Mode {
 /// One unit of work in a `parallel`/`chain` batch (also models the
 /// single-mode call after parsing).
 #[derive(Debug, Clone)]
-struct SubagentItem {
+struct AgentItem {
     agent: String,
     task: String,
     cwd: Option<String>,
@@ -186,7 +186,7 @@ fn substitute_previous(task: &str, previous: &str) -> String {
 
 /// Parse a `tasks`/`chain` array into concrete items, validating each
 /// entry's shape. `field` names the array for error messages.
-fn parse_items(value: &Value, field: &str) -> Result<Vec<SubagentItem>, String> {
+fn parse_items(value: &Value, field: &str) -> Result<Vec<AgentItem>, String> {
     let arr = value
         .as_array()
         .ok_or_else(|| format!("`{field}` must be an array"))?;
@@ -203,7 +203,7 @@ fn parse_items(value: &Value, field: &str) -> Result<Vec<SubagentItem>, String> 
             .ok_or_else(|| format!("`{field}[{i}].task` must be a string"))?
             .to_string();
         let cwd = it.get("cwd").and_then(|v| v.as_str()).map(String::from);
-        out.push(SubagentItem { agent, task, cwd });
+        out.push(AgentItem { agent, task, cwd });
     }
     Ok(out)
 }
@@ -334,7 +334,7 @@ fn parse_scope(args: &Value) -> Result<AgentScope, String> {
 }
 
 /// Locate the `nanopi` executable to re-invoke. Prefer the running
-/// binary so a subagent uses the exact same build as its parent.
+/// binary so an agent uses the exact same build as its parent.
 fn nanopi_invocation() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nanopi"))
 }
@@ -356,8 +356,8 @@ fn final_assistant_text(env: &JsonEnvelope) -> String {
 }
 
 #[async_trait]
-impl Tool for SubagentTool {
-    // A subagent spawns a whole `nanopi` process; like `bash`, what it
+impl Tool for AgentTool {
+    // An agent spawns a whole `nanopi` process; like `bash`, what it
     // touches is opaque, so serialize the batch it appears in.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
@@ -365,7 +365,7 @@ impl Tool for SubagentTool {
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "subagent".into(),
+            name: "agent".into(),
             description: concat!(
                 "Delegate tasks to specialized agents that each run in an isolated ",
                 "context window (a separate nanopi process). Use this to keep ",
@@ -537,7 +537,7 @@ fn resolve_agent(
 /// child, so dropping the batch kills every in-flight process group.
 async fn run_parallel(
     l: &Launcher,
-    items: Vec<SubagentItem>,
+    items: Vec<AgentItem>,
     scope: AgentScope,
     base_cwd: &Path,
 ) -> ToolOutput {
@@ -556,7 +556,7 @@ async fn run_parallel(
 /// via `{previous}`. Stops at the first failed step and reports where.
 async fn run_chain(
     l: &Launcher,
-    items: Vec<SubagentItem>,
+    items: Vec<AgentItem>,
     scope: AgentScope,
     base_cwd: &Path,
 ) -> ToolOutput {
@@ -637,7 +637,7 @@ const REPORT_CAP: usize = 64 * 1024;
 /// Marks a registry entry `Stopped` if the dispatch future is dropped
 /// before it records a terminal state.
 struct StateGuard<'a> {
-    reg: &'a SubagentRegistry,
+    reg: &'a AgentRegistry,
     id: String,
     done: bool,
 }
@@ -666,7 +666,7 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
     // D-03: agent dir exists before spawn; max_live enforced here.
     let (id, dir) = match reg.reserve(&cwd.join(".nanopi").join("agents")) {
         Ok(v) => v,
-        Err(e) => return soft_error(format!("Cannot start subagent {:?}: {e}", agent.name)),
+        Err(e) => return soft_error(format!("Cannot start agent {:?}: {e}", agent.name)),
     };
     let mut sg = StateGuard {
         reg,
@@ -736,7 +736,7 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
                 .and_then(|m| m["limit"].as_str())
                 .unwrap_or("limit")
                 .to_string();
-            format!("[subagent stopped: {limit} reached]\n\n{text}")
+            format!("[agent stopped: {limit} reached]\n\n{text}")
         } else {
             text
         };
@@ -812,9 +812,9 @@ fn signal_name(sig: i32) -> &'static str {
 fn failed_output(reason: &str, stderr_tail: &str) -> ToolOutput {
     let tail = stderr_tail.trim();
     let content = if tail.is_empty() {
-        format!("Subagent failed: {reason}")
+        format!("Agent failed: {reason}")
     } else {
-        format!("Subagent failed: {reason}\n--- stderr (tail) ---\n{tail}")
+        format!("Agent failed: {reason}\n--- stderr (tail) ---\n{tail}")
     };
     ToolOutput {
         content,
@@ -893,7 +893,7 @@ async fn spawn_and_collect_with(
 
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => return failed_output(&format!("failed to spawn subagent: {e}"), ""),
+        Err(e) => return failed_output(&format!("failed to spawn agent: {e}"), ""),
     };
     let pid = child.id();
     // Kills the whole group if this future is dropped (cancel) or times out.
@@ -903,7 +903,7 @@ async fn spawn_and_collect_with(
     }
 
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return failed_output("subagent stdio not captured", "");
+        return failed_output("agent stdio not captured", "");
     };
 
     let mut out_buf = Vec::new();
@@ -941,7 +941,7 @@ async fn spawn_and_collect_with(
                 let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                 (Err(format!("timed out after {}s", timeout.as_secs_f64())), false)
             }
-            Ok(Err(e)) => (Err(format!("waiting for subagent: {e}")), false),
+            Ok(Err(e)) => (Err(format!("waiting for agent: {e}")), false),
             Ok(Ok(())) => {
                 // WR-04: the leader is gone. Something it spawned may
                 // still hold the pipes open; give the drains a short
@@ -957,7 +957,7 @@ async fn spawn_and_collect_with(
                 }
                 match child.wait().await {
                     Ok(s) => (Ok(s), drained.unwrap_or(false)),
-                    Err(e) => (Err(format!("waiting for subagent: {e}")), false),
+                    Err(e) => (Err(format!("waiting for agent: {e}")), false),
                 }
             }
         }
@@ -1063,13 +1063,13 @@ fn envelope_output(env: JsonEnvelope, stderr_tail: &str) -> ToolOutput {
     }
     let text = final_assistant_text(&env);
     let mut content = if text.trim().is_empty() {
-        "(subagent produced no output)".to_string()
+        "(agent produced no output)".to_string()
     } else {
         text
     };
     if status == "limit_reached" {
         let limit = env.limit.clone().unwrap_or_else(|| "limit".into());
-        content = format!("[subagent stopped: {limit} reached]\n\n{content}");
+        content = format!("[agent stopped: {limit} reached]\n\n{content}");
     }
     ToolOutput {
         content,
@@ -1190,7 +1190,7 @@ mod tests {
     async fn parallel_rejects_over_cap() {
         let dir = std::env::temp_dir().join(format!("nanopi-sa-cap-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tool = SubagentTool::new();
+        let tool = AgentTool::new();
         let ctx = ToolContext { cwd: dir.clone() };
         let tasks: Vec<Value> = (0..MAX_TASKS + 1)
             .map(|_| json!({"agent": "x", "task": "y"}))
@@ -1256,8 +1256,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nanopi-sa-par-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = run_parallel(
-            &SubagentTool::new().launcher(),
-            vec![SubagentItem {
+            &AgentTool::new().launcher(),
+            vec![AgentItem {
                 agent: "__definitely_not_an_agent__".into(),
                 task: "x".into(),
                 cwd: None,
@@ -1276,8 +1276,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nanopi-sa-chn-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = run_chain(
-            &SubagentTool::new().launcher(),
-            vec![SubagentItem {
+            &AgentTool::new().launcher(),
+            vec![AgentItem {
                 agent: "__definitely_not_an_agent__".into(),
                 task: "x".into(),
                 cwd: None,
@@ -1298,7 +1298,7 @@ mod tests {
         // absent by using a name that cannot exist.
         let dir = std::env::temp_dir().join(format!("nanopi-sa-test-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tool = SubagentTool::new();
+        let tool = AgentTool::new();
         let ctx = ToolContext { cwd: dir.clone() };
         let out = tool
             .execute(
@@ -1614,13 +1614,13 @@ mod tests {
     /// `$4` is the brief path.
     #[cfg(unix)]
     fn launcher(script: &str, max_live: usize, max_conc: usize) -> Launcher {
-        let cfg = crate::config::SubagentConfig {
+        let cfg = crate::config::AgentConfig {
             max_live,
             max_concurrency: max_conc,
-            ..crate::config::SubagentConfig::default()
+            ..crate::config::AgentConfig::default()
         };
-        SubagentTool::with_parts(
-            SubagentRegistry::new(&cfg),
+        AgentTool::with_parts(
+            AgentRegistry::new(&cfg),
             spec_fixture(),
             ChildProgram {
                 program: "sh".into(),
@@ -1684,7 +1684,7 @@ mod tests {
         let out = run_single(&l, &agent_fixture(), "t", &cwd).await;
         assert!(out.is_error);
         assert!(
-            out.content.contains("subagent limit reached"),
+            out.content.contains("agent limit reached"),
             "{}",
             out.content
         );

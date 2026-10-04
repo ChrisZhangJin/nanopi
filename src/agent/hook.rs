@@ -428,7 +428,7 @@ pub struct HookInput {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Subagent id, present only when this process runs as a child
+    /// Agent id, present only when this process runs as a child
     /// (`NANOPI_AGENT_ID` set). Omitted otherwise so the main agent's
     /// payload stays byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]

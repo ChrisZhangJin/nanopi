@@ -42,7 +42,7 @@ pub struct JsonEnvelope {
     /// The `--brief` path (the child's report lives there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_path: Option<String>,
-    /// `NANOPI_AGENT_ID` when running as a subagent child.
+    /// `NANOPI_AGENT_ID` when running as an agent child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     /// Error text when `status == failed`.
@@ -50,7 +50,7 @@ pub struct JsonEnvelope {
     pub error: Option<String>,
 }
 
-/// Child-side (`subagent` process) options for print mode.
+/// Child-side (`agent` process) options for print mode.
 #[derive(Debug, Clone, Default)]
 pub struct ChildOptions {
     /// `--session-file`: exact transcript path; never the active session.
@@ -63,7 +63,7 @@ pub struct ChildOptions {
     pub brief: Option<PathBuf>,
     /// `NANOPI_AGENT_ID`.
     pub agent_id: Option<String>,
-    /// Running as a child: `subagent` is never registered (D-05).
+    /// Running as a child: `agent` is never registered (D-05).
     pub agent_mode: bool,
 }
 
@@ -224,10 +224,10 @@ pub async fn run_print_mode(
     if !tools_allow.is_empty() {
         registry.set_plugin_allowlist(&plugin_candidates);
     }
-    // Depth 1 (D-05): a child never gets the subagent tool, even if the
+    // Depth 1 (D-05): a child never gets the agent tool, even if the
     // parent listed it.
     if child.agent_mode {
-        registry.remove("subagent");
+        registry.remove("agent");
     }
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` live in config.toml,

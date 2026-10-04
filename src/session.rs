@@ -328,7 +328,7 @@ pub fn new_ephemeral_session(
 
 /// Open the session at exactly `path`, creating it (with a fresh
 /// header) if it does not exist or is empty. Backs the child-side
-/// `--session-file`: the parent picks where a subagent's transcript
+/// `--session-file`: the parent picks where an agent's transcript
 /// lives, and the child never touches the cwd's active-session pointer.
 ///
 /// Returns the header and `true` when an existing transcript was

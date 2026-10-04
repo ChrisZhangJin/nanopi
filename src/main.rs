@@ -155,7 +155,7 @@ struct Args {
 
     /// Write this run's transcript to exactly this file (created, or
     /// resumed if it exists). Never touches the cwd's active-session
-    /// pointer. Used by the parent when launching a subagent child.
+    /// pointer. Used by the parent when launching an agent child.
     #[arg(
         long = "session-file",
         value_name = "PATH",
@@ -171,12 +171,12 @@ struct Args {
     #[arg(long = "token-budget", value_name = "N")]
     token_budget: Option<u64>,
 
-    /// Brief file for a subagent child. Its presence marks agent mode.
+    /// Brief file for an agent child. Its presence marks agent mode.
     #[arg(long = "brief", value_name = "PATH")]
     brief: Option<PathBuf>,
 }
 
-/// Agent (child) mode: launched by a parent nanopi as a subagent.
+/// Agent (child) mode: launched by a parent nanopi as an agent.
 fn is_agent_mode(args: &Args) -> bool {
     args.brief.is_some() || std::env::var_os("NANOPI_AGENT_ID").is_some()
 }
@@ -468,20 +468,20 @@ async fn main() -> ExitCode {
         }
     }
 
-    // Subagent supervision (01-05): one registry per run, and the
+    // Agent supervision (01-05): one registry per run, and the
     // resolved provider settings every child inherits (D-01).
-    nanopi::subagent_registry::set_global(nanopi::subagent_registry::SubagentRegistry::new(
-        &cfg.subagent,
+    nanopi::agent_registry::set_global(nanopi::agent_registry::AgentRegistry::new(
+        &cfg.agent,
     ));
-    nanopi::tool::subagent::set_launch_spec(nanopi::tool::subagent::ChildLaunchSpec {
+    nanopi::tool::agent::set_launch_spec(nanopi::tool::agent::ChildLaunchSpec {
         model: Some(model.clone()),
         base_url: Some(base_url.clone()),
         api_kind: api_kind_raw.map(str::to_string),
         api_key: Some(api_key.clone()),
         trust: Some(project_trusted),
-        max_turns: cfg.subagent.max_turns,
-        token_budget: cfg.subagent.token_budget,
-        timeout: std::time::Duration::from_secs(cfg.subagent.timeout_secs),
+        max_turns: cfg.agent.max_turns,
+        token_budget: cfg.agent.token_budget,
+        timeout: std::time::Duration::from_secs(cfg.agent.timeout_secs),
     });
 
     // The TUI needs a real terminal. `-p` is the explicit non-interactive
@@ -553,12 +553,12 @@ async fn main() -> ExitCode {
                 agent_mode,
             },
         );
-        // SIGINT/SIGTERM in print mode: kill every subagent child, then exit
+        // SIGINT/SIGTERM in print mode: kill every agent child, then exit
         // 130/143. Dropping the print future also drops each child's guard.
         tokio::select! {
             r = print_fut => r,
             code = wait_for_term_signal() => {
-                if let Some(reg) = nanopi::subagent_registry::global() {
+                if let Some(reg) = nanopi::agent_registry::global() {
                     reg.kill_all();
                 }
                 Ok(code)
@@ -566,7 +566,7 @@ async fn main() -> ExitCode {
         }
     } else {
         // Ephemeral runs are only wired through the non-interactive print
-        // path (which is where the subagent tool and scripts use it). The
+        // path (which is where the agent tool and scripts use it). The
         // TUI persists across turns and has no clean single teardown to
         // hang temp-file cleanup on; rather than half-wire it, refuse.
         if args.no_session {
@@ -596,7 +596,7 @@ async fn main() -> ExitCode {
     };
 
     // Never leave a running child behind on exit.
-    if let Some(reg) = nanopi::subagent_registry::global() {
+    if let Some(reg) = nanopi::agent_registry::global() {
         reg.kill_all();
     }
     match result {

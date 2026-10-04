@@ -161,15 +161,15 @@ pub struct Config {
     #[serde(default)]
     pub max_replay_entries: Option<usize>,
 
-    /// Child-process subagent limits (`[subagent]` section).
+    /// Child-process agent limits (`[agent]` section).
     #[serde(default)]
-    pub subagent: SubagentConfig,
+    pub agent: AgentConfig,
 }
 
-/// `[subagent]` config: caps for orchestrator-spawned `nanopi -p` children.
+/// `[agent]` config: caps for orchestrator-spawned `nanopi -p` children.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-pub struct SubagentConfig {
+pub struct AgentConfig {
     /// Max simultaneously tracked (non-terminal) children. Default 8.
     pub max_live: usize,
     /// Max children running at once; the rest queue. Default 4.
@@ -182,7 +182,7 @@ pub struct SubagentConfig {
     pub timeout_secs: u64,
 }
 
-impl Default for SubagentConfig {
+impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_live: 8,
@@ -431,7 +431,7 @@ impl Config {
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
-            subagent: SubagentConfig::default(),
+            agent: AgentConfig::default(),
         }
     }
 }
@@ -455,7 +455,7 @@ pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
     }
 
     validate_tool_exec_overrides(&merged)?;
-    validate_subagent(&merged)?;
+    validate_agent(&merged)?;
 
     Ok(merged)
 }
@@ -506,11 +506,11 @@ fn validate_tool_exec_overrides(cfg: &Config) -> Result<(), ConfigError> {
     })
 }
 
-/// `[subagent]` caps of 0 would silently disable subagents
+/// `[agent]` caps of 0 would silently disable agents
 /// (`max_live = 0` refuses every spawn, `timeout_secs = 0` times every
 /// child out at once), so they are refused at load, naming the key (WR-06).
-fn validate_subagent(cfg: &Config) -> Result<(), ConfigError> {
-    let s = &cfg.subagent;
+fn validate_agent(cfg: &Config) -> Result<(), ConfigError> {
+    let s = &cfg.agent;
     let zero: Vec<&str> = [
         ("max_live", s.max_live == 0),
         ("max_concurrency", s.max_concurrency == 0),
@@ -528,7 +528,7 @@ fn validate_subagent(cfg: &Config) -> Result<(), ConfigError> {
     Err(ConfigError::Toml {
         path,
         source: toml::de::Error::custom(format!(
-            "[subagent] {} must be at least 1 (0 would disable subagents)",
+            "[agent] {} must be at least 1 (0 would disable agents)",
             zero.join(", ")
         )),
     })
@@ -646,10 +646,10 @@ fn merge(a: Config, b: Config) -> Config {
         // Scalar Option: b (project) wins if set, else a (global).
         max_replay_entries: b.max_replay_entries.or(a.max_replay_entries),
         // Section-level: project wins if it differs from defaults.
-        subagent: if b.subagent != SubagentConfig::default() {
-            b.subagent
+        agent: if b.agent != AgentConfig::default() {
+            b.agent
         } else {
-            a.subagent
+            a.agent
         },
     }
 }
@@ -965,7 +965,7 @@ command = "echo hi"
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
-            subagent: SubagentConfig::default(),
+            agent: AgentConfig::default(),
         };
         let b = Config {
             model: None,
@@ -982,7 +982,7 @@ command = "echo hi"
             tool_exec_mode: ToolExecMode::default(),
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
-            subagent: SubagentConfig::default(),
+            agent: AgentConfig::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));
@@ -1103,11 +1103,11 @@ command = "/bin/true"
     }
 
     #[test]
-    fn subagent_config_defaults() {
+    fn agent_config_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(
-            c.subagent,
-            SubagentConfig {
+            c.agent,
+            AgentConfig {
                 max_live: 8,
                 max_concurrency: 4,
                 max_turns: 50,
@@ -1118,18 +1118,18 @@ command = "/bin/true"
     }
 
     #[test]
-    fn subagent_config_partial_override() {
-        let c: Config = toml::from_str("[subagent]\nmax_live = 2\n").unwrap();
-        assert_eq!(c.subagent.max_live, 2);
-        assert_eq!(c.subagent.max_concurrency, 4);
-        assert_eq!(c.subagent.timeout_secs, 1800);
+    fn agent_config_partial_override() {
+        let c: Config = toml::from_str("[agent]\nmax_live = 2\n").unwrap();
+        assert_eq!(c.agent.max_live, 2);
+        assert_eq!(c.agent.max_concurrency, 4);
+        assert_eq!(c.agent.timeout_secs, 1800);
     }
 
     #[test]
-    fn subagent_zero_caps_rejected_at_load() {
+    fn agent_zero_caps_rejected_at_load() {
         for key in ["max_live", "timeout_secs"] {
             let tmp = TempDir::new();
-            tmp.write(".nanopi/config.toml", &format!("[subagent]\n{key} = 0\n"));
+            tmp.write(".nanopi/config.toml", &format!("[agent]\n{key} = 0\n"));
             let err = load_config(tmp.path()).unwrap_err().to_string();
             assert!(err.contains(key), "{err}");
         }

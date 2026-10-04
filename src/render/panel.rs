@@ -36,12 +36,12 @@ impl ToolPanel {
         } else {
             args_str.clone()
         };
-        // The subagent tool's args are a nested task/tasks/chain shape
+        // The agent tool's args are a nested task/tasks/chain shape
         // that reads as opaque JSON; give it the same human-readable
         // preview the `-p` renderer uses, falling back to the generic
         // form for any shape we don't recognize.
-        let summary = match (call.name.as_str(), crate::render::subagent_preview(&call.arguments)) {
-            ("subagent", Some(s)) => s,
+        let summary = match (call.name.as_str(), crate::render::agent_preview(&call.arguments)) {
+            ("agent", Some(s)) => s,
             _ => format!("{} {}", call.name, preview),
         };
         Self {
@@ -179,32 +179,32 @@ mod tests {
     }
 
     #[test]
-    fn subagent_panel_summary_is_human_readable() {
+    fn agent_panel_summary_is_human_readable() {
         // single
         let p = ToolPanel::new(&call(
-            "subagent",
+            "agent",
             json!({"agent": "scout", "task": "map the render layer"}),
         ));
         assert_eq!(p.summary, "scout: map the render layer");
         // parallel
         let p = ToolPanel::new(&call(
-            "subagent",
+            "agent",
             json!({"tasks": [{"agent": "scout", "task": "a"}, {"agent": "worker", "task": "b"}]}),
         ));
         assert_eq!(p.summary, "parallel x2: scout, worker");
         // chain
         let p = ToolPanel::new(&call(
-            "subagent",
+            "agent",
             json!({"chain": [{"agent": "planner", "task": "p"}, {"agent": "worker", "task": "w"}]}),
         ));
         assert_eq!(p.summary, "chain: planner -> worker");
     }
 
     #[test]
-    fn subagent_panel_summary_falls_back_on_malformed_args() {
+    fn agent_panel_summary_falls_back_on_malformed_args() {
         // No recognized shape → the generic `name args` summary, no panic.
-        let p = ToolPanel::new(&call("subagent", json!({"nonsense": 1})));
-        assert!(p.summary.starts_with("subagent "), "{:?}", p.summary);
+        let p = ToolPanel::new(&call("agent", json!({"nonsense": 1})));
+        assert!(p.summary.starts_with("agent "), "{:?}", p.summary);
     }
 
     #[test]

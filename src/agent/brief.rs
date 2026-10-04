@@ -1,4 +1,4 @@
-//! Brief / amendment / report text model for subagents (RT-09, D-09..D-11).
+//! Brief / amendment / report text model for agents (RT-09, D-09..D-11).
 //!
 //! A brief is a markdown file the orchestrator writes for a child. Later
 //! instructions are appended as `## Amendment N` sections. Amendments are

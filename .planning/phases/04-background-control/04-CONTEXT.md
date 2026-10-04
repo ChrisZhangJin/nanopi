@@ -6,7 +6,7 @@
 <domain>
 ## Phase Boundary
 
-The model can run subagents in the background, then amend, stop, list
+The model can run agents in the background, then amend, stop, list
 and continue them. Reports flow back to the main agent automatically.
 Print mode never leaves an agent running after it exits. Code-writing
 agents can work in git worktrees that are merged back. Covers
@@ -18,11 +18,11 @@ CTL-01..07 and ISO-01..02.
 ## Implementation Decisions
 
 ### Launch
-- **D-01:** Add `background: bool` to the `subagent` call (default
+- **D-01:** Add `background: bool` to the `agent` call (default
   false). A background dispatch returns at once with
   `{id, state: queued|running, archive path}`.
 
-### Control tools (main agent only; never given to subagents)
+### Control tools (main agent only; never given to agents)
 - **D-02:** `send_message {id, message}`:
   - Running agent: the message is delivered through the agent's steer
     channel at its next turn boundary, never during a tool call, and
@@ -44,7 +44,7 @@ CTL-01..07 and ISO-01..02.
 
 ### Report injection
 - **D-06:** When a background agent finishes, the main agent receives
-  `[subagent a3 finished: done] <capped report>`. If the main agent is
+  `[agent a3 finished: done] <capped report>`. If the main agent is
   idle, the message starts a new turn, using the queued follow-up path.
   If it is streaming, the message is delivered as
   `SteerMessage::FollowUp`. Several reports that finish together are
@@ -118,6 +118,6 @@ mechanism.
 
 ## Revision 2026-10-03 (supersedes conflicting decisions above)
 
-Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Subagents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
+Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Agents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
 - Amend = append to brief.md (no in-memory steer channel). Stop = kill the child process group. Continue = start a new `nanopi -p --session` on the same transcript; also used for amendments that arrive after the child finished.
-- No user Esc/stop-all for subagents.
+- No user Esc/stop-all for agents.

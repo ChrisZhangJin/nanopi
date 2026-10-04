@@ -15,7 +15,7 @@ pub mod find;
 pub mod grep;
 pub mod ls;
 pub mod read;
-pub mod subagent;
+pub mod agent;
 pub mod write;
 
 use std::collections::HashMap;
@@ -429,7 +429,7 @@ impl ToolRegistry {
     }
 
     /// Remove one tool by exact name. Only ever used to *narrow* the
-    /// toolset (e.g. stripping `subagent` from a child agent, D-05);
+    /// toolset (e.g. stripping `agent` from a child agent, D-05);
     /// returns whether something was removed.
     pub fn remove(&mut self, name: &str) -> bool {
         self.tools.remove(name).is_some()
@@ -574,7 +574,7 @@ impl ToolRegistry {
         r.register(Arc::new(grep::GrepTool));
         r.register(Arc::new(find::FindTool));
         r.register(Arc::new(ls::LsTool));
-        r.register(Arc::new(subagent::SubagentTool::new()));
+        r.register(Arc::new(agent::AgentTool::new()));
         r
     }
 
@@ -681,9 +681,9 @@ mod tests {
             "unlisted plugin tool must not register"
         );
         let mut r = ToolRegistry::standard();
-        assert!(r.remove("subagent"));
-        assert!(r.get("subagent").is_none());
-        assert!(!r.remove("subagent"));
+        assert!(r.remove("agent"));
+        assert!(r.get("agent").is_none());
+        assert!(!r.remove("agent"));
     }
 
     struct EchoTool;
@@ -830,7 +830,7 @@ mod tests {
         let names = ToolRegistry::standard().names();
         assert_eq!(
             names,
-            vec!["bash", "edit", "find", "grep", "ls", "read", "subagent", "write"]
+            vec!["agent", "bash", "edit", "find", "grep", "ls", "read", "write"]
         );
     }
 

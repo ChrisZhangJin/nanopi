@@ -7,10 +7,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use nanopi::agent::agents::{AgentConfig, AgentSource};
-use nanopi::config::SubagentConfig;
-use nanopi::subagent_registry::{AgentState, SubagentRegistry};
-use nanopi::tool::subagent::{
-    build_child_args, build_child_env, run_single, ChildLaunchSpec, ChildProgram, SubagentTool,
+use nanopi::config::AgentConfig as AgentLimits;
+use nanopi::agent_registry::{AgentState, AgentRegistry};
+use nanopi::tool::agent::{
+    build_child_args, build_child_env, run_single, ChildLaunchSpec, ChildProgram, AgentTool,
 };
 
 /// Serve the same SSE body to every request (copied from print_mode_e2e).
@@ -69,7 +69,7 @@ fn finish(reason: &str) -> String {
 #[tokio::test]
 async fn spawn_real_child() {
     let port = spawn_sse_server(vec![delta("- [x] task — CHILD-ANSWER"), finish("stop")]);
-    let cwd = std::env::temp_dir().join(format!("nanopi-subagent-spawn-{port}"));
+    let cwd = std::env::temp_dir().join(format!("nanopi-agent-spawn-{port}"));
     let _ = std::fs::remove_dir_all(&cwd);
     let home = cwd.join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -101,8 +101,8 @@ async fn spawn_real_child() {
             env!("CARGO_BIN_EXE_nanopi").to_string(),
         ],
     };
-    let reg = SubagentRegistry::new(&SubagentConfig::default());
-    let tool = SubagentTool::with_parts(reg.clone(), spec, program);
+    let reg = AgentRegistry::new(&AgentLimits::default());
+    let tool = AgentTool::with_parts(reg.clone(), spec, program);
     let agent = AgentConfig {
         name: "scout".into(),
         description: "test agent".into(),

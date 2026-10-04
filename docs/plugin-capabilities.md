@@ -66,7 +66,7 @@ of them is the missing veto**:
   nanopi's TUI has no overlay compositor and its dock is two lines;
   more importantly, plugins here exist to add backend capability, not
   to change how nanopi looks.
-- **Providers, subagents, compaction strategy.** These require the
+- **Providers, agents, compaction strategy.** These require the
   plugin to sit on the critical path and have its result used, which
   is a different mechanism (a *slot*, not an event) and a separate
   document if it ever happens.

@@ -1,11 +1,11 @@
-# Subagents
+# Agents
 
-The `subagent` tool runs each subagent as a separate `nanopi -p` child process.
+The `agent` tool runs each agent as a separate `nanopi -p` child process.
 Modes: single, parallel (up to 8 tasks), chain. A child that crashes, panics,
 is killed or times out comes back to the model as an in-band `status: failed`
 result; the parent keeps running.
 
-There is no keybinding, slash command, prompt or TUI action for subagents.
+There is no keybinding, slash command, prompt or TUI action for agents.
 They are controlled only by the model through the tool.
 
 ## Child command line
@@ -21,7 +21,7 @@ nanopi -p --output json \
 
 - The child inherits the parent's model, base url and api kind.
 - Trust: an approved parent passes `--approve`; otherwise `--distrust`. A child never prompts.
-- In agent mode the `subagent` tool is removed, so children cannot recurse.
+- In agent mode the `agent` tool is removed, so children cannot recurse.
 - stdin is null; the child runs in its own process group.
 
 ## Environment
@@ -35,8 +35,8 @@ nanopi -p --output json \
 ## Config
 
 ```toml
-[subagent]
-max_live = 8          # tracked non-terminal children; beyond -> "subagent limit reached"
+[agent]
+max_live = 8          # tracked non-terminal children; beyond -> "agent limit reached"
 max_concurrency = 4   # running at once; the rest queue
 max_turns = 50        # per child
 token_budget = 300000 # per child

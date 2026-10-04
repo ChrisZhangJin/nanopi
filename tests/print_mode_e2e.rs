@@ -1027,7 +1027,7 @@ fn limit_token_budget_reports_limit_reached() {
 }
 
 #[test]
-fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
+fn tools_allowlist_agent_strips_agent_and_denies_unlisted_in_band() {
     let (port, log) = spawn_recording_server(vec![
         vec![
             tool_call_delta(0, "c1", "bash", r#"{"command":"echo hi"}"#),
@@ -1043,7 +1043,7 @@ fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
         port,
         &[
             "--tools",
-            "read,subagent",
+            "read,agent",
             "--brief",
             brief.to_str().unwrap(),
             "go",
@@ -1071,7 +1071,7 @@ fn tools_allowlist_agent_strips_subagent_and_denies_unlisted_in_band() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
         .collect();
-    assert_eq!(names, vec!["read"], "only listed tools, subagent stripped");
+    assert_eq!(names, vec!["read"], "only listed tools, agent stripped");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

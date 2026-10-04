@@ -1,32 +1,32 @@
-# Requirements — v0.13.0 Orchestrator & Dynamic Subagents
+# Requirements — v0.13.0 Orchestrator & Dynamic Agents
 
 Source: `.planning/PROJECT.md`, `.planning/research/SUMMARY.md`, and
 owner decisions made on 2026-10-03.
 
 ## v1 Requirements (this milestone)
 
-### Runtime (RT) — child-process subagents (owner decision 2026-10-03)
+### Runtime (RT) — child-process agents (owner decision 2026-10-03)
 
-- [x] **RT-01**: Each subagent runs as an isolated `nanopi -p` child
-  process. A crash, panic, stack overflow or OOM in a subagent never
+- [x] **RT-01**: Each agent runs as an isolated `nanopi -p` child
+  process. A crash, panic, stack overflow or OOM in an agent never
   affects the main nanopi process.
 
 - [x] **RT-02**: Every child process is tracked by the orchestrator
   (id, pid, state) and is killed when it is stopped, when its parent
   turn is cancelled, or when nanopi exits. No orphaned processes.
 
-- [x] **RT-03**: Subagents are controlled only by the orchestrator
+- [x] **RT-03**: Agents are controlled only by the orchestrator
   (main agent) through tools. The user never stops, answers or messages
-  a subagent directly; they talk only to the orchestrator.
+  an agent directly; they talk only to the orchestrator.
 
-- [x] **RT-04**: Each subagent has its own session transcript in its
+- [x] **RT-04**: Each agent has its own session transcript in its
   agent directory, and nothing leaks into the parent session.
 
-- [x] **RT-05**: Subagents cannot spawn subagents (the child is started
-  without the subagent/control tools). A global cap limits how many
+- [x] **RT-05**: Agents cannot spawn agents (the child is started
+  without the agent/control tools). A global cap limits how many
   child processes are alive at once.
 
-- [x] **RT-06**: Each subagent has a turn limit and a token budget,
+- [x] **RT-06**: Each agent has a turn limit and a token budget,
   passed to the child on its command line, with configurable defaults.
   When it hits either, it stops and reports partial work.
 
@@ -48,7 +48,7 @@ owner decisions made on 2026-10-03.
 
 ### Dynamic dispatch (DYN)
 
-- [ ] **DYN-01**: The model can dispatch a subagent by describing the
+- [ ] **DYN-01**: The model can dispatch an agent by describing the
   task only. Without an agent name, a general-purpose agent is used.
 
 - [ ] **DYN-02**: The model can give an ad-hoc role prompt and a
@@ -58,40 +58,40 @@ owner decisions made on 2026-10-03.
 - [ ] **DYN-03**: Predefined agent files and single / parallel / chain
   modes keep working.
 
-- [ ] **DYN-04**: The model can choose a model per subagent.
+- [ ] **DYN-04**: The model can choose a model per agent.
 - [ ] **DYN-05**: The parent receives a capped summary report, not the
-  subagent's full transcript.
+  agent's full transcript.
 
 ### Control & communication (CTL)
 
-- [ ] **CTL-01**: The model can launch a subagent in the background and
+- [ ] **CTL-01**: The model can launch an agent in the background and
   keep working; every agent has an id.
 
-- [ ] **CTL-02**: The model can amend a running subagent's task by
+- [ ] **CTL-02**: The model can amend a running agent's task by
   appending to its brief file (RT-09). The child picks it up between
   turns, never in the middle of a tool call. If the child has already
   finished, the amendment is handled by continuing it (CTL-06).
 
-- [ ] **CTL-03**: The model can stop a running subagent, and the
-  subagent reports its partial work.
+- [ ] **CTL-03**: The model can stop a running agent, and the
+  agent reports its partial work.
 
-- [ ] **CTL-04**: The model can list subagents with their status.
-- [ ] **CTL-05**: A finished background subagent's report is delivered
+- [ ] **CTL-04**: The model can list agents with their status.
+- [ ] **CTL-05**: A finished background agent's report is delivered
   to the main agent automatically. If the main agent is idle, the
   report starts a new turn; if it is streaming, the report is queued as
   a follow-up.
 
-- [ ] **CTL-06**: The model can continue a finished subagent with a new
+- [ ] **CTL-06**: The model can continue a finished agent with a new
   message: a new `nanopi -p` is started on the same session, so the
-  subagent keeps its previous context.
+  agent keeps its previous context.
 
 - [ ] **CTL-07**: In print mode (`-p`), nanopi waits for background
-  subagents (or stops them) before exiting, so no task is left
+  agents (or stops them) before exiting, so no task is left
   orphaned.
 
 ### Archive (ARC)
 
-- [ ] **ARC-01**: Each subagent writes
+- [ ] **ARC-01**: Each agent writes
   `.nanopi/agents/<run>/<id>/brief.md` (task, role, tools, model) when
   it starts. Amendments are appended to that file.
 
@@ -101,7 +101,7 @@ owner decisions made on 2026-10-03.
 - [ ] **ARC-03**: `.nanopi/agents/` is added to `.gitignore`
   automatically and is excluded from the agents' own searches.
 
-- [ ] **ARC-04**: Subagents that were still running when nanopi exited
+- [ ] **ARC-04**: Agents that were still running when nanopi exited
   are marked `interrupted` on the next start; they are not re-run.
 
 - [ ] **ARC-05**: The user can clean up the archive with one command,
@@ -110,7 +110,7 @@ owner decisions made on 2026-10-03.
 
 ### Isolation (ISO)
 
-- [ ] **ISO-01**: A subagent that writes code can run in its own git
+- [ ] **ISO-01**: An agent that writes code can run in its own git
   worktree, either opt-in per dispatch or by default for parallel
   writers. The report includes the worktree path and branch.
 
@@ -124,7 +124,7 @@ owner decisions made on 2026-10-03.
 
 ### TUI agents strip (UI)
 
-- [ ] **UI-01**: When subagents exist, a 1–3 line strip appears above
+- [ ] **UI-01**: When agents exist, a 1–3 line strip appears above
   the input box. Each line shows the agent's id, role, short task,
   state (running / waiting for approval / done / failed / stopped /
   interrupted) and elapsed time.
@@ -134,7 +134,7 @@ owner decisions made on 2026-10-03.
   expanded view shows each agent's latest activity and its report path.
 
 - [ ] **UI-03**: The strip is display-only. It has no stop, approve or
-  message actions; subagents are controlled through the orchestrator
+  message actions; agents are controlled through the orchestrator
   (RT-03).
 
 - [ ] **UI-04**: The strip is redrawn from a registry snapshot on the
@@ -151,7 +151,7 @@ owner decisions made on 2026-10-03.
   continue. The write, edit and bash tools are not registered.
 
 - [ ] **ORC-03**: The orchestrator's system prompt tells it to
-  analyse, split the work, dispatch subagents, monitor them, and
+  analyse, split the work, dispatch agents, monitor them, and
   synthesise their reports for the user.
 
 - [ ] **ORC-04**: When orchestrator mode is off, the prompts and tool
@@ -179,12 +179,12 @@ owner decisions made on 2026-10-03.
 
 | Item | Reason |
 |------|--------|
-| Stopping or messaging a subagent directly from the expanded panel | Owner chose to control agents through the orchestrator and tools only |
+| Stopping or messaging an agent directly from the expanded panel | Owner chose to control agents through the orchestrator and tools only |
 | Nested teams / swarms; workers messaging each other | Anti-feature: cost and complexity, and hard to observe |
 | Orchestrator with write / edit / bash | It would end up doing the work itself |
 | Orchestrator mode as the default | Experimental |
-| Forking the parent's full context into subagents by default | Bloats context; the brief is the interface |
-| Child-process subagent fallback | Owner chose to remove the old runtime |
+| Forking the parent's full context into agents by default | Bloats context; the brief is the interface |
+| Child-process agent fallback | Owner chose to remove the old runtime |
 | ratatui 0.30 upgrade | API split; not this milestone |
 
 ## Traceability

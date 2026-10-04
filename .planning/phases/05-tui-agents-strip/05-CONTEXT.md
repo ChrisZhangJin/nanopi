@@ -6,7 +6,7 @@
 <domain>
 ## Phase Boundary
 
-A bottom strip in the TUI shows every subagent at a glance. It expands
+A bottom strip in the TUI shows every agent at a glance. It expands
 with a shortcut to show details, and the user approves or denies
 queued permission requests there, replacing the interim prompt from
 Phase 1. Covers UI-01..04.
@@ -112,5 +112,5 @@ every new key needs a manual end-to-end test row (QA-01).
 
 ## Revision 2026-10-03 (supersedes conflicting decisions above)
 
-Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Subagents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
-- The strip is display-only (UI-03 revised): no approve/deny, stop or message actions. Subagents never prompt; permissions are decided by the orchestrator at dispatch.
+Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Agents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
+- The strip is display-only (UI-03 revised): no approve/deny, stop or message actions. Agents never prompt; permissions are decided by the orchestrator at dispatch.

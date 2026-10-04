@@ -1,8 +1,8 @@
 //! End-to-end proof of the Phase 1 success criteria (01-07): a real parent
-//! `nanopi -p` drives the `subagent` tool, which spawns real `nanopi -p`
+//! `nanopi -p` drives the `agent` tool, which spawns real `nanopi -p`
 //! children (same binary). Parent and child traffic share one scripted
 //! fake OpenAI endpoint; the handler tells them apart by whether the
-//! request's tools array advertises `subagent` (children never get it).
+//! request's tools array advertises `agent` (children never get it).
 //!
 //! Run in debug and with `--release` (panic = "abort").
 #![cfg(unix)]
@@ -90,12 +90,12 @@ fn call(name: &str, args: serde_json::Value) -> Vec<String> {
     ]
 }
 
-/// The parent is the only process whose tools include `subagent`.
+/// The parent is the only process whose tools include `agent`.
 fn is_parent(req: &str) -> bool {
     let v: serde_json::Value = serde_json::from_str(req).unwrap_or_default();
     v["tools"]
         .as_array()
-        .map(|a| a.iter().any(|t| t["function"]["name"] == "subagent"))
+        .map(|a| a.iter().any(|t| t["function"]["name"] == "agent"))
         .unwrap_or(false)
 }
 
@@ -261,7 +261,7 @@ fn handler(
     Arc::new(move |req: &str| {
         if is_parent(req) {
             if tool_results(req) == 0 {
-                call("subagent", args.clone())
+                call("agent", args.clone())
             } else {
                 text("PARENT-DONE")
             }
@@ -347,7 +347,7 @@ fn sc1_child_panic_isolated() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(v["status"], "completed", "{v}");
     let tools = tool_texts(&v).join("\n");
-    assert!(tools.contains("Subagent failed"), "{tools}");
+    assert!(tools.contains("Agent failed"), "{tools}");
     assert!(tools.contains("signal 9"), "{tools}");
     let last = v["messages"].as_array().unwrap().last().unwrap().to_string();
     assert!(last.contains("PARENT-DONE"), "parent kept running: {last}");
@@ -440,7 +440,7 @@ fn sc3_transcript_isolated() {
     assert!(!parent_sessions.is_empty(), "parent session persisted");
     for p in parent_sessions {
         let s = std::fs::read_to_string(&p).unwrap();
-        assert!(s.contains("subagent"), "parent holds the tool call");
+        assert!(s.contains("agent"), "parent holds the tool call");
         assert!(
             !s.contains("CHILD-INTERNAL-SC3"),
             "child messages leaked into {}",
@@ -480,7 +480,7 @@ fn sc4_tools_limits_cap() {
     {
         let sb = Sandbox::new("sc4turns");
         sb.agent("looper", "ls");
-        sb.config("[subagent]\nmax_turns = 1\n");
+        sb.config("[agent]\nmax_turns = 1\n");
         let (port, _log) = spawn_server(handler(
             serde_json::json!({"agent":"looper","task":"sc4 loop"}),
             |_req: &str| call("ls", serde_json::json!({"path":"."})),
@@ -494,7 +494,7 @@ fn sc4_tools_limits_cap() {
     {
         let sb = Sandbox::new("sc4cap");
         sb.agent("scout", "read");
-        sb.config("[subagent]\nmax_live = 1\n");
+        sb.config("[agent]\nmax_live = 1\n");
         let (port, _log) = spawn_server(handler(
             serde_json::json!({"tasks":[
                 {"agent":"scout","task":"sc4 one"},
@@ -508,7 +508,7 @@ fn sc4_tools_limits_cap() {
         assert!(out.status.success());
         let tools = tool_texts(&v).join("\n");
         assert_eq!(
-            tools.matches("subagent limit reached").count(),
+            tools.matches("agent limit reached").count(),
             1,
             "{tools}"
         );
@@ -651,10 +651,10 @@ fn sc6_cross_process_stale_write() {
     );
 }
 
-// ── SC6 (roadmap #6): no subagent controls in the TUI ──
+// ── SC6 (roadmap #6): no agent controls in the TUI ──
 
 #[test]
-fn sc_no_subagent_ui_controls() {
+fn sc_no_agent_ui_controls() {
     let keys = include_str!("../src/keys.rs");
-    assert!(!keys.to_lowercase().contains("subagent"));
+    assert!(!keys.to_lowercase().contains("agent"));
 }

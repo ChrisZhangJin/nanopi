@@ -1,4 +1,4 @@
-# Phase 3: Dynamic subagents - Context
+# Phase 3: Dynamic agents - Context
 
 **Gathered:** 2026-10-03
 **Status:** Ready for planning
@@ -6,7 +6,7 @@
 <domain>
 ## Phase Boundary
 
-The model can start a subagent by describing the task, optionally with
+The model can start an agent by describing the task, optionally with
 a role prompt, a toolset and a model, without any predefined agent
 file. Existing agent files and single / parallel / chain modes keep
 working. Covers DYN-01..05.
@@ -17,7 +17,7 @@ working. Covers DYN-01..05.
 ## Implementation Decisions
 
 ### Tool schema
-- **D-01:** Keep the tool name `subagent`. Its fields are:
+- **D-01:** The tool is named `agent` (user decision 2026-10-04; supersedes the earlier "keep the tool name `subagent`"). Its fields are:
   - `task`, required.
   - `agent`, optional. It names a predefined agent file.
   - `role`, optional. An inline role prompt, appended to the
@@ -49,7 +49,7 @@ working. Covers DYN-01..05.
   `report.md`. The parent never receives the transcript.
 - **D-07:** The tool description tells the model when to delegate:
   independent or exploratory work, or large reads that would flood the
-  context. It also says to prefer one subagent for sequential work.
+  context. It also says to prefer one agent for sequential work.
 
 ### Claude's Discretion
 - Exact wording of the general-purpose prompt and the tool description.
@@ -70,7 +70,7 @@ Reference: Claude Code's general-purpose agent and AgentTool schema
 
 - `.planning/REQUIREMENTS.md` — DYN-01..05
 - `.planning/research/FEATURES.md`
-- `src/tool/subagent.rs` — the current schema and the `select_mode` /
+- `src/tool/agent.rs` — the current schema and the `select_mode` /
   `parse_items` helpers
 - `src/models.rs` — model registry
 

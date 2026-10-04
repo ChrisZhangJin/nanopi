@@ -35,7 +35,7 @@ pub mod resources;
 pub mod session;
 pub mod settings;
 pub mod settings_toml;
-pub mod subagent_registry;
+pub mod agent_registry;
 pub mod subscriber;
 pub mod trust;
 pub mod wizard;

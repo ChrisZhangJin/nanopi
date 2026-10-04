@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::SubagentConfig;
+use crate::config::AgentConfig;
 
 /// Lifecycle state of a tracked child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,7 @@ pub struct AgentEntry {
 
 /// Registry of all children spawned in this nanopi run.
 #[derive(Debug)]
-pub struct SubagentRegistry {
+pub struct AgentRegistry {
     run_id: String,
     counter: AtomicU64,
     entries: Mutex<Vec<AgentEntry>>,
@@ -51,8 +51,8 @@ pub struct SubagentRegistry {
     semaphore: Arc<Semaphore>,
 }
 
-impl SubagentRegistry {
-    pub fn new(cfg: &SubagentConfig) -> Arc<Self> {
+impl AgentRegistry {
+    pub fn new(cfg: &AgentConfig) -> Arc<Self> {
         Arc::new(Self {
             run_id: uuid::Uuid::now_v7().to_string(),
             counter: AtomicU64::new(0),
@@ -78,7 +78,7 @@ impl SubagentRegistry {
         let live = entries.iter().filter(|e| !e.state.is_terminal()).count();
         if live >= self.max_live {
             return Err(format!(
-                "subagent limit reached: {} live agents (max_live)",
+                "agent limit reached: {} live agents (max_live)",
                 self.max_live
             ));
         }
@@ -101,7 +101,7 @@ impl SubagentRegistry {
         Arc::clone(&self.semaphore)
             .acquire_owned()
             .await
-            .expect("subagent semaphore never closed")
+            .expect("agent semaphore never closed")
     }
 
     pub fn set_pid(&self, id: &str, pid: u32) {
@@ -193,15 +193,15 @@ impl Drop for ChildGuard {
     }
 }
 
-static GLOBAL: OnceLock<Arc<SubagentRegistry>> = OnceLock::new();
+static GLOBAL: OnceLock<Arc<AgentRegistry>> = OnceLock::new();
 
 /// Install the process-wide registry (first call wins).
-pub fn set_global(reg: Arc<SubagentRegistry>) {
+pub fn set_global(reg: Arc<AgentRegistry>) {
     let _ = GLOBAL.set(reg);
 }
 
 /// Process-wide registry, if one was installed (for exit-time kill_all).
-pub fn global() -> Option<Arc<SubagentRegistry>> {
+pub fn global() -> Option<Arc<AgentRegistry>> {
     GLOBAL.get().cloned()
 }
 
@@ -210,18 +210,18 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn cfg(max_live: usize, max_concurrency: usize) -> SubagentConfig {
-        SubagentConfig {
+    fn cfg(max_live: usize, max_concurrency: usize) -> AgentConfig {
+        AgentConfig {
             max_live,
             max_concurrency,
-            ..SubagentConfig::default()
+            ..AgentConfig::default()
         }
     }
 
     #[test]
     fn run_id_is_uuid_v7_and_ids_sequential() {
         let tmp = tempfile::tempdir().unwrap();
-        let reg = SubagentRegistry::new(&cfg(8, 4));
+        let reg = AgentRegistry::new(&cfg(8, 4));
         let u = uuid::Uuid::parse_str(reg.run_id()).unwrap();
         assert_eq!(u.get_version_num(), 7);
         for want in ["a1", "a2", "a3"] {
@@ -244,17 +244,17 @@ mod tests {
     #[test]
     fn max_live_cap_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let reg = SubagentRegistry::new(&cfg(2, 4));
+        let reg = AgentRegistry::new(&cfg(2, 4));
         reg.reserve(tmp.path()).unwrap();
         reg.reserve(tmp.path()).unwrap();
         let err = reg.reserve(tmp.path()).unwrap_err();
-        assert_eq!(err, "subagent limit reached: 2 live agents (max_live)");
+        assert_eq!(err, "agent limit reached: 2 live agents (max_live)");
     }
 
     #[test]
     fn finishing_frees_live_slot() {
         let tmp = tempfile::tempdir().unwrap();
-        let reg = SubagentRegistry::new(&cfg(1, 4));
+        let reg = AgentRegistry::new(&cfg(1, 4));
         let (id, _) = reg.reserve(tmp.path()).unwrap();
         assert!(reg.reserve(tmp.path()).is_err());
         reg.set_state(&id, AgentState::Completed);
@@ -267,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrency_semaphore_blocks_second() {
-        let reg = SubagentRegistry::new(&cfg(8, 1));
+        let reg = AgentRegistry::new(&cfg(8, 1));
         let p1 = reg.acquire_run().await;
         assert!(
             tokio::time::timeout(Duration::from_millis(100), reg.acquire_run())
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn kill_all_kills_registered_groups() {
         let tmp = tempfile::tempdir().unwrap();
-        let reg = SubagentRegistry::new(&cfg(8, 4));
+        let reg = AgentRegistry::new(&cfg(8, 4));
         let mut kids = Vec::new();
         for i in 0..2 {
             let (id, _) = reg.reserve(tmp.path()).unwrap();
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn global_roundtrip() {
-        let reg = SubagentRegistry::new(&cfg(8, 4));
+        let reg = AgentRegistry::new(&cfg(8, 4));
         set_global(Arc::clone(&reg));
         assert!(global().is_some());
     }
