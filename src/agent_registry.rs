@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::archive;
 use crate::config::AgentConfig;
 
 /// Lifecycle state of a tracked child.
@@ -22,12 +23,29 @@ pub enum AgentState {
     LimitReached,
     Failed,
     Stopped,
+    /// Found non-terminal by a later run's startup scan (D-06); never set
+    /// by the process that owns the agent.
+    Interrupted,
 }
 
 impl AgentState {
     /// Terminal states no longer count against `max_live`.
     pub fn is_terminal(self) -> bool {
         !matches!(self, AgentState::Queued | AgentState::Running)
+    }
+
+    /// On-disk state name (D-05). The Rust variant name intentionally
+    /// differs from `Completed`'s on-disk `"done"` to avoid churn.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentState::Queued => "queued",
+            AgentState::Running => "running",
+            AgentState::Completed => "done",
+            AgentState::LimitReached => "limit_reached",
+            AgentState::Failed => "failed",
+            AgentState::Stopped => "stopped",
+            AgentState::Interrupted => "interrupted",
+        }
     }
 }
 
@@ -54,7 +72,7 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     pub fn new(cfg: &AgentConfig) -> Arc<Self> {
         Arc::new(Self {
-            run_id: uuid::Uuid::now_v7().to_string(),
+            run_id: archive::new_run_id(),
             counter: AtomicU64::new(0),
             entries: Mutex::new(Vec::new()),
             max_live: cfg.max_live,
@@ -62,7 +80,8 @@ impl AgentRegistry {
         })
     }
 
-    /// Run directory name (uuid v7) shared by every child of this run.
+    /// Run directory name (D-01: `YYYYMMDD-HHMMSS-<8 hex>`) shared by every
+    /// child of this run.
     pub fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -84,8 +103,15 @@ impl AgentRegistry {
         }
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!("a{n}");
-        let dir = agents_root.join(&self.run_id).join(&id);
+        let run_dir = agents_root.join(&self.run_id);
+        let run_dir_is_new = !run_dir.exists();
+        let dir = run_dir.join(&id);
         create_private_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        if run_dir_is_new {
+            if let Err(e) = archive::write_run_pid(&run_dir) {
+                eprintln!("nanopi: debug: write_run_pid({}): {e}", run_dir.display());
+            }
+        }
         entries.push(AgentEntry {
             id: id.clone(),
             pid: None,
@@ -111,8 +137,16 @@ impl AgentRegistry {
     }
 
     pub fn set_state(&self, id: &str, state: AgentState) {
-        if let Some(e) = self.lock().iter_mut().find(|e| e.id == id) {
+        let dir = {
+            let mut entries = self.lock();
+            let Some(e) = entries.iter_mut().find(|e| e.id == id) else {
+                return;
+            };
             e.state = state;
+            e.dir.clone()
+        };
+        if let Err(e) = archive::set_agent_state(&dir, state.as_str()) {
+            eprintln!("nanopi: debug: set_agent_state({}): {e}", dir.display());
         }
     }
 
@@ -219,11 +253,18 @@ mod tests {
     }
 
     #[test]
-    fn run_id_is_uuid_v7_and_ids_sequential() {
+    fn run_id_matches_archive_format_and_ids_sequential() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = AgentRegistry::new(&cfg(8, 4));
-        let u = uuid::Uuid::parse_str(reg.run_id()).unwrap();
-        assert_eq!(u.get_version_num(), 7);
+        let id = reg.run_id();
+        assert!(
+            id.len() == 24
+                && id.as_bytes()[8] == b'-'
+                && id[..8].bytes().all(|b| b.is_ascii_digit())
+                && id[9..15].bytes().all(|b| b.is_ascii_digit())
+                && id[16..].bytes().all(|b| b.is_ascii_hexdigit()),
+            "run id {id} does not match YYYYMMDD-HHMMSS-<8 hex>"
+        );
         for want in ["a1", "a2", "a3"] {
             let (id, dir) = reg.reserve(tmp.path()).unwrap();
             assert_eq!(id, want);
@@ -263,6 +304,48 @@ mod tests {
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].state, AgentState::Completed);
+    }
+
+    #[test]
+    fn reserve_writes_run_pid_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let (_, _) = reg.reserve(tmp.path()).unwrap();
+        let run_dir = tmp.path().join(reg.run_id());
+        assert!(run_dir.join("run.pid").is_file());
+        let pid: u32 = std::fs::read_to_string(run_dir.join("run.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn set_state_persists_to_brief_and_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let (id, dir) = reg.reserve(tmp.path()).unwrap();
+        let brief = crate::agent::brief::render_brief_with_meta(
+            &crate::agent::brief::BriefSpec::default(),
+            &crate::agent::brief::BriefMeta {
+                id: id.clone(),
+                state: "queued".into(),
+                started: "2024-01-01T00:00:00Z".into(),
+                parent: reg.run_id().to_string(),
+            },
+        );
+        std::fs::write(dir.join("brief.md"), brief).unwrap();
+        reg.set_state(&id, AgentState::Completed);
+        let content = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+        assert_eq!(
+            crate::agent::brief::front_matter_get(&content, "state").as_deref(),
+            Some("done")
+        );
+        let index = std::fs::read_to_string(tmp.path().join(reg.run_id()).join("index.md"))
+            .unwrap();
+        assert!(index.contains(&id));
+        assert!(index.contains("done"));
     }
 
     #[tokio::test]
