@@ -59,7 +59,7 @@ owner decisions made on 2026-10-03.
   modes keep working.
 
 - [x] **DYN-04**: The model can choose a model per agent.
-- [ ] **DYN-05**: The parent receives a capped summary report, not the
+- [x] **DYN-05**: The parent receives a capped summary report, not the
   agent's full transcript.
 
 ### Control & communication (CTL)
@@ -210,7 +210,7 @@ owner decisions made on 2026-10-03.
 | DYN-02 | Phase 3 | Complete |
 | DYN-03 | Phase 3 | Complete |
 | DYN-04 | Phase 3 | Complete |
-| DYN-05 | Phase 3 | Pending |
+| DYN-05 | Phase 3 | Complete |
 | CTL-01 | Phase 4 | Pending |
 | CTL-02 | Phase 4 | Pending |
 | CTL-03 | Phase 4 | Pending |
