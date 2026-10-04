@@ -16,6 +16,7 @@ pub enum ActionId {
     ThinkingCycle,
     ToolCancel,
     ExpandLastTool,
+    ToggleAgentsStrip,
     NewlineInInput,
     OpenSlashPalette,
     OpenSettings,
@@ -27,6 +28,7 @@ impl ActionId {
             ActionId::ThinkingCycle,
             ActionId::ToolCancel,
             ActionId::ExpandLastTool,
+            ActionId::ToggleAgentsStrip,
             ActionId::NewlineInInput,
             ActionId::OpenSlashPalette,
             ActionId::OpenSettings,
@@ -38,6 +40,7 @@ impl ActionId {
             ActionId::ThinkingCycle => "Cycle thinking level",
             ActionId::ToolCancel => "Cancel current tool / turn",
             ActionId::ExpandLastTool => "Expand last tool output",
+            ActionId::ToggleAgentsStrip => "Toggle agents strip",
             ActionId::NewlineInInput => "Insert newline in input",
             ActionId::OpenSlashPalette => "Open slash-command palette",
             ActionId::OpenSettings => "Open settings menu",
@@ -165,6 +168,10 @@ impl KeyBindings {
         map.insert(
             ActionId::ExpandLastTool,
             KeySpec { code: KeyCode::Char('o'), mods: KeyModifiers::CONTROL },
+        );
+        map.insert(
+            ActionId::ToggleAgentsStrip,
+            KeySpec { code: KeyCode::Char('g'), mods: KeyModifiers::CONTROL },
         );
         map.insert(
             ActionId::NewlineInInput,
@@ -345,6 +352,76 @@ mod tests {
     #[test]
     fn overrides_are_empty_for_default_bindings() {
         assert!(KeyBindings::default().overrides().is_empty());
+    }
+
+    #[test]
+    fn default_bindings_match_ctrl_g_toggle_agents_strip() {
+        let kb = KeyBindings::default();
+        assert!(kb.matches(
+            ActionId::ToggleAgentsStrip,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        ));
+        // Ctrl+O still matches only ExpandLastTool, not the new binding.
+        assert!(kb.matches(
+            ActionId::ExpandLastTool,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        ));
+        assert!(!kb.matches(
+            ActionId::ToggleAgentsStrip,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        ));
+    }
+
+    #[test]
+    fn no_two_default_bindings_share_a_keyspec() {
+        let kb = KeyBindings::default();
+        let mut seen: Vec<(ActionId, KeySpec)> = Vec::new();
+        for action in ActionId::all() {
+            if let Some(spec) = kb.get(*action) {
+                for (other_action, other_spec) in &seen {
+                    assert!(
+                        spec != *other_spec,
+                        "default KeySpec {:?} is shared between {:?} and {:?}",
+                        spec,
+                        action,
+                        other_action
+                    );
+                }
+                seen.push((*action, spec));
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_agents_strip_rebinds_like_expand_last_tool() {
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            ActionId::ToggleAgentsStrip,
+            KeySpec { code: KeyCode::Char('g'), mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT },
+        );
+        let kb = KeyBindings::from_overrides(overrides);
+
+        // New binding matches.
+        assert!(kb.matches(
+            ActionId::ToggleAgentsStrip,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ));
+        // Old default Ctrl+G no longer matches.
+        assert!(!kb.matches(
+            ActionId::ToggleAgentsStrip,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        ));
+
+        // Persisted-name round trip: overrides() reports the diff, and
+        // rebuilding from it reproduces the same bindings.
+        let ov = kb.overrides();
+        assert_eq!(ov.len(), 1);
+        assert!(ov.contains_key(&ActionId::ToggleAgentsStrip));
+        let rebuilt = KeyBindings::from_overrides(ov);
+        assert!(rebuilt.matches(
+            ActionId::ToggleAgentsStrip,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ));
     }
 
     #[test]

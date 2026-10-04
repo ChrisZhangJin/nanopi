@@ -169,6 +169,7 @@ fn action_toml_key(a: ActionId) -> &'static str {
         ActionId::ThinkingCycle => "thinking_cycle",
         ActionId::ToolCancel => "tool_cancel",
         ActionId::ExpandLastTool => "expand_last_tool",
+        ActionId::ToggleAgentsStrip => "toggle_agents_strip",
         ActionId::NewlineInInput => "newline_in_input",
         ActionId::OpenSlashPalette => "open_slash_palette",
         ActionId::OpenSettings => "open_settings",
