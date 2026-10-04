@@ -308,9 +308,14 @@ Plans:
   4. With the mode off, prompts and tool specs are byte-identical to v0.12 (tested).
   5. The manual E2E plan has rows for amend, stop, expand, toggle and clean; the release binary grew by no more than ~150 KB with no unjustified new crates.
 
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+
+- [ ] 06-01-PLAN.md — orchestrator registry, coordinator prompt, mode-aware composer, config key, ORC-04 snapshots
+- [ ] 06-02-PLAN.md — TUI /orchestrator toggle, in-place swap, rebuild sites, status-line segment
+- [ ] 06-03-PLAN.md — print mode ignores key with one-line stderr note (real-binary tests)
+- [ ] 06-04-PLAN.md — consolidated v0.13 manual test plan (incl. Ctrl+G), agents.md, binary size gate
 **UI hint**: yes
-**Research flags**: needs research — orchestrator prompt and cost evaluation.
 
 ## Notes
 
