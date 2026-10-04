@@ -35,6 +35,126 @@ fn escape_body(text: &str) -> String {
         .join("\n")
 }
 
+/// Front-matter metadata rendered ahead of a brief body (D-02).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BriefMeta {
+    pub id: String,
+    pub state: String,
+    pub started: String,
+    pub parent: String,
+}
+
+/// Collapse a front-matter value to a single line, trimmed, capped at 120
+/// chars (T-02-03), and never empty (T-02-01: a newline in the input can
+/// never forge a new key line or close the block).
+fn fm_value(s: &str) -> String {
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "(none)".to_string();
+    }
+    if collapsed.chars().count() > 120 {
+        let truncated: String = collapsed.chars().take(120).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
+    }
+}
+
+/// Render a brief preceded by a hand-written front-matter block (D-02); no
+/// YAML crate is used.
+pub fn render_brief_with_meta(spec: &BriefSpec, meta: &BriefMeta) -> String {
+    let role = fm_value(spec.role.as_deref().unwrap_or("(default)"));
+    let model = fm_value(spec.model.as_deref().unwrap_or("(inherit)"));
+    let tools = if spec.tools.is_empty() {
+        "(all)".to_string()
+    } else {
+        fm_value(&spec.tools.join(", "))
+    };
+    format!(
+        "---\nid: {}\nrole: {role}\nmodel: {model}\ntools: {tools}\nstate: {}\nstarted: {}\nparent: {}\n---\n\n{}",
+        fm_value(&meta.id),
+        fm_value(&meta.state),
+        fm_value(&meta.started),
+        fm_value(&meta.parent),
+        render_brief(spec)
+    )
+}
+
+/// Parse the leading `---` / `key: value` / `---` block only. Returns
+/// empty if the content does not begin with one.
+pub fn parse_front_matter(content: &str) -> Vec<(String, String)> {
+    let mut lines = content.lines();
+    match lines.next() {
+        Some("---") => {}
+        _ => return Vec::new(),
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        if line == "---" {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(": ") {
+            out.push((k.to_string(), v.to_string()));
+        }
+    }
+    out
+}
+
+/// Convenience accessor over [`parse_front_matter`].
+pub fn front_matter_get(content: &str, key: &str) -> Option<String> {
+    parse_front_matter(content)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+}
+
+/// Rewrite a single `key: value` line inside the leading front-matter
+/// block, leaving everything else byte-identical. `None` if there is no
+/// block or no such key in it.
+pub fn set_front_matter_field(content: &str, key: &str, value: &str) -> Option<String> {
+    let mut iter = content.split_inclusive('\n');
+    let first = iter.next()?;
+    if first.trim_end_matches(['\n', '\r']) != "---" {
+        return None;
+    }
+    let mut out = String::from(first);
+    let mut found = false;
+    let prefix = format!("{key}: ");
+    loop {
+        let line = iter.next()?;
+        let bare = line.trim_end_matches(['\n', '\r']);
+        if bare == "---" {
+            out.push_str(line);
+            break;
+        }
+        if !found && bare.starts_with(&prefix) {
+            found = true;
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            out.push_str(&format!("{key}: {}{ending}", fm_value(value)));
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !found {
+        return None;
+    }
+    out.extend(iter);
+    Some(out)
+}
+
+/// Process-wide lock so an amendment append never races a front-matter
+/// rewrite in the same process.
+pub fn brief_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub fn render_brief(spec: &BriefSpec) -> String {
     let mut out = String::from("# Brief\n\n## Task\n\n");
     out.push_str(escape_body(spec.task.trim_end()).as_str());
@@ -62,6 +182,9 @@ pub fn render_brief(spec: &BriefSpec) -> String {
 /// (atomic w.r.t. concurrent readers for typical sizes). New files are
 /// created with mode 0o600.
 pub fn append_amendment(path: &Path, n: u32, text: &str) -> io::Result<()> {
+    let _guard = brief_write_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -70,8 +193,9 @@ pub fn append_amendment(path: &Path, n: u32, text: &str) -> io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
+    let time = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let chunk = format!(
-        "\n{AMENDMENT_PREFIX}{n}\n\n{}\n",
+        "\n{AMENDMENT_PREFIX}{n} ({time})\n\n{}\n",
         escape_body(text.trim_end())
     );
     f.write_all(chunk.as_bytes())
@@ -105,7 +229,13 @@ pub fn parse_amendments_with(content: &str, stable: bool) -> Vec<(u32, String)> 
     for line in tail.split_inclusive('\n') {
         let bare = line.trim_end_matches(['\n', '\r']);
         if let Some(num) = bare.strip_prefix(AMENDMENT_PREFIX) {
-            if let Ok(n) = num.trim().parse::<u32>() {
+            // Accept either the bare legacy form (`N`) or the timestamped
+            // form (`N (<time>)`); anything else is not a heading.
+            let num_part = match num.find(" (") {
+                Some(idx) if num.ends_with(')') => &num[..idx],
+                _ => num,
+            };
+            if let Ok(n) = num_part.trim().parse::<u32>() {
                 if let Some((cn, lines)) = current.take() {
                     out.push((cn, join_body(&lines), true));
                 }
@@ -359,7 +489,7 @@ mod tests {
     #[test]
     fn amendment_time_heading_parses_and_legacy_form_still_works() {
         let mut b = render_brief(&spec("t"));
-        b.push_str("\n## Amendment 2 (2026-10-04T10:00:00+08:00)\n\nsecond\n\n## Amendment 1\n\nfirst\n");
+        b.push_str("\n## Amendment 1\n\nfirst\n\n## Amendment 2 (2026-10-04T10:00:00+08:00)\n\nsecond\n");
         assert_eq!(
             parse_amendments(&b),
             vec![(1, "first".to_string()), (2, "second".to_string())]
