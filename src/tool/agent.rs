@@ -665,10 +665,14 @@ fn ensure_gitignore_once(cwd: &Path) {
     let mut seen = gitignored_cwds()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if seen.insert(cwd.to_path_buf()) {
-        if let Err(e) = archive::ensure_gitignore(cwd) {
-            eprintln!("nanopi: debug: ensure_gitignore({}): {e}", cwd.display());
+    if seen.contains(cwd) {
+        return;
+    }
+    match archive::ensure_gitignore(cwd) {
+        Ok(_) => {
+            seen.insert(cwd.to_path_buf());
         }
+        Err(e) => crate::note!("nanopi: debug: ensure_gitignore({}): {e}", cwd.display()),
     }
 }
 
@@ -703,11 +707,11 @@ fn ensure_report(dir: &Path, id: &str, state: AgentState, error_text: &str) {
     );
     // Pre-create at 0600 so the atomic rename preserves perms.
     if let Err(e) = write_private(&report, "") {
-        eprintln!("nanopi: debug: precreate report({}): {e}", report.display());
+        crate::note!("nanopi: debug: precreate report({}): {e}", report.display());
         return;
     }
     if let Err(e) = crate::tool::file_state::atomic_write(&report, body.as_bytes()) {
-        eprintln!("nanopi: debug: ensure_report({}): {e}", report.display());
+        crate::note!("nanopi: debug: ensure_report({}): {e}", report.display());
     }
 }
 
@@ -767,7 +771,7 @@ pub async fn run_single(l: &Launcher, agent: &AgentConfig, task: &str, cwd: &Pat
     }
     if let Some(run_dir) = dir.parent() {
         if let Err(e) = archive::regenerate_index(run_dir) {
-            eprintln!("nanopi: debug: regenerate_index({}): {e}", run_dir.display());
+            crate::note!("nanopi: debug: regenerate_index({}): {e}", run_dir.display());
         }
     }
 

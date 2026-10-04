@@ -109,7 +109,7 @@ impl AgentRegistry {
         create_private_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         if run_dir_is_new {
             if let Err(e) = archive::write_run_pid(&run_dir) {
-                eprintln!("nanopi: debug: write_run_pid({}): {e}", run_dir.display());
+                crate::note!("nanopi: debug: write_run_pid({}): {e}", run_dir.display());
             }
         }
         entries.push(AgentEntry {
@@ -146,7 +146,7 @@ impl AgentRegistry {
             e.dir.clone()
         };
         if let Err(e) = archive::set_agent_state(&dir, state.as_str()) {
-            eprintln!("nanopi: debug: set_agent_state({}): {e}", dir.display());
+            crate::note!("nanopi: debug: set_agent_state({}): {e}", dir.display());
         }
     }
 
