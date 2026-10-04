@@ -147,7 +147,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | 1 | Child-process runtime | 7/7 | Complete   | 2026-10-03 |
 | 2 | Archive & lifecycle | 7/7 | Complete   | 2026-10-04 |
 | 3 | Dynamic agents | 3/3 | Complete   | 2026-10-04 |
-| 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
+| 4 | Background launch & control | 1/5 | In Progress|  |
 | 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
 
@@ -264,11 +264,12 @@ Plans:
 **Plans**: 5 plans
 Plans:
 
-- [ ] 04-01-PLAN.md — registry background tracking/stop/reactivate/outbox + `background: true` dispatch
+- [x] 04-01-PLAN.md — registry background tracking/stop/reactivate/outbox + `background: true` dispatch
 - [ ] 04-02-PLAN.md — git worktree module (create, commit, cleanup, auto-merge/conflict)
 - [ ] 04-03-PLAN.md — control tools: send_message (amend/continue), stop_agent, list_agents
 - [ ] 04-04-PLAN.md — report injection (TUI follow-up path) + print-mode drain with Ctrl-C stop_all
 - [ ] 04-05-PLAN.md — worktree isolation wired into dispatch
+
 **Research flags**: needs research — report injection path and print-mode exit.
 
 ### Phase 5: TUI agents strip
