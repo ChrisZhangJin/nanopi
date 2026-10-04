@@ -148,14 +148,14 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 | 2 | Archive & lifecycle | 7/7 | Complete   | 2026-10-04 |
 | 3 | Dynamic agents | 3/3 | Complete   | 2026-10-04 |
 | 4 | Background launch & control | 6/6 | Complete   | 2026-10-04 |
-| 5 | TUI agents strip | 2/3 | In Progress|  |
+| 5 | TUI agents strip | 3/3 | Complete   | 2026-10-04 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
 
 - [x] **Phase 1: Child-process runtime** - isolated `nanopi -p` children, process tracking/kill, caps, brief-file amendments and final self-check (completed 2026-10-03)
 - [x] **Phase 2: Archive & lifecycle** - brief.md / report.md, state machine, interrupted marking, cleanup (completed 2026-10-04)
 - [x] **Phase 3: Dynamic agents** - optional agent name, inline role/tools/model, capped report (completed 2026-10-04)
 - [x] **Phase 4: Background launch & control** - background ids, amend/stop/list/continue, report injection, print-mode drain, worktrees (completed 2026-10-04)
-- [ ] **Phase 5: TUI agents strip** - collapsible, display-only bottom strip with states
+- [x] **Phase 5: TUI agents strip** - collapsible, display-only bottom strip with states (completed 2026-10-04)
 - [ ] **Phase 6: Orchestrator mode** - `/orchestrator` toggle, restricted tools, coordinator prompt, release gates
 
 ### Phase 1: Child-process runtime
@@ -290,7 +290,7 @@ Plans:
 
 - [x] 05-01-PLAN.md — agents strip model + pure renderer (src/mode/agents_strip.rs), TDD
 - [x] 05-02-PLAN.md — Ctrl+G ToggleAgentsStrip keybinding + docs/manual test row
-- [ ] 05-03-PLAN.md — wire strip into TUI dock, tick refresh, Ctrl+G/Esc, expanded detail
+- [x] 05-03-PLAN.md — wire strip into TUI dock, tick refresh, Ctrl+G/Esc, expanded detail
 
 **UI hint**: yes
 **Research flags**: standard patterns.
