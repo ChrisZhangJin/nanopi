@@ -203,10 +203,11 @@ impl Tool for StopAgentTool {
 }
 
 /// `send_message` (CTL-02/CTL-06): amend a running agent's brief, or
-/// continue a finished one under the same id. Only agents tracked in
-/// this process's registry are addressable (adopting an on-disk entry
-/// from an earlier process in the same run is a known gap — see plan
-/// 04-03 SUMMARY).
+/// continue a finished one under the same id. An id absent from this
+/// process's in-memory registry is adopted from
+/// `agents_root/<run_id>/<id>/brief.md` (+ `report.md`) before giving up
+/// (CTL-06/D-05: "also works for agents from an earlier nanopi process
+/// in the same run") — see `AgentRegistry::adopt_from_disk`.
 #[derive(Default)]
 pub struct SendMessageTool {
     registry: Option<Arc<AgentRegistry>>,
@@ -257,8 +258,20 @@ impl Tool for SendMessageTool {
             .to_string();
 
         let reg = registry_for(&self.registry, &self.fallback);
-        let Some(entry) = reg.snapshot().into_iter().find(|e| e.id == id) else {
-            return Ok(in_band_error(format!("no such agent: {id}")));
+        let entry = match reg.snapshot().into_iter().find(|e| e.id == id) {
+            Some(e) => e,
+            None => {
+                // CTL-06: not in this process's in-memory snapshot — it
+                // may have been dispatched by an earlier nanopi process
+                // in the same run (joined via NANOPI_RUN_ID). Adopt it
+                // from disk before giving up; any rejection (missing,
+                // malformed, non-terminal, interrupted, other-run) is
+                // surfaced in-band unchanged.
+                match reg.adopt_from_disk(&crate::paths::project_agents_dir(&ctx.cwd), &id) {
+                    Ok(e) => e,
+                    Err(e) => return Ok(in_band_error(e)),
+                }
+            }
         };
 
         let brief_path = entry.dir.join("brief.md");

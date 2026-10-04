@@ -305,6 +305,228 @@ async fn continue_finished_agent_same_id() {
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
+// --- CTL-06 gap closure (plan 04-06): continue from an earlier process ---
+
+/// CTL-06/D-05: a finished agent dispatched by an earlier `AgentRegistry`
+/// (standing in for an earlier nanopi process) is adopted from disk by a
+/// brand-new registry that only shares the run id, and `send_message`
+/// continues it exactly like the same-process path: previous report.md
+/// kept, `## Continued` appended, brief.md amended. (The actual child
+/// re-invoked for the continuation defaults to `current_exe()`, i.e. this
+/// test binary itself, same as `continue_finished_agent_same_id` above —
+/// a real second LLM round-trip for the adopted id is covered by the
+/// two-process `nanopi -p` e2e in `print_mode_e2e.rs`.)
+#[tokio::test]
+async fn continue_finished_agent_from_earlier_process() {
+    let port = spawn_sse_server(vec![delta("- [x] task — FIRST-ANSWER"), finish("stop")]);
+    let cwd = std::env::temp_dir().join(format!("nanopi-agent-earlier-proc-{port}"));
+    let _ = std::fs::remove_dir_all(&cwd);
+    let home = cwd.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let spec = ChildLaunchSpec {
+        model: Some("fake-model".into()),
+        base_url: Some(format!("http://127.0.0.1:{port}")),
+        api_kind: Some("openai".into()),
+        api_key: Some("not-a-real-key".into()),
+        trust: Some(false),
+        timeout: std::time::Duration::from_secs(60),
+        ..ChildLaunchSpec::default()
+    };
+    let program = ChildProgram {
+        program: PathBuf::from("env"),
+        leading_args: vec![
+            format!("HOME={}", home.display()),
+            format!("NANOPI_HOME={}", home.join(".nanopi").display()),
+            env!("CARGO_BIN_EXE_nanopi").to_string(),
+        ],
+    };
+
+    // Registry A: stands in for an earlier nanopi process. It dispatches
+    // a1 to completion, then is dropped — nothing from it is referenced
+    // afterwards.
+    let reg_a = AgentRegistry::new(&AgentLimits::default());
+    let run_id = reg_a.run_id().to_string();
+    let tool_a = AgentTool::with_parts(reg_a.clone(), spec, program);
+    let agent = AgentConfig {
+        name: "scout".into(),
+        description: "test agent".into(),
+        tools: Some(vec!["read".into()]),
+        model: None,
+        system_prompt: "You are a scout.".into(),
+        source: AgentSource::User,
+        file_path: PathBuf::from("/nonexistent/scout.md"),
+    };
+    let out = run_single(&tool_a.launcher(), &agent, "FIRST-TASK", &cwd, None, None).await;
+    assert!(!out.is_error, "first run failed: {}", out.content);
+    let dir = cwd.join(".nanopi/agents").join(&run_id).join("a1");
+    let first_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+    assert!(!first_report.trim().is_empty());
+    drop(tool_a);
+    drop(reg_a);
+
+    // Registry B: a fresh process state that only shares the run id.
+    let reg_b = AgentRegistry::with_run_id(&AgentLimits::default(), run_id.clone());
+    assert!(
+        reg_b.snapshot().is_empty(),
+        "B must start with no in-memory knowledge of a1"
+    );
+
+    let port2 = spawn_sse_server(vec![delta("- [x] task — SECOND-ANSWER"), finish("stop")]);
+    let spec2 = ChildLaunchSpec {
+        model: Some("fake-model".into()),
+        base_url: Some(format!("http://127.0.0.1:{port2}")),
+        api_kind: Some("openai".into()),
+        api_key: Some("not-a-real-key".into()),
+        trust: Some(false),
+        timeout: std::time::Duration::from_secs(60),
+        ..ChildLaunchSpec::default()
+    };
+    nanopi::tool::agent::set_launch_spec(spec2);
+
+    let ctl_tool = SendMessageTool::with_registry(reg_b.clone());
+    let ctx = ToolContext { cwd: cwd.clone() };
+    let args = serde_json::json!({"id": "a1", "message": "CONTINUE-MSG"});
+    let out = ctl_tool.execute(args, &ctx).await.expect("send_message");
+    assert!(!out.is_error, "{}", out.content);
+    let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+    assert_eq!(v["delivered"], "continuing");
+
+    reg_b.wait_background().await;
+
+    let brief = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+    assert!(brief.contains("## Amendment 1"), "{brief}");
+    assert!(brief.contains("CONTINUE-MSG"), "{brief}");
+
+    let final_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+    assert!(
+        final_report.contains("## Continued"),
+        "missing continuation marker: {final_report}"
+    );
+    assert!(
+        final_report.contains(first_report.trim()),
+        "previous report lost: {final_report}"
+    );
+
+    let batch = reg_b.take_reports().expect("continuation outbox entry");
+    assert!(batch.contains("[agent a1 finished:"), "{batch}");
+
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// CTL-06: an id with no on-disk dir under the registry's own run is
+/// refused, not silently treated as a fresh agent.
+#[tokio::test]
+async fn send_message_from_earlier_process_unknown_id_is_in_band_error() {
+    let cwd = std::env::temp_dir().join(format!(
+        "nanopi-agent-earlier-proc-unknown-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cwd);
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let reg = AgentRegistry::with_run_id(&AgentLimits::default(), "20261004-000000-aaaaaaaa".into());
+    let tool = SendMessageTool::with_registry(reg);
+    let out = tool
+        .execute(
+            serde_json::json!({"id": "a9", "message": "hi"}),
+            &ToolContext { cwd: cwd.clone() },
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error);
+    assert!(out.content.contains("no such agent: a9"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+fn write_fixture_brief(dir: &std::path::Path, id: &str, state: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    use nanopi::agent::brief::{render_brief_with_meta, BriefMeta, BriefSpec};
+    let brief = render_brief_with_meta(
+        &BriefSpec {
+            task: "do the thing".into(),
+            role: None,
+            tools: vec![],
+            model: None,
+        },
+        &BriefMeta {
+            id: id.into(),
+            state: state.into(),
+            started: "now".into(),
+            parent: "run".into(),
+            label: None,
+            worktree: None,
+            branch: None,
+        },
+    );
+    std::fs::write(dir.join("brief.md"), brief).unwrap();
+}
+
+/// CTL-06/D-05: an on-disk agent that is non-terminal or interrupted is
+/// never re-run — `send_message` refuses it in-band, and brief.md is left
+/// untouched (no amendment appended before the refusal).
+#[tokio::test]
+async fn send_message_from_earlier_process_refuses_non_continuable_states() {
+    for (id, state) in [("a1", "running"), ("a2", "queued"), ("a3", "interrupted")] {
+        let cwd = std::env::temp_dir().join(format!(
+            "nanopi-agent-earlier-proc-noncontinuable-{id}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cwd);
+        let run_id = "20261004-000000-bbbbbbbb";
+        let agent_dir = cwd.join(".nanopi/agents").join(run_id).join(id);
+        write_fixture_brief(&agent_dir, id, state);
+        let before = std::fs::read_to_string(agent_dir.join("brief.md")).unwrap();
+
+        let reg = AgentRegistry::with_run_id(&AgentLimits::default(), run_id.into());
+        let tool = SendMessageTool::with_registry(reg);
+        let out = tool
+            .execute(
+                serde_json::json!({"id": id, "message": "hi"}),
+                &ToolContext { cwd: cwd.clone() },
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "state={state}");
+        assert!(out.content.contains("not continuable"), "{}", out.content);
+
+        let after = std::fs::read_to_string(agent_dir.join("brief.md")).unwrap();
+        assert_eq!(before, after, "brief.md must be unchanged for state={state}");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+}
+
+/// CTL-06: adoption only ever looks under the registry's own run id — an
+/// agent on disk under a DIFFERENT run id is never found.
+#[tokio::test]
+async fn send_message_never_adopts_across_different_run_ids() {
+    let cwd = std::env::temp_dir().join(format!(
+        "nanopi-agent-earlier-proc-otherrun-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cwd);
+    let other_run_id = "20261004-000000-cccccccc";
+    let agent_dir = cwd.join(".nanopi/agents").join(other_run_id).join("a1");
+    write_fixture_brief(&agent_dir, "a1", "done");
+
+    let my_run_id = "20261004-000000-dddddddd";
+    let reg = AgentRegistry::with_run_id(&AgentLimits::default(), my_run_id.into());
+    let tool = SendMessageTool::with_registry(reg);
+    let out = tool
+        .execute(
+            serde_json::json!({"id": "a1", "message": "hi"}),
+            &ToolContext { cwd: cwd.clone() },
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error);
+    assert!(out.content.contains("no such agent: a1"), "{}", out.content);
+
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
 // --- ISO-01/ISO-02: worktree isolation (plan 04-05) ---
 
 const OK_ENV: &str = r#"{"session_id":"s","model":"m","finish_reason":"stop","duration_ms":1,"usage":{},"messages":[{"role":"assistant","content":"DONE"}],"status":"completed"}"#;
