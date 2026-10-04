@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: verifying
-last_updated: "2026-10-04T10:58:04.286Z"
+last_updated: "2026-10-04T16:21:22.739Z"
 last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 23
-  completed_plans: 23
+  total_plans: 26
+  completed_plans: 24
   percent: 67
 ---
 
@@ -17,9 +17,9 @@ progress:
 
 ## Current Position
 
-Phase: 04 (background-control) — COMPLETE
-Plan: 6 of 6 complete
-Status: Phase complete — ready for verification
+Phase: 05 (tui-agents-strip) — IN PROGRESS
+Plan: 1 of 3 complete (05-01 done; 05-02, 05-03 remaining)
+Status: 05-01-PLAN.md complete (agents-strip model + pure renderer)
 Last activity: 2026-10-04
 
 ---
@@ -319,6 +319,7 @@ pinned by wall-clock tests.
 | Phase 04 P03 | 70min | 2 tasks | 6 files |
 | Phase 04 P04 | 180min | 2 tasks | 5 files |
 | Phase 04-background-control P06 | 150min | - tasks | - files |
+| Phase 05-tui-agents-strip P01 | 35min | 1 tasks | 2 files |
 
 ## Decisions
 
@@ -346,3 +347,4 @@ pinned by wall-clock tests.
 - [Phase ?]: Narrowed main.rs outer signal handler to SIGTERM-only so print.rs's new Ctrl-C drain-window handling is reachable; Ctrl-C during the main turn no longer triggers outer kill_all (known bounded regression)
 - [Phase ?]: -p now awaits all background agents before exit, running at most one bounded extra main turn if reports arrived (D-07)
 - [Phase ?]: adopt_from_disk reuses the shared seed_counter_from_disk full-scan helper so reserve() never reuses an on-disk id after a partial adopt
+- [Phase 05]: agents_strip collapse rule: >3 agents shows the first 2 in D-02 order and folds the rest into one "+K more (R running)" row; ordered_agents (uncapped) and collapsed_rows (capped at 3) are separate primitives so ordering and the cap are independently testable

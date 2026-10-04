@@ -124,7 +124,7 @@ owner decisions made on 2026-10-03.
 
 ### TUI agents strip (UI)
 
-- [ ] **UI-01**: When agents exist, a 1–3 line strip appears above
+- [x] **UI-01**: When agents exist, a 1–3 line strip appears above
   the input box. Each line shows the agent's id, role, short task,
   state (running / waiting for approval / done / failed / stopped /
   interrupted) and elapsed time.
@@ -133,11 +133,11 @@ owner decisions made on 2026-10-03.
   shortcut (default **Ctrl+G**, if it is free in `keys.rs`). The
   expanded view shows each agent's latest activity and its report path.
 
-- [ ] **UI-03**: The strip is display-only. It has no stop, approve or
+- [x] **UI-03**: The strip is display-only. It has no stop, approve or
   message actions; agents are controlled through the orchestrator
   (RT-03).
 
-- [ ] **UI-04**: The strip is redrawn from a registry snapshot on the
+- [x] **UI-04**: The strip is redrawn from a registry snapshot on the
   TUI tick, not once per event.
 
 ### Orchestrator mode (ORC)
@@ -220,10 +220,10 @@ owner decisions made on 2026-10-03.
 | CTL-07 | Phase 4 | Complete |
 | ISO-01 | Phase 4 | Complete |
 | ISO-02 | Phase 4 | Complete |
-| UI-01 | Phase 5 | Pending |
+| UI-01 | Phase 5 | Complete |
 | UI-02 | Phase 5 | Pending |
-| UI-03 | Phase 5 | Pending |
-| UI-04 | Phase 5 | Pending |
+| UI-03 | Phase 5 | Complete |
+| UI-04 | Phase 5 | Complete |
 | ORC-01 | Phase 6 | Pending |
 | ORC-02 | Phase 6 | Pending |
 | ORC-03 | Phase 6 | Pending |
