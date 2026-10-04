@@ -464,7 +464,7 @@ process exit) for `stop_agent{id}` / `stop_agent{id:"all"}`.
 **If this table is empty:** N/A — see rows above; all are flagged for
 planner/discuss-phase confirmation.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **How does the main agent's turn-task actually reach a background
    report into `pending_follow_ups` when the main agent is mid-stream?**

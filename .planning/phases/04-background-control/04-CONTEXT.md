@@ -121,3 +121,11 @@ mechanism.
 Phase 1 changed to a child-process runtime (see `01-child-process-runtime/01-CONTEXT.md`). Agents are `nanopi -p` children controlled only by the orchestrator; the user never controls them directly.
 - Amend = append to brief.md (no in-memory steer channel). Stop = kill the child process group. Continue = start a new `nanopi -p --session` on the same transcript; also used for amendments that arrive after the child finished.
 - No user Esc/stop-all for agents.
+
+## Addendum (2026-10-04, planning)
+
+Resolutions of the research open questions, applied by the phase plans:
+
+1. **D-11 merge conflicts** are surfaced as text in the main agent's reply (the conflict and the kept branch are written into the report injected back to the main agent). No new blocking approval gate is added in TUI or print mode.
+2. **Print-mode Ctrl-C during the drain loop** calls `AgentRegistry::stop_all()` per D-07. Verified while planning: `src/mode/print.rs` has no SIGINT/`ctrl_c` handling today, so the drain loop installs its own `tokio::signal::ctrl_c()` listener (new wiring, not an extension).
+3. **Worktree "unchanged"** (D-10) = empty `git status --porcelain` in the worktree AND zero commits ahead of base (`git rev-list <base>..<branch> --count` == 0).

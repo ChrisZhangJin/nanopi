@@ -261,7 +261,14 @@ Plans:
   4. In `-p` mode, nanopi waits for (or stops) background agents before exiting — no orphans.
   5. A writer dispatched with worktree isolation reports its worktree path and branch; unchanged worktrees are removed, changed ones kept and listed.
 
-**Plans**: TBD
+**Plans**: 5 plans
+Plans:
+
+- [ ] 04-01-PLAN.md — registry background tracking/stop/reactivate/outbox + `background: true` dispatch
+- [ ] 04-02-PLAN.md — git worktree module (create, commit, cleanup, auto-merge/conflict)
+- [ ] 04-03-PLAN.md — control tools: send_message (amend/continue), stop_agent, list_agents
+- [ ] 04-04-PLAN.md — report injection (TUI follow-up path) + print-mode drain with Ctrl-C stop_all
+- [ ] 04-05-PLAN.md — worktree isolation wired into dispatch
 **Research flags**: needs research — report injection path and print-mode exit.
 
 ### Phase 5: TUI agents strip
