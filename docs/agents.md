@@ -5,8 +5,10 @@ Modes: single, parallel (up to 8 tasks), chain. A child that crashes, panics,
 is killed or times out comes back to the model as an in-band `status: failed`
 result; the parent keeps running.
 
-There is no keybinding, slash command, prompt or TUI action for agents.
-They are controlled only by the model through the tool.
+There is no slash command, prompt or control action for agents in the TUI.
+They are controlled only by the model through the tool. The TUI does show a
+read-only agents strip while agents are running or recently finished — see
+below.
 
 ## Child command line
 
@@ -85,6 +87,60 @@ Every child is killed (whole process group, SIGKILL) when:
 - print mode finishes,
 - print mode receives SIGINT (exit 130) or SIGTERM (exit 143),
 - a child times out.
+
+## Agents strip (TUI)
+
+A read-only strip shows every agent at a glance while any are running or
+recently finished. It sits between the status line and the input box, and is
+hidden whenever the current run has no agents.
+
+**Glyphs:**
+
+| Glyph | Meaning |
+|-------|---------|
+| `●` | running |
+| `◐` | queued |
+| `✓` | done |
+| `✗` | failed |
+| `■` | stopped |
+| `⏱` | limit reached |
+| `?` | interrupted |
+
+There is no "waiting for permission" state: children run with `--approve` or
+`--distrust` decided at dispatch and never prompt, so the strip has nothing to
+approve or deny (display-only, UI-03).
+
+**Collapsed** (default), the strip is 1–3 lines: a header
+`agents (N) · Ctrl+G expand`, then at most 3 rows — agents needing attention
+first, then running, then most recently finished. With more than 3 agents the
+last row folds the rest into `+K more (R running)`.
+
+**Expanded** (`Ctrl+G` toggles), the in-dock rows keep showing each agent's
+latest activity and the dock grows to show more of the list, while a full
+detail block (activity history, turns/tokens, worktree/branch, report path)
+for the agents in view is printed into scrollback. `Ctrl+G` or `Esc` collapses
+it back.
+
+On narrow terminals (under ~60 columns) the activity text drops first, then
+the description; on short terminals (under ~15 rows) the strip shows only its
+header line (D-08).
+
+The `Ctrl+G` binding (`ActionId::ToggleAgentsStrip`) is configurable through
+the same keybindings/settings menu as every other action — see `src/keys.rs`.
+
+### Manual test
+
+| 前提 Precondition | 步骤 Steps | 期望 Expected | 结果 Result |
+|---|---|---|---|
+| Model has access to the `agent` tool | Dispatch 1 agent, then dispatch 4+ more (background) in the same or a later turn | Strip appears between status line and input once the first agent starts; with 4+ agents, strip shows at most 3 rows plus a `+K more (R running)` row | ☐通过 ☐失败 |
+| Strip visible, collapsed | Press `Ctrl+G` | Strip expands: detail is printed to scrollback and in-dock rows keep showing latest activity | ☐通过 ☐失败 |
+| Strip expanded | Press `Ctrl+G` again, or `Esc` | Strip collapses back to the 1–3 line summary | ☐通过 ☐失败 |
+| An agent has finished (done) | Observe the strip after all agents finish | Strip remains visible showing `✓` for finished agents (does not vanish immediately) | ☐通过 ☐失败 |
+| Agents idle/no new activity | Watch the strip for several seconds | No flicker or redraw churn while idle (draws come from the existing tick, not per-event) | ☐通过 ☐失败 |
+| Input box focused, no modifier held | Type the letter `g` (no Ctrl) | `g` is inserted into the input as a normal character; the strip does not toggle | ☐通过 ☐失败 |
+
+Phase 6 owns the consolidated manual test plan (QA-01); this table is the
+Ctrl+G row set it will collect into that plan.
 
 ## Known gaps
 
