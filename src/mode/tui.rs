@@ -1879,6 +1879,12 @@ async fn run_app(
     // single slot silently kept only the second — after echoing both.
     let mut follow_up_slot: std::collections::VecDeque<String> =
         std::collections::VecDeque::new();
+    // Background-agent reports (D-06) that could not be steered into a
+    // live turn — kept here rather than dropped so the next idle pick
+    // still finds them. Checked before a fresh `take_reports()` so an
+    // earlier failed send is not overtaken by a later one.
+    let mut agent_report_slot: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
     let mut turn_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut cancel: Option<CancellationToken> = None;
     // 120ms ticker keeps the "Elapsed X.Xs" / spinner glyph moving
@@ -2014,13 +2020,22 @@ async fn run_app(
                 // something, which is the silent-drop shape all over
                 // again.
                 if app.status != Status::Streaming && turn_task.is_none() {
-                    if let Some(text) = pick_follow_up(None, &mut follow_up_slot) {
+                    if let Some(text) = pick_follow_up(None, &mut follow_up_slot, &mut agent_report_slot) {
                         handle_action(
                             KeyAction::StartTurn(text),
                             app, term, &agent_slot,
                             &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
                         ).await?;
                     }
+                } else if app.status == Status::Streaming {
+                    // D-06: a background agent finished while the main
+                    // agent is mid-turn. Deliver it as a
+                    // `SteerMessage::FollowUp` at the next iteration
+                    // boundary rather than between a tool call and its
+                    // result; on a failed send (turn ending right now)
+                    // the text is kept for the next idle pick, never
+                    // lost, never duplicated.
+                    send_agent_reports_to_turn(steer_tx_slot.as_ref(), &mut agent_report_slot);
                 }
                 // Redraw only when there's a live counter to update.
                 if app.turn_started_at.is_some()
@@ -2160,7 +2175,7 @@ async fn run_app(
                             let mut g = agent_slot.lock().await;
                             g.as_mut().and_then(|a| a.pending_follow_ups.pop_front())
                         };
-                        let follow_up = pick_follow_up(from_agent, &mut follow_up_slot);
+                        let follow_up = pick_follow_up(from_agent, &mut follow_up_slot, &mut agent_report_slot);
                         if let Some(text) = follow_up {
                             handle_action(
                                 KeyAction::StartTurn(text),
@@ -3739,17 +3754,77 @@ async fn handle_action(
 /// precondition — the ticker checks `status != Streaming && turn_task
 /// .is_none()` before calling, and the turn-completion site sets
 /// `status = Idle` well above. Do not add a third call site without it.
+///
+/// v0.13 adds a FOURTH source, between the human's queued line and the
+/// plugin overflow: finished background-agent reports (D-06). It reads
+/// `agent_reports` (a send that `send_agent_reports_to_turn` could not
+/// steer into a live turn) before a fresh `take_reports()`, so an
+/// earlier failed send is delivered before a later report leapfrogs it.
+/// Placed after the human source (typed and watched land) but before
+/// the plugin's, matching the plugin's existing "goes LAST" rationale.
 fn pick_follow_up(
     from_agent: Option<String>,
     slot: &mut std::collections::VecDeque<String>,
+    agent_reports: &mut std::collections::VecDeque<String>,
+) -> Option<String> {
+    pick_follow_up_with_registry(from_agent, slot, agent_reports, crate::agent_registry::global().as_deref())
+}
+
+/// Same as [`pick_follow_up`], but takes the registry explicitly so
+/// tests are not at the mercy of the process-wide `OnceLock` (which
+/// only ever accepts its FIRST caller and is shared with every other
+/// test in this binary).
+fn pick_follow_up_with_registry(
+    from_agent: Option<String>,
+    slot: &mut std::collections::VecDeque<String>,
+    agent_reports: &mut std::collections::VecDeque<String>,
+    reg: Option<&crate::agent_registry::AgentRegistry>,
 ) -> Option<String> {
     from_agent
         .or_else(|| slot.pop_front())
+        .or_else(|| agent_reports.pop_front())
+        .or_else(|| reg.and_then(|r| r.take_reports()))
         // `take_pending` also stages the turn origin, which is what
         // makes §2.4's rule 2 true for a turn a plugin STARTED (as
         // opposed to one it steered). `KeyAction::StartTurn`'s
         // `plugin_send::reset_turn()` promotes it a moment later.
         .or_else(|| crate::plugin_send::take_pending().map(|p| p.text))
+}
+
+/// D-06's streaming half: hand a finished background agent's batched
+/// report to the running turn via `steer_tx`. `take_reports()` already
+/// batches everything waiting into one string (`AgentRegistry`,
+/// 04-01), so this never needs to merge multiple calls itself. On a
+/// failed send — no turn ever ran, or the turn just ended — the text
+/// is pushed back onto `agent_report_slot` rather than dropped; the
+/// next idle `pick_follow_up` call finds it there first.
+fn send_agent_reports_to_turn(
+    steer_tx: Option<&mpsc::Sender<SteerMessage>>,
+    agent_report_slot: &mut std::collections::VecDeque<String>,
+) {
+    let reg = crate::agent_registry::global();
+    send_agent_reports_to_turn_with_registry(steer_tx, agent_report_slot, reg.as_deref());
+}
+
+/// Same as [`send_agent_reports_to_turn`], but with an explicit
+/// registry for tests (see [`pick_follow_up_with_registry`]).
+fn send_agent_reports_to_turn_with_registry(
+    steer_tx: Option<&mpsc::Sender<SteerMessage>>,
+    agent_report_slot: &mut std::collections::VecDeque<String>,
+    reg: Option<&crate::agent_registry::AgentRegistry>,
+) {
+    let Some(reg) = reg else {
+        return;
+    };
+    let Some(text) = reg.take_reports() else {
+        return;
+    };
+    let sent = steer_tx
+        .map(|tx| tx.try_send(SteerMessage::FollowUp { text: text.clone() }).is_ok())
+        .unwrap_or(false);
+    if !sent {
+        agent_report_slot.push_front(text);
+    }
 }
 
 /// Route a mid-stream message into the running turn, or queue it as the
@@ -5789,23 +5864,24 @@ mod tests {
 
         let mut slot: VecDeque<String> = VecDeque::new();
         slot.push_back("from the human".to_string());
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
 
         assert_eq!(
-            pick_follow_up(Some("from the agent".into()), &mut slot).as_deref(),
+            pick_follow_up(Some("from the agent".into()), &mut slot, &mut agent_reports).as_deref(),
             Some("from the agent"),
             "1st: a FollowUp handled inside the turn, or a demoted steer"
         );
         assert_eq!(
-            pick_follow_up(None, &mut slot).as_deref(),
+            pick_follow_up(None, &mut slot, &mut agent_reports).as_deref(),
             Some("from the human"),
             "2nd: the human's queued line must beat the plugin's message"
         );
         assert_eq!(
-            pick_follow_up(None, &mut slot).as_deref(),
+            pick_follow_up(None, &mut slot, &mut agent_reports).as_deref(),
             Some("from the plugin"),
             "3rd, and only once the human has been served"
         );
-        assert_eq!(pick_follow_up(None, &mut slot), None, "and then nothing");
+        assert_eq!(pick_follow_up(None, &mut slot, &mut agent_reports), None, "and then nothing");
     }
 
     /// **A structural test, and a test of last resort.** The reversion
@@ -5867,7 +5943,8 @@ mod tests {
         let _g = send_guard();
         crate::plugin_send::send("p", "x").expect("queued");
         let mut slot: VecDeque<String> = VecDeque::new();
-        assert_eq!(pick_follow_up(None, &mut slot).as_deref(), Some("x"));
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
+        assert_eq!(pick_follow_up(None, &mut slot, &mut agent_reports).as_deref(), Some("x"));
         crate::plugin_send::reset_turn();
         let err = crate::plugin_send::send("p", "again")
             .expect_err("the turn that just started is this plugin's own");
@@ -5875,6 +5952,121 @@ mod tests {
             err, "this plugin cannot send during a turn its own message started",
             "{err}"
         );
+    }
+
+    fn reg_cfg() -> crate::config::AgentConfig {
+        crate::config::AgentConfig {
+            max_live: 8,
+            max_concurrency: 4,
+            ..crate::config::AgentConfig::default()
+        }
+    }
+
+    /// Two reports that finish together must arrive as ONE follow-up
+    /// (D-06), because `AgentRegistry::take_reports` already batches
+    /// everything waiting into one string (04-01) and `pick_follow_up`
+    /// must not call it twice for the same drain.
+    #[test]
+    fn pending_follow_ups_batches_concurrent_reports() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        reg.push_report("a1", crate::agent_registry::AgentState::Completed, "r1");
+        reg.push_report("a2", crate::agent_registry::AgentState::Completed, "r2");
+
+        let mut slot: VecDeque<String> = VecDeque::new();
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
+        let text = pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg))
+            .expect("one batched follow-up");
+        assert!(text.contains("[agent a1 finished"), "{text}");
+        assert!(text.contains("[agent a2 finished"), "{text}");
+        assert_eq!(
+            pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg)),
+            None,
+            "drained — a second pick must not resurface the same reports"
+        );
+    }
+
+    /// Idle: a pending report makes the follow-up picker return it, the
+    /// same path a queued human line takes.
+    #[test]
+    fn idle_pick_surfaces_a_pending_agent_report() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        reg.push_report("a1", crate::agent_registry::AgentState::Completed, "done");
+        let mut slot: VecDeque<String> = VecDeque::new();
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
+        let text = pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg))
+            .expect("the idle picker finds it");
+        assert!(text.contains("[agent a1 finished"), "{text}");
+    }
+
+    /// Streaming: the report is sent as `SteerMessage::FollowUp` on
+    /// `steer_tx`.
+    #[test]
+    fn streaming_send_delivers_report_as_follow_up_steer_message() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        reg.push_report("a1", crate::agent_registry::AgentState::Completed, "done");
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
+        send_agent_reports_to_turn_with_registry(Some(&tx), &mut agent_reports, Some(&reg));
+        match rx.try_recv().expect("a message was sent") {
+            SteerMessage::FollowUp { text } => assert!(text.contains("[agent a1 finished")),
+            other => panic!("expected FollowUp, got {other:?}"),
+        }
+        assert!(agent_reports.is_empty(), "delivered, not kept for later");
+    }
+
+    /// If the send fails (turn ended, receiver dropped) the text stays
+    /// in the outbox slot and is picked up when idle — never lost,
+    /// never duplicated.
+    #[test]
+    fn streaming_send_failure_keeps_the_report_for_the_next_idle_pick() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        reg.push_report("a1", crate::agent_registry::AgentState::Completed, "done");
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx); // receiver gone: the turn already ended
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
+        send_agent_reports_to_turn_with_registry(Some(&tx), &mut agent_reports, Some(&reg));
+        assert_eq!(agent_reports.len(), 1, "kept, not dropped");
+
+        let mut slot: VecDeque<String> = VecDeque::new();
+        let text = pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg))
+            .expect("the next idle pick finds it");
+        assert!(text.contains("[agent a1 finished"), "{text}");
+        assert_eq!(
+            pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg)),
+            None,
+            "never duplicated"
+        );
+    }
+
+    /// Human `follow_up_slot` / `Agent::pending_follow_ups` keep their
+    /// existing priority over agent reports.
+    #[test]
+    fn human_follow_up_outranks_a_pending_agent_report() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        reg.push_report("a1", crate::agent_registry::AgentState::Completed, "done");
+        let mut slot: VecDeque<String> = VecDeque::new();
+        slot.push_back("from the human".to_string());
+        let mut agent_reports: VecDeque<String> = VecDeque::new();
+
+        assert_eq!(
+            pick_follow_up_with_registry(
+                Some("from the agent field".into()),
+                &mut slot,
+                &mut agent_reports,
+                Some(&reg)
+            )
+            .as_deref(),
+            Some("from the agent field"),
+            "1st: Agent::pending_follow_ups"
+        );
+        assert_eq!(
+            pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg)).as_deref(),
+            Some("from the human"),
+            "2nd: follow_up_slot beats the background-agent report"
+        );
+        let text = pick_follow_up_with_registry(None, &mut slot, &mut agent_reports, Some(&reg))
+            .expect("3rd: the background report, once humans are served");
+        assert!(text.contains("[agent a1 finished"), "{text}");
     }
 
     /// Tabs must be expanded to spaces before we hand a line to
