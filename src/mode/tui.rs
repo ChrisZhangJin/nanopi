@@ -2018,6 +2018,46 @@ fn apply_orchestrator_mode(app: &mut App, agent: &mut Agent, on: bool) {
     agent.set_system_base(prompt);
 }
 
+/// Outcome of attempting to flip `app.orchestrator`, pulled out as a pure
+/// decision function so the CR-02 fix (refuse-when-busy) has a test seam
+/// that does not require a `Term`/`agent_slot` (see the identical note on
+/// `handle_reload`'s lack of one).
+#[derive(Debug, PartialEq, Eq)]
+enum OrchestratorToggleOutcome {
+    /// The value changed and was applied to a present Agent.
+    Applied,
+    /// `new_val` already equalled `app.orchestrator` — nothing to do.
+    Unchanged,
+    /// A turn is in flight (the Agent is out of `agent_slot`): the toggle
+    /// is refused and `app.orchestrator` is left untouched.
+    RefusedBusy,
+}
+
+/// The Agent is moved OUT of `agent_slot` for the duration of a turn (see
+/// the identical note in `handle_reload`), so a toggle attempted mid-turn
+/// would previously find the slot empty, silently skip applying the
+/// change, yet still flip `app.orchestrator` and report success — leaving
+/// the status line lying about the real registry/prompt (T-06-06) with
+/// nothing left to reconcile it once the turn ends. Refuse instead:
+/// `app.orchestrator` is left untouched when the slot is empty.
+fn try_apply_orchestrator_toggle(
+    app: &mut App,
+    agent: Option<&mut Agent>,
+    new_val: bool,
+) -> OrchestratorToggleOutcome {
+    if new_val == app.orchestrator {
+        return OrchestratorToggleOutcome::Unchanged;
+    }
+    match agent {
+        Some(a) => {
+            app.orchestrator = new_val;
+            apply_orchestrator_mode(app, a, new_val);
+            OrchestratorToggleOutcome::Applied
+        }
+        None => OrchestratorToggleOutcome::RefusedBusy,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Main event loop
 // ─────────────────────────────────────────────────────────────────────
@@ -3060,27 +3100,38 @@ async fn handle_action(
         }
         KeyAction::SetOrchestrator(explicit) => {
             let new_val = explicit.unwrap_or(!app.orchestrator);
-            if new_val != app.orchestrator {
-                app.orchestrator = new_val;
-                let mut g = agent_slot.lock().await;
-                if let Some(a) = g.as_mut() {
-                    apply_orchestrator_mode(app, a, new_val);
+            let mut g = agent_slot.lock().await;
+            match try_apply_orchestrator_toggle(app, g.as_mut(), new_val) {
+                OrchestratorToggleOutcome::Applied | OrchestratorToggleOutcome::Unchanged => {
+                    drop(g);
+                    let msg = if new_val {
+                        "orchestrator mode on (from next turn)"
+                    } else {
+                        "orchestrator mode off (from next turn)"
+                    };
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            msg,
+                            Style::default()
+                                .fg(Color::Indexed(108))
+                                .add_modifier(Modifier::ITALIC),
+                        )]),
+                    )?;
+                }
+                OrchestratorToggleOutcome::RefusedBusy => {
+                    drop(g);
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            "orchestrator mode: a turn is in flight — try again once it finishes",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::ITALIC),
+                        )]),
+                    )?;
                 }
             }
-            let msg = if new_val {
-                "orchestrator mode on (from next turn)"
-            } else {
-                "orchestrator mode off (from next turn)"
-            };
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    msg,
-                    Style::default()
-                        .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
-                )]),
-            )?;
         }
         KeyAction::OrchestratorUsage(msg) => {
             insert_line(
@@ -8257,6 +8308,38 @@ mod tests {
             after_entry.map(|e| e.state),
             "toggling orchestrator mode must never touch AgentRegistry"
         );
+    }
+
+    #[test]
+    fn try_apply_orchestrator_toggle_refuses_mid_turn_without_flipping_flag() {
+        // CR-02: a toggle attempted while the Agent is out of
+        // `agent_slot` (turn in flight) must neither silently flip
+        // `app.orchestrator` nor report success — it must refuse and
+        // leave the flag exactly as it was.
+        let mut app = mkapp();
+        assert!(!app.orchestrator);
+
+        let outcome = try_apply_orchestrator_toggle(&mut app, None, true);
+        assert_eq!(outcome, OrchestratorToggleOutcome::RefusedBusy);
+        assert!(
+            !app.orchestrator,
+            "a refused toggle must not flip app.orchestrator"
+        );
+
+        // Once the Agent is back in the slot, the toggle must succeed.
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-cr02", HooksConfig::default());
+        let outcome = try_apply_orchestrator_toggle(&mut app, Some(&mut agent), true);
+        assert_eq!(outcome, OrchestratorToggleOutcome::Applied);
+        assert!(app.orchestrator);
+    }
+
+    #[test]
+    fn try_apply_orchestrator_toggle_is_noop_when_value_unchanged() {
+        let mut app = mkapp();
+        let outcome = try_apply_orchestrator_toggle(&mut app, None, false);
+        assert_eq!(outcome, OrchestratorToggleOutcome::Unchanged);
+        assert!(!app.orchestrator);
     }
 
     #[test]
