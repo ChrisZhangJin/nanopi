@@ -284,7 +284,12 @@ Plans:
   3. The strip is display-only: no approve/stop/message actions (control goes through the orchestrator).
   4. The strip updates on the TUI tick from a registry snapshot, with no flicker or redraw storm under many agent events.
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — agents strip model + pure renderer (src/mode/agents_strip.rs), TDD
+- [ ] 05-02-PLAN.md — Ctrl+G ToggleAgentsStrip keybinding + docs/manual test row
+- [ ] 05-03-PLAN.md — wire strip into TUI dock, tick refresh, Ctrl+G/Esc, expanded detail
 **UI hint**: yes
 **Research flags**: standard patterns.
 
