@@ -3,6 +3,11 @@
 //! Read-only, cwd-bounded. Skips a small ignore list (`.git`, `node_modules`,
 //! `target`, `.venv`, `dist`, `build`) plus dotfiles at any depth (unless
 //! `all=true`). Caps at 1000 results.
+//!
+//! The agents archive (`paths::project_agents_dir`, `.nanopi/agents/`) is
+//! always excluded regardless of `all` (D-08) — agents must not search other
+//! agents' briefs/reports/transcripts. This exclusion is path-based, not
+//! name-based, so `.nanopi/skills` stays searchable with `all=true`.
 
 use std::path::{Path, PathBuf};
 
@@ -63,10 +68,25 @@ impl Tool for FindTool {
         let base_str = args["path"].as_str().unwrap_or(".");
         let all = args["all"].as_bool().unwrap_or(false);
         let base = resolve_dir(&ctx.cwd, base_str)?;
+        let agents_root = crate::paths::project_agents_dir(&ctx.cwd);
+        let agents_root = std::fs::canonicalize(&agents_root).unwrap_or(agents_root);
 
         let mut results: Vec<String> = Vec::new();
         let mut truncated = false;
-        walk(&base, &base, &re, all, 0, &mut results, &mut truncated);
+        if is_within_agents_root(&base, &agents_root) {
+            // Base itself is inside (or is) the archive root: nothing to return.
+        } else {
+            walk(
+                &base,
+                &base,
+                &re,
+                all,
+                0,
+                &mut results,
+                &mut truncated,
+                &agents_root,
+            );
+        }
 
         results.sort();
         let out = if results.is_empty() {
@@ -88,6 +108,23 @@ impl Tool for FindTool {
     }
 }
 
+/// True if `path` equals or is nested inside `agents_root`, comparing both
+/// lexically (joined from the same cwd) and, when possible, canonicalized
+/// (to also catch a symlinked cwd). This check is independent of `all` —
+/// the archive must stay hidden under every flag combination (D-08).
+fn is_within_agents_root(path: &Path, agents_root: &Path) -> bool {
+    if path == agents_root || path.starts_with(agents_root) {
+        return true;
+    }
+    if let (Ok(p), Ok(a)) = (std::fs::canonicalize(path), std::fs::canonicalize(agents_root)) {
+        if p == a || p.starts_with(&a) {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk(
     root: &Path,
     dir: &Path,
@@ -96,6 +133,7 @@ fn walk(
     depth: usize,
     out: &mut Vec<String>,
     truncated: &mut bool,
+    agents_root: &Path,
 ) {
     if *truncated || depth > MAX_DEPTH {
         return;
@@ -110,6 +148,11 @@ fn walk(
         }
         let name = e.file_name().to_string_lossy().into_owned();
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let full = e.path();
+        // D-08: always skip the agents archive, regardless of `all`.
+        if is_within_agents_root(&full, agents_root) {
+            continue;
+        }
         if !all {
             if name.starts_with('.') {
                 continue;
@@ -118,14 +161,13 @@ fn walk(
                 continue;
             }
         }
-        let full = e.path();
         let rel = full.strip_prefix(root).unwrap_or(&full);
         let rel_str = rel.to_string_lossy();
         if re.is_match(&rel_str) {
             out.push(rel_str.into_owned());
         }
         if is_dir {
-            walk(root, &full, re, all, depth + 1, out, truncated);
+            walk(root, &full, re, all, depth + 1, out, truncated, agents_root);
         }
     }
 }
