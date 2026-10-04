@@ -57,6 +57,33 @@ pub struct AgentConfig {
     pub file_path: PathBuf,
 }
 
+/// Display name of the built-in general-purpose agent.
+pub const GENERAL_PURPOSE_NAME: &str = "general-purpose";
+
+/// System prompt for the built-in general-purpose agent, modelled on
+/// Claude Code's general-purpose agent: works autonomously with no
+/// access to the parent's conversation, does not ask questions, and
+/// always ends with a structured report.
+const GENERAL_PURPOSE_PROMPT: &str = "You are a general-purpose agent dispatched to research and complete a single delegated task.\n\nYou work autonomously: you have no access to the parent conversation beyond the brief you were given, and you cannot ask the parent (or the user) clarifying questions mid-task. Make reasonable assumptions, note them in your report, and keep going.\n\nComplete the task fully rather than stopping halfway. When searching the codebase or filesystem, start broad and then narrow once you have found the relevant area. Prefer editing existing files over creating new ones unless the task clearly calls for a new file.\n\nWhen you are done, end your final message with a structured report using exactly these headings:\n\n## Summary\nWhat you did and what the outcome was.\n\n## Files changed\nEvery file you created or modified, with a one-line note on what changed.\n\n## Open issues\nAnything unresolved, assumptions you made, or follow-up work the parent should know about. Write \"None\" if there are none.";
+
+impl AgentConfig {
+    /// The built-in general-purpose agent: no tool restriction, no model
+    /// override (inherits the parent's model), trusted as a user-level
+    /// definition since the prompt ships with nanopi itself.
+    pub fn general_purpose() -> AgentConfig {
+        AgentConfig {
+            name: GENERAL_PURPOSE_NAME.to_string(),
+            description: "General-purpose agent for researching and completing a delegated task"
+                .to_string(),
+            tools: None,
+            model: None,
+            system_prompt: GENERAL_PURPOSE_PROMPT.to_string(),
+            source: AgentSource::User,
+            file_path: PathBuf::new(),
+        }
+    }
+}
+
 /// Result of [`discover_agents`].
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryResult {
@@ -269,6 +296,21 @@ mod tests {
         let agents = load_agents_from_dir(&dir, AgentSource::Project);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "good");
+    }
+
+    #[test]
+    fn general_purpose_is_well_formed() {
+        let cfg = AgentConfig::general_purpose();
+        assert_eq!(cfg.name, GENERAL_PURPOSE_NAME);
+        assert_eq!(cfg.name, "general-purpose");
+        assert_eq!(cfg.tools, None);
+        assert_eq!(cfg.model, None);
+        assert_eq!(cfg.source, AgentSource::User);
+        assert!(!cfg.system_prompt.is_empty());
+        assert!(cfg.system_prompt.to_lowercase().contains("autonomously"));
+        assert!(cfg.system_prompt.contains("## Summary"));
+        assert!(cfg.system_prompt.contains("## Files changed"));
+        assert!(cfg.system_prompt.contains("## Open issues"));
     }
 
     #[test]

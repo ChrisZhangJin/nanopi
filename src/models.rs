@@ -32,11 +32,23 @@ pub struct ModelInfo {
 /// just disagreed. `MODELS` ids themselves stay mixed-case; only the
 /// comparison folds case.
 pub fn context_window(model_id: &str) -> Option<u32> {
+    lookup(model_id).map(|m| m.context_window)
+}
+
+/// Which vendor serves a model id, or `None` if we don't know it.
+///
+/// Same case-insensitive longest-prefix semantics as [`context_window`] —
+/// both call the same private [`lookup`] so they can never disagree.
+pub fn model_vendor(model_id: &str) -> Option<&'static str> {
+    lookup(model_id).map(|m| m.vendor)
+}
+
+/// Shared lookup backing both [`context_window`] and [`model_vendor`].
+fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     let id_lc = model_id.to_ascii_lowercase();
     MODELS
         .iter()
         .find(|m| id_lc.starts_with(&m.id.to_ascii_lowercase()))
-        .map(|m| m.context_window)
 }
 
 /// Every model we know `vendor` serves, sorted by id.
@@ -944,6 +956,21 @@ mod tests {
         assert_eq!(context_window("minimax-M3"), Some(1_000_000));
         assert_eq!(context_window("MINIMAX-M3"), Some(1_000_000));
         assert_eq!(context_window("minimax-m3"), Some(1_000_000));
+    }
+
+    #[test]
+    fn model_vendor_prefix_and_case_insensitive() {
+        assert_eq!(model_vendor("claude-opus-4-7-20260101"), Some("anthropic"));
+        assert_eq!(model_vendor("DEEPSEEK-v4-pro"), Some("deepseek"));
+        assert_eq!(model_vendor("no-such-model"), None);
+    }
+
+    #[test]
+    fn model_vendor_and_context_window_agree() {
+        for m in MODELS {
+            assert_eq!(context_window(m.id), Some(m.context_window));
+            assert_eq!(model_vendor(m.id), Some(m.vendor));
+        }
     }
 
     #[test]
