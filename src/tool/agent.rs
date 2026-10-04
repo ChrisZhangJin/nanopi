@@ -446,20 +446,28 @@ impl Tool for AgentTool {
         ToolSpec {
             name: "agent".into(),
             description: concat!(
-                "Delegate tasks to specialized agents that each run in an isolated ",
-                "context window (a separate nanopi process). Use this to keep ",
-                "large, self-contained subtasks (recon, planning, review) out of ",
-                "your own context. Agents are defined as markdown files in ",
-                "~/.nanopi/agents (user) or .nanopi/agents (project). The default ",
-                "agent_scope is \"user\"; \"project\"/\"both\" require a trusted ",
-                "project.\n\n",
+                "Delegate independent or exploratory work, or reads that would flood ",
+                "your own context (recon, planning, review, large file scans), to an ",
+                "agent that runs in an isolated context window (a separate nanopi ",
+                "process). Give it a complete, self-contained task: the agent sees ",
+                "none of your conversation. It returns a capped report, not its ",
+                "transcript. `agent` is optional — omit it to use the built-in ",
+                "general-purpose agent; name one of the markdown files in ",
+                "~/.nanopi/agents (user) or .nanopi/agents (project) to use a ",
+                "predefined agent instead. The default agent_scope is \"user\"; ",
+                "\"project\"/\"both\" require a trusted project. Prefer one agent ",
+                "working through a sequence of dependent steps (chain mode) over ",
+                "several short, separate dispatches.\n\n",
                 "Provide EXACTLY ONE of three modes:\n",
-                "- single: {agent, task} — one agent, returns its final answer.\n",
-                "- parallel: {tasks: [{agent, task, cwd?}, ...]} — runs concurrently ",
-                "(max 8 tasks, 4 at a time); returns a section per task.\n",
-                "- chain: {chain: [{agent, task, cwd?}, ...]} — runs sequentially; the ",
-                "literal `{previous}` in each task is replaced by the prior step's ",
-                "output (empty for the first step); stops at the first failed step."
+                "- single: {task, agent?, role?, tools?, model?, description?} — one ",
+                "agent, returns its final answer.\n",
+                "- parallel: {tasks: [{task, agent?, role?, tools?, model?, ",
+                "description?, cwd?}, ...]} — runs concurrently (max 8 tasks, 4 at a ",
+                "time); returns a section per task.\n",
+                "- chain: {chain: [{task, agent?, role?, tools?, model?, ",
+                "description?, cwd?}, ...]} — runs sequentially; the literal ",
+                "`{previous}` in each task is replaced by the prior step's output ",
+                "(empty for the first step); stops at the first failed step."
             )
             .into(),
             parameters: json!({
@@ -467,11 +475,28 @@ impl Tool for AgentTool {
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "description": "single mode: name of the agent to invoke (its frontmatter `name`)."
+                        "description": "optional: name of a predefined agent file; omit to use the built-in general-purpose agent."
                     },
                     "task": {
                         "type": "string",
                         "description": "single mode: the task to delegate. Be specific and self-contained: the agent shares none of your context."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "optional: exactly these tools (by name); `agent` is never allowed."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "optional: model id; must be served by the active provider; defaults to yours."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "optional: 3-6 word label."
                     },
                     "tasks": {
                         "type": "array",
@@ -479,11 +504,15 @@ impl Tool for AgentTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "agent": {"type": "string", "description": "Name of the agent to invoke."},
+                                "agent": {"type": "string", "description": "optional: name of a predefined agent file; omit to use the built-in general-purpose agent."},
                                 "task": {"type": "string", "description": "Task to delegate to the agent."},
-                                "cwd": {"type": "string", "description": "Optional working directory for this agent."}
+                                "cwd": {"type": "string", "description": "Optional working directory for this agent."},
+                                "role": {"type": "string", "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."},
+                                "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
+                                "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
+                                "description": {"type": "string", "description": "optional: 3-6 word label."}
                             },
-                            "required": ["agent", "task"]
+                            "required": ["task"]
                         }
                     },
                     "chain": {
@@ -492,11 +521,15 @@ impl Tool for AgentTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "agent": {"type": "string", "description": "Name of the agent to invoke."},
+                                "agent": {"type": "string", "description": "optional: name of a predefined agent file; omit to use the built-in general-purpose agent."},
                                 "task": {"type": "string", "description": "Task with optional {previous} placeholder for prior output."},
-                                "cwd": {"type": "string", "description": "Optional working directory for this agent."}
+                                "cwd": {"type": "string", "description": "Optional working directory for this agent."},
+                                "role": {"type": "string", "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."},
+                                "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
+                                "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
+                                "description": {"type": "string", "description": "optional: 3-6 word label."}
                             },
-                            "required": ["agent", "task"]
+                            "required": ["task"]
                         }
                     },
                     "agent_scope": {
@@ -1470,6 +1503,44 @@ mod tests {
         // contain a replacement character from a bad cut.
         assert!(!capped.contains('\u{FFFD}'));
         assert!(capped.contains("report truncated"));
+    }
+
+    #[test]
+    fn spec_schema_exposes_inline_overrides_and_optional_agent() {
+        let spec = AgentTool::default().spec();
+        let params = spec.parameters;
+        let props = &params["properties"];
+        for key in [
+            "agent",
+            "task",
+            "role",
+            "tools",
+            "model",
+            "description",
+            "tasks",
+            "chain",
+            "agent_scope",
+            "cwd",
+        ] {
+            assert!(props[key].is_object(), "missing top-level property {key}");
+        }
+        assert_eq!(props["tools"]["type"], json!("array"));
+        assert_eq!(props["tools"]["items"]["type"], json!("string"));
+
+        for list in ["tasks", "chain"] {
+            let item_props = &props[list]["items"]["properties"];
+            for key in ["agent", "task", "cwd", "role", "tools", "model", "description"] {
+                assert!(
+                    item_props[key].is_object(),
+                    "missing {list} item property {key}"
+                );
+            }
+            assert_eq!(props[list]["items"]["required"], json!(["task"]));
+        }
+
+        let desc = spec.description;
+        assert!(desc.contains("optional"));
+        assert!(desc.contains("sequence of dependent steps"));
     }
 
     #[test]
