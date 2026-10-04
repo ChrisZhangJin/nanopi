@@ -868,8 +868,30 @@ pub fn build_child_env(spec: &ChildLaunchSpec, agent_id: &str) -> Vec<(String, S
     e
 }
 
-/// Max bytes of `report.md` returned to the parent model.
-const REPORT_CAP: usize = 64 * 1024;
+/// Max bytes of `report.md` returned to the parent model (D-06): the
+/// parent sees only a capped excerpt plus a pointer to the full
+/// `report.md` on disk, never the child's transcript.
+const PARENT_REPORT_CAP: usize = 8 * 1024;
+
+/// Cap `text` to `PARENT_REPORT_CAP` bytes at a UTF-8 char boundary,
+/// appending a truncation note naming `report_path` when cut (D-06).
+/// Pure.
+fn cap_report(text: String, report_path: &Path) -> String {
+    if text.len() <= PARENT_REPORT_CAP {
+        return text;
+    }
+    let mut cut = PARENT_REPORT_CAP;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut capped = text;
+    capped.truncate(cut);
+    capped.push_str(&format!(
+        "\n…(report truncated at 8 KB; full report: {})",
+        report_path.display()
+    ));
+    capped
+}
 
 /// Marks a registry entry `Stopped` if the dispatch future is dropped
 /// before it records a terminal state.
@@ -1057,15 +1079,7 @@ pub async fn run_single(
 
     let report = dir.join("report.md");
     if let Ok(text) = std::fs::read_to_string(&report) {
-        let mut text = text;
-        if text.len() > REPORT_CAP {
-            let mut cut = REPORT_CAP;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            text.truncate(cut);
-            text.push_str("\n…(report truncated)");
-        }
+        let text = cap_report(text, &report);
         out.content = if out.is_error {
             format!("{}\n\n--- report.md ---\n{text}", out.content)
         } else if status == "limit_reached" {
@@ -1426,6 +1440,37 @@ fn envelope_output(env: JsonEnvelope, stderr_tail: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_report_leaves_small_report_unchanged() {
+        let text = "a".repeat(100);
+        let path = Path::new("/tmp/report.md");
+        assert_eq!(cap_report(text.clone(), path), text);
+    }
+
+    #[test]
+    fn cap_report_truncates_at_8kb_with_path_note() {
+        let text = "x".repeat(20 * 1024);
+        let path = Path::new("/tmp/agents/run/a1/report.md");
+        let capped = cap_report(text, path);
+        assert!(capped.len() <= PARENT_REPORT_CAP + 200);
+        assert!(capped.contains("report truncated"));
+        assert!(capped.contains("/tmp/agents/run/a1/report.md"));
+    }
+
+    #[test]
+    fn cap_report_never_splits_a_utf8_char() {
+        // Multi-byte char ('é', 2 bytes) straddling the 8 KiB cut point.
+        let mut text = "a".repeat(PARENT_REPORT_CAP - 1);
+        text.push('é');
+        text.push_str(&"b".repeat(100));
+        let path = Path::new("/tmp/report.md");
+        let capped = cap_report(text, path);
+        // Must be valid UTF-8 (String guarantees this) and must not
+        // contain a replacement character from a bad cut.
+        assert!(!capped.contains('\u{FFFD}'));
+        assert!(capped.contains("report truncated"));
+    }
 
     #[test]
     fn parse_scope_defaults_to_user() {
