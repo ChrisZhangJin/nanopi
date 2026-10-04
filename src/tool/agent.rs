@@ -177,6 +177,9 @@ struct AgentItem {
     tools: Option<Vec<String>>,
     model: Option<String>,
     description: Option<String>,
+    /// ISO-01: opt-in `"worktree"` isolation. Validated in [`parse_item`]
+    /// so an invalid value is an in-band error before anything spawns.
+    isolation: Option<String>,
 }
 
 /// Decide which mode the arguments select, enforcing exactly-one-of
@@ -234,6 +237,15 @@ fn parse_item(it: &Value, prefix: &str) -> Result<AgentItem, String> {
     let role = opt_str_field(it, prefix, "role")?;
     let model = opt_str_field(it, prefix, "model")?;
     let description = opt_str_field(it, prefix, "description")?;
+    let isolation = opt_str_field(it, prefix, "isolation")?;
+    if let Some(v) = &isolation {
+        if v != "worktree" {
+            return Err(format!(
+                "`{}` must be \"worktree\" (the only supported isolation mode)",
+                errkey(prefix, "isolation")
+            ));
+        }
+    }
     let tools = match it.get("tools") {
         None | Some(Value::Null) => None,
         Some(Value::Array(arr)) => {
@@ -272,6 +284,7 @@ fn parse_item(it: &Value, prefix: &str) -> Result<AgentItem, String> {
         tools,
         model,
         description,
+        isolation,
     })
 }
 
@@ -498,6 +511,11 @@ impl Tool for AgentTool {
                     "description": {
                         "type": "string",
                         "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["worktree"],
+                        "description": "optional: run the agent in its own git worktree/branch (opt-in). Outside a git repo this is ignored with a warning; on finish an unchanged worktree is removed, a changed one is merged or (on conflict) kept with the branch for manual follow-up."
                     },
                     "tasks": {
                         "type": "array",
@@ -782,7 +800,15 @@ async fn run_item(
             return soft_error(e);
         }
     }
-    run_single(l, &cfg, task, run_cwd, item.description.as_deref()).await
+    run_single(
+        l,
+        &cfg,
+        task,
+        run_cwd,
+        item.description.as_deref(),
+        item.isolation.as_deref(),
+    )
+    .await
 }
 
 /// `background: true` counterpart to [`run_item`]: identical
@@ -818,7 +844,14 @@ fn run_item_background(
             return soft_error(e);
         }
     }
-    match prepare_run(l, &cfg, task, run_cwd, item.description.as_deref()) {
+    match prepare_run(
+        l,
+        &cfg,
+        task,
+        run_cwd,
+        item.description.as_deref(),
+        item.isolation.as_deref(),
+    ) {
         Ok(prepared) => spawn_background(&l.registry, prepared),
         Err(soft) => soft,
     }
@@ -1021,13 +1054,52 @@ struct StateGuard<'a> {
     id: String,
     dir: PathBuf,
     done: bool,
+    /// ISO-02: carried so a dropped (stopped) dispatch still finishes
+    /// its worktree — partial work must never be silently lost.
+    worktree: Option<crate::worktree::Worktree>,
 }
 
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
         if !self.done {
             ensure_report(&self.dir, &self.id, AgentState::Stopped, "stopped by parent");
+            if let Some(wt) = self.worktree.take() {
+                finish_worktree_and_record(&self.dir, &self.id, &wt);
+            }
             self.reg.set_state(&self.id, AgentState::Stopped);
+        }
+    }
+}
+
+/// ISO-02: run `worktree::finish` (D-09..D-11), append its outcome line
+/// to `report.md`, and record `worktree_outcome:` in `brief.md`'s front
+/// matter. Blocking (shells out to `git`); callers on the async path
+/// run this via `spawn_blocking`, the `StateGuard::drop` path (sync by
+/// construction) calls it directly.
+fn finish_worktree_and_record(dir: &Path, id: &str, wt: &crate::worktree::Worktree) {
+    let outcome = crate::worktree::finish(wt, id);
+    let line = wt.report_line(&outcome);
+    let report_path = dir.join("report.md");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&report_path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "\n{line}");
+    }
+    let outcome_key = match &outcome {
+        crate::worktree::WorktreeOutcome::Removed => "removed",
+        crate::worktree::WorktreeOutcome::Merged { .. } => "merged",
+        crate::worktree::WorktreeOutcome::Conflict { .. } => "conflict",
+        crate::worktree::WorktreeOutcome::Error(_) => "error",
+    };
+    let brief_path = dir.join("brief.md");
+    if let Ok(content) = std::fs::read_to_string(&brief_path) {
+        if let Some(updated) =
+            crate::agent::brief::upsert_front_matter_field(&content, "worktree_outcome", outcome_key)
+        {
+            let _ = write_private(&brief_path, &updated);
         }
     }
 }
@@ -1052,6 +1124,43 @@ fn ensure_gitignore_once(cwd: &Path) {
         }
         Err(e) => crate::note!("nanopi: debug: ensure_gitignore({}): {e}", cwd.display()),
     }
+    // T-04-14: `.nanopi/worktrees/` holds a clone of the repo's own
+    // tracked files per isolated agent — keep it out of the user's `git
+    // status`/`git add -A` the same way `.nanopi/agents/` already is.
+    if let Some(root) = crate::worktree::detect(cwd) {
+        ensure_gitignore_entry(&root, ".nanopi/worktrees/");
+    }
+}
+
+/// Append `entry` to `root/.gitignore` if an equivalent line isn't
+/// already present. Append-only, never truncates. Best-effort: errors
+/// are logged, never surfaced.
+fn ensure_gitignore_entry(root: &Path, entry: &str) {
+    let path = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let bare = entry.trim_end_matches('/');
+    if existing
+        .lines()
+        .any(|l| matches!(l.trim(), e if e == entry || e == bare || e == format!("/{entry}") || e == format!("/{bare}")))
+    {
+        return;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644);
+    }
+    use std::io::Write as _;
+    let Ok(mut f) = opts.open(&path) else {
+        return;
+    };
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        let _ = f.write_all(b"\n");
+    }
+    let _ = f.write_all(entry.as_bytes());
+    let _ = f.write_all(b"\n");
 }
 
 /// D-04: if the child left no `report.md` (killed, crashed, stopped,
@@ -1112,6 +1221,13 @@ pub(crate) struct PreparedRun {
     dir: PathBuf,
     command: Command,
     timeout: Duration,
+    /// ISO-01: the worktree the child runs in, when isolation was
+    /// requested and `git` was detected. `run_body` finishes it after
+    /// the child exits.
+    worktree: Option<crate::worktree::Worktree>,
+    /// ISO-01: isolation was requested but ignored (not a git repo / no
+    /// `git` on PATH, D-08) — surfaced to the model as a warning.
+    warning: Option<String>,
 }
 
 impl PreparedRun {
@@ -1132,6 +1248,7 @@ fn prepare_run(
     task: &str,
     cwd: &Path,
     label: Option<&str>,
+    isolation: Option<&str>,
 ) -> Result<PreparedRun, ToolOutput> {
     let reg = &*l.registry;
     // D-07: register .nanopi/agents/ in the project .gitignore before the
@@ -1147,6 +1264,38 @@ fn prepare_run(
     } else {
         Some(agent.system_prompt.clone())
     };
+
+    // ISO-01: opt-in worktree isolation. Outside a git repo (or no
+    // `git` on PATH), isolation is ignored and a warning is surfaced in
+    // the tool result rather than failing the dispatch (D-08). The
+    // worktree path comes only from the registry's run id + the
+    // reserved agent id (T-04-13) — never from model-supplied strings.
+    let mut worktree = None;
+    let mut warning = None;
+    let mut child_cwd = cwd.to_path_buf();
+    if isolation == Some("worktree") {
+        match crate::worktree::detect(cwd) {
+            Some(root) => match crate::worktree::create(&root, reg.run_id(), &id) {
+                Ok(wt) => {
+                    child_cwd = wt.path.clone();
+                    worktree = Some(wt);
+                }
+                Err(e) => {
+                    warning = Some(format!(
+                        "isolation: \"worktree\" requested but could not be created ({e}); running unisolated"
+                    ));
+                }
+            },
+            None => {
+                warning = Some(
+                    "isolation: \"worktree\" requested but this is not a git repository \
+                     (or `git` is unavailable); running unisolated"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     let started = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     let brief = render_brief_with_meta(
         &BriefSpec {
@@ -1161,6 +1310,8 @@ fn prepare_run(
             started,
             parent: reg.run_id().to_string(),
             label: label.map(str::to_string),
+            worktree: worktree.as_ref().map(|w| w.path.to_string_lossy().into_owned()),
+            branch: worktree.as_ref().map(|w| w.branch.clone()),
         },
     );
     if let Err(e) = write_private(&dir.join("brief.md"), &brief) {
@@ -1183,13 +1334,15 @@ fn prepare_run(
             agent.model.as_deref(),
         ))
         .envs(build_child_env(&l.spec, &id))
-        .current_dir(cwd);
+        .current_dir(&child_cwd);
 
     Ok(PreparedRun {
         id,
         dir,
         command,
         timeout: l.spec.timeout,
+        worktree,
+        warning,
     })
 }
 
@@ -1204,12 +1357,15 @@ pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> Tool
         dir,
         command,
         timeout,
+        worktree,
+        warning,
     } = prepared;
     let mut sg = StateGuard {
         reg,
         id: id.clone(),
         dir: dir.clone(),
         done: false,
+        worktree: worktree.clone(),
     };
 
     // Beyond max_concurrency: queue here (state stays Queued).
@@ -1240,6 +1396,19 @@ pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> Tool
     };
     ensure_report(&dir, &id, state, &error_text);
 
+    // ISO-02: finish the worktree (commit/remove/merge/conflict) for
+    // every terminal state, including failed/limit_reached — partial
+    // work is never discarded. Blocking (shells out to `git`), so it
+    // runs on a blocking thread rather than the async executor.
+    if let Some(wt) = worktree {
+        let dir2 = dir.clone();
+        let id2 = id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            finish_worktree_and_record(&dir2, &id2, &wt);
+        })
+        .await;
+    }
+
     let report = dir.join("report.md");
     if let Ok(text) = std::fs::read_to_string(&report) {
         let text = cap_report(text, &report);
@@ -1264,6 +1433,9 @@ pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> Tool
         m["agent_id"] = json!(id);
         m["agent_dir"] = json!(dir.to_string_lossy());
     }
+    if let Some(w) = &warning {
+        out.content = format!("Warning: {w}\n\n{}", out.content);
+    }
 
     reg.set_state(&id, state);
     sg.done = true;
@@ -1277,8 +1449,9 @@ pub async fn run_single(
     task: &str,
     cwd: &Path,
     label: Option<&str>,
+    isolation: Option<&str>,
 ) -> ToolOutput {
-    match prepare_run(l, agent, task, cwd, label) {
+    match prepare_run(l, agent, task, cwd, label, isolation) {
         Ok(prepared) => run_body(&l.registry, prepared).await,
         Err(soft) => soft,
     }
@@ -1359,6 +1532,8 @@ pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -
         dir: dir.to_path_buf(),
         command,
         timeout: l.spec.timeout,
+        worktree: None,
+        warning: None,
     }
 }
 
@@ -2130,6 +2305,7 @@ mod tests {
                 tools: None,
                 model: None,
                 description: None,
+                isolation: None,
             }],
             AgentScope::Project,
             &dir,
@@ -2154,6 +2330,7 @@ mod tests {
                 tools: None,
                 model: None,
                 description: None,
+                isolation: None,
             }],
             AgentScope::Project,
             &dir,
@@ -2539,7 +2716,7 @@ mod tests {
             "[ -f \"$4\" ] || exit 7; [ \"$NANOPI_AGENT_ID\" = a1 ] || exit 8; echo '{OK_ENV}'"
         );
         let l = launcher(&script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "find the thing", &cwd, None).await;
+        let out = run_single(&l, &agent_fixture(), "find the thing", &cwd, None, None).await;
         assert!(!out.is_error, "{}", out.content);
         let dir = cwd
             .join(".nanopi/agents")
@@ -2629,7 +2806,7 @@ mod tests {
         let cwd = tmp("live");
         let l = launcher(&format!("echo '{OK_ENV}'"), 1, 4);
         l.registry.reserve(&cwd.join(".nanopi/agents")).unwrap(); // one live entry
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
         assert!(out.is_error);
         assert!(
             out.content.contains("agent limit reached"),
@@ -2646,7 +2823,7 @@ mod tests {
         let l = launcher(&format!("sleep 0.4; echo '{OK_ENV}'"), 8, 1);
         let a = agent_fixture();
         let t0 = std::time::Instant::now();
-        let (x, y) = tokio::join!(run_single(&l, &a, "1", &cwd, None), run_single(&l, &a, "2", &cwd, None));
+        let (x, y) = tokio::join!(run_single(&l, &a, "1", &cwd, None, None), run_single(&l, &a, "2", &cwd, None, None));
         assert!(!x.is_error && !y.is_error);
         assert!(
             t0.elapsed() >= Duration::from_millis(800),
@@ -2666,9 +2843,9 @@ mod tests {
         );
         let l = launcher(&script, 8, 4);
         let a = agent_fixture();
-        let f = run_single(&l, &a, "t", &cwd, None).await;
+        let f = run_single(&l, &a, "t", &cwd, None, None).await;
         assert!(f.is_error);
-        let ok = run_single(&l, &a, "t", &cwd, None).await;
+        let ok = run_single(&l, &a, "t", &cwd, None, None).await;
         assert!(!ok.is_error);
         assert!(ok.content.contains("REPORT-BODY"), "{}", ok.content);
         let rp = ok.metadata.as_ref().unwrap()["report_path"]
@@ -2676,7 +2853,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rp.ends_with("/a2/report.md"), "{rp}");
-        let lr = run_single(&l, &a, "t", &cwd, None).await;
+        let lr = run_single(&l, &a, "t", &cwd, None, None).await;
         assert!(!lr.is_error);
         let st: Vec<AgentState> = l.registry.snapshot().iter().map(|e| e.state).collect();
         assert_eq!(
@@ -2696,7 +2873,7 @@ mod tests {
         let cwd = tmp("fallback");
         let script = "exit 3";
         let l = launcher(script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
         assert!(out.is_error);
         let dir = cwd
             .join(".nanopi/agents")
@@ -2719,7 +2896,7 @@ mod tests {
             "echo MINE > \"$(dirname \"$4\")/report.md\"; echo '{OK_ENV}'"
         );
         let l = launcher(&script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
         assert!(!out.is_error);
         let dir = cwd
             .join(".nanopi/agents")
@@ -2735,7 +2912,7 @@ mod tests {
     async fn brief_front_matter_and_index_after_dispatch() {
         let cwd = tmp("frontmatter");
         let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
         assert!(!out.is_error, "{}", out.content);
         let run_dir = cwd.join(".nanopi/agents").join(l.registry.run_id());
         let brief = std::fs::read_to_string(run_dir.join("a1").join("brief.md")).unwrap();
@@ -2758,7 +2935,7 @@ mod tests {
         let cwd = tmp("gitignore");
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
         let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
         assert!(!out.is_error, "{}", out.content);
         let gi = std::fs::read_to_string(cwd.join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".nanopi/agents"), "{gi}");
@@ -2780,6 +2957,7 @@ mod tests {
             tools: Some(vec!["nope".into()]),
             model: None,
             description: None,
+            isolation: None,
         };
         let out = run_item(&l, &item, &item.task, AgentScope::Project, &cwd).await;
         assert!(out.is_error);
@@ -2795,11 +2973,144 @@ mod tests {
             tools: None,
             model: Some("no-such-model-xyz".into()),
             description: None,
+            isolation: None,
         };
         let out = run_item(&l, &item, &item.task, AgentScope::Project, &cwd).await;
         assert!(out.is_error);
         assert!(out.content.contains("unknown model"), "{}", out.content);
         assert!(!run_dir.exists(), "no agent dir should have been reserved");
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ── Plan 04-05: worktree isolation wiring ──
+
+    #[cfg(unix)]
+    fn tmp_repo(tag: &str) -> PathBuf {
+        let d = tmp(tag);
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&d)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "nanopi-test"]);
+        run(&["config", "user.email", "nanopi-test@example.com"]);
+        std::fs::write(d.join("README.md"), "init\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+        d
+    }
+
+    /// ISO-02/D-11: with direct access to `prepare_run`/`run_body` we can
+    /// dirty the main tree *after* the worktree's base is captured but
+    /// *before* `finish()`'s merge attempt — reproducing a real
+    /// concurrent-edit conflict deterministically (the window isn't
+    /// reachable from a black-box integration test). The merge is
+    /// aborted, the worktree and branch are kept (nothing lost), and the
+    /// report/brief carry CONFLICT text rather than a blocking gate.
+    #[tokio::test]
+    async fn worktree_merge_conflict_aborts_and_keeps_branch() {
+        let repo = tmp_repo("wtconflict");
+        let script = "echo 'worktree change' > README.md; echo '{OK_ENV}'".replace("{OK_ENV}", OK_ENV);
+        let l = launcher(&script, 8, 4);
+
+        let prepared = prepare_run(&l, &agent_fixture(), "t", &repo, None, Some("worktree"))
+            .expect("prepare_run should create the worktree");
+        let wt = prepared.worktree.clone().expect("worktree created");
+
+        // Diverge the main tree on the same file *after* the worktree's
+        // base was captured, so the subsequent merge genuinely conflicts.
+        std::fs::write(repo.join("README.md"), "main change\n").unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("spawn git")
+        };
+        assert!(run(&["add", "-A"]).status.success());
+        assert!(run(&["commit", "-q", "-m", "main edit"]).status.success());
+
+        let out = run_body(&l.registry, prepared).await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let dir = repo
+            .join(".nanopi/agents")
+            .join(l.registry.run_id())
+            .join("a1");
+        let report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(report.contains("CONFLICT"), "{report}");
+        let brief = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+        assert_eq!(
+            crate::agent::brief::front_matter_get(&brief, "worktree_outcome").as_deref(),
+            Some("conflict")
+        );
+        assert!(wt.path.exists(), "conflicted worktree should be kept");
+        let branch_list = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("branch")
+            .arg("--list")
+            .arg(&wt.branch)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&branch_list.stdout).trim().is_empty(), "branch should be kept");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// ISO-02: an agent stopped mid-run (the dispatch future dropped,
+    /// `StateGuard`'s Drop path) still finishes its worktree — partial
+    /// work is committed and kept/merged, never silently discarded.
+    #[tokio::test]
+    async fn stopped_agent_still_finishes_worktree() {
+        let repo = tmp_repo("wtstop");
+        let script = "echo feature > feature.txt; sleep 300";
+        let l = launcher(script, 8, 4);
+        let prepared = prepare_run(&l, &agent_fixture(), "t", &repo, None, Some("worktree"))
+            .expect("prepare_run should create the worktree");
+        let wt = prepared.worktree.clone().expect("worktree created");
+        let reg = l.registry.clone();
+
+        let handle = tokio::spawn(async move { run_body(&reg, prepared).await });
+        // Give the shell time to write feature.txt before cancelling.
+        for _ in 0..50 {
+            if wt.path.join("feature.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.abort();
+        let _ = handle.await;
+
+        // StateGuard::drop ran synchronously inside the aborted task;
+        // give the (already-completed, blocking) finish a moment in case
+        // of any scheduling slack, then assert the outcome landed.
+        let dir = repo
+            .join(".nanopi/agents")
+            .join(l.registry.run_id())
+            .join("a1");
+        for _ in 0..50 {
+            if dir.join("report.md").exists()
+                && std::fs::read_to_string(dir.join("report.md"))
+                    .map(|t| t.contains("worktree:"))
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(report.contains("worktree:"), "{report}");
+        // Either removed (if the write hadn't landed yet) or merged —
+        // never left dangling without being recorded.
+        assert!(!wt.path.exists() || report.contains("merged") || report.contains("CONFLICT"));
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

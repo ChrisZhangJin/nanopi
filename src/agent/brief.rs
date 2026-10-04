@@ -47,6 +47,11 @@ pub struct BriefMeta {
     /// present and non-blank; briefs without one are byte-identical to
     /// before this field existed.
     pub label: Option<String>,
+    /// ISO-01: absolute path of the worktree the child runs in, when
+    /// isolation is active. `None` for a normal (unisolated) dispatch.
+    pub worktree: Option<String>,
+    /// ISO-01: the branch created alongside `worktree`.
+    pub branch: Option<String>,
 }
 
 /// Collapse a front-matter value to a single line, trimmed, capped at 120
@@ -86,6 +91,12 @@ pub fn render_brief_with_meta(spec: &BriefSpec, meta: &BriefMeta) -> String {
         if !label.trim().is_empty() {
             fm.push_str(&format!("label: {}\n", fm_value(label)));
         }
+    }
+    if let Some(w) = meta.worktree.as_deref() {
+        fm.push_str(&format!("worktree: {}\n", fm_value(w)));
+    }
+    if let Some(b) = meta.branch.as_deref() {
+        fm.push_str(&format!("branch: {}\n", fm_value(b)));
     }
     fm.push_str(&format!("---\n\n{}", render_brief(spec)));
     fm
@@ -156,6 +167,34 @@ pub fn set_front_matter_field(content: &str, key: &str, value: &str) -> Option<S
         return None;
     }
     out.extend(iter);
+    Some(out)
+}
+
+/// Set a front-matter field, inserting it just before the closing `---`
+/// when `key` isn't already present (unlike [`set_front_matter_field`],
+/// which only updates an existing key). `None` if there is no leading
+/// front-matter block at all. Used post-hoc for fields decided only
+/// after the brief was first written (e.g. `worktree_outcome`, ISO-02).
+pub fn upsert_front_matter_field(content: &str, key: &str, value: &str) -> Option<String> {
+    if let Some(updated) = set_front_matter_field(content, key, value) {
+        return Some(updated);
+    }
+    let mut lines = content.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim_end_matches(['\n', '\r']) != "---" {
+        return None;
+    }
+    let mut out = String::from(first);
+    let mut inserted = false;
+    for line in lines {
+        if !inserted && line.trim_end_matches(['\n', '\r']) == "---" {
+            out.push_str(&format!("{key}: {}\n", fm_value(value)));
+            out.push_str(line);
+            inserted = true;
+        } else {
+            out.push_str(line);
+        }
+    }
     Some(out)
 }
 
@@ -563,6 +602,8 @@ mod tests {
             started: "2026-10-04T10:00:00+08:00".into(),
             parent: "run-1".into(),
             label: None,
+            worktree: None,
+            branch: None,
         }
     }
 

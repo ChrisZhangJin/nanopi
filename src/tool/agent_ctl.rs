@@ -320,6 +320,8 @@ mod tests {
                 started: "now".into(),
                 parent: "run1".into(),
                 label: label.map(str::to_string),
+                worktree: None,
+                branch: None,
             },
         );
         std::fs::write(dir.join("brief.md"), brief).unwrap();

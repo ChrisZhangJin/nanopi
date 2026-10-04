@@ -115,7 +115,7 @@ async fn spawn_real_child() {
         file_path: PathBuf::from("/nonexistent/scout.md"),
     };
 
-    let out = run_single(&tool.launcher(), &agent, "SPAWN-TASK", &cwd, None).await;
+    let out = run_single(&tool.launcher(), &agent, "SPAWN-TASK", &cwd, None, None).await;
     assert!(!out.is_error, "child failed: {}", out.content);
 
     let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
@@ -252,7 +252,7 @@ async fn continue_finished_agent_same_id() {
         file_path: PathBuf::from("/nonexistent/scout.md"),
     };
 
-    let out = run_single(&tool.launcher(), &agent, "FIRST-TASK", &cwd, None).await;
+    let out = run_single(&tool.launcher(), &agent, "FIRST-TASK", &cwd, None, None).await;
     assert!(!out.is_error, "first run failed: {}", out.content);
     let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
     let first_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
@@ -304,3 +304,207 @@ async fn continue_finished_agent_same_id() {
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+// --- ISO-01/ISO-02: worktree isolation (plan 04-05) ---
+
+const OK_ENV: &str = r#"{"session_id":"s","model":"m","finish_reason":"stop","duration_ms":1,"usage":{},"messages":[{"role":"assistant","content":"DONE"}],"status":"completed"}"#;
+
+fn agent_fixture() -> AgentConfig {
+    AgentConfig {
+        name: "scout".into(),
+        description: "d".into(),
+        tools: Some(vec!["read".into()]),
+        model: None,
+        system_prompt: "You are a scout.".into(),
+        source: AgentSource::User,
+        file_path: PathBuf::from("/nonexistent/scout.md"),
+    }
+}
+
+/// `sh -c script` as the child; argv after the script becomes $0.., so
+/// `$4` is the brief path.
+fn iso_launcher(script: &str) -> nanopi::tool::agent::Launcher {
+    let cfg = AgentLimits::default();
+    AgentTool::with_parts(
+        AgentRegistry::new(&cfg),
+        ChildLaunchSpec::default(),
+        ChildProgram {
+            program: "sh".into(),
+            leading_args: vec!["-c".into(), script.into()],
+        },
+    )
+    .launcher()
+}
+
+fn tmp_repo(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "nanopi-iso-{tag}-{}",
+        nanopi::util::uuid::v7()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&d)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.name", "nanopi-test"]);
+    run(&["config", "user.email", "nanopi-test@example.com"]);
+    std::fs::write(d.join("README.md"), "init\n").unwrap();
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "init"]);
+    d
+}
+
+/// ISO-01: `isolation: "worktree"` runs the child with cwd inside
+/// `.nanopi/worktrees/<run>-<id>` on branch `nanopi/<run>/<id>`; the
+/// brief carries both, and an unchanged worktree is removed on finish
+/// with "removed" recorded in both report.md and brief.md.
+#[tokio::test]
+async fn worktree_isolation_creates_branch_and_path_and_removes_when_unchanged() {
+    let repo = tmp_repo("create");
+    let script = format!("pwd > \"$(dirname \"$4\")/where\"; echo '{OK_ENV}'");
+    let l = iso_launcher(&script);
+    let out = run_single(&l, &agent_fixture(), "t", &repo, None, Some("worktree")).await;
+    assert!(!out.is_error, "{}", out.content);
+
+    let dir = repo
+        .join(".nanopi/agents")
+        .join(l.registry.run_id())
+        .join("a1");
+    let where_path = std::fs::read_to_string(dir.join("where")).unwrap();
+    let want = repo.join(".nanopi/worktrees").join(format!("{}-a1", l.registry.run_id()));
+    let repo_canon = std::fs::canonicalize(&repo).unwrap();
+    let want_canon = repo_canon
+        .join(".nanopi/worktrees")
+        .join(format!("{}-a1", l.registry.run_id()));
+    // The worktree is already removed by the time we get here (unchanged
+    // -> finish() cleans it up), so compare the path the child recorded
+    // textually rather than via `canonicalize` (which requires the path
+    // to still exist).
+    assert_eq!(
+        where_path.trim(),
+        want_canon.to_string_lossy(),
+        "child did not run inside the worktree"
+    );
+
+    let brief = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+    assert_eq!(
+        nanopi::agent::brief::front_matter_get(&brief, "worktree").as_deref(),
+        Some(want.to_string_lossy().into_owned()).as_deref()
+    );
+    let branch_want = format!("nanopi/{}/a1", l.registry.run_id());
+    assert_eq!(
+        nanopi::agent::brief::front_matter_get(&brief, "branch").as_deref(),
+        Some(branch_want.as_str())
+    );
+    assert_eq!(
+        nanopi::agent::brief::front_matter_get(&brief, "worktree_outcome").as_deref(),
+        Some("removed")
+    );
+    assert!(!want.exists(), "unchanged worktree should be removed");
+
+    let report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+    assert!(report.contains("worktree: no changes, removed"), "{report}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// ISO-01/D-08: outside a git repo, isolation is ignored and the tool
+/// result carries a warning rather than failing the dispatch.
+#[tokio::test]
+async fn worktree_isolation_warns_outside_git_repo() {
+    let non_repo = std::env::temp_dir().join(format!(
+        "nanopi-iso-norepo-{}",
+        nanopi::util::uuid::v7()
+    ));
+    std::fs::create_dir_all(&non_repo).unwrap();
+    let script = format!("pwd > \"$(dirname \"$4\")/where\"; echo '{OK_ENV}'");
+    let l = iso_launcher(&script);
+    let out = run_single(&l, &agent_fixture(), "t", &non_repo, None, Some("worktree")).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("Warning:"), "{}", out.content);
+    assert!(out.content.contains("not a git repository"), "{}", out.content);
+
+    let dir = non_repo
+        .join(".nanopi/agents")
+        .join(l.registry.run_id())
+        .join("a1");
+    let where_path = std::fs::read_to_string(dir.join("where")).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(where_path.trim()).unwrap(),
+        std::fs::canonicalize(&non_repo).unwrap(),
+        "child should run in the normal cwd, unisolated"
+    );
+
+    let _ = std::fs::remove_dir_all(&non_repo);
+}
+
+/// Invalid isolation value is an in-band error before anything spawns.
+#[tokio::test]
+async fn worktree_isolation_invalid_value_is_in_band_error() {
+    let cwd = std::env::temp_dir().join(format!("nanopi-iso-bad-{}", nanopi::util::uuid::v7()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let ctx = ToolContext { cwd: cwd.clone() };
+    let tool = AgentTool::with_parts(
+        AgentRegistry::new(&AgentLimits::default()),
+        ChildLaunchSpec::default(),
+        ChildProgram {
+            program: "sh".into(),
+            leading_args: vec!["-c".into(), format!("echo '{OK_ENV}'")],
+        },
+    );
+    let args = serde_json::json!({"task": "t", "isolation": "bogus"});
+    let err = tool.execute(args, &ctx).await.expect_err("should reject before spawn");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("worktree"), "{msg}");
+    assert!(!cwd.join(".nanopi").exists(), "no agent dir should have been reserved");
+
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// ISO-02: a worktree with a change is merged into the main tree and
+/// cleaned up; the outcome is recorded in report.md and brief.md, and
+/// (for background dispatch) injected into the outbox text reaching
+/// the main agent.
+#[tokio::test]
+async fn worktree_merge_no_conflict_auto_merges_and_cleans_up_background() {
+    let repo = tmp_repo("merge");
+    let script = "echo feature > \"$PWD/feature.txt\"; echo '{OK_ENV}'".replace("{OK_ENV}", OK_ENV);
+    let l = iso_launcher(&script);
+    let reg = l.registry.clone();
+
+    let tool = AgentTool::with_parts(reg.clone(), l.spec.clone(), l.program.clone());
+    let ctx = ToolContext { cwd: repo.clone() };
+    let args = serde_json::json!({"task": "t", "background": true, "isolation": "worktree"});
+    let out = tool.execute(args, &ctx).await.expect("dispatch");
+    assert!(!out.is_error, "{}", out.content);
+
+    reg.wait_background().await;
+
+    assert!(repo.join("feature.txt").exists(), "merged file missing from main tree");
+    let dir = repo.join(".nanopi/agents").join(reg.run_id()).join("a1");
+    let report = std::fs::read_to_string(dir.join("report.md")).unwrap();
+    assert!(report.contains("worktree: merged"), "{report}");
+    let brief = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+    assert_eq!(
+        nanopi::agent::brief::front_matter_get(&brief, "worktree_outcome").as_deref(),
+        Some("merged")
+    );
+
+    let batch = reg.take_reports().expect("one pending report");
+    assert!(batch.contains("worktree: merged"), "{batch}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+// A deterministic merge-conflict scenario needs the main tree to move
+// *after* the worktree's base is captured but *before* `finish()`'s
+// merge attempt — control only available with direct access to
+// `prepare_run`/`run_body` (`pub(crate)`). See
+// `tool::agent::tests::worktree_merge_conflict_aborts_and_keeps_branch`
+// in src/tool/agent.rs for that scenario.
