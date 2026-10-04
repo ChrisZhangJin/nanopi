@@ -202,13 +202,28 @@ Plans:
 **Plans**: 7 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 02-01-PLAN.md — brief.md/report.md front-matter, timestamped amendments
 - [ ] 02-02-PLAN.md — project_agents_dir + grep/find archive exclusion
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 02-03-PLAN.md — src/archive.rs: run id, durable state, index.md, interrupted scan, .gitignore
 - [ ] 02-04-PLAN.md — durable child report.md with turns/tokens/files changed
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 02-05-PLAN.md — archive_keep_days, auto-prune, clean_runs
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 02-06-PLAN.md — wire registry, dispatch, fallback report, startup scan/prune
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 02-07-PLAN.md — /agents clean command + integration tests
+
 **Research flags**: standard patterns.
 
 ### Phase 3: Dynamic agents
