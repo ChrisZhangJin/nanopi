@@ -4472,12 +4472,22 @@ async fn handle_reload(
             // plugin context contribution survives the reload (see the
             // doc comment above — `[[extensions]]` is not reloaded
             // either).
-            let base = crate::agent::build::compose_system_prompt(
+            //
+            // Must go through `compose_system_prompt_mode` with
+            // `app.orchestrator`, not the plain `compose_system_prompt`:
+            // `/reload` does not rebuild `a.registry` from scratch, so if
+            // orchestrator mode is active the registry here is still the
+            // restricted one — a prompt composed with the non-orchestrator
+            // template would describe `write`/`edit`/`bash` as available
+            // and drop the orchestrator workflow instructions, breaking
+            // the registry/prompt sync invariant (T-06-04/T-06-06).
+            let base = crate::agent::build::compose_system_prompt_mode(
                 &a.cwd,
                 &tool_names,
                 &a.skills,
                 a.no_context_files,
                 &a.prompt_overrides,
+                app.orchestrator,
             );
             a.set_system_base(base);
             let h = &a.hooks;
@@ -8212,6 +8222,42 @@ mod tests {
             before_entry.map(|e| e.state),
             after_entry.map(|e| e.state),
             "toggling orchestrator mode must never touch AgentRegistry"
+        );
+    }
+
+    #[test]
+    fn reload_resyncs_system_prompt_to_orchestrator_mode() {
+        // CR-01: `/reload` must recompose the system prompt with
+        // `compose_system_prompt_mode(.., app.orchestrator)`, matching the
+        // other rebuild sites (`/new`, `/resume`, `/import`, `/fork`),
+        // rather than unconditionally using the plain non-orchestrator
+        // template. This test pins the composition call directly (the
+        // same expression `handle_reload` uses) since `handle_reload`
+        // itself has no test seam (`Term` is not a `TestBackend`).
+        let dir = tmp_dir();
+        let agent = agent_with_id(&dir, "sess-cr01", HooksConfig::default());
+        let mut app = mkapp();
+        app.orchestrator = true;
+
+        let tool_names = agent.registry.names();
+        let base = crate::agent::build::compose_system_prompt_mode(
+            &agent.cwd,
+            &tool_names,
+            &agent.skills,
+            agent.no_context_files,
+            &agent.prompt_overrides,
+            app.orchestrator,
+        );
+        let non_orchestrator_base = crate::agent::build::compose_system_prompt(
+            &agent.cwd,
+            &tool_names,
+            &agent.skills,
+            agent.no_context_files,
+            &agent.prompt_overrides,
+        );
+        assert_ne!(
+            base, non_orchestrator_base,
+            "orchestrator-mode reload must not fall back to the plain template"
         );
     }
 
