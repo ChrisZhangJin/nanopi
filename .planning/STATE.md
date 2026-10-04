@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v0.13.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-10-04T03:39:29.025Z"
-last_activity: 2026-10-04 -- Phase 2 planning complete
+last_updated: "2026-10-04T07:21:29.614Z"
+last_activity: 2026-10-04
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 7
+  completed_plans: 8
   percent: 17
 ---
 
@@ -17,10 +17,10 @@ progress:
 
 ## Current Position
 
-Phase: 1 of 6 (Child-process runtime) — executing
-Plan: 7 of 7 (01-01..01-07 complete; phase ready for verification)
+Phase: 02 (archive-lifecycle) — EXECUTING
+Plan: 2 of 7
 Status: Ready to execute
-Last activity: 2026-10-04 -- Phase 2 planning complete
+Last activity: 2026-10-04
 
 ---
 
@@ -304,9 +304,11 @@ pinned by wall-clock tests.
 |-------|------|----------|-------|
 | Phase 01 P01 | 10min | 2 tasks | 5 files |
 | Phase 01 P07 | 20min | 2 tasks | 4 files |
+| Phase 02 P01 | 12min | 2 tasks | 2 files |
 
 ## Decisions
 
 - [Phase 1]: tool renamed subagent→agent per user, 2026-10-04 (config `[agent]`, AgentTool/AgentRegistry, supersedes Phase 3 D-01)
 - [Phase 1]: report.md Summary now holds the child's final task answer (self-check turns no longer overwrite it), so the parent's tool result shows answer above checklist
 - [Phase ?]: ISO-03: process-global FileStateTracker, len+hash stale check, shared guarded_write
+- [Phase 02]: fm_value sanitizer collapses newlines/caps 120 chars so no front-matter value can forge a key line (T-02-01)

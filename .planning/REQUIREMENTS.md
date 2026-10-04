@@ -91,11 +91,11 @@ owner decisions made on 2026-10-03.
 
 ### Archive (ARC)
 
-- [ ] **ARC-01**: Each agent writes
+- [x] **ARC-01**: Each agent writes
   `.nanopi/agents/<run>/<id>/brief.md` (task, role, tools, model) when
   it starts. Amendments are appended to that file.
 
-- [ ] **ARC-02**: `report.md` is written before the result is returned
+- [x] **ARC-02**: `report.md` is written before the result is returned
   to the parent, so a report cannot be lost.
 
 - [ ] **ARC-03**: `.nanopi/agents/` is added to `.gitignore`
@@ -201,8 +201,8 @@ owner decisions made on 2026-10-03.
 | RT-08 | Phase 1 | Complete |
 | RT-09 | Phase 1 | Complete |
 | ISO-03 | Phase 1 | Complete |
-| ARC-01 | Phase 2 | Pending |
-| ARC-02 | Phase 2 | Pending |
+| ARC-01 | Phase 2 | Complete |
+| ARC-02 | Phase 2 | Complete |
 | ARC-03 | Phase 2 | Pending |
 | ARC-04 | Phase 2 | Pending |
 | ARC-05 | Phase 2 | Pending |
