@@ -318,6 +318,211 @@ pub fn ensure_gitignore(cwd: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// True if `name` has the `YYYYMMDD-HHMMSS-<8 hex>` shape produced by
+/// [`new_run_id`]. Used to scope deletion candidates to run dirs only
+/// (T-02-14): anything else under `agents_root` is left alone.
+fn is_run_id_shaped(name: &str) -> bool {
+    let parts: Vec<&str> = name.splitn(3, '-').collect();
+    parts.len() == 3
+        && parts[0].len() == 8
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+        && parts[1].len() == 6
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && parts[2].len() == 8
+        && parts[2].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Best-effort start time for a run dir: the timestamp encoded in its
+/// name, falling back to the directory's mtime when that fails to parse.
+fn run_effective_start(run_dir: &Path, name: &str) -> chrono::NaiveDateTime {
+    if let Some(t) = run_started(name) {
+        return t;
+    }
+    std::fs::symlink_metadata(run_dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| {
+            let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+            chrono::DateTime::<chrono::Utc>::from_timestamp(dur.as_secs() as i64, 0)
+                .map(|dt| dt.naive_local())
+        })
+        .unwrap_or_else(|| chrono::Local::now().naive_local())
+}
+
+/// Whether `run_dir` must never be deleted: a live `run.pid`, or any
+/// child agent brief in a non-terminal state (T-02-15).
+fn run_is_protected(run_dir: &Path) -> bool {
+    if run_is_live(run_dir) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let agent_dir = entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let brief_path = agent_dir.join("brief.md");
+        let Ok(content) = std::fs::read_to_string(&brief_path) else {
+            continue;
+        };
+        let Some(state) = front_matter_get(&content, "state") else {
+            continue;
+        };
+        if !is_terminal_state(&state) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursive size of `path` in bytes. Never follows symlinks (uses
+/// `symlink_metadata`), so a symlinked file/dir inside a run contributes
+/// nothing to the total and cannot be used to read or delete data outside
+/// the archive (T-02-14).
+fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        return meta.len();
+    }
+    if meta.is_dir() {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                total += dir_size(&entry.path());
+            }
+        }
+        return total;
+    }
+    0
+}
+
+/// Selection strategy for [`clean_runs`] (D-10, ARC-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanMode {
+    /// Remove every run except `current_run`.
+    AllButCurrent,
+    /// Remove runs whose start time is at least this many days in the
+    /// past.
+    OlderThanDays(u64),
+    /// Keep only the `n` most recently started runs (plus `current_run`,
+    /// which is always kept); remove the rest.
+    KeepRecent(usize),
+}
+
+/// Result of a [`clean_runs`] / [`auto_prune`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanReport {
+    pub removed_runs: usize,
+    pub removed_bytes: u64,
+    pub skipped_live: Vec<String>,
+}
+
+/// Delete run dirs under `agents_root` per `mode`, never touching
+/// `current_run` and never a run that [`run_is_protected`] (a live
+/// `run.pid` or a non-terminal agent brief) (D-10, ARC-05, T-02-15).
+///
+/// Only direct children of `agents_root` whose name is
+/// [`is_run_id_shaped`] are considered; anything else (including
+/// symlinks) is left alone (T-02-14). Missing `agents_root` -> an empty
+/// report.
+pub fn clean_runs(agents_root: &Path, current_run: &str, mode: CleanMode) -> io::Result<CleanReport> {
+    let entries = match std::fs::read_dir(agents_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CleanReport::default()),
+        Err(e) => return Err(e),
+    };
+
+    let mut report = CleanReport::default();
+    let mut candidates: Vec<(String, PathBuf, chrono::NaiveDateTime)> = Vec::new();
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current_run {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        if !is_run_id_shaped(&name) {
+            continue;
+        }
+        let run_dir = entry.path();
+        if run_is_protected(&run_dir) {
+            report.skipped_live.push(name);
+            continue;
+        }
+        let started = run_effective_start(&run_dir, &name);
+        candidates.push((name, run_dir, started));
+    }
+
+    let to_remove: Vec<(String, PathBuf)> = match mode {
+        CleanMode::AllButCurrent => candidates.into_iter().map(|(n, p, _)| (n, p)).collect(),
+        CleanMode::OlderThanDays(days) => {
+            let cutoff = chrono::Local::now().naive_local() - chrono::Duration::days(days as i64);
+            candidates
+                .into_iter()
+                .filter(|(_, _, started)| *started <= cutoff)
+                .map(|(n, p, _)| (n, p))
+                .collect()
+        }
+        CleanMode::KeepRecent(keep) => {
+            let mut sorted = candidates;
+            sorted.sort_by_key(|x| std::cmp::Reverse(x.2));
+            sorted
+                .into_iter()
+                .skip(keep)
+                .map(|(n, p, _)| (n, p))
+                .collect()
+        }
+    };
+
+    for (_, run_dir) in to_remove {
+        let bytes = dir_size(&run_dir);
+        std::fs::remove_dir_all(&run_dir)?;
+        report.removed_runs += 1;
+        report.removed_bytes += bytes;
+    }
+
+    Ok(report)
+}
+
+/// Startup auto-prune per D-09: `keep_days == 0` disables pruning
+/// entirely (empty report, no filesystem access beyond the check);
+/// otherwise delegates to [`clean_runs`] with
+/// `CleanMode::OlderThanDays(keep_days)`.
+pub fn auto_prune(agents_root: &Path, current_run: &str, keep_days: u64) -> io::Result<CleanReport> {
+    if keep_days == 0 {
+        return Ok(CleanReport::default());
+    }
+    clean_runs(agents_root, current_run, CleanMode::OlderThanDays(keep_days))
+}
+
+/// Human-readable byte count: `B`, `KiB`, `MiB`, `GiB`, one decimal place
+/// above `B`.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit_idx = 0;
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    format!("{:.1} {}", value, UNITS[unit_idx])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +781,175 @@ mod tests {
         let result = ensure_gitignore(tmp.path()).unwrap();
         assert!(result);
         assert!(tmp.path().join(".gitignore").exists());
+    }
+
+    fn run_id_days_ago(days: i64, tail: &str) -> String {
+        let ts = (chrono::Local::now() - chrono::Duration::days(days)).format("%Y%m%d-%H%M%S");
+        format!("{ts}-{tail}")
+    }
+
+    fn make_run(root: &Path, run_id: &str) -> PathBuf {
+        let dir = root.join(run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clean_runs_older_than_days_keeps_current_and_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old5 = run_id_days_ago(5, "aaaaaaaa");
+        let old3 = run_id_days_ago(3, "bbbbbbbb");
+        let recent1 = run_id_days_ago(1, "cccccccc");
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &old5);
+        make_run(root, &old3);
+        make_run(root, &recent1);
+        make_run(root, &current);
+
+        let report = clean_runs(root, &current, CleanMode::OlderThanDays(2)).unwrap();
+        assert_eq!(report.removed_runs, 2);
+        assert!(!root.join(&old5).exists());
+        assert!(!root.join(&old3).exists());
+        assert!(root.join(&recent1).exists());
+        assert!(root.join(&current).exists());
+    }
+
+    #[test]
+    fn clean_runs_all_but_current_removes_all_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old5 = run_id_days_ago(5, "aaaaaaaa");
+        let old3 = run_id_days_ago(3, "bbbbbbbb");
+        let recent1 = run_id_days_ago(1, "cccccccc");
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &old5);
+        make_run(root, &old3);
+        make_run(root, &recent1);
+        make_run(root, &current);
+
+        let report = clean_runs(root, &current, CleanMode::AllButCurrent).unwrap();
+        assert_eq!(report.removed_runs, 3);
+        assert!(root.join(&current).exists());
+        assert!(!root.join(&old5).exists());
+        assert!(!root.join(&old3).exists());
+        assert!(!root.join(&recent1).exists());
+    }
+
+    #[test]
+    fn clean_runs_keep_recent_keeps_newest_non_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old5 = run_id_days_ago(5, "aaaaaaaa");
+        let old3 = run_id_days_ago(3, "bbbbbbbb");
+        let recent1 = run_id_days_ago(1, "cccccccc");
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &old5);
+        make_run(root, &old3);
+        make_run(root, &recent1);
+        make_run(root, &current);
+
+        let report = clean_runs(root, &current, CleanMode::KeepRecent(1)).unwrap();
+        assert_eq!(report.removed_runs, 2);
+        assert!(root.join(&current).exists());
+        assert!(root.join(&recent1).exists(), "newest non-current run must be kept");
+        assert!(!root.join(&old5).exists());
+        assert!(!root.join(&old3).exists());
+    }
+
+    #[test]
+    fn clean_runs_skips_live_pid_and_non_terminal_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &current);
+
+        let live_run_id = run_id_days_ago(5, "11111111");
+        let live_dir = make_run(root, &live_run_id);
+        write_run_pid(&live_dir).unwrap();
+
+        let running_run_id = run_id_days_ago(5, "22222222");
+        let running_dir = make_run(root, &running_run_id);
+        write_brief(&running_dir.join("a1"), "running", "a1", "r");
+
+        let report = clean_runs(root, &current, CleanMode::AllButCurrent).unwrap();
+        assert_eq!(report.removed_runs, 0);
+        assert!(root.join(&live_run_id).exists());
+        assert!(root.join(&running_run_id).exists());
+        assert!(report.skipped_live.contains(&live_run_id));
+        assert!(report.skipped_live.contains(&running_run_id));
+    }
+
+    #[test]
+    fn clean_runs_reports_removed_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &current);
+        let old = run_id_days_ago(5, "aaaaaaaa");
+        let old_dir = make_run(root, &old);
+        std::fs::write(old_dir.join("f.txt"), vec![0u8; 100]).unwrap();
+
+        let report = clean_runs(root, &current, CleanMode::AllButCurrent).unwrap();
+        assert_eq!(report.removed_runs, 1);
+        assert_eq!(report.removed_bytes, 100);
+    }
+
+    #[test]
+    fn clean_runs_ignores_non_run_id_shaped_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &current);
+        std::fs::create_dir_all(root.join("not-a-run")).unwrap();
+
+        let report = clean_runs(root, &current, CleanMode::AllButCurrent).unwrap();
+        assert_eq!(report.removed_runs, 0);
+        assert!(root.join("not-a-run").exists());
+    }
+
+    #[test]
+    fn clean_runs_missing_root_is_empty_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let report = clean_runs(&missing, "current", CleanMode::AllButCurrent).unwrap();
+        assert_eq!(report, CleanReport::default());
+    }
+
+    #[test]
+    fn auto_prune_zero_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &current);
+        let old = run_id_days_ago(10, "aaaaaaaa");
+        make_run(root, &old);
+
+        let report = auto_prune(root, &current, 0).unwrap();
+        assert_eq!(report, CleanReport::default());
+        assert!(root.join(&old).exists());
+    }
+
+    #[test]
+    fn auto_prune_delegates_to_older_than_days() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = run_id_days_ago(0, "dddddddd");
+        make_run(root, &current);
+        let old = run_id_days_ago(10, "aaaaaaaa");
+        make_run(root, &old);
+
+        let report = auto_prune(root, &current, 2).unwrap();
+        assert_eq!(report.removed_runs, 1);
+        assert!(!root.join(&old).exists());
+    }
+
+    #[test]
+    fn format_bytes_renders_expected_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1024 * 1024 * 3), "3.0 MiB");
+        assert_eq!(format_bytes(1024u64 * 1024 * 1024 * 2), "2.0 GiB");
     }
 }
