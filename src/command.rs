@@ -114,6 +114,7 @@ pub const RESERVED_COMMAND_NAMES: &[&str] = &[
     "copy",
     "export",
     "import",
+    "agents",
     "compact",
     "hotkeys",
     "skills",

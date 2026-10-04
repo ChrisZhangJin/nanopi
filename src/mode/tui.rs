@@ -91,6 +91,10 @@ enum SlashCmd {
     Name,
     /// Copy the last assistant message to the OS clipboard via OSC 52.
     Copy,
+    /// `/agents clean [--older <days> | --keep <n>]` — D-10/ARC-05:
+    /// prune the archive on demand. Payload is the raw argument
+    /// string, parsed by `parse_agents_args` at dispatch time.
+    Agents,
     /// Enter capture mode; next Enter writes a JSONL copy of the
     /// current session to the typed path.
     Export,
@@ -212,6 +216,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             SlashCmd::Export,
         ),
         MenuItem::new("/import", "Import a session from JSONL", SlashCmd::Import),
+        MenuItem::new(
+            "/agents",
+            "Agent archive: clean [--older <days> | --keep <n>]",
+            SlashCmd::Agents,
+        ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
         MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
         MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
@@ -1160,6 +1169,11 @@ enum KeyAction {
     ShowCurrentName,
     /// `/name X` — set the session name to `X` on the header.
     ApplyName(String),
+    /// `/agents clean ...` parsed successfully — run the prune.
+    CleanAgents(crate::archive::CleanMode),
+    /// `/agents ...` with bad/missing arguments — print the usage
+    /// line, delete nothing (T-02-19).
+    AgentsUsage(String),
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
     /// `/export [path]` — write the current session to a file.
@@ -1737,6 +1751,51 @@ fn sync_palette(app: &mut App) {
     }
 }
 
+/// `/agents` usage line, shown on any bad/missing argument (T-02-19:
+/// strict parse, anything unrecognized deletes nothing).
+const AGENTS_USAGE: &str = "Usage: /agents clean [--older <days> | --keep <n>]";
+
+/// Parse the argument string after `/agents` into a [`crate::archive::CleanMode`]
+/// (D-10, ARC-05). Only `clean`, `clean --older <u64>` and
+/// `clean --keep <usize>` are accepted; anything else (including bare
+/// `/agents`, `/agents list`, or a non-numeric/trailing-garbage value)
+/// is `Err(AGENTS_USAGE)`.
+fn parse_agents_args(arg: &str) -> Result<crate::archive::CleanMode, String> {
+    let mut parts = arg.trim().split_whitespace();
+    match parts.next() {
+        Some("clean") => match parts.next() {
+            None => {
+                if parts.next().is_some() {
+                    return Err(AGENTS_USAGE.to_string());
+                }
+                Ok(crate::archive::CleanMode::AllButCurrent)
+            }
+            Some("--older") => {
+                let days = parts
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| AGENTS_USAGE.to_string())?;
+                if parts.next().is_some() {
+                    return Err(AGENTS_USAGE.to_string());
+                }
+                Ok(crate::archive::CleanMode::OlderThanDays(days))
+            }
+            Some("--keep") => {
+                let n = parts
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(|| AGENTS_USAGE.to_string())?;
+                if parts.next().is_some() {
+                    return Err(AGENTS_USAGE.to_string());
+                }
+                Ok(crate::archive::CleanMode::KeepRecent(n))
+            }
+            _ => Err(AGENTS_USAGE.to_string()),
+        },
+        _ => Err(AGENTS_USAGE.to_string()),
+    }
+}
+
 fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
     match cmd {
         SlashCmd::Compact => KeyAction::Compact,
@@ -1759,6 +1818,10 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
                 KeyAction::ApplyName(arg)
             }
         }
+        SlashCmd::Agents => match parse_agents_args(&arg) {
+            Ok(mode) => KeyAction::CleanAgents(mode),
+            Err(msg) => KeyAction::AgentsUsage(msg),
+        },
         SlashCmd::Copy => KeyAction::CopyLastReply,
         // PI's /export (interactive-mode.ts:5501-5544):
         //   * bare `/export` → HTML file in cwd, auto-named
@@ -2699,6 +2762,60 @@ async fn handle_action(
                     )?;
                 }
             }
+        }
+        KeyAction::CleanAgents(mode) => {
+            let root = crate::paths::project_agents_dir(&app.cwd);
+            // Empty string is never a valid run id, so when there is no
+            // live registry (e.g. `-p` headless path never applies, but
+            // defensively) nothing gets treated as "current" and
+            // clean_runs' own live-run protection still applies.
+            let current = crate::agent_registry::global()
+                .map(|r| r.run_id().to_string())
+                .unwrap_or_default();
+            match crate::archive::clean_runs(&root, &current, mode) {
+                Ok(report) => {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!(
+                                "Removed {} run(s), {} freed",
+                                report.removed_runs,
+                                crate::archive::format_bytes(report.removed_bytes)
+                            ),
+                            Style::default().fg(Color::Indexed(108)),
+                        )]),
+                    )?;
+                    if !report.skipped_live.is_empty() {
+                        insert_line(
+                            term,
+                            Line::from(vec![Span::styled(
+                                format!("Skipped live: {}", report.skipped_live.join(", ")),
+                                Style::default().fg(Color::Yellow),
+                            )]),
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    insert_line(
+                        term,
+                        Line::from(vec![Span::styled(
+                            format!("[/agents clean failed: {e}]"),
+                            Style::default().fg(Color::Red),
+                        )]),
+                    )?;
+                }
+            }
+        }
+        KeyAction::AgentsUsage(msg) => {
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    msg,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            )?;
         }
         KeyAction::CopyLastReply => {
             // Find the last Assistant text block in context.
@@ -7032,6 +7149,52 @@ mod tests {
         assert!(take_pending_bar(&mut app, "call_a").is_none());
     }
 
+    #[test]
+    fn agents_clean_parses_bare_and_flags() {
+        use crate::archive::CleanMode;
+        assert_eq!(parse_agents_args("clean"), Ok(CleanMode::AllButCurrent));
+        assert_eq!(
+            parse_agents_args("clean --older 3"),
+            Ok(CleanMode::OlderThanDays(3))
+        );
+        assert_eq!(
+            parse_agents_args("clean --keep 2"),
+            Ok(CleanMode::KeepRecent(2))
+        );
+    }
+
+    #[test]
+    fn agents_clean_rejects_bad_args() {
+        assert!(parse_agents_args("").is_err());
+        assert!(parse_agents_args("list").is_err());
+        assert!(parse_agents_args("clean --older x").is_err());
+        assert!(parse_agents_args("clean --keep").is_err());
+        assert!(parse_agents_args("clean bogus").is_err());
+    }
+
+    #[test]
+    fn dispatch_agents_clean_yields_clean_agents_action() {
+        let got = dispatch_slash(SlashCmd::Agents, "clean --older 3".to_string());
+        match got {
+            KeyAction::CleanAgents(crate::archive::CleanMode::OlderThanDays(3)) => {}
+            other => panic!("expected CleanAgents(OlderThanDays(3)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_agents_bad_arg_yields_usage() {
+        let got = dispatch_slash(SlashCmd::Agents, "bogus".to_string());
+        match got {
+            KeyAction::AgentsUsage(msg) => assert!(msg.contains("Usage: /agents clean")),
+            other => panic!("expected AgentsUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_in_palette() {
+        assert!(slash_items().iter().any(|i| i.label == "/agents"));
+    }
+
     /// Typing a command name in full must preselect that command.
     #[test]
     fn typing_a_command_name_preselects_it() {
@@ -7042,6 +7205,7 @@ mod tests {
             "/compact",
             "/name",
             "/export",
+            "/agents",
         ] {
             let mut app = mkapp();
             seed_input(&mut app, cmd);
