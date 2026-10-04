@@ -146,7 +146,7 @@ orchestrator mode. Phases derived from `.planning/REQUIREMENTS.md`
 |-------|------|------|--------------|------------|
 | 1 | Child-process runtime | 7/7 | Complete   | 2026-10-03 |
 | 2 | Archive & lifecycle | 7/7 | Complete   | 2026-10-04 |
-| 3 | Dynamic agents | 1/3 | In Progress|  |
+| 3 | Dynamic agents | 2/3 | In Progress|  |
 | 4 | Background launch & control | The model runs, amends, stops and continues agents | CTL-01..CTL-07, ISO-01, ISO-02 | 3 |
 | 5 | TUI agents strip | The user can watch agents at a glance (display-only) | UI-01..UI-04 | 4 |
 | 6 | Orchestrator mode | Opt-in mode where the main agent only plans and delegates | ORC-01..ORC-05, QA-01, QA-02 | 3, 4, 5 |
@@ -243,7 +243,7 @@ Plans:
 Plans:
 
 - [x] 03-01-PLAN.md — general-purpose AgentConfig, models::model_vendor, brief label
-- [ ] 03-02-PLAN.md — optional agent + inline role/tools/model/description, pre-spawn validation
+- [x] 03-02-PLAN.md — optional agent + inline role/tools/model/description, pre-spawn validation
 - [ ] 03-03-PLAN.md — 8 KB parent report cap, schema + delegation guidance, regression gate
 
 **Research flags**: standard patterns.

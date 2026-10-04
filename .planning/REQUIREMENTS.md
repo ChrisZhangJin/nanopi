@@ -48,17 +48,17 @@ owner decisions made on 2026-10-03.
 
 ### Dynamic dispatch (DYN)
 
-- [ ] **DYN-01**: The model can dispatch an agent by describing the
+- [x] **DYN-01**: The model can dispatch an agent by describing the
   task only. Without an agent name, a general-purpose agent is used.
 
-- [ ] **DYN-02**: The model can give an ad-hoc role prompt and a
+- [x] **DYN-02**: The model can give an ad-hoc role prompt and a
   toolset per call. The toolset is checked against the allowlist and
   deny-list.
 
-- [ ] **DYN-03**: Predefined agent files and single / parallel / chain
+- [x] **DYN-03**: Predefined agent files and single / parallel / chain
   modes keep working.
 
-- [ ] **DYN-04**: The model can choose a model per agent.
+- [x] **DYN-04**: The model can choose a model per agent.
 - [ ] **DYN-05**: The parent receives a capped summary report, not the
   agent's full transcript.
 
@@ -206,10 +206,10 @@ owner decisions made on 2026-10-03.
 | ARC-03 | Phase 2 | Complete |
 | ARC-04 | Phase 2 | Complete |
 | ARC-05 | Phase 2 | Complete |
-| DYN-01 | Phase 3 | Pending |
-| DYN-02 | Phase 3 | Pending |
-| DYN-03 | Phase 3 | Pending |
-| DYN-04 | Phase 3 | Pending |
+| DYN-01 | Phase 3 | Complete |
+| DYN-02 | Phase 3 | Complete |
+| DYN-03 | Phase 3 | Complete |
+| DYN-04 | Phase 3 | Complete |
 | DYN-05 | Phase 3 | Pending |
 | CTL-01 | Phase 4 | Pending |
 | CTL-02 | Phase 4 | Pending |
