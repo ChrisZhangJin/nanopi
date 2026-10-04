@@ -241,6 +241,7 @@ fn tail_activity(path: &std::path::Path) -> Vec<String> {
             continue;
         }
         let tool_name = v.get("tool_name").and_then(|t| t.as_str()).unwrap_or("?");
+        let tool_name = truncate_to_width(&sanitize(tool_name), 40);
         let args = v.get("arguments");
         let short_arg = args.and_then(|a| {
             for key in ["path", "command", "pattern", "query"] {
@@ -255,7 +256,7 @@ fn tail_activity(path: &std::path::Path) -> Vec<String> {
                 let arg = truncate_to_width(&sanitize(&arg), 40);
                 format!("{tool_name} {arg}")
             }
-            None => tool_name.to_string(),
+            None => tool_name.clone(),
         };
         out.push(formatted);
     }
@@ -803,6 +804,47 @@ mod tests {
         assert_eq!(info.activity[0], "grep c.rs");
         assert_eq!(info.activity[1], "read d.rs");
         assert_eq!(info.activity[2], "write e.rs");
+    }
+
+    #[test]
+    fn activity_sanitizes_and_bounds_tool_name_from_untrusted_transcript() {
+        // CR-01 regression: `tool_name` is attacker/model-influenced text
+        // read straight from transcript.jsonl and must be stripped of
+        // control characters (T-05-01) and bounded in width just like `arg`.
+        let now = Instant::now();
+        let d1 = tmp_dir();
+        let malicious_name = format!("evil\x1b[31m{}", "x".repeat(100));
+        write_transcript_lines(d1.path(), &[(&malicious_name, "a.rs")]);
+        let mut view = AgentsView::new();
+        view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
+        let info = &view.agents()[0];
+        assert_eq!(info.activity.len(), 1);
+        let line = &info.activity[0];
+        assert!(!line.contains('\x1b'), "escape byte leaked into activity: {line:?}");
+        assert!(!line.chars().any(|c| c.is_control()), "control char leaked: {line:?}");
+        assert!(display_width(line) <= 40 + 1 + display_width("a.rs"));
+    }
+
+    #[test]
+    fn activity_sanitizes_tool_name_with_no_arg() {
+        // Same as above but exercising the `None` branch of `short_arg`,
+        // where `tool_name` is used standalone.
+        let now = Instant::now();
+        let d1 = tmp_dir();
+        let mut f = std::fs::File::create(d1.path().join("transcript.jsonl")).unwrap();
+        let line = serde_json::json!({
+            "type": "tool_call",
+            "tool_name": format!("bad\x07name{}", "z".repeat(100)),
+            "arguments": {},
+        });
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+        let mut view = AgentsView::new();
+        view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
+        let info = &view.agents()[0];
+        assert_eq!(info.activity.len(), 1);
+        assert!(!info.activity[0].contains('\x07'));
+        assert!(display_width(&info.activity[0]) <= 40);
     }
 
     #[test]
