@@ -130,6 +130,11 @@ enum SlashCmd {
     /// at dispatch time rather than carried here, so `SlashCmd` stays
     /// `PartialEq` and cheap for the palette's filter.
     Plugin(String),
+    /// ORC-01/02: `/orchestrator` toggles orchestrator mode; `on`/`off`
+    /// set it explicitly. Any other argument is a usage error (parsed
+    /// at dispatch time by `parse_orchestrator_args`, mirroring
+    /// `/agents`).
+    Orchestrator,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -244,6 +249,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/keybindings",
             "List keybindings + how to override",
             SlashCmd::Keybindings,
+        ),
+        MenuItem::new(
+            "/orchestrator",
+            "Toggle orchestrator mode (on|off to set explicitly)",
+            SlashCmd::Orchestrator,
         ),
         MenuItem::new("/quit", "Exit the session", SlashCmd::Quit),
         MenuItem::new("/exit", "Exit the session", SlashCmd::Quit),
@@ -599,6 +609,16 @@ pub async fn run_tui_mode(
         .max_replay_entries
         .unwrap_or(DEFAULT_MAX_REPLAY_ENTRIES);
     app.inline_think_tags = inline_think_tags;
+    // ORC-02: seed from config.toml's `[experimental] orchestrator`
+    // (single source of truth, Pitfall 4) and apply the swap to the
+    // initial agent before the first turn if it's on by default.
+    app.orchestrator = cfg_for_build.experimental.orchestrator;
+    if app.orchestrator {
+        let mut g = agent_slot.lock().await;
+        if let Some(a) = g.as_mut() {
+            apply_orchestrator_mode(&mut app, a, true);
+        }
+    }
     let initial_vendor = crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), model);
     app.vendor_id = Some(initial_vendor.id().to_string());
     // Prime the skills cache from the just-built agent so the very
@@ -965,6 +985,20 @@ struct App {
     /// Defaults to 24; kept current by the main loop each iteration via
     /// `term.size()`.
     term_rows: u16,
+    /// ORC-01/02/05: whether orchestrator mode is currently applied to
+    /// the live Agent's registry/prompt. Single source of truth — the
+    /// status-line segment and the toggle handler both read/write only
+    /// this field (T-06-06). Seeded at startup from
+    /// `config.experimental.orchestrator`.
+    orchestrator: bool,
+    /// The Agent's tool registry as it was BEFORE orchestrator mode was
+    /// last turned on, so turning it off restores exactly what was
+    /// there (including any plugin tools) rather than rebuilding from
+    /// scratch. `None` when orchestrator mode is off. Rebuild sites
+    /// (`/model`, `/new`, `/resume`, `/fork`) reset this to the freshly
+    /// built registry before re-applying the mode, so toggling off
+    /// after a rebuild restores the NEW registry, not a stale one.
+    saved_registry: Option<crate::tool::ToolRegistry>,
 }
 
 impl App {
@@ -1033,6 +1067,8 @@ impl App {
             agents_view: AgentsView::new(),
             agents_strip_expanded: false,
             term_rows: 24,
+            orchestrator: false,
+            saved_registry: None,
         }
     }
 }
@@ -1215,6 +1251,14 @@ enum KeyAction {
     /// `/agents ...` with bad/missing arguments — print the usage
     /// line, delete nothing (T-02-19).
     AgentsUsage(String),
+    /// `/orchestrator` parsed successfully: `None` = bare toggle,
+    /// `Some(bool)` = explicit `on`/`off`. Runs the in-place
+    /// registry/prompt swap on the current Agent and takes effect from
+    /// the next turn (D-02).
+    SetOrchestrator(Option<bool>),
+    /// `/orchestrator <bad arg>` — print the usage line, change
+    /// nothing (T-06-05).
+    OrchestratorUsage(String),
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
     /// `/export [path]` — write the current session to a file.
@@ -1853,6 +1897,20 @@ fn parse_agents_args(arg: &str) -> Result<crate::archive::CleanMode, String> {
     }
 }
 
+const ORCHESTRATOR_USAGE: &str = "Usage: /orchestrator [on|off]";
+
+/// Parse `/orchestrator`'s argument: bare toggles (`None`), `on`/`off`
+/// set explicitly (`Some(bool)`), anything else is a usage error and
+/// changes nothing (T-06-05).
+fn parse_orchestrator_args(arg: &str) -> Result<Option<bool>, String> {
+    match arg.trim() {
+        "" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        _ => Err(ORCHESTRATOR_USAGE.to_string()),
+    }
+}
+
 fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
     match cmd {
         SlashCmd::Compact => KeyAction::Compact,
@@ -1909,7 +1967,55 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         // `/export` and `/import`; a plugin command that treated
         // whitespace differently would be the odd one out.
         SlashCmd::Plugin(name) => KeyAction::RunPluginCommand { name, args: arg },
+        SlashCmd::Orchestrator => match parse_orchestrator_args(&arg) {
+            Ok(v) => KeyAction::SetOrchestrator(v),
+            Err(msg) => KeyAction::OrchestratorUsage(msg),
+        },
     }
+}
+
+/// ORC-01/02: lightweight in-place swap between the Agent's standing
+/// tool registry/prompt and the orchestrator-restricted set. Mutates
+/// ONLY `agent.registry`, `agent.context.tools`, and the system prompt
+/// base (via `set_system_base`) — it never touches `AgentRegistry`
+/// (running background agents are unaffected, T-06-04/D-01).
+///
+/// `on = true`: if `app.saved_registry` is empty, stash the Agent's
+/// CURRENT registry there first (so toggling on twice in a row does
+/// not stash the orchestrator registry as "the original" — idempotent
+/// per the plan's behavior list), then swap in
+/// `ToolRegistry::orchestrator()`.
+///
+/// `on = false`: restore `app.saved_registry` if present (preserving
+/// any plugin tools that were registered before the swap), else leave
+/// the registry untouched (nothing to restore).
+///
+/// Either way, `context.tools` is refreshed from the resulting registry
+/// (T-06-04: registry and context.tools must never drift) and the
+/// system prompt base is recomposed via `compose_system_prompt_mode`
+/// with the matching `orchestrator` flag, through the same
+/// `set_system_base` → `refresh_system_prompt` path `build_fresh` /
+/// `hydrate_resumed` use, so the prompt composition matches exactly.
+fn apply_orchestrator_mode(app: &mut App, agent: &mut Agent, on: bool) {
+    if on {
+        if app.saved_registry.is_none() {
+            app.saved_registry = Some(agent.registry.clone());
+        }
+        agent.registry = crate::tool::ToolRegistry::orchestrator();
+    } else if let Some(saved) = app.saved_registry.take() {
+        agent.registry = saved;
+    }
+    agent.context.tools = agent.registry.all_specs();
+    let tool_names = agent.registry.names();
+    let prompt = crate::agent::build::compose_system_prompt_mode(
+        &agent.cwd,
+        &tool_names,
+        &agent.skills,
+        agent.no_context_files,
+        &agent.prompt_overrides,
+        on,
+    );
+    agent.set_system_base(prompt);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2508,7 +2614,7 @@ async fn handle_action(
             // config for exec mode + extensions the same way startup
             // does. Picks up an edited config.toml without a restart.
             let cfg_now = crate::config::load_config(&cwd).unwrap_or_default();
-            let (new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
+            let (mut new_agent, diags) = Agent::build_fresh(crate::agent::build::AgentBuildInputs {
                 cwd: cwd.clone(),
                 registry,
                 provider: crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags),
@@ -2528,6 +2634,13 @@ async fn handle_action(
                 extensions: cfg_now.extensions,
             });
             crate::agent::build::print_skill_diagnostics(&diags);
+            // ORC-01: `/new`, `/resume`, `/fork` rebuild the Agent from
+            // scratch, so the freshly built registry becomes the new
+            // "standing" one before re-applying orchestrator mode.
+            if app.orchestrator {
+                app.saved_registry = None;
+                apply_orchestrator_mode(app, &mut new_agent, true);
+            }
             swap_agent_with_reason(agent_slot, new_agent, "new").await;
             app.session_id = new_header.id.clone();
             app.usage = crate::event::Usage::default();
@@ -2687,6 +2800,10 @@ async fn handle_action(
                 &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
+            if app.orchestrator {
+                app.saved_registry = None;
+                apply_orchestrator_mode(app, &mut new_agent, true);
+            }
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &path);
             swap_agent_with_reason(agent_slot, new_agent, "resume").await;
@@ -2931,6 +3048,41 @@ async fn handle_action(
             }
         }
         KeyAction::AgentsUsage(msg) => {
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    msg,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+        }
+        KeyAction::SetOrchestrator(explicit) => {
+            let new_val = explicit.unwrap_or(!app.orchestrator);
+            if new_val != app.orchestrator {
+                app.orchestrator = new_val;
+                let mut g = agent_slot.lock().await;
+                if let Some(a) = g.as_mut() {
+                    apply_orchestrator_mode(app, a, new_val);
+                }
+            }
+            let msg = if new_val {
+                "orchestrator mode on (from next turn)"
+            } else {
+                "orchestrator mode off (from next turn)"
+            };
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    msg,
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::ITALIC),
+                )]),
+            )?;
+        }
+        KeyAction::OrchestratorUsage(msg) => {
             insert_line(
                 term,
                 Line::from(vec![Span::styled(
@@ -3198,6 +3350,10 @@ async fn handle_action(
                 &app.extensions,
             );
             crate::agent::build::print_skill_diagnostics(&diags);
+            if app.orchestrator {
+                app.saved_registry = None;
+                apply_orchestrator_mode(app, &mut new_agent, true);
+            }
             let new_session_id = new_agent.session_id.clone();
             let _ = session::set_active_session(&cwd, &dest);
             swap_agent_with_reason(agent_slot, new_agent, "import").await;
@@ -4075,6 +4231,10 @@ async fn execute_fork(
         &app.extensions,
     );
     crate::agent::build::print_skill_diagnostics(&diags);
+    if app.orchestrator {
+        app.saved_registry = None;
+        apply_orchestrator_mode(app, &mut new_agent, true);
+    }
     let new_session_id = new_header.id;
 
     swap_agent_with_reason(agent_slot, new_agent, "fork").await;
@@ -5580,6 +5740,16 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
                     .add_modifier(Modifier::ITALIC),
             ));
         }
+    }
+    // ORC-05: orchestrator-mode indicator, next to think:/vendor:.
+    if app.orchestrator {
+        l2.push(Span::raw(" · "));
+        l2.push(Span::styled(
+            "⎈ orchestrator",
+            Style::default()
+                .fg(Color::Indexed(108))
+                .add_modifier(Modifier::ITALIC),
+        ));
     }
     // Context ratio (`1.4%/205k (auto)`), color-coded by usage.
     // Auto-compact is always on today; if we add a config toggle we
@@ -7910,6 +8080,189 @@ mod tests {
             crate::agent_registry::AgentState::Queued,
             "no strip key may change agent state"
         );
+    }
+
+    // ─────── orchestrator mode (06-02) ───────
+
+    #[test]
+    fn orchestrator_slash_toggles_flag() {
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Orchestrator, "".to_string()),
+            KeyAction::SetOrchestrator(None)
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Orchestrator, "on".to_string()),
+            KeyAction::SetOrchestrator(Some(true))
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Orchestrator, "off".to_string()),
+            KeyAction::SetOrchestrator(Some(false))
+        ));
+        match dispatch_slash(SlashCmd::Orchestrator, "bogus".to_string()) {
+            KeyAction::OrchestratorUsage(msg) => assert!(msg.contains("Usage: /orchestrator")),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orchestrator_toggle_updates_context_tools() {
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-orch", HooksConfig::default());
+        // Seed the Agent the way `build_fresh` would: a non-orchestrator
+        // registry + prompt, so the "off" path has something real to
+        // restore.
+        agent.context.tools = agent.registry.all_specs();
+        let before_names = agent.registry.names();
+        let before_prompt = crate::agent::build::compose_system_prompt(
+            &agent.cwd,
+            &before_names,
+            &agent.skills,
+            agent.no_context_files,
+            &agent.prompt_overrides,
+        );
+        agent.set_system_base(before_prompt.clone());
+
+        let mut app = mkapp();
+        apply_orchestrator_mode(&mut app, &mut agent, true);
+
+        let mut after_names = agent.registry.names();
+        after_names.sort();
+        assert_eq!(
+            after_names,
+            vec![
+                "agent",
+                "find",
+                "grep",
+                "list_agents",
+                "read",
+                "send_message",
+                "stop_agent",
+            ]
+        );
+        let mut tool_spec_names: Vec<String> =
+            agent.context.tools.iter().map(|s| s.name.clone()).collect();
+        tool_spec_names.sort();
+        assert_eq!(tool_spec_names, after_names);
+        assert!(
+            agent.system_base.as_deref().unwrap().contains("orchestrator")
+                || agent
+                    .system_base
+                    .as_deref()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("coordinat"),
+            "{:?}",
+            agent.system_base
+        );
+
+        apply_orchestrator_mode(&mut app, &mut agent, false);
+        let mut restored_names = agent.registry.names();
+        restored_names.sort();
+        let mut before_names_sorted = before_names.clone();
+        before_names_sorted.sort();
+        assert_eq!(restored_names, before_names_sorted);
+        let mut tool_spec_names_after: Vec<String> =
+            agent.context.tools.iter().map(|s| s.name.clone()).collect();
+        tool_spec_names_after.sort();
+        assert_eq!(tool_spec_names_after, before_names_sorted);
+        assert_eq!(agent.system_base.as_deref(), Some(before_prompt.as_str()));
+    }
+
+    #[test]
+    fn orchestrator_toggle_on_twice_is_idempotent() {
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-orch2", HooksConfig::default());
+        agent.context.tools = agent.registry.all_specs();
+        let before_names = agent.registry.names();
+
+        let mut app = mkapp();
+        apply_orchestrator_mode(&mut app, &mut agent, true);
+        // Calling "on" again must not stash the (already orchestrator)
+        // registry as "the original".
+        apply_orchestrator_mode(&mut app, &mut agent, true);
+        apply_orchestrator_mode(&mut app, &mut agent, false);
+        let mut restored = agent.registry.names();
+        restored.sort();
+        let mut expected = before_names.clone();
+        expected.sort();
+        assert_eq!(
+            restored, expected,
+            "double on-then-off must restore the real original registry"
+        );
+    }
+
+    #[test]
+    fn orchestrator_toggle_does_not_touch_running_agents() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        let agents_root = tempfile::tempdir().unwrap();
+        let (id, dir) = reg.reserve(agents_root.path()).expect("reserve");
+        std::fs::write(dir.join("brief.md"), "---\nlabel: alpha\n---\n").unwrap();
+        let before = reg.snapshot();
+        let before_entry = before.iter().find(|e| e.id == id).cloned();
+
+        let agent_dir = tmp_dir();
+        let mut agent = agent_with_id(&agent_dir, "sess-orch3", HooksConfig::default());
+        let mut app = mkapp();
+        apply_orchestrator_mode(&mut app, &mut agent, true);
+        apply_orchestrator_mode(&mut app, &mut agent, false);
+
+        let after = reg.snapshot();
+        let after_entry = after.iter().find(|e| e.id == id).cloned();
+        assert_eq!(
+            before_entry.map(|e| e.state),
+            after_entry.map(|e| e.state),
+            "toggling orchestrator mode must never touch AgentRegistry"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_orchestrator_segment_when_on() {
+        let mut app = mkapp();
+        app.orchestrator = true;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, &app);
+        let all: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("⎈ orchestrator"), "{all}");
+    }
+
+    #[test]
+    fn status_line_omits_orchestrator_segment_when_off() {
+        let app_on = {
+            let mut a = mkapp();
+            a.orchestrator = true;
+            a
+        };
+        let app_off = mkapp();
+        assert!(!app_off.orchestrator);
+        let area = Rect::new(0, 0, 80, 24);
+
+        let mut buf_on = Buffer::empty(area);
+        draw_dock(&mut buf_on, area, &app_on);
+        let mut buf_off = Buffer::empty(area);
+        draw_dock(&mut buf_off, area, &app_off);
+
+        let render = |buf: &Buffer| -> String {
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let on_text = render(&buf_on);
+        let off_text = render(&buf_off);
+        assert!(!off_text.contains("orchestrator"), "{off_text}");
+        assert!(on_text.contains("orchestrator"));
     }
 }
 
