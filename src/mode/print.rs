@@ -371,6 +371,31 @@ pub async fn run_print_mode(
     };
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+    // CR-01: a plain top-level `select!` in `main.rs` racing the whole
+    // `print_fut` against `ctrl_c()` always won (a bare `ctrl_c().await`
+    // has no way to lose that race once the signal fires), which tore
+    // down this entire future via `Drop` before the drain-window logic
+    // below ever got a chance to run gracefully. Instead, run a listener
+    // *inside* this future that never competes with `print_fut` itself —
+    // it only flips a flag and asks already-tracked background agents to
+    // stop. That makes Ctrl-C at any point during the run (not just the
+    // drain window) reach `stop_all()`, so no background child is ever
+    // orphaned by a stray SIGINT.
+    let ctrl_c_interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ctrl_c_task = {
+        let flag = ctrl_c_interrupted.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(reg) = crate::agent_registry::global() {
+                    reg.stop_all();
+                }
+            }
+        })
+    };
     let agent_task = {
         let mut agent = agent; // move
         let brief_path = brief_path.clone();
@@ -412,25 +437,23 @@ pub async fn run_print_mode(
             }
             // D-07: never exit with agents still running. Skipped
             // entirely when none are tracked, so a `-p` run with zero
-            // background agents pays nothing extra (Addendum 2: no
-            // ctrl_c listener is installed for the ordinary main-turn
-            // case, only for this drain window).
+            // background agents pays nothing extra. The top-level
+            // `ctrl_c_task` above (CR-01) stops every tracked agent on
+            // Ctrl-C regardless of which `wait_background()` call below
+            // is pending — or whether neither is pending yet, closing the
+            // gap where a Ctrl-C during the main turn left no handler
+            // installed at all. Both waits below are therefore plain
+            // (unconditional) awaits: once `stop_all()` has cancelled the
+            // tracked tasks, they unwind promptly and the await simply
+            // observes that (WR-02: this uniformly covers the *second*
+            // wait too, which previously had no Ctrl-C race at all).
             let mut interrupted = false;
             let mut extra_reports_appendix: Option<String> = None;
             if let Some(reg) = crate::agent_registry::global() {
                 if reg.has_background() {
-                    tokio::select! {
-                        _ = reg.wait_background() => {}
-                        _ = tokio::signal::ctrl_c() => {
-                            // Ctrl-C during the drain: stop every
-                            // tracked agent, then await again so the
-                            // partial reports they write on the way
-                            // down are flushed (Pitfall 3) before this
-                            // process exits.
-                            reg.stop_all();
-                            reg.wait_background().await;
-                            interrupted = true;
-                        }
+                    reg.wait_background().await;
+                    if ctrl_c_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                        interrupted = true;
                     }
                     if !interrupted {
                         if let Some(text) = reg.take_reports() {
@@ -447,6 +470,9 @@ pub async fn run_print_mode(
                             }
                             limit = limit.or_else(|| agent.last_limit_hit());
                             reg.wait_background().await;
+                            if ctrl_c_interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                                interrupted = true;
+                            }
                             extra_reports_appendix = reg.take_reports();
                         }
                     }
@@ -508,6 +534,11 @@ pub async fn run_print_mode(
         interrupted,
         extra_reports_appendix,
     ) = agent_task.await?;
+    // The listener's only job was flipping `ctrl_c_interrupted` for the
+    // agent task above; nothing reads it after this point, and leaving it
+    // running would hold an extra `ctrl_c()` registration for the rest of
+    // process lifetime.
+    ctrl_c_task.abort();
     let status = if interrupted {
         "interrupted"
     } else if turn_result.is_err() {
