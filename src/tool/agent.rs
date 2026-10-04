@@ -649,6 +649,12 @@ fn validate_tools(tools: &[String]) -> Result<Vec<String>, String> {
             continue;
         }
         match registry.canonical_name(t) {
+            // Re-check the deny-list on the *canonical* name — canonicalization
+            // can fold a mangled name (e.g. "agent_tool") back onto a denied
+            // literal ("agent"), and that must still be denied.
+            Some(canonical) if DENIED_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(&canonical)) => {
+                bad.push(t.clone());
+            }
             Some(canonical) => {
                 if !out.contains(&canonical) {
                     out.push(canonical);
@@ -1748,6 +1754,13 @@ mod tests {
         assert!(validate_tools(&["agent".into()]).is_err());
         assert!(validate_tools(&["subagent".into()]).is_err());
         assert!(validate_tools(&["AGENT".into()]).is_err());
+    }
+
+    #[test]
+    fn validate_tools_denies_mangled_agent_names() {
+        assert!(validate_tools(&["agent_tool".into()]).is_err());
+        assert!(validate_tools(&["AGENT_TOOL".into()]).is_err());
+        assert!(validate_tools(&["Agent_Tool".into()]).is_err());
     }
 
     #[test]
