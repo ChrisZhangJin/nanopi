@@ -55,6 +55,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, SteerMessage};
+use crate::mode::agents_strip::{self, AgentsView, StripOpts};
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
@@ -388,12 +389,17 @@ fn grants_section(grants: &[crate::plugin_grants::PluginGrants]) -> Vec<Line<'st
 
 const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
 
-/// Max input content lines shown at once when no overlay menu is open.
-/// The input box grows with the buffer up to this, then scrolls to keep
-/// the cursor visible (Claude Code's bounded-viewport model, sized to
-/// our fixed inline dock — see `draw_dock`). 5 = DOCK_HEIGHT − status(1)
-/// − borders(2) − footer(2), i.e. it reclaims the otherwise-blank
-/// palette rows when no dropdown is up.
+/// Max input content lines shown at once when no overlay menu is open and
+/// the agents strip (Phase 5, `src/mode/agents_strip.rs`) is empty. The
+/// input box grows with the buffer up to this, then scrolls to keep the
+/// cursor visible (Claude Code's bounded-viewport model, sized to our
+/// fixed inline dock — see `draw_dock`). 5 = DOCK_HEIGHT − status(1) −
+/// borders(2) − footer(2), i.e. it reclaims the otherwise-blank palette
+/// rows when no dropdown is up. When the strip is non-empty, `draw_dock`
+/// subtracts the strip's row count from this budget (never below 1) —
+/// ratatui 0.29's `Viewport::Inline` cannot grow `DOCK_HEIGHT` per frame
+/// (see 05-03-PLAN.md rendering_decision), so the strip takes its rows
+/// from this budget rather than the fixed dock height.
 const MAX_INPUT_LINES: usize = 5;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -941,6 +947,24 @@ struct App {
     /// `summarize_task`.
     command_task:
         Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
+    /// Phase 5 agents strip (UI-01): cached, display-only snapshot of
+    /// background agents. Refreshed ONLY on the 120ms tick arm (D-07,
+    /// UI-04) — never from agent events or key handling — so the dock
+    /// never does filesystem IO off the tick.
+    agents_view: AgentsView,
+    /// Ctrl+G toggle (UI-02). When true, `draw_dock` shows each agent's
+    /// latest activity in the in-dock rows instead of its description,
+    /// and the toggle also prints the full detail block into scrollback
+    /// (ratatui 0.29's inline viewport can't grow per-frame, so the
+    /// "~40% of screen" expanded view from D-04 lives in scrollback
+    /// instead — see 05-03-PLAN.md rendering_decision).
+    agents_strip_expanded: bool,
+    /// Real terminal row count (NOT the fixed `DOCK_HEIGHT` inline
+    /// viewport), used only for the short-terminal check (D-08:
+    /// `strip_height` collapses to its header row below 15 rows).
+    /// Defaults to 24; kept current by the main loop each iteration via
+    /// `term.size()`.
+    term_rows: u16,
 }
 
 impl App {
@@ -1006,6 +1030,9 @@ impl App {
             subscriptions_cache: Vec::new(),
             plugin_grants_cache: Vec::new(),
             command_task: None,
+            agents_view: AgentsView::new(),
+            agents_strip_expanded: false,
+            term_rows: 24,
         }
     }
 }
@@ -1154,6 +1181,13 @@ enum KeyAction {
     /// the next level to the current Agent.
     CycleThinking,
     ExpandLastTool,
+    /// Ctrl+G (UI-02): flip `agents_strip_expanded`. A no-op when the
+    /// agents strip is empty — nothing to expand (D-05, display-only).
+    ToggleAgentsStrip,
+    /// Esc, when the strip is expanded and no turn/tool is running
+    /// (05-03-PLAN.md interfaces: must consume the Esc so it doesn't
+    /// also arm the double-Esc fork-picker timer).
+    CollapseAgentsStrip,
     /// `/new`: swap the Agent for a fresh session in the same cwd.
     NewSession,
     /// `/resume`: open a picker over sessions on disk.
@@ -1278,6 +1312,11 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     if app.bindings.matches(crate::keys::ActionId::ExpandLastTool, k) {
         return KeyAction::ExpandLastTool;
     }
+    // Ctrl+G — toggle the agents strip (UI-02, D-05: the ONLY strip key;
+    // no key here ever stops/approves/messages an agent).
+    if app.bindings.matches(crate::keys::ActionId::ToggleAgentsStrip, k) {
+        return KeyAction::ToggleAgentsStrip;
+    }
 
     // ── Summary modal (highest priority once open) ──────────────────
     if app.summary_prompt.is_some() {
@@ -1334,6 +1373,17 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 return KeyAction::Nothing
             }
         }
+    }
+
+    // ── Expanded agents strip + idle: Esc collapses instead of its
+    // usual double-tap/cancel behavior (05-03-PLAN.md interfaces: must
+    // consume the key so it never also arms the double-Esc timer).
+    if app.agents_strip_expanded
+        && app.bindings.matches(crate::keys::ActionId::ToolCancel, k)
+        && app.turn_started_at.is_none()
+        && app.tool_started_at.is_none()
+    {
+        return KeyAction::CollapseAgentsStrip;
     }
 
     // ── Esc during a streaming turn = interrupt (PI's app.interrupt,
@@ -1904,6 +1954,13 @@ async fn run_app(
         if app.should_exit {
             return Ok(0);
         }
+        // Keep the real terminal row count current for the agents
+        // strip's short-terminal check (D-08) — NOT the fixed
+        // `DOCK_HEIGHT` inline viewport, which `term.size()` does not
+        // report; this is the actual window size.
+        if let Ok(sz) = term.size() {
+            app.term_rows = sz.height;
+        }
 
         tokio::select! {
             _ = tick.tick() => {
@@ -2037,10 +2094,23 @@ async fn run_app(
                     // lost, never duplicated.
                     send_agent_reports_to_turn(steer_tx_slot.as_ref(), &mut agent_report_slot);
                 }
-                // Redraw only when there's a live counter to update.
+                // Agents strip (D-07/UI-04): refresh the cached snapshot
+                // ONLY here, on the tick — never from agent events or key
+                // handling, so the strip can never race ahead of or
+                // stall independent of the registry's own pace.
+                let was_empty = app.agents_view.is_empty();
+                if let Some(reg) = crate::agent_registry::global() {
+                    app.agents_view.refresh(&reg.snapshot(), std::time::Instant::now());
+                }
+                let became_empty = !was_empty && app.agents_view.is_empty();
+                // Redraw when there's a live counter to update, the strip
+                // has agents to show, or the strip just emptied out (so
+                // it disappears instead of leaving a stale last frame).
                 if app.turn_started_at.is_some()
                     || app.tool_started_at.is_some()
                     || app.status_note.is_some()
+                    || !app.agents_view.is_empty()
+                    || became_empty
                 {
                     term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
                 }
@@ -2243,6 +2313,27 @@ async fn handle_action(
                     app.last_skill_block = None;
                 }
             }
+        }
+        KeyAction::ToggleAgentsStrip => {
+            // D-05/UI-03: no-op with no agents — nothing to expand, and
+            // this must never become a reason to redraw or touch the
+            // registry.
+            if !app.agents_view.is_empty() {
+                app.agents_strip_expanded = !app.agents_strip_expanded;
+                if app.agents_strip_expanded {
+                    let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
+                    insert_line(term, Line::from(vec![Span::styled(
+                        "── agents ──",
+                        Style::default().fg(Color::DarkGray),
+                    )]))?;
+                    for text in agents_detail_block(app, width) {
+                        insert_line(term, Line::from(vec![Span::raw(text)]))?;
+                    }
+                }
+            }
+        }
+        KeyAction::CollapseAgentsStrip => {
+            app.agents_strip_expanded = false;
         }
         KeyAction::OpenModelPicker => {
             // Offer the models the ACTIVE vendor serves. Listing every
@@ -5251,6 +5342,14 @@ fn wrap_input_lines(
     (rows, cursor_index)
 }
 
+/// Pure helper (T-05-05: reuses `agents_strip`'s own sanitization — all
+/// text in `view` was already control-char-stripped by `AgentsView::
+/// refresh`) building the lines Ctrl+G inserts into scrollback: per-agent
+/// activity, turns/tokens, worktree/branch and the report path (D-04).
+fn agents_detail_block(app: &App, width: usize) -> Vec<String> {
+    agents_strip::expanded_detail_lines(&app.agents_view, width)
+}
+
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // Is a dropdown overlay open? When one is, it claims the top 4 rows
     // and the input box collapses to a single content line. When none is
@@ -5263,7 +5362,23 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         || app.palette.is_some()
         || app.settings_menu.is_some()
         || app.keybindings_menu.is_some();
-    let max_input_lines = if overlay_open { 1 } else { MAX_INPUT_LINES };
+    // Agents strip height (D-01/D-07/D-08, 05-03-PLAN.md rendering_decision).
+    // When an overlay is open the overlay wins the top slack: the strip
+    // collapses to its header line only, or hides entirely if there would
+    // be under 5 slack rows left (keeps menus from ever shrinking).
+    let strip_h: u16 = if app.agents_view.is_empty() {
+        0
+    } else if overlay_open {
+        let base_slack = area.height.saturating_sub(1 + 2 + 1 + 1); // status + input(1 line) + footer(2)
+        if base_slack < 5 { 0 } else { 1 }
+    } else {
+        agents_strip::strip_height(&app.agents_view, app.term_rows, app.agents_strip_expanded)
+    };
+    let max_input_lines = if overlay_open {
+        1
+    } else {
+        MAX_INPUT_LINES.saturating_sub(strip_h as usize).max(1)
+    };
     // Content width available for the input text: full dock width minus
     // the 2-column `> ` marker (the box has no left/right border). Wrap
     // the buffer to that width so long lines occupy several display rows
@@ -5273,15 +5388,20 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         wrap_input_lines(app.input.lines(), input_width, app.input.cursor());
     let input_content_h = wrapped_rows.len().clamp(1, max_input_lines) as u16;
 
-    // Layout: [overlay/top-slack] + status(1) + input(2 border+content)
-    // + footer(2) = DOCK_HEIGHT. `Min(0)` absorbs the slack at the top so
-    // the input box stays anchored just above the footer and grows
-    // upward; when an overlay is open it lands in that same top region.
+    // Layout: [overlay/top-slack] + status(1) + strip(strip_h) +
+    // input(2 border+content) + footer(2) = DOCK_HEIGHT. `Min(0)` absorbs
+    // the slack at the top so the input box stays anchored just above the
+    // footer and grows upward; when an overlay is open it lands in that
+    // same top region. The strip sits between the status line and the
+    // input box per D-01, drawn from the row budget the input box would
+    // otherwise grow into (ratatui 0.29 cannot grow the fixed inline
+    // viewport per frame).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),                      // palette / overlay / slack
             Constraint::Length(1),                   // status strip
+            Constraint::Length(strip_h),              // agents strip
             Constraint::Length(2 + input_content_h), // input box (borders + content)
             Constraint::Length(1),                   // cwd + branch
             Constraint::Length(1),                   // stats
@@ -5309,6 +5429,22 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // ── Status strip ─────────────────────────────────────────────
     // Priority: tool running (blue bar) > turn thinking > blank.
     draw_status_strip(buf, chunks[1], app);
+
+    // ── Agents strip (UI-01, between status line and input box) ────
+    if strip_h > 0 {
+        let toggle_key_label = app
+            .bindings
+            .get(crate::keys::ActionId::ToggleAgentsStrip)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Ctrl+G".to_string());
+        let opts = StripOpts {
+            expanded: app.agents_strip_expanded,
+            term_rows: app.term_rows,
+            toggle_key_label,
+            now: std::time::Instant::now(),
+        };
+        agents_strip::draw_agents_strip(buf, chunks[2], &app.agents_view, &opts);
+    }
 
     // ── Input box ────────────────────────────────────────────────
     // The box shows up to `input_content_h` buffer lines, scrolling so
@@ -5382,7 +5518,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let input_para = Paragraph::new(input_lines)
         .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
-    input_para.render(chunks[2], buf);
+    input_para.render(chunks[3], buf);
 
     // Line 1 of footer: cwd + branch + session
     let cwd_str = crate::render::status_line::cwd_display(&app.cwd);
@@ -5398,7 +5534,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         format!("  · session {}", sid_short),
         Style::default().fg(Color::DarkGray),
     ));
-    Paragraph::new(Line::from(l1)).render(chunks[3], buf);
+    Paragraph::new(Line::from(l1)).render(chunks[4], buf);
 
     // Line 2: tokens + cost + model + context ratio (PI-style)
     let mut l2: Vec<Span> = Vec::new();
@@ -5463,7 +5599,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
                 .add_modifier(Modifier::ITALIC),
         ));
     }
-    Paragraph::new(Line::from(l2)).render(chunks[4], buf);
+    Paragraph::new(Line::from(l2)).render(chunks[5], buf);
 }
 
 /// Render the full tool output as an extension of the last tool card —
@@ -7425,6 +7561,325 @@ mod tests {
                 sel.label
             );
         }
+    }
+
+    // ── Phase 5 Plan 3: agents strip wiring ─────────────────────────
+
+    /// Fabricate an `AgentEntry` backed by a real tempdir with a
+    /// `brief.md` (and optional `report.md`), so `AgentsView::refresh`'s
+    /// IO path has something real to read — never touches the global
+    /// registry (05-03-PLAN.md: "do not touch the global registry in
+    /// tests").
+    fn fabricate_agent(
+        id: &str,
+        state: crate::agent_registry::AgentState,
+        label: &str,
+    ) -> (tempfile::TempDir, crate::agent_registry::AgentEntry) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("brief.md"),
+            format!("---\nlabel: {label}\nrole: worker\n---\ndo the thing\n"),
+        )
+        .unwrap();
+        let entry = crate::agent_registry::AgentEntry {
+            id: id.to_string(),
+            pid: None,
+            state,
+            started: std::time::Instant::now(),
+            dir: dir.path().to_path_buf(),
+        };
+        (dir, entry)
+    }
+
+    #[test]
+    fn agents_strip_hidden_when_empty() {
+        let app = mkapp();
+        assert!(app.agents_view.is_empty());
+        let rows_before = render_input_rows(&app);
+
+        // A second App with an untouched (empty) AgentsView must render
+        // byte-identical dock input rows to the pre-change layout.
+        let app2 = mkapp();
+        let rows_after = render_input_rows(&app2);
+        assert_eq!(rows_before, rows_after);
+
+        // And the strip itself must occupy zero rows.
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, &app);
+        // No "agents (" header anywhere in the buffer.
+        let mut found = false;
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("agents (") {
+                found = true;
+            }
+        }
+        assert!(!found, "strip header must not render when the view is empty");
+    }
+
+    #[test]
+    fn agents_strip_shows_entries() {
+        let mut app = mkapp();
+        let (_d1, e1) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        let (_d2, e2) =
+            fabricate_agent("a2", crate::agent_registry::AgentState::Queued, "bravo");
+        app.agents_view.refresh(&[e1, e2], std::time::Instant::now());
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, &app);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let all = rows.join("\n");
+        assert!(all.contains("agents (2)"), "{all}");
+        assert!(all.contains("#a1"), "{all}");
+        assert!(all.contains("#a2"), "{all}");
+        assert!(all.contains("alpha") || all.contains("bravo"), "{all}");
+    }
+
+    #[test]
+    fn strip_shrinks_input_budget() {
+        let mut app = mkapp();
+        let mut dirs = Vec::new();
+        let mut entries = Vec::new();
+        for (id, label) in [("a1", "one"), ("a2", "two"), ("a3", "three")] {
+            let (d, e) = fabricate_agent(id, crate::agent_registry::AgentState::Running, label);
+            dirs.push(d);
+            entries.push(e);
+        }
+        app.agents_view.refresh(&entries, std::time::Instant::now());
+        app.input.insert_str("a\nb\nc\nd\ne\nf");
+
+        let rows = render_input_rows(&app);
+        // 3 agents -> strip_h = 1 (header) + 3 rows = 4; input budget is
+        // max(1, MAX_INPUT_LINES - 4) = max(1, 1) = 1 content line, plus
+        // top/bottom border rows that `render_input_rows` filters out
+        // (it only keeps the `>`-prefixed row and any non-blank rows
+        // after it).
+        assert!(
+            rows.len() <= 2,
+            "expected a shrunk input box (<=2 visible rows), got {}: {rows:#?}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn overlay_wins_over_strip() {
+        let mut app = mkapp();
+        let (_d, e) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        app.agents_view.refresh(&[e], std::time::Instant::now());
+        seed_input(&mut app, "/");
+        assert!(app.palette.is_some(), "sanity: palette should be open");
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, &app);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let all = rows.join("\n");
+        // Palette renders (its own content, e.g. a slash command label).
+        assert!(all.contains('/'), "palette should still render: {all}");
+        // The strip must not show its full agent rows while the overlay
+        // is open — at most the header line ("agents (") may appear.
+        let header_count = rows.iter().filter(|r| r.contains("agents (")).count();
+        assert!(header_count <= 1, "{all}");
+    }
+
+    #[test]
+    fn strip_render_deterministic_across_ticks() {
+        let mut app = mkapp();
+        let (_d, e) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        app.agents_view.refresh(&[e], std::time::Instant::now());
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf1 = Buffer::empty(area);
+        draw_dock(&mut buf1, area, &app);
+        let mut buf2 = Buffer::empty(area);
+        draw_dock(&mut buf2, area, &app);
+        assert_eq!(buf1, buf2);
+    }
+
+    #[test]
+    fn strip_short_terminal_header_only() {
+        let mut app = mkapp();
+        app.term_rows = 12;
+        let mut dirs = Vec::new();
+        let mut entries = Vec::new();
+        for (id, label) in [("a1", "one"), ("a2", "two")] {
+            let (d, e) = fabricate_agent(id, crate::agent_registry::AgentState::Running, label);
+            dirs.push(d);
+            entries.push(e);
+        }
+        app.agents_view.refresh(&entries, std::time::Instant::now());
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, &app);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let header_rows: Vec<&String> = rows.iter().filter(|r| r.contains("agents (")).collect();
+        assert_eq!(header_rows.len(), 1, "exactly one strip row: {rows:#?}");
+        // The row right after the header must not be an agent row
+        // (would start with the glyph/id, not blank/status/input chrome).
+        let header_idx = rows.iter().position(|r| r.contains("agents (")).unwrap();
+        assert!(
+            !rows[header_idx + 1].contains("#a1") && !rows[header_idx + 1].contains("#a2"),
+            "row after header must not be an agent row: {:?}",
+            rows[header_idx + 1]
+        );
+    }
+
+    // ── Task 2: Ctrl+G toggle / Esc collapse / display-only ─────────
+
+    #[test]
+    fn ctrl_g_toggles_strip() {
+        let mut app = mkapp();
+        let (_d, e) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        app.agents_view.refresh(&[e], std::time::Instant::now());
+        seed_input(&mut app, "hello"); // non-empty input must survive untouched.
+
+        let action = interpret_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(action, KeyAction::ToggleAgentsStrip), "{action:?}");
+        assert_eq!(app.input.as_string(), "hello", "Ctrl+G must not touch the input buffer");
+
+        assert!(!app.agents_strip_expanded);
+        apply_toggle_for_test(&mut app);
+        assert!(app.agents_strip_expanded);
+        apply_toggle_for_test(&mut app);
+        assert!(!app.agents_strip_expanded);
+    }
+
+    /// Mirrors `handle_action(KeyAction::ToggleAgentsStrip, ...)`'s flag
+    /// flip without requiring a live `Term` (that path also inserts
+    /// scrollback lines, exercised separately via `agents_detail_block`).
+    fn apply_toggle_for_test(app: &mut App) {
+        if !app.agents_view.is_empty() {
+            app.agents_strip_expanded = !app.agents_strip_expanded;
+        }
+    }
+
+    #[test]
+    fn ctrl_g_without_agents_is_noop() {
+        let mut app = mkapp();
+        assert!(app.agents_view.is_empty());
+        let action = interpret_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(action, KeyAction::ToggleAgentsStrip));
+        apply_toggle_for_test(&mut app);
+        assert!(!app.agents_strip_expanded, "no agents -> toggle is a no-op");
+    }
+
+    #[test]
+    fn esc_collapses_strip() {
+        let mut app = mkapp();
+        let (_d, e) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        app.agents_view.refresh(&[e], std::time::Instant::now());
+        app.agents_strip_expanded = true;
+
+        // Idle: Esc collapses instead of arming the double-Esc timer.
+        let action = interpret_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(action, KeyAction::CollapseAgentsStrip), "{action:?}");
+        assert!(app.last_esc_at.is_none(), "collapse must not arm the double-Esc timer");
+
+        // Turn running: Esc keeps its existing cancel behavior.
+        let mut app2 = mkapp();
+        let (_d2, e2) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        app2.agents_view.refresh(&[e2], std::time::Instant::now());
+        app2.agents_strip_expanded = true;
+        app2.status = Status::Streaming;
+        app2.turn_started_at = Some(std::time::Instant::now());
+        let action2 = interpret_key(&mut app2, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(action2, KeyAction::CancelTurn), "{action2:?}");
+    }
+
+    #[test]
+    fn expanded_strip_shows_detail() {
+        let mut app = mkapp();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("brief.md"),
+            "---\nlabel: alpha\nrole: worker\n---\ndo the thing\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("report.md"),
+            "---\nturns: 3\ntokens: 120\nworktree: /tmp/wt\nbranch: agent/a1\n---\ndone\n",
+        )
+        .unwrap();
+        let entry = crate::agent_registry::AgentEntry {
+            id: "a1".into(),
+            pid: None,
+            state: crate::agent_registry::AgentState::Completed,
+            started: std::time::Instant::now(),
+            dir: dir.path().to_path_buf(),
+        };
+        app.agents_view.refresh(&[entry], std::time::Instant::now());
+
+        let lines = agents_detail_block(&app, 80);
+        let all = lines.join("\n");
+        assert!(all.contains("turns"), "{all}");
+        assert!(all.contains("worktree"), "{all}");
+        assert!(all.contains("report.md"), "{all}");
+    }
+
+    /// UI-03/T-05-06: feeding every ordinary key plus the strip's own
+    /// toggle/collapse keys at a REAL `AgentRegistry` with a reserved
+    /// (queued) entry must never change that entry's state or call
+    /// stop — the strip is read-only.
+    #[test]
+    fn strip_is_display_only_no_mutation() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        let agents_root = tempfile::tempdir().unwrap();
+        // Reserve a live entry the same way a dispatch would.
+        let (id, dir) = reg.reserve(agents_root.path()).expect("reserve");
+        std::fs::write(dir.join("brief.md"), "---\nlabel: alpha\n---\n").unwrap();
+
+        let mut app = mkapp();
+        app.agents_view
+            .refresh(&reg.snapshot(), std::time::Instant::now());
+        app.agents_strip_expanded = false;
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            let _ = interpret_key(&mut app, key);
+        }
+
+        let snap = reg.snapshot();
+        let entry = snap.iter().find(|e| e.id == id).expect("entry still present");
+        assert_eq!(
+            entry.state,
+            crate::agent_registry::AgentState::Queued,
+            "no strip key may change agent state"
+        );
     }
 }
 
