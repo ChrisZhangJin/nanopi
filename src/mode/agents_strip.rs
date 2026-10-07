@@ -301,10 +301,14 @@ impl AgentsView {
     /// agents at most once per second (T-05-02).
     pub fn refresh(&mut self, snapshot: &[AgentEntry], now: Instant) {
         use std::collections::HashSet;
-        let seen: HashSet<&str> = snapshot.iter().map(|e| e.id.as_str()).collect();
+        // Only live agents are shown: one that has finished (done, failed,
+        // stopped, ...) leaves the strip on the next tick. Its report still
+        // reaches the conversation through the normal injection path.
+        let live: Vec<&AgentEntry> = snapshot.iter().filter(|e| !e.state.is_terminal()).collect();
+        let seen: HashSet<&str> = live.iter().map(|e| e.id.as_str()).collect();
         self.agents.retain(|a| seen.contains(a.id.as_str()));
 
-        for entry in snapshot {
+        for entry in live {
             if let Some(info) = self.agents.iter_mut().find(|a| a.id == entry.id) {
                 let state_changed = info.last_state_for_reread != entry.state;
                 info.state = entry.state;
@@ -586,7 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn ordering_failed_running_queued_finished() {
+    fn ordering_running_then_queued_finished_agents_dropped() {
+        // Finished agents (terminal states) must not appear in the view at
+        // all: only `Running`/`Queued` are live. "fail3" (Failed) and
+        // "done1" (Completed) are both terminal and are dropped on refresh.
         let now = Instant::now();
         let d1 = tmp_dir();
         let d2 = tmp_dir();
@@ -601,48 +608,40 @@ mod tests {
         let mut view = AgentsView::new();
         view.refresh(&snapshot, now);
         let ids: Vec<&str> = ordered_agents(&view).iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["fail3", "run2", "queued4", "done1"]);
+        assert_eq!(ids, vec!["run2", "queued4"]);
     }
 
     #[test]
-    fn most_recently_finished_sorts_first_among_finished() {
+    fn finished_agent_is_removed_from_view_and_strip_becomes_empty() {
+        // An agent present while Running must be removed from the view
+        // after a refresh in which its state is terminal (Completed or
+        // Failed); if it was the only agent, the strip becomes empty
+        // (height 0 / hidden).
         let t0 = Instant::now();
         let d1 = tmp_dir();
-        let d2 = tmp_dir();
         let mut view = AgentsView::new();
 
-        // Both start running.
-        let snap1 = vec![
-            entry("a", AgentState::Running, t0, d1.path().to_path_buf()),
-            entry("b", AgentState::Running, t0, d2.path().to_path_buf()),
-        ];
+        let snap1 = vec![entry("a", AgentState::Running, t0, d1.path().to_path_buf())];
         view.refresh(&snap1, t0);
+        assert_eq!(view.len(), 1);
+        assert_eq!(strip_height(&view, 40, false), 2);
 
-        // "a" finishes first.
         let t1 = t0 + Duration::from_millis(10);
-        let snap2 = vec![
-            entry("a", AgentState::Completed, t0, d1.path().to_path_buf()),
-            entry("b", AgentState::Running, t0, d2.path().to_path_buf()),
-        ];
+        let snap2 = vec![entry("a", AgentState::Completed, t0, d1.path().to_path_buf())];
         view.refresh(&snap2, t1);
 
-        // "b" finishes second.
-        let t2 = t1 + Duration::from_millis(10);
-        let snap3 = vec![
-            entry("a", AgentState::Completed, t0, d1.path().to_path_buf()),
-            entry("b", AgentState::Completed, t0, d2.path().to_path_buf()),
-        ];
-        view.refresh(&snap3, t2);
+        assert!(view.is_empty(), "completed agent should be dropped from the view");
+        assert_eq!(strip_height(&view, 40, false), 0);
 
-        let rows = collapsed_rows(&view);
-        let ids: Vec<&str> = rows
-            .iter()
-            .map(|r| match r {
-                StripRow::Agent(a) => a.id.as_str(),
-                StripRow::More { .. } => "+more",
-            })
-            .collect();
-        assert_eq!(ids, vec!["b", "a"]);
+        // Same for Failed.
+        let d2 = tmp_dir();
+        let mut view2 = AgentsView::new();
+        let snap3 = vec![entry("b", AgentState::Running, t0, d2.path().to_path_buf())];
+        view2.refresh(&snap3, t0);
+        let snap4 = vec![entry("b", AgentState::Failed, t0, d2.path().to_path_buf())];
+        view2.refresh(&snap4, t1);
+        assert!(view2.is_empty(), "failed agent should be dropped from the view");
+        assert_eq!(strip_height(&view2, 40, false), 0);
     }
 
     #[test]
@@ -663,8 +662,9 @@ mod tests {
         view3.refresh(&snap, now);
         assert_eq!(strip_height(&view3, 40, false), 4);
 
-        // 5 agents -> capped to 3 rows + header = 4; the 2 shown are fail + the
-        // first running agent, leaving 2 running (plus queued) collapsed into
+        // 5 live agents (Failed is terminal and is excluded entirely) ->
+        // capped to 3 rows + header = 4; the 2 shown are the first two
+        // running agents, leaving 2 running (plus queued) collapsed into
         // "+3 more (2 running)".
         let dirs5: Vec<_> = (0..5).map(|_| tmp_dir()).collect();
         let states = [
@@ -682,13 +682,15 @@ mod tests {
             .collect();
         let mut view5 = AgentsView::new();
         view5.refresh(&snap5, now);
+        // Only the 3 Running + 1 Queued are live (Failed is dropped).
+        assert_eq!(view5.len(), 4);
         assert_eq!(strip_height(&view5, 40, false), 4);
         let rows = collapsed_rows(&view5);
         assert_eq!(rows.len(), 3);
         match rows.last().unwrap() {
             StripRow::More { count, running } => {
-                assert_eq!(*count, 3);
-                assert_eq!(*running, 2);
+                assert_eq!(*count, 2);
+                assert_eq!(*running, 1);
             }
             StripRow::Agent(_) => panic!("expected More row"),
         }
@@ -984,7 +986,7 @@ mod tests {
         )
         .unwrap();
         let mut view = AgentsView::new();
-        view.refresh(&[entry("a", AgentState::Completed, now, d1.path().to_path_buf())], now);
+        view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
         let lines = expanded_detail_lines(&view, 80, now);
         assert!(lines.iter().any(|l| l.contains("turns 3") && l.contains("tokens 1200")));
         assert!(lines.iter().any(|l| l.contains("worktree /tmp/wt (feature/x)")));

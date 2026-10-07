@@ -8142,7 +8142,7 @@ mod tests {
         let entry = crate::agent_registry::AgentEntry {
             id: "a1".into(),
             pid: None,
-            state: crate::agent_registry::AgentState::Completed,
+            state: crate::agent_registry::AgentState::Running,
             started: std::time::Instant::now(),
             dir: dir.path().to_path_buf(),
         };

@@ -7,8 +7,7 @@ result; the parent keeps running.
 
 There is no slash command, prompt or control action for agents in the TUI.
 They are controlled only by the model through the tool. The TUI does show a
-read-only agents strip while agents are running or recently finished — see
-below.
+read-only agents strip while agents are running or queued — see below.
 
 ## Child command line
 
@@ -90,9 +89,13 @@ Every child is killed (whole process group, SIGKILL) when:
 
 ## Agents strip (TUI)
 
-A read-only strip shows every agent at a glance while any are running or
-recently finished. It sits between the status line and the input box, and is
-hidden whenever the current run has no agents.
+A read-only strip shows every live agent at a glance while any are running or
+queued. It sits between the status line and the input box, and is hidden
+whenever the current run has no live agents. Once an agent reaches a terminal
+state (done, failed, stopped, limit reached, interrupted) it disappears from
+the strip on the next refresh — its report is still delivered to the
+conversation through the normal injection path; the strip itself is not where
+you read results.
 
 **Glyphs:**
 
@@ -106,14 +109,18 @@ hidden whenever the current run has no agents.
 | `⏱` | limit reached |
 | `?` | interrupted |
 
+Terminal-state glyphs (`✓`/`✗`/`■`/`⏱`/`?`) are kept here for reference, but
+in practice an agent that reaches one of these states is removed from the
+strip on its next refresh, so they are not normally visible in the live view.
+
 There is no "waiting for permission" state: children run with `--approve` or
 `--distrust` decided at dispatch and never prompt, so the strip has nothing to
 approve or deny (display-only, UI-03).
 
 **Collapsed** (default), the strip is 1–3 lines: a header
-`agents (N) · Ctrl+G expand`, then at most 3 rows — agents needing attention
-first, then running, then most recently finished. With more than 3 agents the
-last row folds the rest into `+K more (R running)`.
+`agents (N) · Ctrl+G expand`, then at most 3 rows — running agents first, then
+queued. With more than 3 live agents the last row folds the rest into
+`+K more (R running)`.
 
 **Expanded** (`Ctrl+G` toggles), the in-dock rows keep showing each agent's
 latest activity and the dock grows to show more of the list, while a full
