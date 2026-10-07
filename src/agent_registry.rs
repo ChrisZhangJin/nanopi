@@ -112,6 +112,10 @@ pub struct AgentRegistry {
     /// (CTL-06 T-04-06-05): written exactly once, whether the run dir is
     /// new or joined via `NANOPI_RUN_ID`.
     run_pid_written: AtomicBool,
+    /// Set by the TUI: a single-mode `agent` call without an explicit
+    /// `background` runs in the background, so the foreground
+    /// conversation stays free while the agent works.
+    background_default: AtomicBool,
 }
 
 impl std::fmt::Debug for AgentRegistry {
@@ -147,6 +151,7 @@ impl AgentRegistry {
             reports: Mutex::new(Vec::new()),
             notify_sink: Mutex::new(None),
             seeded: AtomicBool::new(false),
+            background_default: AtomicBool::new(false),
             run_pid_written: AtomicBool::new(false),
         })
     }
@@ -269,6 +274,15 @@ impl AgentRegistry {
     /// than pay for a no-op `select!` and an unused `ctrl_c` listener).
     pub fn has_background(&self) -> bool {
         !self.bg_lock().is_empty()
+    }
+
+    /// Make background the default for single-mode dispatches.
+    pub fn set_background_default(&self, on: bool) {
+        self.background_default.store(on, Ordering::Relaxed);
+    }
+
+    pub fn background_default(&self) -> bool {
+        self.background_default.load(Ordering::Relaxed)
     }
 
     /// Install the sink that wakes a consumer when a report arrives.

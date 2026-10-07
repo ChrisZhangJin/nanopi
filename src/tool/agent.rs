@@ -562,7 +562,7 @@ impl Tool for AgentTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "single mode only: if true, return {id, state, archive_path} immediately and finish the agent in the background; its report is injected into your context once done. Default false."
+                        "description": "single mode only: if true, return {id, state, archive_path} immediately and finish the agent in the background; its report is injected into your context once done. Default true in the interactive TUI, false otherwise; pass false to wait for the result."
                     }
                 }
             }),
@@ -572,12 +572,12 @@ impl Tool for AgentTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let scope = parse_scope(&args).map_err(ToolError::InvalidArgs)?;
         let mode = select_mode(&args).map_err(ToolError::InvalidArgs)?;
+        let l = self.launcher();
         let background = match args.get("background") {
-            None | Some(Value::Null) => false,
+            None | Some(Value::Null) => mode == Mode::Single && l.registry.background_default(),
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err(ToolError::InvalidArgs("`background` must be a boolean".into())),
         };
-        let l = self.launcher();
 
         if background && mode != Mode::Single {
             return Err(ToolError::InvalidArgs(
@@ -2855,6 +2855,26 @@ mod tests {
             "{v}"
         );
         assert!(v["archive_path"].as_str().unwrap().contains("a1"));
+        l.registry.wait_background().await;
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_default_applies_when_flag_omitted() {
+        let cwd = tmp("bg-default");
+        let l = launcher(&format!("sleep 5; echo '{OK_ENV}'"), 8, 4);
+        l.registry.set_background_default(true);
+        let tool = AgentTool::with_parts(l.registry.clone(), l.spec.clone(), l.program.clone());
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(json!({"task": "slow task"}), &ToolContext { cwd: cwd.clone() })
+            .await
+            .expect("in-band dispatch");
+        assert!(start.elapsed() < Duration::from_secs(2), "must not block on the child");
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["id"].as_str(), Some("a1"));
+        l.registry.stop_all();
         l.registry.wait_background().await;
         let _ = std::fs::remove_dir_all(&cwd);
     }

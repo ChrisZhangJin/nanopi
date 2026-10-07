@@ -654,6 +654,11 @@ pub async fn run_tui_mode(
         }
     }
 
+    // Agents dispatched from the TUI run in the background by default so
+    // the user can keep talking while they work; reports arrive later.
+    if let Some(reg) = crate::agent_registry::global() {
+        reg.set_background_default(true);
+    }
     let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
     // TUI quit: stop every live agent child before anything else.
     if let Some(reg) = crate::agent_registry::global() {
