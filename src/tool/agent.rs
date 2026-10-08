@@ -562,7 +562,7 @@ impl Tool for AgentTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "single mode only: if true, return {id, state, archive_path} immediately and finish the agent in the background; its report is injected into your context once done. Default true in the interactive TUI, false otherwise; pass false to wait for the result."
+                        "description": "single mode only: if true, return {id, state, archive_path} immediately and finish the agent in the background; its report is injected into your context once done. Default true in the interactive TUI, false otherwise; pass false to wait for the result. Never poll or sleep waiting for a background agent."
                     }
                 }
             }),
@@ -1552,6 +1552,7 @@ pub(crate) fn spawn_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) 
             "id": id,
             "state": AgentState::Queued.as_str(),
             "archive_path": archive_path,
+            "note": BACKGROUND_NOTE,
         })
         .to_string(),
         is_error: false,
@@ -1559,6 +1560,14 @@ pub(crate) fn spawn_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) 
         images: Vec::new(),
     }
 }
+
+/// Told to the model with every background dispatch: without it, models
+/// tend to keep the turn open and poll (`list_agents`, `bash sleep`),
+/// which blocks the foreground conversation the dispatch was meant to
+/// free up.
+const BACKGROUND_NOTE: &str = "The agent is running in the background. Its report will be \
+added to the conversation automatically when it finishes. Do not wait, poll list_agents, \
+or sleep for it: tell the user it has started and end your turn.";
 
 /// Build the child command to continue a finished agent (CTL-06): same
 /// id and dir, same `--session-file` transcript (which auto-resumes —
