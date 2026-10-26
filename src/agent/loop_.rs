@@ -327,6 +327,41 @@ already had are still in place. Do not assume it failed. If the answer \
 matters, verify the current state before acting — and prefer a \
 read-only check over re-running anything that writes.";
 
+/// Flag a session that stopped with a completed tool result but no
+/// assistant turn after it — the process died between the tool
+/// finishing and the model producing its next reply, so the last thing
+/// a resumed (or exported) transcript shows is raw tool output with no
+/// wrap-up, no "here's what I found", nothing. `repair_orphaned_tool_calls`
+/// only catches calls that never got an answer; this catches the
+/// sibling case where the answer came back fine but the turn that
+/// would have read it never ran. Surfaces a visible `note!` (not just a
+/// log line) so the user isn't left staring at a dead end wondering
+/// what happened, and nudges the model to summarize where things stood
+/// before continuing.
+fn note_if_session_ended_mid_turn(context: &Context) {
+    if !session_ended_mid_turn(context) {
+        return;
+    }
+    crate::note!(
+        "nanopi: this session stopped right after a tool call returned, \
+         before the model replied — nanopi most likely exited mid-turn. \
+         Nothing summarized what that last tool call found; ask the \
+         model to pick up from there if it's unclear."
+    );
+}
+
+/// True when the context's last message is a tool result with nothing
+/// after it — the shape a process leaves when it dies between the tool
+/// answering and the model reading that answer. Split out from
+/// `note_if_session_ended_mid_turn` so tests can check the detection
+/// without touching the process-wide raw-tty notice queue.
+fn session_ended_mid_turn(context: &Context) -> bool {
+    matches!(
+        context.messages.last(),
+        Some(crate::agent::context::ContextMessage::Tool { .. })
+    )
+}
+
 impl Agent {
     /// Reconstruct an Agent from an existing session JSONL file.
     /// Replays message entries into the Context so a new turn can build
@@ -436,6 +471,7 @@ impl Agent {
         }
         flush(&mut pending, &mut context);
         repair_orphaned_tool_calls(&mut context);
+        note_if_session_ended_mid_turn(&context);
         Ok(Self {
             context,
             provider: Box::new(OpenAiProvider::new("", "", "")),
@@ -4894,6 +4930,55 @@ mod tests {
         let before = serde_json::to_value(&ctx.messages).unwrap();
         repair_orphaned_tool_calls(&mut ctx);
         assert_eq!(serde_json::to_value(&ctx.messages).unwrap(), before);
+    }
+
+    /// A session ending right after a tool result — the sibling case
+    /// `repair_orphaned_tool_calls` doesn't cover, because the call DID
+    /// get an answer; the model just never got to read it — must surface
+    /// a visible note so a resumed session isn't a silent dead end.
+    #[test]
+    fn session_ended_mid_turn_flags_a_trailing_tool_result() {
+        use crate::agent::context::{AssistantBlock, ContextMessage, ToolCallBlock};
+
+        let mut ctx = Context::default();
+        ctx.push_user_text("investigate the build failure".to_string());
+        ctx.messages.push(ContextMessage::Assistant {
+            content: vec![AssistantBlock::ToolCall {
+                call: ToolCallBlock {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "grep foo"}),
+                },
+            }],
+        });
+        ctx.push_tool_result_with_images("call_1", "no matches", false, Vec::new());
+
+        assert!(
+            session_ended_mid_turn(&ctx),
+            "a session ending on a bare tool result must be flagged"
+        );
+    }
+
+    /// A healthy session that ended on an assistant reply must not be
+    /// flagged — that's the normal, non-truncated shape.
+    #[test]
+    fn session_ended_mid_turn_leaves_a_healthy_session_alone() {
+        let mut ctx = Context::default();
+        ctx.push_user_text("hi".to_string());
+        ctx.push_assistant_text("hello".to_string());
+
+        assert!(
+            !session_ended_mid_turn(&ctx),
+            "a session ending on assistant text is fine as-is"
+        );
+    }
+
+    /// Empty context (e.g. a brand-new session) must not panic or be
+    /// flagged.
+    #[test]
+    fn session_ended_mid_turn_handles_empty_context() {
+        let ctx = Context::default();
+        assert!(!session_ended_mid_turn(&ctx));
     }
 
     /// End to end through the real replay path, on the exact file a
