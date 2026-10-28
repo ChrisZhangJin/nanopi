@@ -412,6 +412,12 @@ const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
 /// from this budget rather than the fixed dock height.
 const MAX_INPUT_LINES: usize = 5;
 
+/// Minimum dock width before the context usage bar is drawn. The stats
+/// row already carries tokens, cost, model, vendor and the ratio; below
+/// this the bar is the first thing to go, since the numeric percentage
+/// beside it says the same thing in fewer columns.
+const CONTEXT_BAR_MIN_COLS: u16 = 72;
+
 /// Rows a dropdown overlay needs before the agents strip is allowed to
 /// take one for itself. At the standard `DOCK_HEIGHT` the overlay gets
 /// exactly 4 (`10 - status(1) - input(3) - footer(2)`), which is under
@@ -5951,10 +5957,9 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     if let Some(ratio) =
         crate::render::status_line::context_ratio(&app.model, app.context_chars, true)
     {
+        let pct = crate::render::status_line::context_percent(&app.model, app.context_chars);
         // Only color-code when we have a real percentage (known window)
-        let color = if let Some(pct) =
-            crate::render::status_line::context_percent(&app.model, app.context_chars)
-        {
+        let color = if let Some(pct) = pct {
             match crate::render::status_line::context_color(pct) {
                 "red" => Color::Red,
                 "yellow" => Color::Yellow,
@@ -5965,6 +5970,21 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             Color::Indexed(108)
         };
         l2.push(Span::raw("  "));
+        // Usage bar, when the window is known (an unknown window has no
+        // meaningful fill) and the line has room for it. This row is a
+        // non-wrapping `Paragraph`, so anything past the edge is simply
+        // cut — the bar must not be what pushes the percentage off.
+        if let Some(pct) = pct {
+            if area.width >= CONTEXT_BAR_MIN_COLS {
+                let (filled, empty) = crate::render::status_line::context_bar_parts(
+                    pct,
+                    crate::render::status_line::CONTEXT_BAR_CELLS,
+                );
+                l2.push(Span::styled(filled, Style::default().fg(color)));
+                l2.push(Span::styled(empty, Style::default().fg(Color::DarkGray)));
+                l2.push(Span::raw(" "));
+            }
+        }
         l2.push(Span::styled(ratio, Style::default().fg(color)));
     }
     if app.status == Status::Streaming {
@@ -8744,6 +8764,52 @@ mod tests {
         assert_eq!(built.names(), vec!["grep", "read"]);
         assert!(built.get("send_message").is_none());
         assert!(built.get("agent").is_none());
+    }
+
+    /// The stats row shows a usage bar beside the context percentage,
+    /// and drops it (keeping the number) when the dock is too narrow to
+    /// carry both — the row is a non-wrapping `Paragraph`, so an
+    /// over-long line loses its tail silently.
+    #[test]
+    fn status_line_shows_a_context_bar_and_drops_it_when_narrow() {
+        let mut app = mkapp();
+        // A model with a known window, half consumed: ~4 of 8 cells.
+        app.model = "claude-opus-4-7".to_string();
+        app.context_chars = 2_000_000; // 500k tokens of a 1M window
+
+        let render = |app: &App, w: u16| -> String {
+            let area = Rect::new(0, 0, w, DOCK_HEIGHT);
+            let mut buf = Buffer::empty(area);
+            draw_dock(&mut buf, area, app);
+            (0..area.height)
+                .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let wide = render(&app, 100);
+        assert!(wide.contains("50.0%/1.0M"), "{wide}");
+        assert!(
+            wide.contains("████░░░░"),
+            "half-full context must render a half-full bar: {wide}"
+        );
+
+        // Narrow: the number survives, the bar does not.
+        let narrow = render(&app, CONTEXT_BAR_MIN_COLS - 1);
+        assert!(
+            !narrow.contains('█') && !narrow.contains('░'),
+            "bar must drop on a narrow dock: {narrow}"
+        );
+
+        // An unknown window has no meaningful fill, so no bar at any
+        // width — but the `?/…` ratio still shows.
+        app.model = "no-such-model-xyz".to_string();
+        let unknown = render(&app, 100);
+        assert!(unknown.contains("?/"), "{unknown}");
+        assert!(
+            !unknown.contains('█') && !unknown.contains('░'),
+            "unknown window must not fake a fill level: {unknown}"
+        );
     }
 
     /// ORC-05: the status badge marks the deviation, not the default.

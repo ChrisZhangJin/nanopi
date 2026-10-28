@@ -99,6 +99,30 @@ pub fn context_ratio(model: &str, chars: usize, auto_compact: bool) -> Option<St
     }
 }
 
+/// Default width, in terminal cells, of the context usage bar.
+pub const CONTEXT_BAR_CELLS: usize = 8;
+
+/// Split a context-usage bar into its filled and empty halves, so the
+/// caller can colour them separately (filled by threshold, empty dim).
+///
+/// Both glyphs are single-width, so the bar is always exactly `cells`
+/// columns — it must not shift the rest of the status line around.
+///
+/// The fill is honestly rounded rather than floored-to-at-least-one: a
+/// 0.1% context shows an empty bar. Forcing a first cell would read as
+/// ~12% at the default width, and the exact figure is printed right
+/// next to it anyway. Over 100% (possible before an auto-compact
+/// fires) saturates rather than overflowing.
+pub fn context_bar_parts(pct: f64, cells: usize) -> (String, String) {
+    if cells == 0 {
+        return (String::new(), String::new());
+    }
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * cells as f64).round() as usize;
+    let filled = filled.min(cells);
+    ("█".repeat(filled), "░".repeat(cells - filled))
+}
+
 /// Pick a color name (returned as a `&'static str` matching ratatui /
 /// ANSI conventions) for a context percentage.
 pub fn context_color(pct: f64) -> &'static str {
@@ -201,6 +225,37 @@ mod tests {
         // context_percent should still return None for unknown models
         // (so callers can distinguish known vs unknown)
         assert_eq!(context_percent("no-such-model", 10_000), None);
+    }
+
+    #[test]
+    fn context_bar_fill_is_proportional_and_fixed_width() {
+        let joined = |pct: f64, cells: usize| {
+            let (f, e) = context_bar_parts(pct, cells);
+            format!("{f}{e}")
+        };
+        assert_eq!(joined(0.0, 8), "░░░░░░░░");
+        assert_eq!(joined(50.0, 8), "████░░░░");
+        assert_eq!(joined(100.0, 8), "████████");
+        // A barely-used context reads empty rather than faking a cell:
+        // one of eight would look like ~12%.
+        assert_eq!(joined(0.1, 8), "░░░░░░░░");
+        // Over-window (reachable before an auto-compact fires) and
+        // negative both saturate instead of panicking or overflowing.
+        assert_eq!(joined(150.0, 8), "████████");
+        assert_eq!(joined(-5.0, 8), "░░░░░░░░");
+
+        // Always exactly `cells` columns — the bar must never shift the
+        // rest of the status line as usage changes.
+        for cells in [0usize, 1, 8, 20] {
+            for pct in [0.0, 0.4, 12.5, 49.9, 73.0, 99.9, 100.0] {
+                let (f, e) = context_bar_parts(pct, cells);
+                assert_eq!(
+                    f.chars().count() + e.chars().count(),
+                    cells,
+                    "pct {pct} at {cells} cells"
+                );
+            }
+        }
     }
 
     #[test]
