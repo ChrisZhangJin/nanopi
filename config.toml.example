@@ -381,6 +381,44 @@ base_url = "https://api.openai.com/v1"
 # at startup so you don't accidentally commit this file with the key.
 # api_key = "sk-..."
 
+# ─── Model catalogue: ~/.nanopi/models.json (v0.14) ─────────────────
+#
+# NOT part of this file — noted here because it is the other thing you
+# may need to edit, and it is easy to miss.
+#
+# nanopi needs a model's context window to show the usage bar and to
+# decide when to auto-compact. It ships a built-in table, but that table
+# is baked into the binary, so a model released after your build reads
+# `?/128.0k` and auto-compaction falls back to a cruder heuristic.
+#
+# On first interactive run nanopi writes `~/.nanopi/models.json`:
+#
+#   {
+#     "generated_by": "0.14.0",
+#     "custom":  [],
+#     "builtin": [ { "id": "...", "vendor": "...", "context_window": 0 } ]
+#   }
+#
+# Add new models to `custom`:
+#
+#   "custom": [
+#     { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
+#   ]
+#
+# `custom` wins over `builtin` when the id matches, so it also fixes a
+# wrong window. Matching is a case-insensitive longest-prefix, so
+# `my-model` also covers `my-model-20260101`.
+#
+# `builtin` is regenerated whenever nanopi's version changes — the old
+# file is copied to `models.json.bak` first and your `custom` entries
+# are carried over untouched. Edits inside `builtin` work until that
+# point, then they are replaced; put anything you want to keep in
+# `custom`.
+#
+# A malformed file is never overwritten: nanopi says so and falls back
+# to the built-in table for that run. `nanopi -p` reads the file but
+# never creates or refreshes it.
+
 # ─── Orchestrator mode (v0.13) ──────────────────────────────────────
 #
 # The TUI's default main flow. The main agent never does concrete work

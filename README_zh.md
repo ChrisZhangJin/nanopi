@@ -194,6 +194,42 @@ nanopi --fork <id>
 | `--system-prompt <文本\|路径>` | — | 替换内置 system prompt |
 | `--append-system-prompt <文本\|路径>` | — | 追加到 system prompt 末尾（可重复） |
 
+## 模型表（`~/.nanopi/models.json`）
+
+nanopi 需要知道模型的 **context window**，用途有两个：状态栏的用量进度条，
+以及判断什么时候自动压缩（auto-compact）对话。内置表里有约 163 个模型，但
+它是编进二进制的——比你这个构建更晚发布的模型会显示 `?/128.0k`，
+auto-compact 也只能退回到更粗糙的字符数阈值。
+
+首次以交互模式启动时，nanopi 会写出 `~/.nanopi/models.json`。内置表里没有的
+模型，加到 `custom` 里即可：
+
+```json
+{
+  "generated_by": "0.14.0",
+  "custom": [
+    { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
+  ],
+  "builtin": [ "… 随版本发布的内置表，供参考 …" ]
+}
+```
+
+同一个 id 下 `custom` 优先于 `builtin`，所以它也可以用来修正写错的 window。
+匹配规则是大小写不敏感的最长前缀匹配，因此 `my-model` 同时能覆盖
+`my-model-20260101`。
+
+nanopi 版本变化时会重新生成 `builtin`——先把旧文件复制成 `models.json.bak`，
+并原样保留你的 `custom`。这个拆分正是让文件不会过期的关键：升级 nanopi 就能
+拿到新的内置模型，同时保住你自己加的条目。直接改 `builtin` 里的内容也有效，
+但下次升级会被覆盖，想长期保留就放进 `custom`。
+
+文件格式错误时**绝不覆盖**——nanopi 会报出错误所在行，并在本次运行回退到内置表。
+`nanopi -p` 只读取该文件，永远不会创建或刷新它，脚本化运行没有任何副作用。
+
+要从源头刷新内置表：`python3 scripts/gen-models.py <api.json>`
+（取自 [models.dev](https://models.dev/api.json)）。它是**并集**而非替换，
+已有条目不会被删掉。
+
 ## 编排模式（orchestrator）
 
 TUI 里主 agent 是一个**编排者**：它自己从不做具体的活儿——连"看一眼文件"

@@ -117,6 +117,16 @@ pub fn global_settings_path() -> Option<PathBuf> {
     nanopi_home().map(|h| h.join("settings.toml"))
 }
 
+/// The global `models.json` (see `crate::model_catalogue`).
+///
+/// Global only, with no project-local sibling: creating any file under
+/// a project's `.nanopi/` flips that cwd from `NoProjectResources` to
+/// `NeedsPrompt` in `crate::trust`, which would change the trust
+/// posture of every repo that adopted a project-scoped catalogue.
+pub fn global_models_path() -> Option<PathBuf> {
+    nanopi_home().map(|h| h.join("models.json"))
+}
+
 /// Rustyline history file.
 pub fn history_path() -> Option<PathBuf> {
     nanopi_home().map(|h| h.join("history.txt"))

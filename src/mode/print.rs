@@ -246,6 +246,11 @@ pub async fn run_print_mode(
     // to defaults quietly instead of double-reporting.
     let cfg_for_build = crate::config::load_config(&cwd).unwrap_or_default();
 
+    // Read `models.json` if the user has one, but never create or
+    // refresh it: a scripted `-p` run must not write files as a side
+    // effect. The TUI owns materialising it.
+    crate::model_catalogue::init(false);
+
     // D-01: print mode never restricts its tool registry or prompt based
     // on `experimental.orchestrator` (on by default for the TUI) — a
     // scripted `-p` run must never be silently limited to the

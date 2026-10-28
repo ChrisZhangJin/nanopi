@@ -571,6 +571,14 @@ pub async fn run_tui_mode(
     // (only meaningful with the unrestricted default set).
     let registry = tui_registry(&tools_allow).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Merge `<nanopi_home>/models.json` over the compiled catalogue,
+    // creating or refreshing it as needed. Must run before the Agent is
+    // built: `context_window` feeds both the status bar and
+    // auto-compaction, and a user's entry has to be in force from the
+    // first turn. Writes are allowed here (interactive); print mode
+    // passes false.
+    crate::model_catalogue::init(true);
+
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.
     // Re-read it here; a parse failure already surfaced through

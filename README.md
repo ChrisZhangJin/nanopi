@@ -207,6 +207,45 @@ nanopi --fork <id>
 | `--system-prompt <text\|path>` | — | Replace the built-in system prompt |
 | `--append-system-prompt <text\|path>` | — | Append to the system prompt (repeatable) |
 
+## Model catalogue (`~/.nanopi/models.json`)
+
+nanopi needs a model's **context window** for two things: the usage bar in the
+status line, and deciding when to auto-compact the conversation. It ships a
+built-in table of ~163 models, but that table is baked into the binary — a model
+released after your build shows `?/128.0k` and auto-compaction falls back to a
+cruder char-count heuristic.
+
+On first interactive run nanopi writes `~/.nanopi/models.json`. Add anything it
+doesn't know to `custom`:
+
+```json
+{
+  "generated_by": "0.14.0",
+  "custom": [
+    { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
+  ],
+  "builtin": [ "… the shipped table, for reference …" ]
+}
+```
+
+`custom` wins over `builtin` by id, so it also corrects a wrong window. Lookup is
+a case-insensitive longest-prefix match, so `my-model` also covers
+`my-model-20260101`.
+
+`builtin` is regenerated whenever nanopi's version changes — the previous file is
+copied to `models.json.bak` first, and your `custom` entries carry over untouched.
+That split is what stops the file going stale: upgrade nanopi and you get its newer
+models, while keeping your own. Edits made directly inside `builtin` work until the
+next upgrade replaces them, so put anything you want to keep in `custom`.
+
+A malformed file is never overwritten — nanopi reports the line and falls back to the
+built-in table for that run. `nanopi -p` reads the file but never creates or refreshes
+it, so a scripted run has no side effects.
+
+To refresh the shipped table from source: `python3 scripts/gen-models.py <api.json>`
+(from [models.dev](https://models.dev/api.json)). It unions rather than replaces, so
+an existing entry is never dropped.
+
 ## Orchestrator mode
 
 In the TUI, the main agent is an **orchestrator**: it never does concrete

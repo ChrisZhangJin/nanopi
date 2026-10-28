@@ -46,10 +46,44 @@ pub fn model_vendor(model_id: &str) -> Option<&'static str> {
 /// Shared lookup backing both [`context_window`] and [`model_vendor`].
 fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     let id_lc = model_id.to_ascii_lowercase();
-    MODELS
+    catalogue()
         .iter()
         .find(|m| id_lc.starts_with(&m.id.to_ascii_lowercase()))
 }
+
+/// The catalogue in force: whatever [`install`] was given, else the
+/// compiled-in table.
+///
+/// Everything that reads model data goes through here, so a user's
+/// `models.json` reaches every consumer — status bar, auto-compaction,
+/// `/model` picker, agent validation — without any of them knowing the
+/// catalogue is no longer purely static.
+pub fn catalogue() -> &'static [ModelInfo] {
+    CATALOGUE.get().copied().unwrap_or(BUILTIN_MODELS)
+}
+
+/// Install a merged catalogue for the rest of the process. Called once
+/// at startup; later calls are ignored.
+///
+/// Takes `&'static` because [`ModelInfo`] holds `&'static str` and two
+/// call sites depend on that lifetime (notably `tool::agent`'s
+/// `Vec<&str>` collected out of a temporary `Vec<ModelInfo>`). Callers
+/// get there by leaking once — bounded, and the catalogue must outlive
+/// everything anyway.
+///
+/// Returns whether it took effect, so a second call is a visible no-op
+/// rather than a silent one.
+pub fn install(models: &'static [ModelInfo]) -> bool {
+    CATALOGUE.set(models).is_ok()
+}
+
+/// The compiled-in table, ignoring any installed catalogue. The base
+/// `model_catalogue` merges a user's `models.json` over.
+pub fn builtin() -> &'static [ModelInfo] {
+    BUILTIN_MODELS
+}
+
+static CATALOGUE: std::sync::OnceLock<&'static [ModelInfo]> = std::sync::OnceLock::new();
 
 /// Every model we know `vendor` serves, sorted by id.
 ///
@@ -57,7 +91,7 @@ fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
 /// "Only showing models from configured providers" — offering models the
 /// current API key cannot reach only produces confusing 401s.
 pub fn models_for_vendor(vendor: &str) -> Vec<ModelInfo> {
-    let mut v: Vec<ModelInfo> = MODELS
+    let mut v: Vec<ModelInfo> = catalogue()
         .iter()
         .copied()
         .filter(|m| m.vendor == vendor)
@@ -87,7 +121,12 @@ pub fn fmt_tokens(n: u32) -> String {
 /// Ordered LONGEST ID FIRST. `context_window` prefix-matches so that
 /// date-suffixed variants (`claude-opus-4-7-20260101`) resolve, and
 /// first-match-wins would otherwise let `gpt-5` shadow `gpt-5.4`.
-const MODELS: &[ModelInfo] = &[
+///
+/// Regenerate with `scripts/gen-models.py`; the markers below delimit
+/// what it rewrites. It unions rather than replaces, so an entry here
+/// is never dropped by a refresh.
+const BUILTIN_MODELS: &[ModelInfo] = &[
+    // BEGIN GENERATED MODELS
     ModelInfo {
         id: "qwen3-coder-480b-a35b-instruct",
         vendor: "qwen",
@@ -96,7 +135,7 @@ const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "deepseek-v4-flash-vision-exp",
         vendor: "deepseek",
-        context_window: 1000000,
+        context_window: 1048576,
     },
     ModelInfo {
         id: "qwen3-coder-30b-a3b-instruct",
@@ -116,7 +155,7 @@ const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "claude-sonnet-4-5-20250929",
         vendor: "anthropic",
-        context_window: 1000000,
+        context_window: 200000,
     },
     ModelInfo {
         id: "qwen2-5-coder-32b-instruct",
@@ -149,7 +188,17 @@ const MODELS: &[ModelInfo] = &[
         context_window: 200000,
     },
     ModelInfo {
+        id: "gpt-daybreak-blue-latest",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
         id: "mimo-v2.5-pro-ultraspeed",
+        vendor: "xiaomi",
+        context_window: 1048576,
+    },
+    ModelInfo {
+        id: "mimo-v2.6-pro-ultraspeed",
         vendor: "xiaomi",
         context_window: 1048576,
     },
@@ -164,24 +213,14 @@ const MODELS: &[ModelInfo] = &[
         context_window: 4096,
     },
     ModelInfo {
-        id: "gpt-daybreak-blue-latest",
+        id: "gpt-daybreak-red-latest",
         vendor: "openai",
-        context_window: 1050000,
-    },
-    ModelInfo {
-        id: "mimo-v2.6-pro-ultraspeed",
-        vendor: "xiaomi",
-        context_window: 1048576,
+        context_window: 400000,
     },
     ModelInfo {
         id: "qwen2-5-vl-72b-instruct",
         vendor: "qwen",
         context_window: 131072,
-    },
-    ModelInfo {
-        id: "gpt-daybreak-red-latest",
-        vendor: "openai",
-        context_window: 400000,
     },
     ModelInfo {
         id: "MiniMax-M2.5-highspeed",
@@ -249,6 +288,11 @@ const MODELS: &[ModelInfo] = &[
         context_window: 262144,
     },
     ModelInfo {
+        id: "MiniMax-M3.1-Flash",
+        vendor: "minimax",
+        context_window: 1000000,
+    },
+    ModelInfo {
         id: "qwen-deep-research",
         vendor: "qwen",
         context_window: 1000000,
@@ -266,7 +310,7 @@ const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "claude-sonnet-4-5",
         vendor: "anthropic",
-        context_window: 1000000,
+        context_window: 200000,
     },
     ModelInfo {
         id: "claude-sonnet-4-6",
@@ -274,9 +318,14 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1000000,
     },
     ModelInfo {
+        id: "claude-sonnet-5-5",
+        vendor: "anthropic",
+        context_window: 1000000,
+    },
+    ModelInfo {
         id: "deepseek-v4-flash",
         vendor: "deepseek",
-        context_window: 1000000,
+        context_window: 1048576,
     },
     ModelInfo {
         id: "gpt-4o-2024-05-13",
@@ -309,7 +358,7 @@ const MODELS: &[ModelInfo] = &[
         context_window: 262144,
     },
     ModelInfo {
-        id: "claude-sonnet-5-5",
+        id: "claude-fable-5-1",
         vendor: "anthropic",
         context_window: 1000000,
     },
@@ -317,6 +366,11 @@ const MODELS: &[ModelInfo] = &[
         id: "claude-haiku-4-5",
         vendor: "anthropic",
         context_window: 200000,
+    },
+    ModelInfo {
+        id: "claude-haiku-5-5",
+        vendor: "anthropic",
+        context_window: 1000000,
     },
     ModelInfo {
         id: "gpt-realtime-2.1",
@@ -339,11 +393,6 @@ const MODELS: &[ModelInfo] = &[
         context_window: 131072,
     },
     ModelInfo {
-        id: "claude-fable-5-1",
-        vendor: "anthropic",
-        context_window: 1000000,
-    },
-    ModelInfo {
         id: "claude-opus-4-5",
         vendor: "anthropic",
         context_window: 200000,
@@ -364,6 +413,11 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1000000,
     },
     ModelInfo {
+        id: "claude-opus-5-5",
+        vendor: "anthropic",
+        context_window: 1000000,
+    },
+    ModelInfo {
         id: "claude-sonnet-5",
         vendor: "anthropic",
         context_window: 1000000,
@@ -371,7 +425,12 @@ const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "deepseek-v4-pro",
         vendor: "deepseek",
-        context_window: 1000000,
+        context_window: 1048576,
+    },
+    ModelInfo {
+        id: "mimo-v2.6-flash",
+        vendor: "xiaomi",
+        context_window: 1048576,
     },
     ModelInfo {
         id: "qwen-math-turbo",
@@ -404,24 +463,29 @@ const MODELS: &[ModelInfo] = &[
         context_window: 262144,
     },
     ModelInfo {
-        id: "claude-opus-5-5",
-        vendor: "anthropic",
-        context_window: 1000000,
-    },
-    ModelInfo {
-        id: "mimo-v2.6-flash",
-        vendor: "xiaomi",
-        context_window: 1048576,
-    },
-    ModelInfo {
         id: "claude-fable-5",
         vendor: "anthropic",
         context_window: 1000000,
     },
     ModelInfo {
+        id: "deepseek-flash",
+        vendor: "deepseek",
+        context_window: 1048576,
+    },
+    ModelInfo {
+        id: "glm-4.6v-flash",
+        vendor: "zai",
+        context_window: 128000,
+    },
+    ModelInfo {
         id: "glm-4.7-flashx",
         vendor: "zai",
         context_window: 200000,
+    },
+    ModelInfo {
+        id: "glm-5.3-flashx",
+        vendor: "zai",
+        context_window: 1000000,
     },
     ModelInfo {
         id: "qwen-doc-turbo",
@@ -432,21 +496,6 @@ const MODELS: &[ModelInfo] = &[
         id: "qwen-math-plus",
         vendor: "qwen",
         context_window: 4096,
-    },
-    ModelInfo {
-        id: "deepseek-flash",
-        vendor: "deepseek",
-        context_window: 1000000,
-    },
-    ModelInfo {
-        id: "glm-4.6v-flash",
-        vendor: "zai",
-        context_window: 128000,
-    },
-    ModelInfo {
-        id: "glm-5.3-flashx",
-        vendor: "zai",
-        context_window: 1000000,
     },
     ModelInfo {
         id: "claude-opus-5",
@@ -464,6 +513,11 @@ const MODELS: &[ModelInfo] = &[
         context_window: 200000,
     },
     ModelInfo {
+        id: "glm-5.3-flash",
+        vendor: "zai",
+        context_window: 1000000,
+    },
+    ModelInfo {
         id: "gpt-5.3-codex",
         vendor: "openai",
         context_window: 400000,
@@ -474,12 +528,22 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1050000,
     },
     ModelInfo {
+        id: "gpt-6.1-terra",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
         id: "mimo-v2-flash",
         vendor: "xiaomi",
         context_window: 262144,
     },
     ModelInfo {
         id: "mimo-v2.5-pro",
+        vendor: "xiaomi",
+        context_window: 1048576,
+    },
+    ModelInfo {
+        id: "mimo-v2.6-pro",
         vendor: "xiaomi",
         context_window: 1048576,
     },
@@ -506,16 +570,6 @@ const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "qwen3.8-flash",
         vendor: "qwen",
-        context_window: 1000000,
-    },
-    ModelInfo {
-        id: "mimo-v2.6-pro",
-        vendor: "xiaomi",
-        context_window: 1048576,
-    },
-    ModelInfo {
-        id: "glm-5.3-flash",
-        vendor: "zai",
         context_window: 1000000,
     },
     ModelInfo {
@@ -629,6 +683,16 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1050000,
     },
     ModelInfo {
+        id: "gpt-6-astra",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
+        id: "gpt-6.1-sol",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
         id: "mimo-v2-pro",
         vendor: "xiaomi",
         context_window: 1048576,
@@ -659,16 +723,6 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1000000,
     },
     ModelInfo {
-        id: "gpt-6-astra",
-        vendor: "openai",
-        context_window: 1050000,
-    },
-    ModelInfo {
-        id: "gpt-6.1-sol",
-        vendor: "openai",
-        context_window: 1050000,
-    },
-    ModelInfo {
         id: "MiniMax-M2",
         vendor: "minimax",
         context_window: 204800,
@@ -689,6 +743,11 @@ const MODELS: &[ModelInfo] = &[
         context_window: 400000,
     },
     ModelInfo {
+        id: "gpt-6-luna",
+        vendor: "openai",
+        context_window: 1050000,
+    },
+    ModelInfo {
         id: "qwen-flash",
         vendor: "qwen",
         context_window: 1000000,
@@ -699,14 +758,14 @@ const MODELS: &[ModelInfo] = &[
         context_window: 1000000,
     },
     ModelInfo {
-        id: "gpt-6-luna",
-        vendor: "openai",
-        context_window: 1050000,
-    },
-    ModelInfo {
         id: "gpt-5-pro",
         vendor: "openai",
         context_window: 400000,
+    },
+    ModelInfo {
+        id: "gpt-6-sol",
+        vendor: "openai",
+        context_window: 1050000,
     },
     ModelInfo {
         id: "mimo-v2.5",
@@ -737,11 +796,6 @@ const MODELS: &[ModelInfo] = &[
         id: "qwen3-max",
         vendor: "qwen",
         context_window: 262144,
-    },
-    ModelInfo {
-        id: "gpt-6-sol",
-        vendor: "openai",
-        context_window: 1050000,
     },
     ModelInfo {
         id: "glm-4.5v",
@@ -888,6 +942,7 @@ const MODELS: &[ModelInfo] = &[
         vendor: "openai",
         context_window: 200000,
     },
+    // END GENERATED MODELS
 ];
 
 #[cfg(test)]
@@ -913,7 +968,7 @@ mod tests {
         assert_ne!(context_window("gpt-5"), context_window("gpt-5.4"));
         assert_eq!(context_window("gpt-5"), Some(400_000));
         assert_eq!(context_window("gpt-5.4"), Some(1_050_000));
-        for pair in MODELS.windows(2) {
+        for pair in BUILTIN_MODELS.windows(2) {
             assert!(
                 pair[0].id.len() >= pair[1].id.len(),
                 "MODELS must stay longest-first: {:?} before {:?}",
@@ -967,9 +1022,70 @@ mod tests {
 
     #[test]
     fn model_vendor_and_context_window_agree() {
-        for m in MODELS {
+        for m in BUILTIN_MODELS {
             assert_eq!(context_window(m.id), Some(m.context_window));
             assert_eq!(model_vendor(m.id), Some(m.vendor));
+        }
+    }
+
+    /// Windows corrected against models.dev during the 2026-10 refresh.
+    ///
+    /// `claude-sonnet-4-5` is the one that mattered: it was recorded as
+    /// 1,000,000 (the flagged beta tier) when the default is 200,000,
+    /// so `should_auto_compact` compared against a window five times
+    /// the real one and compaction fired far too late — the turn could
+    /// overflow instead.
+    #[test]
+    fn corrected_windows_from_the_2026_10_refresh() {
+        assert_eq!(context_window("claude-sonnet-4-5"), Some(200_000));
+        assert_eq!(context_window("claude-sonnet-4-5-20250929"), Some(200_000));
+        for id in ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"] {
+            assert_eq!(context_window(id), Some(1_048_576), "{id}");
+        }
+    }
+
+    /// Models added by that refresh. Cheap guard against a future
+    /// regeneration quietly dropping them.
+    #[test]
+    fn models_added_by_the_2026_10_refresh_resolve() {
+        assert_eq!(context_window("claude-haiku-5-5"), Some(1_000_000));
+        assert_eq!(context_window("gpt-6.1-terra"), Some(1_050_000));
+        assert_eq!(context_window("MiniMax-M3.1-Flash"), Some(1_000_000));
+        assert_eq!(model_vendor("claude-haiku-5-5"), Some("anthropic"));
+        assert_eq!(model_vendor("gpt-6.1-terra"), Some("openai"));
+        assert_eq!(model_vendor("MiniMax-M3.1-Flash"), Some("minimax"));
+    }
+
+    /// `model_vendor` must agree with `vendor::pick_vendor`'s own
+    /// model-id prefix sniff, or `validate_model` starts reporting
+    /// bogus cross-vendor errors. A regeneration that imported, say,
+    /// Alibaba's re-listing of `deepseek-*` under vendor `qwen` would
+    /// break exactly this — and a longer foreign id sorts AHEAD of a
+    /// shorter native one, so it would shadow the real entry.
+    #[test]
+    fn catalogue_vendors_agree_with_the_vendor_prefix_sniff() {
+        let expected: &[(&str, &str)] = &[
+            ("claude-", "anthropic"),
+            ("deepseek", "deepseek"),
+            ("glm-", "zai"),
+            ("mimo", "xiaomi"),
+        ];
+        for m in BUILTIN_MODELS {
+            let id_lc = m.id.to_ascii_lowercase();
+            for (prefix, vendor) in expected {
+                if id_lc.starts_with(prefix) {
+                    assert_eq!(
+                        m.vendor, *vendor,
+                        "`{}` starts with `{prefix}` but is filed under `{}`",
+                        m.id, m.vendor
+                    );
+                }
+            }
+            assert!(
+                !m.id.contains('/'),
+                "`{}` is an aggregator-namespaced id, not a vendor-native one",
+                m.id
+            );
         }
     }
 
