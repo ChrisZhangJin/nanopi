@@ -1287,63 +1287,124 @@ fn brief_report_completed_has_done_state_and_numeric_turns() {
 // 04-04 Task 2: print-mode drain loop with Ctrl-C stop_all (D-07)
 // ─────────────────────────────────────────────────────────────────────
 
-/// Like [`spawn_sse_server_seq`], but response `delay_idx` sleeps for
-/// `delay` before writing — long enough that a Ctrl-C sent right after
-/// launch still lands while that request is outstanding.
-fn spawn_sse_server_seq_delayed(
-    responses: Vec<Vec<String>>,
-    delay_idx: usize,
+/// Substring that appears in a dispatched child's request and in no
+/// parent request: the opening line of `GENERAL_PURPOSE_PROMPT`
+/// (`src/agent/agents.rs`), which only ever lands in a child's system
+/// prompt.
+const CHILD_ROLE_NEEDLE: &str = "You are a general-purpose agent dispatched";
+
+/// Like [`spawn_sse_server_seq`], but routes by WHO is asking instead of
+/// by arrival order, and makes the child's reply slow.
+///
+/// The parent and its background child hit this server concurrently, so
+/// arrival order is a race: an index-keyed server can hand the child the
+/// parent's fast "main done" body, which makes the child finish on its
+/// own before the test's Ctrl-C lands. Keying on the child's role prompt
+/// instead makes the pairing deterministic — the child always gets
+/// `child_response`, always after `delay`, and the parent always walks
+/// `parent_responses` in order.
+///
+/// Returns the port plus a flag set the instant a child request lands,
+/// so a caller can signal the parent only once its child is provably in
+/// flight instead of guessing with a sleep (the child process can take
+/// well over a second to come up on a loaded machine).
+fn spawn_sse_server_parent_child_delayed(
+    parent_responses: Vec<Vec<String>>,
+    child_response: Vec<String>,
     delay: std::time::Duration,
-) -> u16 {
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    fn sse_body(chunks: &[String]) -> String {
+        let mut body = String::new();
+        for c in chunks {
+            body.push_str("data: ");
+            body.push_str(c);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local_addr").port();
 
-    let bodies: Vec<String> = responses
-        .iter()
-        .map(|chunks| {
-            let mut body = String::new();
-            for c in chunks {
-                body.push_str("data: ");
-                body.push_str(c);
-                body.push_str("\n\n");
-            }
-            body.push_str("data: [DONE]\n\n");
-            body
-        })
-        .collect();
+    let parent_bodies: Vec<String> = parent_responses.iter().map(|c| sse_body(c)).collect();
+    let child_body = sse_body(&child_response);
+
+    // Parent and child are separate processes talking to this server at
+    // the same time, so connections get their own thread: the child's
+    // `delay` must not also stall the parent's next turn (which is what
+    // a serial accept loop would do).
+    let parent_n = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let parent_bodies = std::sync::Arc::new(parent_bodies);
+    let child_body = std::sync::Arc::new(child_body);
+    let child_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_seen_out = std::sync::Arc::clone(&child_seen);
 
     std::thread::spawn(move || {
-        let mut n = 0usize;
         for stream in listener.incoming() {
-            let mut stream = match stream {
+            let mut s = match stream {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let mut seen = Vec::new();
-            let mut byte = [0u8; 1];
-            while !seen.ends_with(b"\r\n\r\n") {
-                match stream.read(&mut byte) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => seen.push(byte[0]),
+            let parent_n = std::sync::Arc::clone(&parent_n);
+            let parent_bodies = std::sync::Arc::clone(&parent_bodies);
+            let child_body = std::sync::Arc::clone(&child_body);
+            let child_seen = std::sync::Arc::clone(&child_seen);
+            std::thread::spawn(move || {
+                // Read headers, then exactly Content-Length bytes of the
+                // body, so the request can be classified by its contents.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => head.push(byte[0]),
+                    }
                 }
-            }
-            let this_idx = n.min(bodies.len() - 1);
-            if this_idx == delay_idx {
-                std::thread::sleep(delay);
-            }
-            let body = &bodies[this_idx];
-            n += 1;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
+                let head_str = String::from_utf8_lossy(&head).to_lowercase();
+                let len: usize = head_str
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body_buf = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut body_buf).is_err() {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&body_buf);
+
+                // The child's system prompt carries the role needle; the
+                // parent's turns never do (its dispatch tool-call
+                // arguments carry only the task string, not the role).
+                let body = if req.contains(CHILD_ROLE_NEEDLE) {
+                    // Announce BEFORE sleeping: the flag means "the
+                    // child is mid-request", which is exactly the window
+                    // the caller wants to interrupt in.
+                    child_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(delay);
+                    (*child_body).clone()
+                } else {
+                    // The parent's turns are strictly sequential — it
+                    // never has two in flight — so a counter bump under
+                    // the lock preserves script order.
+                    let mut n = parent_n.lock().unwrap();
+                    let idx = (*n).min(parent_bodies.len() - 1);
+                    *n += 1;
+                    parent_bodies[idx].clone()
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            });
         }
     });
 
-    port
+    (port, child_seen_out)
 }
 
 /// Script a main turn that dispatches one background `agent` call,
@@ -1475,21 +1536,36 @@ fn print_mode_zero_background_agents_behaves_as_before() {
 #[test]
 fn print_mode_ctrl_c_stops_all_background_agents() {
     let mut script = background_dispatch_script();
-    // req2 (the child's turn) is made slow enough that the signal sent
-    // below is guaranteed to land while the drain is still waiting.
-    let port = spawn_sse_server_seq_delayed(
+    // Split the shared script into the parent's turns (req0 dispatch,
+    // req1 "main done", req3 the drain's extra turn) and the child's one
+    // turn (req2), which the server routes by the child's role prompt
+    // rather than by arrival order. The child's reply is made slow
+    // enough that the signal sent below is guaranteed to land while the
+    // drain is still waiting on it.
+    let child_turn = script.remove(2);
+    let (port, child_in_flight) = spawn_sse_server_parent_child_delayed(
         std::mem::take(&mut script),
-        2,
+        child_turn,
         std::time::Duration::from_secs(5),
     );
     let dir = fresh_dir("bgctrlc", port);
     std::fs::create_dir_all(dir.join("home")).expect("home dir");
 
     let mut child = spawn_p(&dir, port, &["do it"]);
-    // Give the main turn + tool dispatch + child-process spawn time to
-    // get the background agent's own request in flight, well before
-    // its 5s-delayed response would otherwise arrive.
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    // Wait for the background agent's own request to actually be in
+    // flight rather than sleeping a fixed interval. A fixed sleep is a
+    // race: on a loaded machine the main turn + tool dispatch +
+    // child-process spawn can take over a second, and a signal that
+    // lands before the child exists leaves it running to completion
+    // (`state: done`) instead of being stopped.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !child_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background agent never issued its request"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     // SAFETY: `child.id()` is a live pid owned by this process; SIGINT
     // is the same signal Ctrl-C sends to a foreground process group
     // leader.
