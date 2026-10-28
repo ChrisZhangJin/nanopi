@@ -1558,11 +1558,37 @@ fn print_mode_ctrl_c_stops_all_background_agents() {
     // child-process spawn can take over a second, and a signal that
     // lands before the child exists leaves it running to completion
     // (`state: done`) instead of being stopped.
+    //
+    // The likeliest regression here is parent-side (dispatch broken,
+    // `agent` missing from print mode, the parent erroring before the
+    // tool call) — in which case the parent exits almost immediately
+    // and waiting on the child is pointless. Poll for that too and
+    // report the parent's own output, instead of spinning the full
+    // deadline and then blaming the child for a parent-side failure.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !child_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(status) = child.try_wait().expect("try_wait on the parent") {
+            let mut out = String::new();
+            let mut err = String::new();
+            if let Some(mut s) = child.stdout.take() {
+                let _ = s.read_to_string(&mut out);
+            }
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            panic!(
+                "the parent exited ({status:?}) before dispatching a background \
+                 agent — the agent was never spawned, so there was nothing to \
+                 stop.\nstdout={}\nstderr={}",
+                strip_sgr(&out),
+                err
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "the background agent never issued its request"
+            "the background agent never issued its request within 30s, and the \
+             parent is still running — dispatch appears to be hung rather than \
+             broken"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -1608,14 +1634,27 @@ fn print_mode_ctrl_c_stops_all_background_agents() {
         })
         .expect("the background agent's brief.md must exist");
     let brief_text = std::fs::read_to_string(&brief).expect("read brief.md");
-    // `stop()` races the child's own natural completion/failure under
-    // system load (it may already be mid-teardown from the killed pgid
-    // when `stop_all` reaches it) — the load-bearing property is
-    // TERMINAL and not `running`/`queued`, not the exact terminal
-    // variant.
+    // The load-bearing property: the agent is TERMINAL and was not
+    // allowed to finish its work. `done` or a still-`running`/`queued`
+    // entry means `stop_all` did not reach it.
+    //
+    // On the exact variant: `stop()` cancels the token and then kills
+    // the process group, and both `spawn_background`'s biased `select!`
+    // and `StateGuard::drop` intend `Stopped`. In practice this path
+    // lands on `failed` — measured deterministically, 12/12 — because
+    // the kill makes `run_body` return before the cancelled branch is
+    // polled, so it records its own failure first. That is pre-existing
+    // (it predates the de-flake; the original assertion accepted both
+    // states for this reason, with a since-disproved explanation) and
+    // is arguably wrong user-facing bookkeeping: pressing Ctrl-C should
+    // report `stopped`, not `failed`. Both are accepted here so the
+    // test does not enshrine the wart, while still catching the
+    // regression it exists for.
+    let state_ok = brief_text.contains("state: stopped") || brief_text.contains("state: failed");
     assert!(
-        brief_text.contains("state: stopped") || brief_text.contains("state: failed"),
-        "the background agent must end terminal, not left running: {brief_text}"
+        state_ok,
+        "the background agent must end terminal and not `done` — \
+         `stop_all` did not reach it: {brief_text}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

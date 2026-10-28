@@ -103,12 +103,13 @@ Current working directory: {cwd_str}"
 ///
 /// A new sibling to [`build`], not an edit of it: the default path must
 /// stay byte-identical (T-06-02, pinned by the snapshot tests in
-/// `tool/mod.rs` and `agent/build.rs`). In this mode `write`/`edit`/
-/// `bash` are not in the registry at all — the model plans and
-/// delegates instead of touching files or a shell directly.
+/// `tool/mod.rs` and `agent/build.rs`). In this mode NO file or shell
+/// tool is in the registry at all — not `write`/`edit`/`bash`, and not
+/// `read`/`grep`/`find`/`ls` either. The model delegates every
+/// concrete job instead of doing any of it directly.
 ///
-/// Encodes the orchestrator workflow (D-08): understand the task (via
-/// `read`/`grep`/`find`, or by dispatching an exploratory agent) ->
+/// Encodes the orchestrator workflow (D-08): understand the task (by
+/// dispatching an exploratory agent, since it cannot look itself) ->
 /// plan -> dispatch -> monitor (react to agent reports, amend
 /// direction with `send_message`, `stop_agent` when direction changes,
 /// continue a finished agent with `send_message`) -> verify (dispatch a
@@ -293,12 +294,55 @@ mod tests {
     }
 
     fn orchestrator_tools() -> Vec<String> {
-        vec![
-            "agent".into(),
-            "list_agents".into(),
-            "send_message".into(),
-            "stop_agent".into(),
-        ]
+        crate::tool::ToolRegistry::orchestrator().names()
+    }
+
+    /// The prompt and the registry must not drift apart. Every
+    /// assertion below is on wording, and wording survives a revert —
+    /// the PREVIOUS prompt ("use read/grep/find yourself for a quick
+    /// look") satisfies all of them, so reverting it would ship green
+    /// while telling the model to call tools that are not registered.
+    /// This couples the two directly: no file or shell tool may be
+    /// described as something the orchestrator can use.
+    #[test]
+    fn orchestrator_prompt_never_offers_a_tool_it_does_not_have() {
+        let tools = orchestrator_tools();
+        let p = build_orchestrator(&PathBuf::from("/tmp"), &tools);
+
+        // Guard the fixture itself: if the registry ever gains a file
+        // or shell tool, this test must be revisited, not silently
+        // weakened.
+        for absent in ["read", "grep", "find", "ls", "write", "edit", "bash"] {
+            assert!(
+                !tools.iter().any(|t| t == absent),
+                "registry unexpectedly has `{absent}` — revisit this test"
+            );
+        }
+
+        // The prompt may NAME an absent tool only to say it is absent.
+        // It must never instruct the model to use one. These phrasings
+        // are exactly what the pre-rewrite prompt said.
+        let lc = p.to_ascii_lowercase();
+        for forbidden in [
+            "use read",
+            "read/grep/find",
+            "use read/grep/find",
+            "quick look at a file yourself",
+            "grep yourself",
+        ] {
+            assert!(
+                !lc.contains(forbidden),
+                "prompt tells the model to use an unregistered tool \
+                 ({forbidden:?}): {p}"
+            );
+        }
+
+        // And it must positively state the delegation rule, so the
+        // absence above is a stated contract rather than an omission.
+        assert!(
+            lc.contains("no file") || lc.contains("not even"),
+            "prompt must state it has no file/shell tools at all: {p}"
+        );
     }
 
     #[test]

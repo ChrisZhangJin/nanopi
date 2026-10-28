@@ -8,6 +8,12 @@
 //! the system prompt via `formatSkillsForPrompt` only when the `read`
 //! tool is available — otherwise the model has no way to load their
 //! full content on demand.
+//!
+//! nanopi widens that rule by one case: an orchestrator has no `read`
+//! but does have `agent`, and can route a skill to a dispatched agent
+//! that will read it. So the catalogue is injected when EITHER tool is
+//! present, with the how-to-use line adapted — see
+//! `resources::format_skills_for_prompt_mode`.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +23,7 @@ use crate::agent::permission::PermissionGate;
 use crate::agent::prompt_override::PromptOverrides;
 use crate::event::Usage;
 use crate::resources::{
-    format_skills_for_prompt, load_skills, LoadSkillsOptions, LoadSkillsResult, Skill,
+    load_skills, LoadSkillsOptions, LoadSkillsResult, Skill,
     SkillDiagnostic,
 };
 use crate::tool::ToolRegistry;
@@ -812,9 +818,18 @@ pub fn compose_system_prompt_mode(
         prompt.push_str(&crate::agent::context_files::format_context_files(&files));
     }
 
+    // The catalogue is listed for any agent that can act on it: one
+    // that loads skill files itself (`read`), or an orchestrator that
+    // routes a skill to a dispatched agent (`agent`). Gating on `read`
+    // alone silently hid every skill from the orchestrator once its
+    // tool set lost that tool. An agent with neither still gets
+    // nothing — it could not use a skill it was told about.
     let has_read = tool_names.iter().any(|n| n == "read");
-    if has_read && !skills.is_empty() {
-        prompt.push_str(&format_skills_for_prompt(skills));
+    let can_delegate = tool_names.iter().any(|n| n == "agent");
+    if (has_read || can_delegate) && !skills.is_empty() {
+        prompt.push_str(&crate::resources::format_skills_for_prompt_mode(
+            skills, !has_read,
+        ));
     }
     prompt
 }
@@ -910,6 +925,63 @@ mod tests {
             compose_system_prompt_mode(&cwd, &names, &[], true, &overrides, true);
         assert!(composed_custom.starts_with("You are Bob"));
         assert!(!composed_custom.contains("orchestrator mode"));
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The skills catalogue used to be gated on the `read` tool alone.
+    /// The orchestrator registry has no `read`, so once orchestrator
+    /// mode became the default every skill silently vanished from the
+    /// main agent's prompt and it could no longer route work to one.
+    /// It must see the catalogue, with delegating wording since it
+    /// cannot open the file itself.
+    #[test]
+    fn orchestrator_prompt_lists_skills_with_delegating_wording() {
+        let cwd = tmpdir("orch-skills");
+        let names = vec!["agent".to_string(), "list_agents".to_string()];
+        let skills = vec![one_skill()];
+        let composed = compose_system_prompt_mode(
+            &cwd,
+            &names,
+            &skills,
+            true,
+            &PromptOverrides::default(),
+            true,
+        );
+        assert!(composed.contains("<available_skills>"), "{composed}");
+        assert!(composed.contains("demo"), "{composed}");
+        assert!(
+            composed.contains("name that skill"),
+            "orchestrator must be told to pass the skill to an agent: {composed}"
+        );
+        assert!(
+            !composed.contains("Use the read tool to load"),
+            "orchestrator has no read tool: {composed}"
+        );
+
+        // A solo agent still gets the original read-it-yourself wording.
+        let solo_names = vec!["read".to_string(), "bash".to_string()];
+        let solo = compose_system_prompt_mode(
+            &cwd,
+            &solo_names,
+            &skills,
+            true,
+            &PromptOverrides::default(),
+            false,
+        );
+        assert!(solo.contains("Use the read tool to load"), "{solo}");
+
+        // An agent that can neither read nor delegate gets nothing —
+        // listing a skill it cannot reach is just context bloat.
+        let blind = compose_system_prompt_mode(
+            &cwd,
+            &["write".to_string()],
+            &skills,
+            true,
+            &PromptOverrides::default(),
+            false,
+        );
+        assert!(!blind.contains("<available_skills>"), "{blind}");
 
         std::fs::remove_dir_all(&cwd).ok();
     }

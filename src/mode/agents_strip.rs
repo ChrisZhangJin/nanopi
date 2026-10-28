@@ -459,11 +459,16 @@ fn status_text(info: &AgentInfo) -> String {
     }
 }
 
-/// Width of the name column for the rows currently shown, so statuses
-/// line up under each other.
-fn name_column_width(view: &AgentsView) -> usize {
-    view.agents
-        .iter()
+/// Width of the name column across exactly the agents passed in, so
+/// statuses line up under each other.
+///
+/// Takes the agents rather than the whole view because the collapsed
+/// strip draws only `collapsed_rows` — at most two agents plus a
+/// `+N more` row. Measuring every agent in the view would pad the
+/// column to the width of a name that is not on screen, and the gap
+/// would jump whenever a hidden agent started or finished.
+fn name_column_width<'a>(agents: impl Iterator<Item = &'a AgentInfo>) -> usize {
+    agents
         .map(|a| display_width(&display_name(a)))
         .max()
         .unwrap_or(0)
@@ -510,7 +515,8 @@ fn pad_line(left: &str, right: &str, width: usize) -> String {
 /// activity lines, "turns N · tokens M" when known, "worktree <path>
 /// (<branch>)" when present, "report <dir>/report.md".
 pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> Vec<String> {
-    let name_w = name_column_width(view);
+    // This path lists EVERY agent, so measure every agent.
+    let name_w = name_column_width(view.agents.iter());
     let mut out = Vec::new();
     for info in ordered_agents(view) {
         out.push(agent_line(info, name_w, width, now));
@@ -562,8 +568,13 @@ pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: 
         return;
     }
 
-    let name_w = name_column_width(view);
+    // Measure only the agents that actually get a row — see
+    // `name_column_width`.
     let rows = collapsed_rows(view);
+    let name_w = name_column_width(rows.iter().filter_map(|r| match r {
+        StripRow::Agent(info) => Some(*info),
+        StripRow::More { .. } => None,
+    }));
     for (i, row) in rows.iter().enumerate() {
         let y = area.y + 1 + i as u16;
         if y >= area.y + area.height {
@@ -744,6 +755,64 @@ mod tests {
         assert!(row(1).starts_with("○ #a"), "{:?}", row(1));
     }
 
+    /// The collapsed strip draws at most 2 agents plus a `+N more`
+    /// row, so the name column must be measured over those rows only.
+    /// Measuring the whole view padded the column to the width of a
+    /// name nobody can see, and the gap jumped whenever a HIDDEN agent
+    /// started or finished.
+    #[test]
+    fn name_column_ignores_agents_that_are_not_drawn() {
+        let now = Instant::now();
+        let dirs: Vec<_> = (0..5).map(|_| tmp_dir()).collect();
+        let labels = ["x", "y", "a-really-long-hidden-name", "z", "w"];
+        let mut entries = Vec::new();
+        for (i, d) in dirs.iter().enumerate() {
+            std::fs::write(
+                d.path().join("brief.md"),
+                format!(
+                    "---\nid: a{i}\nstate: running\nstarted: x\nparent: none\nlabel: {}\n---\nbody\n",
+                    labels[i]
+                ),
+            )
+            .unwrap();
+            entries.push(entry(
+                &format!("a{i}"),
+                AgentState::Running,
+                now,
+                d.path().to_path_buf(),
+            ));
+        }
+        let mut view = AgentsView::new();
+        view.refresh(&entries, now);
+
+        let area = Rect::new(0, 0, 70, 4);
+        let mut buf = Buffer::empty(area);
+        draw_agents_strip(
+            &mut buf,
+            area,
+            &view,
+            &StripOpts {
+                expanded: false,
+                term_rows: 40,
+                toggle_key_label: "Ctrl+G".to_string(),
+                now,
+            },
+        );
+        let row = |y: u16| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+
+        // The long name is NOT on screen...
+        let all = (0..area.height).map(row).collect::<Vec<_>>().join("\n");
+        assert!(!all.contains("a-really-long-hidden-name"), "{all}");
+        // ...so it must not push the status column rightwards either.
+        // `○ x` is 3 columns, then the 2-space gap: status at col 5.
+        assert!(
+            row(1).starts_with("○ x  starting…"),
+            "status column padded by an unseen name: {:?}",
+            row(1)
+        );
+        assert!(row(3).contains("+3 more"), "{:?}", row(3));
+    }
+
     #[test]
     fn worker_row_shows_name_then_live_status() {
         let now = Instant::now();
@@ -756,7 +825,7 @@ mod tests {
         write_transcript_lines(d1.path(), &[("read", "src/msg_gateway.rs")]);
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
-        let line = agent_line(&view.agents()[0], name_column_width(&view), 80, now);
+        let line = agent_line(&view.agents()[0], name_column_width(view.agents().iter()), 80, now);
         assert!(line.starts_with("○ msg-framework-dev  read src/msg_gateway.rs"), "{line:?}");
         assert!(display_width(&line) <= 80);
     }

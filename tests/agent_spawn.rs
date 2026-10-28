@@ -834,10 +834,10 @@ fn run_p_capture(port: u16, orchestrator_config: bool, args: &[&str]) -> (String
 }
 
 /// D-01/ORC-01: `experimental.orchestrator = true` must never restrict
-/// print mode's registry — the real binary still has `write` available
-/// (not just `read`/`grep`/`find`, the orchestrator's restricted set).
-/// Proven by having the fake model actually call `write` and checking
-/// the file lands on disk, rather than inspecting the request body.
+/// print mode's registry — the real binary still has `write`, which the
+/// orchestrator's four-tool dispatch-only set does not. Proven by
+/// having the fake model actually call `write` and checking the file
+/// lands on disk, rather than inspecting the request body.
 #[test]
 fn print_mode_ignores_orchestrator_config() {
     let port = spawn_sse_server_seq(vec![
@@ -852,11 +852,11 @@ fn print_mode_ignores_orchestrator_config() {
         ],
         vec![delta("wrote it"), finish("stop")],
     ]);
-    let (stdout, stderr, dir) = run_p_capture(port, true, &["write the proof file"]);
-    assert!(
-        !stderr.contains("experimental.orchestrator"),
-        "print mode no longer notes the (default-on) flag: {stderr:?}"
-    );
+    // No assertion on the absence of the old stderr note: that string
+    // no longer exists anywhere in `src/`, so asserting it is missing
+    // can never fail and only reads as coverage. The `write`-lands-on-
+    // disk check below is what gives this test teeth.
+    let (stdout, _stderr, dir) = run_p_capture(port, true, &["write the proof file"]);
     assert!(
         stdout.contains("wrote it"),
         "turn did not complete: {stdout:?}"

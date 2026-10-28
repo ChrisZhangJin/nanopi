@@ -452,7 +452,22 @@ fn merge_batch(
 /// Format all visible skills as an `<available_skills>` block to
 /// inject into the system prompt. Skills with
 /// `disable_model_invocation = true` are hidden.
+///
+/// Equivalent to [`format_skills_for_prompt_mode`] with `delegating =
+/// false` — i.e. for an agent that loads skill files itself.
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
+    format_skills_for_prompt_mode(skills, false)
+}
+
+/// As [`format_skills_for_prompt`], but `delegating = true` swaps the
+/// how-to-use line for an orchestrator, which has no `read` tool and
+/// must name the skill in a dispatched agent's brief instead.
+///
+/// The catalogue itself is identical either way: an orchestrator that
+/// cannot see which skills exist cannot route work to them, which was
+/// the regression when the orchestrator tool set lost `read` and this
+/// block was gated on that tool's presence.
+pub fn format_skills_for_prompt_mode(skills: &[Skill], delegating: bool) -> String {
     let visible: Vec<&Skill> = skills
         .iter()
         .filter(|s| !s.disable_model_invocation)
@@ -460,12 +475,18 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     if visible.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "\n\nThe following skills provide specialized instructions for specific tasks.\n\
-         Use the read tool to load a skill's file when the task matches its description.\n\
+    let how_to_use = if delegating {
+        "When a task matches a skill's description, name that skill and its \
+         <location> in the brief you give the agent, and tell the agent to read \
+         it first. You have no read tool yourself.\n"
+    } else {
+        "Use the read tool to load a skill's file when the task matches its description.\n\
          When a skill file references a relative path, resolve it against the skill directory \
-         (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n\
-         <available_skills>\n",
+         (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n"
+    };
+    let mut out = format!(
+        "\n\nThe following skills provide specialized instructions for specific tasks.\n\
+         {how_to_use}\n<available_skills>\n"
     );
     for s in visible {
         out.push_str("  <skill>\n");

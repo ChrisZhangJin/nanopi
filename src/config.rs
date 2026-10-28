@@ -171,9 +171,19 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
 }
 
+/// Value of `[experimental] orchestrator` when the key is absent
+/// everywhere. See [`ExperimentalConfig::orchestrator_enabled`].
+pub const DEFAULT_ORCHESTRATOR: bool = true;
+
 /// `[experimental]` config: feature flags not yet promoted to a
 /// top-level, stable setting.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// Fields are `Option` so the global→project merge can tell "unset"
+/// from "explicitly set to the default value". With a plain `bool` and
+/// a non-`false` default, a project file saying `orchestrator = true`
+/// is indistinguishable from an empty section, so the section-level
+/// merge would discard it and silently fall back to the global value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Enables orchestrator mode (ORC-01..ORC-06): a dispatch-only tool
@@ -190,12 +200,25 @@ pub struct ExperimentalConfig {
     /// [experimental]
     /// orchestrator = false
     /// ```
-    pub orchestrator: bool,
+    ///
+    /// `None` means the key was absent; read it through
+    /// [`Self::orchestrator_enabled`] rather than unwrapping here, so
+    /// the default lives in exactly one place.
+    pub orchestrator: Option<bool>,
 }
 
-impl Default for ExperimentalConfig {
-    fn default() -> Self {
-        Self { orchestrator: true }
+impl ExperimentalConfig {
+    /// Whether orchestrator mode is on, resolving an absent key to
+    /// [`DEFAULT_ORCHESTRATOR`].
+    pub fn orchestrator_enabled(&self) -> bool {
+        self.orchestrator.unwrap_or(DEFAULT_ORCHESTRATOR)
+    }
+
+    /// Whether the key was written out explicitly (either value), as
+    /// opposed to falling back to the default. Lets a caller tell "the
+    /// user asked for orchestrator mode" from "nobody said anything".
+    pub fn orchestrator_is_explicit(&self) -> bool {
+        self.orchestrator.is_some()
     }
 }
 
@@ -689,11 +712,14 @@ fn merge(a: Config, b: Config) -> Config {
         } else {
             a.agent
         },
-        // Section-level: project wins if it differs from defaults.
-        experimental: if b.experimental != ExperimentalConfig::default() {
-            b.experimental
-        } else {
-            a.experimental
+        // Field-level, not section-level: an `Option` per key means a
+        // project value wins whenever the key is PRESENT, including
+        // when it happens to equal the built-in default. A
+        // section-level `!= default()` comparison cannot express that
+        // and silently drops `orchestrator = true` once `true` is the
+        // default.
+        experimental: ExperimentalConfig {
+            orchestrator: b.experimental.orchestrator.or(a.experimental.orchestrator),
         },
     }
 }
@@ -867,10 +893,53 @@ mod tests {
     #[test]
     fn experimental_orchestrator_defaults_true() {
         let empty: Config = toml::from_str("").unwrap();
-        assert!(empty.experimental.orchestrator);
+        assert!(empty.experimental.orchestrator_enabled());
+        assert!(
+            !empty.experimental.orchestrator_is_explicit(),
+            "an absent key must not look explicit"
+        );
 
         let off: Config = toml::from_str("[experimental]\norchestrator = false").unwrap();
-        assert!(!off.experimental.orchestrator);
+        assert!(!off.experimental.orchestrator_enabled());
+        assert!(off.experimental.orchestrator_is_explicit());
+
+        let on: Config = toml::from_str("[experimental]\norchestrator = true").unwrap();
+        assert!(on.experimental.orchestrator_enabled());
+        assert!(on.experimental.orchestrator_is_explicit());
+    }
+
+    /// The global→project merge must key on key PRESENCE, not on
+    /// "differs from the default". Once `true` is the default, a
+    /// project file saying `orchestrator = true` parses to the same
+    /// value as an empty section, so a section-level comparison would
+    /// discard it and let the global `false` win — the opt-IN
+    /// direction would silently stop working while the opt-OUT
+    /// direction kept passing.
+    #[test]
+    fn project_orchestrator_wins_over_global_in_both_directions() {
+        let global_off: Config = toml::from_str("[experimental]\norchestrator = false").unwrap();
+        let project_on: Config = toml::from_str("[experimental]\norchestrator = true").unwrap();
+        let merged = merge(global_off.clone(), project_on);
+        assert!(
+            merged.experimental.orchestrator_enabled(),
+            "explicit project `true` must beat global `false`"
+        );
+
+        let global_on: Config = toml::from_str("[experimental]\norchestrator = true").unwrap();
+        let project_off: Config = toml::from_str("[experimental]\norchestrator = false").unwrap();
+        let merged = merge(global_on, project_off);
+        assert!(
+            !merged.experimental.orchestrator_enabled(),
+            "explicit project `false` must beat global `true`"
+        );
+
+        // A project file that says nothing inherits the global value.
+        let project_silent: Config = toml::from_str("").unwrap();
+        let merged = merge(global_off, project_silent);
+        assert!(
+            !merged.experimental.orchestrator_enabled(),
+            "an absent project key must inherit the global value"
+        );
     }
 
     #[test]

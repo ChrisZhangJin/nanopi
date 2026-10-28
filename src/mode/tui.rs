@@ -412,6 +412,80 @@ const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
 /// from this budget rather than the fixed dock height.
 const MAX_INPUT_LINES: usize = 5;
 
+/// Rows a dropdown overlay needs before the agents strip is allowed to
+/// take one for itself. At the standard `DOCK_HEIGHT` the overlay gets
+/// exactly 4 (`10 - status(1) - input(3) - footer(2)`), which is under
+/// this bar — so while a menu is open the strip hides entirely rather
+/// than shrinking the menu. The strip is ambient status; the menu is
+/// what the user is actively looking at.
+const OVERLAY_MIN_ROWS: u16 = 5;
+
+/// Outcome of [`startup_orchestrator_decision`].
+#[derive(Debug, PartialEq, Eq)]
+struct OrchestratorDecision {
+    /// Whether orchestrator mode is applied to the initial agent.
+    on: bool,
+    /// A line to print when the two inputs conflict, so neither choice
+    /// is made silently.
+    note: Option<&'static str>,
+}
+
+/// Decide whether a starting TUI session runs as an orchestrator, from
+/// the `[experimental]` config and any `--tools` allowlist.
+///
+/// Split out of `run_tui_mode` so it can be tested: inline, it sat in
+/// the middle of a 200-line async startup path that no test reaches,
+/// which meant the commit's headline behaviour — "the interactive main
+/// agent is an orchestrator by default" — could be deleted outright
+/// with the whole suite still green.
+///
+/// An explicit `--tools` allowlist suppresses the DEFAULT, because
+/// [`ToolRegistry::orchestrator`] is a closed list that never consults
+/// the allowlist: applying it would both discard the restriction the
+/// user asked for and WIDEN the set, handing the model an `agent` tool
+/// whose children run the full standard registry. A restriction flag
+/// must never end up granting more. An explicit `orchestrator = true`
+/// still wins — the user named both, so honour the more specific
+/// request and say so rather than silently picking one.
+fn startup_orchestrator_decision(
+    experimental: &crate::config::ExperimentalConfig,
+    tools_allow: &[String],
+) -> OrchestratorDecision {
+    let wanted = experimental.orchestrator_enabled();
+    if tools_allow.is_empty() {
+        return OrchestratorDecision { on: wanted, note: None };
+    }
+    if wanted && experimental.orchestrator_is_explicit() {
+        return OrchestratorDecision {
+            on: true,
+            note: Some(
+                "note: --tools is ignored in orchestrator mode (its tool set is fixed); \
+                 use `/orchestrator off` for an allowlisted single agent",
+            ),
+        };
+    }
+    OrchestratorDecision { on: false, note: None }
+}
+
+/// The non-orchestrator tool registry for a TUI session, honouring an
+/// explicit `--tools` allowlist.
+///
+/// The TUI is always the top-level interactive process, so with no
+/// allowlist it gets the main-process-only control tools
+/// (CTL-02/03/04/06) on top of the standard set. Every site that
+/// rebuilds the registry mid-session — `/new`, `/resume`, `/import`,
+/// `/fork`, `/orchestrator off` — must go through here: calling
+/// `standard_with_allowlist(&[])` directly returns the bare standard
+/// set, which silently drops `list_agents`/`stop_agent`/`send_message`
+/// for the rest of the session.
+fn tui_registry(tools_allow: &[String]) -> Result<ToolRegistry, String> {
+    if tools_allow.is_empty() {
+        Ok(ToolRegistry::standard_with_control())
+    } else {
+        ToolRegistry::standard_with_allowlist(tools_allow)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Entry
 // ─────────────────────────────────────────────────────────────────────
@@ -489,12 +563,7 @@ pub async fn run_tui_mode(
     // TUI is always the top-level, interactive process (never a spawned
     // child): wire up CTL-02/03/04/06's main-process-only control tools
     // (only meaningful with the unrestricted default set).
-    let registry = if tools_allow.is_empty() {
-        ToolRegistry::standard_with_control()
-    } else {
-        ToolRegistry::standard_with_allowlist(&tools_allow)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-    };
+    let registry = tui_registry(&tools_allow).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.
@@ -612,7 +681,12 @@ pub async fn run_tui_mode(
     // ORC-02: seed from config.toml's `[experimental] orchestrator`
     // (single source of truth, Pitfall 4) and apply the swap to the
     // initial agent before the first turn if it's on by default.
-    app.orchestrator = cfg_for_build.experimental.orchestrator;
+    //
+    let decision = startup_orchestrator_decision(&cfg_for_build.experimental, &tools_allow);
+    if let Some(msg) = decision.note {
+        crate::note!("{}", msg);
+    }
+    app.orchestrator = decision.on;
     if app.orchestrator {
         let mut g = agent_slot.lock().await;
         if let Some(a) = g.as_mut() {
@@ -2666,7 +2740,7 @@ async fn handle_action(
                 }
             };
             let _ = session::set_active_session(&cwd, &new_path);
-            let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
+            let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
             // `/new` rebuilds the agent from scratch, so re-read
             // config for exec mode + extensions the same way startup
             // does. Picks up an edited config.toml without a restart.
@@ -2841,7 +2915,7 @@ async fn handle_action(
                 }
             };
             let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-            let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
+            let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
                 provider,
@@ -3402,7 +3476,7 @@ async fn handle_action(
                 }
             };
             let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-            let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
+            let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
                 provider,
@@ -4283,7 +4357,7 @@ async fn execute_fork(
         }
     };
     let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-    let registry = crate::tool::ToolRegistry::standard_with_allowlist(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard());
+    let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
     new_agent.context.tools = registry.all_specs();
     let diags = new_agent.hydrate_resumed(
         provider,
@@ -5654,8 +5728,13 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     let strip_h: u16 = if app.agents_view.is_empty() {
         0
     } else if overlay_open {
-        let base_slack = area.height.saturating_sub(1 + 2 + 1 + 1); // status + input(1 line) + footer(2)
-        if base_slack < 5 { 0 } else { 1 }
+        // Rows the overlay would get if the strip took none. With an
+        // overlay open the input box is 2 borders + exactly 1 content
+        // line (`max_input_lines` below is 1), i.e. 3 — counting it as
+        // 2 here overstated the slack by a row and let the strip take
+        // one anyway, shrinking the dropdown it was meant to protect.
+        let base_slack = area.height.saturating_sub(1 + 3 + 2); // status + input + footer(2)
+        if base_slack < OVERLAY_MIN_ROWS { 0 } else { 1 }
     } else {
         agents_strip::strip_height(&app.agents_view, app.term_rows, app.agents_strip_expanded)
     };
@@ -8475,6 +8554,196 @@ mod tests {
         let mut before_sorted = before_names.clone();
         before_sorted.sort();
         assert_eq!(after_names, before_sorted, "registry must be left untouched");
+    }
+
+    /// Every other `draw_dock` test renders into an 80x24 `Rect`, where
+    /// `Constraint::Min(0)` absorbs 14 rows of slack and the constraint
+    /// sum can never be exceeded. Production renders into the fixed
+    /// `DOCK_HEIGHT` inline viewport, where the budget is exact — so
+    /// the geometry that actually ships was the one geometry nothing
+    /// covered. Assert at the real height, for every strip size, that
+    /// the input box keeps a usable content row and the strip stays
+    /// bottom-anchored.
+    #[test]
+    fn dock_fits_at_real_height_for_every_strip_size() {
+        let now = std::time::Instant::now();
+        let area = Rect::new(0, 0, 80, DOCK_HEIGHT);
+        for n_agents in 0..=4usize {
+            let mut app = mkapp();
+            let fabricated: Vec<_> = (0..n_agents)
+                .map(|i| {
+                    fabricate_agent(
+                        &format!("a{i}"),
+                        crate::agent_registry::AgentState::Running,
+                        &format!("agent-{i}"),
+                    )
+                })
+                .collect();
+            let entries: Vec<_> = fabricated.iter().map(|(_d, e)| e.clone()).collect();
+            app.agents_view.refresh(&entries, now);
+            app.term_rows = 40;
+
+            let mut buf = Buffer::empty(area);
+            draw_dock(&mut buf, area, &app);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+
+            // The input box must still have its `> ` content row: an
+            // off-by-one in the budget silently eats it, leaving two
+            // bare border rules and nowhere to type.
+            assert!(
+                rows.iter().any(|r| r.starts_with("> ")),
+                "{n_agents} agents: input content row lost at height {}: {rows:#?}",
+                DOCK_HEIGHT
+            );
+
+            if n_agents == 0 {
+                assert!(
+                    !rows.iter().any(|r| r.contains("● main")),
+                    "no agents must mean no strip: {rows:#?}"
+                );
+            } else {
+                // Strip is bottom-anchored, below the footer.
+                let main_idx = rows.iter().position(|r| r.contains("● main")).unwrap();
+                let input_idx = rows.iter().position(|r| r.starts_with("> ")).unwrap();
+                assert!(
+                    main_idx > input_idx,
+                    "{n_agents} agents: strip must sit below the input box: {rows:#?}"
+                );
+            }
+        }
+    }
+
+    /// With a dropdown open the strip must not steal a row from it —
+    /// the slack formula used to count the input box as 2 rows when it
+    /// is 3, so the strip took a row anyway and the menu rendered one
+    /// entry short of its budget.
+    #[test]
+    fn overlay_keeps_its_full_height_at_real_dock_height() {
+        let now = std::time::Instant::now();
+        let mut app = mkapp();
+        let (_d, e) = fabricate_agent("a1", crate::agent_registry::AgentState::Running, "alpha");
+        app.agents_view.refresh(&[e], now);
+        app.term_rows = 40;
+        seed_input(&mut app, "/");
+        assert!(app.palette.is_some(), "sanity: palette should be open");
+
+        let area = Rect::new(0, 0, 80, DOCK_HEIGHT);
+        let mut buf = Buffer::empty(area);
+        draw_dock(&mut buf, area, &app);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+
+        assert!(
+            !rows.iter().any(|r| r.contains("● main")),
+            "at DOCK_HEIGHT the overlay needs every slack row, so the \
+             strip must hide rather than shrink it: {rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.starts_with("> ")), "{rows:#?}");
+    }
+
+    /// ORC-01/02: a plain TUI session — no config, no `--tools` — must
+    /// come up as an orchestrator AND actually have the restricted
+    /// registry applied to its agent. Without this the startup swap
+    /// could be deleted entirely and the suite would stay green while
+    /// the interactive main agent silently kept its full file/shell
+    /// toolset, which is the one regression this feature exists to
+    /// prevent.
+    #[test]
+    fn default_session_starts_as_a_restricted_orchestrator() {
+        use crate::config::ExperimentalConfig;
+
+        let decision = startup_orchestrator_decision(&ExperimentalConfig::default(), &[]);
+        assert_eq!(
+            decision,
+            OrchestratorDecision { on: true, note: None },
+            "a bare session must default to orchestrator mode"
+        );
+
+        // ...and applying it must really restrict the agent.
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-default-orc", HooksConfig::default());
+        agent.context.tools = agent.registry.all_specs();
+        assert!(agent.registry.get("bash").is_some(), "sanity: starts full");
+
+        let mut app = mkapp();
+        apply_orchestrator_mode(&mut app, &mut agent, decision.on);
+        assert_eq!(
+            agent.registry.names(),
+            vec!["agent", "list_agents", "send_message", "stop_agent"]
+        );
+        for t in ["read", "grep", "find", "ls", "write", "edit", "bash"] {
+            assert!(
+                agent.registry.get(t).is_none(),
+                "`{t}` must be gone in the default session"
+            );
+        }
+    }
+
+    /// An explicit `--tools` allowlist is a RESTRICTION. The
+    /// orchestrator registry is a closed list that ignores it, so
+    /// applying the default on top would discard the restriction and
+    /// hand the model an `agent` tool whose children run the full
+    /// standard set — a restriction flag that grants more.
+    #[test]
+    fn explicit_tools_allowlist_suppresses_the_orchestrator_default() {
+        use crate::config::ExperimentalConfig;
+        let allow = vec!["read".to_string(), "grep".to_string()];
+
+        // Default (implicit) orchestrator yields to the allowlist.
+        let d = startup_orchestrator_decision(&ExperimentalConfig::default(), &allow);
+        assert_eq!(d, OrchestratorDecision { on: false, note: None });
+
+        // An explicit `orchestrator = true` still wins, but says so.
+        let explicit_on = ExperimentalConfig { orchestrator: Some(true) };
+        let d = startup_orchestrator_decision(&explicit_on, &allow);
+        assert!(d.on);
+        assert!(d.note.is_some(), "a conflict must never be silent");
+
+        // An explicit `false` is off either way, with no note.
+        let explicit_off = ExperimentalConfig { orchestrator: Some(false) };
+        assert_eq!(
+            startup_orchestrator_decision(&explicit_off, &allow),
+            OrchestratorDecision { on: false, note: None }
+        );
+        assert_eq!(
+            startup_orchestrator_decision(&explicit_off, &[]),
+            OrchestratorDecision { on: false, note: None }
+        );
+    }
+
+    /// Every mid-session registry rebuild (`/new`, `/resume`,
+    /// `/import`, `/fork`, `/orchestrator off`) must reproduce what
+    /// startup built. `standard_with_allowlist(&[])` returns the BARE
+    /// standard set, so calling it directly on an empty allowlist
+    /// silently dropped `list_agents`/`stop_agent`/`send_message` for
+    /// the rest of the session — the agent could dispatch children and
+    /// then never list or stop them.
+    #[test]
+    fn tui_registry_keeps_control_tools_when_no_allowlist() {
+        let built = tui_registry(&[]).expect("empty allowlist is always valid");
+        assert_eq!(
+            built.names(),
+            crate::tool::ToolRegistry::standard_with_control().names(),
+            "rebuild must match what startup installs"
+        );
+        for t in ["list_agents", "stop_agent", "send_message"] {
+            assert!(built.get(t).is_some(), "control tool `{t}` was dropped");
+        }
+    }
+
+    /// With an explicit `--tools` allowlist the control tools are NOT
+    /// added: they are only meaningful on the unrestricted set, and the
+    /// user asked for exactly these tools.
+    #[test]
+    fn tui_registry_honours_an_explicit_allowlist() {
+        let built = tui_registry(&["read".to_string(), "grep".to_string()])
+            .expect("known tool names");
+        assert_eq!(built.names(), vec!["grep", "read"]);
+        assert!(built.get("send_message").is_none());
+        assert!(built.get("agent").is_none());
     }
 
     /// ORC-05: the status badge marks the deviation, not the default.
