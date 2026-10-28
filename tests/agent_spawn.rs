@@ -833,33 +833,6 @@ fn run_p_capture(port: u16, orchestrator_config: bool, args: &[&str]) -> (String
     )
 }
 
-/// D-01/ORC-04: with `experimental.orchestrator = true` in config, `-p`
-/// prints exactly one stderr line naming the note; without the key, no
-/// such line appears at all.
-#[test]
-fn print_mode_warns_when_orchestrator_config_set() {
-    let port_on = spawn_sse_server(vec![delta("just the answer"), finish("stop")]);
-    let (_, stderr_on, dir_on) = run_p_capture(port_on, true, &["hi"]);
-    let note_lines: Vec<&str> = stderr_on
-        .lines()
-        .filter(|l| l.contains("experimental.orchestrator is set but ignored in print mode"))
-        .collect();
-    assert_eq!(
-        note_lines.len(),
-        1,
-        "expected exactly one note line, got: {stderr_on:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir_on);
-
-    let port_off = spawn_sse_server(vec![delta("just the answer"), finish("stop")]);
-    let (_, stderr_off, dir_off) = run_p_capture(port_off, false, &["hi"]);
-    assert!(
-        !stderr_off.contains("experimental.orchestrator"),
-        "note printed without the config key set: {stderr_off:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir_off);
-}
-
 /// D-01/ORC-01: `experimental.orchestrator = true` must never restrict
 /// print mode's registry — the real binary still has `write` available
 /// (not just `read`/`grep`/`find`, the orchestrator's restricted set).
@@ -881,8 +854,8 @@ fn print_mode_ignores_orchestrator_config() {
     ]);
     let (stdout, stderr, dir) = run_p_capture(port, true, &["write the proof file"]);
     assert!(
-        stderr.contains("experimental.orchestrator is set but ignored in print mode"),
-        "sanity: note should still fire: {stderr:?}"
+        !stderr.contains("experimental.orchestrator"),
+        "print mode no longer notes the (default-on) flag: {stderr:?}"
     );
     assert!(
         stdout.contains("wrote it"),

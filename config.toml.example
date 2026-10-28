@@ -381,6 +381,41 @@ base_url = "https://api.openai.com/v1"
 # at startup so you don't accidentally commit this file with the key.
 # api_key = "sk-..."
 
+# ─── Orchestrator mode (v0.13) ──────────────────────────────────────
+#
+# The TUI's default main flow. The main agent never does concrete work
+# itself — it has NO file or shell tools at all (no read, grep, find,
+# ls, write, edit or bash), only `agent`, `list_agents`, `stop_agent`
+# and `send_message`. Every job becomes a dedicated agent it dispatches,
+# monitors, and whose report it synthesises. Live agents show up in the
+# strip under the input box; Ctrl+G prints their details.
+#
+# Set this to false for the classic single-agent flow, where the main
+# agent reads and edits files and runs commands itself. The toggle is
+# also available in-session as `/orchestrator [on|off]`, which takes
+# effect from the next turn; `⎈ solo` in the status line means the mode
+# is off (the default gets no badge).
+#
+# TUI only. Print mode (`nanopi -p`) ignores this key entirely, so a
+# scripted run always keeps its full tool set.
+# [experimental]
+# orchestrator = false
+
+# ─── Agent caps (v0.13) ─────────────────────────────────────────────
+#
+# Limits on the `nanopi -p` children the `agent` tool spawns. The
+# defaults are shown; every key is optional.
+# [agent]
+# max_live = 8              # max simultaneously tracked (non-terminal)
+#                           # children before dispatch is refused
+# max_concurrency = 4       # max running at once; the rest queue. This
+#                           # is a ceiling, not a target
+# max_turns = 50            # per-child turn limit
+# token_budget = 300000     # per-child token budget
+# timeout_secs = 1800       # per-child wall-clock timeout
+# archive_keep_days = 2     # prune agent runs older than this at
+#                           # startup; 0 disables pruning
+
 # ─── Trust default (optional) ───────────────────────────────────────
 
 # Overrides the interactive trust prompt for project-local resources.

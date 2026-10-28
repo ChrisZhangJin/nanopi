@@ -428,48 +428,71 @@ fn elapsed_secs_for(info: &AgentInfo, now: Instant) -> u64 {
     end.saturating_duration_since(info.started).as_secs()
 }
 
-/// Build the single-line text for one agent row at `width` columns,
-/// dropping activity first and then description as the width shrinks
-/// below 60/30 columns (D-08). The id, glyph and elapsed time are always
-/// present. Never exceeds `width` display columns (CJK-safe).
-fn agent_line(info: &AgentInfo, width: usize, use_activity: bool, now: Instant) -> String {
-    let glyph = glyph_for(info.state);
-    let id = format!("#{}", info.id);
-    let elapsed = format_elapsed(elapsed_secs_for(info, now));
+/// Glyph shown in front of every worker row (Claude Code style); the
+/// row's colour carries the state instead.
+const WORKER_GLYPH: &str = "○";
+/// Glyph for the orchestrator's own `main` row.
+const MAIN_GLYPH: &str = "●";
+/// Widest the name column may get before names are truncated.
+const MAX_NAME_WIDTH: usize = 24;
 
-    let text_slot = if use_activity {
-        info.activity.last().cloned().unwrap_or_default()
+/// The name shown for an agent: its label/description, else `#id`.
+fn display_name(info: &AgentInfo) -> String {
+    if info.description.trim().is_empty() {
+        format!("#{}", info.id)
     } else {
         info.description.clone()
-    };
-
-    // Fixed parts: glyph, id, elapsed, and spacing.
-    let fixed = format!("{glyph} {id}");
-    let fixed_w = display_width(&fixed);
-    let elapsed_w = display_width(&elapsed);
-    // Reserve 1 space before elapsed and 1 space after fixed, when room allows.
-    let reserved = fixed_w + elapsed_w + 2;
-
-    if width <= reserved || width < 60 {
-        // Narrow handling per D-08 thresholds, applied independent of text_slot choice:
-        if width < 30 {
-            // id, glyph, elapsed only.
-            return pad_line(&fixed, &elapsed, width);
-        }
-        if width < 60 {
-            // description kept (if use_activity is false we already have no
-            // activity text); when use_activity requested but width < 60
-            // activity is omitted regardless.
-            let desc = if use_activity { String::new() } else { truncate_to_width(&info.description, width.saturating_sub(reserved)) };
-            let middle = desc;
-            return pad_line(&format!("{fixed} {middle}").trim_end().to_string(), &elapsed, width);
-        }
     }
+}
 
-    let avail = width.saturating_sub(reserved);
-    let middle = truncate_to_width(&text_slot, avail);
-    let left = format!("{fixed} {middle}").trim_end().to_string();
-    pad_line(&left, &elapsed, width)
+/// What the agent is doing right now: its latest tool call while
+/// running, otherwise a word for its state.
+fn status_text(info: &AgentInfo) -> String {
+    match info.state {
+        AgentState::Running => info
+            .activity
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "starting…".to_string()),
+        AgentState::Queued => "queued".to_string(),
+        other => other.as_str().to_string(),
+    }
+}
+
+/// Width of the name column for the rows currently shown, so statuses
+/// line up under each other.
+fn name_column_width(view: &AgentsView) -> usize {
+    view.agents
+        .iter()
+        .map(|a| display_width(&display_name(a)))
+        .max()
+        .unwrap_or(0)
+        .min(MAX_NAME_WIDTH)
+}
+
+/// Build the single-line text for one worker row:
+/// `○ <name padded to name_w>  <status> … <elapsed>`. The status is
+/// dropped below 40 columns, the name is truncated further below that.
+/// Never exceeds `width` display columns (CJK-safe).
+fn agent_line(info: &AgentInfo, name_w: usize, width: usize, now: Instant) -> String {
+    let elapsed = format_elapsed(elapsed_secs_for(info, now));
+    let name = truncate_to_width(&display_name(info), name_w);
+    let name_pad = " ".repeat(name_w.saturating_sub(display_width(&name)));
+    let left = if width < 40 {
+        format!("{WORKER_GLYPH} {name}")
+    } else {
+        format!("{WORKER_GLYPH} {name}{name_pad}  {}", status_text(info))
+    };
+    pad_line(&left, &format!(" {elapsed}"), width)
+}
+
+/// The orchestrator's own row: `● main` plus a dim summary of how many
+/// agents it is waiting on and the details key.
+fn main_line(view: &AgentsView, opts: &StripOpts) -> (String, String) {
+    let n = view.len();
+    let noun = if n == 1 { "agent" } else { "agents" };
+    let hint = format!("  {n} {noun} working · {} details", opts.toggle_key_label);
+    (format!("{MAIN_GLYPH} main"), hint)
 }
 
 fn pad_line(left: &str, right: &str, width: usize) -> String {
@@ -483,20 +506,14 @@ fn pad_line(left: &str, right: &str, width: usize) -> String {
     format!("{left}{}{right}", " ".repeat(pad))
 }
 
-/// Header text: "agents (N) · Ctrl+G expand" collapsed, "... collapse"
-/// expanded.
-fn header_text(n: usize, opts: &StripOpts) -> String {
-    let verb = if opts.expanded { "collapse" } else { "expand" };
-    format!("agents ({n}) · {} {verb}", opts.toggle_key_label)
-}
-
 /// Per-agent expanded detail lines (D-04): the agent line, up to 3
 /// activity lines, "turns N · tokens M" when known, "worktree <path>
 /// (<branch>)" when present, "report <dir>/report.md".
 pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> Vec<String> {
+    let name_w = name_column_width(view);
     let mut out = Vec::new();
     for info in ordered_agents(view) {
-        out.push(agent_line(info, width, false, now));
+        out.push(agent_line(info, name_w, width, now));
         for act in &info.activity {
             out.push(truncate_to_width(&format!("  {act}"), width));
         }
@@ -519,23 +536,33 @@ pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> V
     out
 }
 
-/// Pure draw function: writes header + rows into `buf` at `area`. Reads
-/// only in-memory cached data from `view`; never touches the filesystem
-/// (UI-04). Calling twice with the same `view`/`opts` yields an
-/// identical buffer.
+/// Pure draw function: writes the `● main` row and one row per agent
+/// into `buf` at `area`. Reads only in-memory cached data from `view`;
+/// never touches the filesystem (UI-04). Calling twice with the same
+/// `view`/`opts` yields an identical buffer.
 pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: &StripOpts) {
     if view.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
     let width = area.width as usize;
 
-    let header = truncate_to_width(&header_text(view.len(), opts), width);
-    buf.set_string(area.x, area.y, &header, Style::default().fg(Color::DarkGray));
+    let (main, hint) = main_line(view, opts);
+    let main = truncate_to_width(&main, width);
+    buf.set_string(
+        area.x,
+        area.y,
+        &main,
+        Style::default().fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD),
+    );
+    let hint_x = display_width(&main);
+    let hint = truncate_to_width(&hint, width.saturating_sub(hint_x));
+    buf.set_string(area.x + hint_x as u16, area.y, &hint, Style::default().fg(Color::DarkGray));
 
     if opts.term_rows < 15 || area.height < 2 {
         return;
     }
 
+    let name_w = name_column_width(view);
     let rows = collapsed_rows(view);
     for (i, row) in rows.iter().enumerate() {
         let y = area.y + 1 + i as u16;
@@ -544,11 +571,11 @@ pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: 
         }
         match row {
             StripRow::Agent(info) => {
-                let line = agent_line(info, width, opts.expanded, opts.now);
+                let line = agent_line(info, name_w, width, opts.now);
                 buf.set_string(area.x, y, &line, style_for_state(info.state));
             }
             StripRow::More { count, running } => {
-                let text = truncate_to_width(&format!("+{count} more ({running} running)"), width);
+                let text = truncate_to_width(&format!("{WORKER_GLYPH} +{count} more ({running} running)"), width);
                 buf.set_string(area.x, y, &text, Style::default().fg(Color::DarkGray));
             }
         }
@@ -697,20 +724,41 @@ mod tests {
     }
 
     #[test]
-    fn header_text_collapsed_and_expanded() {
+    fn main_row_heads_the_strip_with_agent_count() {
         let now = Instant::now();
         let d1 = tmp_dir();
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
-        let opts_collapsed = StripOpts {
+        let opts = StripOpts {
             expanded: false,
             term_rows: 40,
             toggle_key_label: "Ctrl+G".to_string(),
             now,
         };
-        assert_eq!(header_text(view.len(), &opts_collapsed), "agents (1) · Ctrl+G expand");
-        let opts_expanded = StripOpts { expanded: true, ..opts_collapsed };
-        assert_eq!(header_text(view.len(), &opts_expanded), "agents (1) · Ctrl+G collapse");
+        let area = Rect::new(0, 0, 60, 2);
+        let mut buf = Buffer::empty(area);
+        draw_agents_strip(&mut buf, area, &view, &opts);
+        let row = |y: u16| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).starts_with("● main"), "{:?}", row(0));
+        assert!(row(0).contains("1 agent working · Ctrl+G details"), "{:?}", row(0));
+        assert!(row(1).starts_with("○ #a"), "{:?}", row(1));
+    }
+
+    #[test]
+    fn worker_row_shows_name_then_live_status() {
+        let now = Instant::now();
+        let d1 = tmp_dir();
+        std::fs::write(
+            d1.path().join("brief.md"),
+            "---\nid: a\nstate: running\nstarted: x\nparent: none\nlabel: msg-framework-dev\n---\nbody\n",
+        )
+        .unwrap();
+        write_transcript_lines(d1.path(), &[("read", "src/msg_gateway.rs")]);
+        let mut view = AgentsView::new();
+        view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
+        let line = agent_line(&view.agents()[0], name_column_width(&view), 80, now);
+        assert!(line.starts_with("○ msg-framework-dev  read src/msg_gateway.rs"), "{line:?}");
+        assert!(display_width(&line) <= 80);
     }
 
     #[test]
@@ -724,9 +772,8 @@ mod tests {
         .unwrap();
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
-        let line = agent_line(&view.agents()[0], 80, false, now);
-        assert!(line.contains("●"));
-        assert!(line.contains("#a"));
+        let line = agent_line(&view.agents()[0], MAX_NAME_WIDTH, 80, now);
+        assert!(line.contains("○"));
         assert!(line.contains("do the thing"));
         assert!(display_width(&line) <= 80);
     }
@@ -744,12 +791,12 @@ mod tests {
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
         let info = &view.agents()[0];
 
-        let at_50 = agent_line(info, 50, true, now);
+        let at_50 = agent_line(info, MAX_NAME_WIDTH, 50, now);
         assert!(display_width(&at_50) <= 50);
 
-        let at_30 = agent_line(info, 30, false, now);
+        let at_30 = agent_line(info, MAX_NAME_WIDTH, 30, now);
         assert!(display_width(&at_30) <= 30);
-        assert!(at_30.contains("#a"));
+        assert!(at_30.starts_with("○ 读取"), "{at_30:?}");
     }
 
     #[test]
@@ -764,7 +811,7 @@ mod tests {
         let mut view = AgentsView::new();
         view.refresh(&[entry("a", AgentState::Running, now, d1.path().to_path_buf())], now);
         for w in [80usize, 50, 30, 20] {
-            let line = agent_line(&view.agents()[0], w, false, now);
+            let line = agent_line(&view.agents()[0], MAX_NAME_WIDTH, w, now);
             assert!(display_width(&line) <= w, "width {w}: {line:?} ({})", display_width(&line));
         }
     }
@@ -920,12 +967,12 @@ mod tests {
         let info = &view.agents()[0];
 
         let now_a = started + Duration::from_secs(5);
-        let line_a = agent_line(info, 80, false, now_a);
-        let line_a_again = agent_line(info, 80, false, now_a);
+        let line_a = agent_line(info, MAX_NAME_WIDTH, 80, now_a);
+        let line_a_again = agent_line(info, MAX_NAME_WIDTH, 80, now_a);
         assert_eq!(line_a, line_a_again, "same `now` must yield identical output");
 
         let now_b = started + Duration::from_secs(65);
-        let line_b = agent_line(info, 80, false, now_b);
+        let line_b = agent_line(info, MAX_NAME_WIDTH, 80, now_b);
         assert_ne!(line_a, line_b, "different `now` must change the elapsed column");
         assert!(line_a.contains("5s"), "{line_a:?}");
         assert!(line_b.contains("1m05s"), "{line_b:?}");
@@ -933,9 +980,9 @@ mod tests {
         // Sleeping real wall-clock time between two calls with the SAME
         // `now` must not change the output (catches direct
         // `Instant::now()` calls inside `agent_line`).
-        let before_sleep = agent_line(info, 80, false, now_a);
+        let before_sleep = agent_line(info, MAX_NAME_WIDTH, 80, now_a);
         std::thread::sleep(Duration::from_millis(20));
-        let after_sleep = agent_line(info, 80, false, now_a);
+        let after_sleep = agent_line(info, MAX_NAME_WIDTH, 80, now_a);
         assert_eq!(before_sleep, after_sleep);
     }
 

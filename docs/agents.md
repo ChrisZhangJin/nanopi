@@ -90,47 +90,40 @@ Every child is killed (whole process group, SIGKILL) when:
 ## Agents strip (TUI)
 
 A read-only strip shows every live agent at a glance while any are running or
-queued. It sits between the status line and the input box, and is hidden
-whenever the current run has no live agents. Once an agent reaches a terminal
-state (done, failed, stopped, limit reached, interrupted) it disappears from
-the strip on the next refresh — its report is still delivered to the
-conversation through the normal injection path; the strip itself is not where
-you read results.
+queued. It sits at the bottom of the dock, under the footer (Claude Code
+style), and is hidden whenever the current run has no live agents:
 
-**Glyphs:**
+```
+● main  3 agents working · ctrl+g details
+○ yearning-dump        read raw.json                                 12s
+○ msg-framework-dev    bash cargo test                             1m05s
+○ write release notes  queued                                         0s
+```
 
-| Glyph | Meaning |
-|-------|---------|
-| `●` | running |
-| `◐` | queued |
-| `✓` | done |
-| `✗` | failed |
-| `■` | stopped |
-| `⏱` | limit reached |
-| `?` | interrupted |
-
-Terminal-state glyphs (`✓`/`✗`/`■`/`⏱`/`?`) are kept here for reference, but
-in practice an agent that reaches one of these states is removed from the
-strip on its next refresh, so they are not normally visible in the live view.
+The first row is the main flow (the orchestrator) with a count of the agents
+it is waiting on. Each worker row shows the agent's name (its `description`
+label, else `#id`), its live status — the latest tool call while running,
+refreshed about once a second, or `queued`/`starting…` — and its elapsed time.
+The row colour carries the state (cyan running, grey queued). Once an agent
+reaches a terminal state (done, failed, stopped, limit reached, interrupted)
+it disappears from the strip on the next refresh — its report is still
+delivered to the conversation through the normal injection path; the strip
+itself is not where you read results.
 
 There is no "waiting for permission" state: children run with `--approve` or
 `--distrust` decided at dispatch and never prompt, so the strip has nothing to
 approve or deny (display-only, UI-03).
 
-**Collapsed** (default), the strip is 1–3 lines: a header
-`agents (N) · Ctrl+G expand`, then at most 3 rows — running agents first, then
-queued. With more than 3 live agents the last row folds the rest into
-`+K more (R running)`.
+At most 3 worker rows are shown — running agents first, then queued. With more
+than 3 live agents the last row folds the rest into `+K more (R running)`.
 
-**Expanded** (`Ctrl+G` toggles), the in-dock rows keep showing each agent's
-latest activity and the dock grows to show more of the list, while a full
-detail block (activity history, turns/tokens, worktree/branch, report path)
-for the agents in view is printed into scrollback. `Ctrl+G` or `Esc` collapses
-it back.
+`Ctrl+G` prints a full detail block (activity history, turns/tokens,
+worktree/branch, report path) for the live agents into scrollback; `Ctrl+G` or
+`Esc` closes it.
 
-On narrow terminals (under ~60 columns) the activity text drops first, then
-the description; on short terminals (under ~15 rows) the strip shows only its
-header line (D-08).
+On narrow terminals (under 40 columns) the status text drops first, then the
+name is truncated; on short terminals (under ~15 rows) the strip shows only
+its `● main` row (D-08).
 
 The `Ctrl+G` binding (`ActionId::ToggleAgentsStrip`) is configurable through
 the same keybindings/settings menu as every other action — see `src/keys.rs`.
@@ -143,30 +136,31 @@ mode, worktree merge, and the dispatch/amend/stop/continue control flow.
 
 ## Orchestrator mode
 
-An experimental, opt-in TUI mode (ORC-01..05) in which the main agent only
-analyses, splits work, delegates it via the `agent` tool, monitors agents,
-and synthesises their results — it never edits, writes, or runs shell
-commands itself.
+The default main flow of the TUI (ORC-01..05): the main agent is an
+orchestrator that never does any concrete work itself. It creates dedicated
+agents via the `agent` tool, assigns the work to them, monitors them, and
+synthesises their results — it does not read files, search, edit, write, or
+run shell commands.
 
 - **Toggle:** `/orchestrator` (bare = toggle, `/orchestrator on|off` sets it
   explicitly, anything else prints `Usage: /orchestrator [on|off]` without
   changing state). Toggling mid-session takes effect from the next turn and
   never touches already-running agents.
-- **Config key:** `[experimental] orchestrator = false` (default) sets the
-  startup value. TUI only — print mode (`-p`) ignores it entirely and emits
-  one unconditional stderr line,
-  `note: experimental.orchestrator is set but ignored in print mode (-p)`,
-  when the key is set, so a scripted run is never silently restricted.
-- **Exact toolset:** `read`, `grep`, `find`, `agent`, `list_agents`,
-  `stop_agent`, `send_message` — seven tools, hand-registered (never derived
-  by filtering a broader set). `write`, `edit`, and `bash` are not
-  registered at all, not just discouraged; `ls` is intentionally excluded
-  too (a test asserts the exact name list).
+- **Config key:** `[experimental] orchestrator = true` (default) sets the
+  startup value; set it to `false` to start in the classic single-agent mode.
+  TUI only — print mode (`-p`) ignores it entirely, so a scripted run is never
+  restricted.
+- **Exact toolset:** `agent`, `list_agents`, `stop_agent`, `send_message` —
+  four tools, hand-registered (never derived by filtering a broader set). No
+  file or shell tool (`read`, `grep`, `find`, `ls`, `write`, `edit`, `bash`)
+  is registered at all, not just discouraged (a test asserts the exact name
+  list).
 - **Off-mode guarantee:** with the mode off, the system prompt and tool
   specs sent to the provider are byte-identical to the pre-orchestrator
   (v0.12) behavior — pinned by a snapshot test.
-- **Status line:** shows `⎈ orchestrator` next to `think:`/`vendor:` while
-  the mode is on.
+- **Status line:** the badge marks the deviation, not the default. In
+  orchestrator mode (the default) there is no badge; turning it off shows
+  `⎈ solo` next to `think:`/`vendor:`.
 
 ## Known gaps
 

@@ -601,22 +601,15 @@ impl ToolRegistry {
     /// `agent::CONTROL_TOOLS` / `DENIED_TOOLS` for the same reason — it
     /// is its own closed list.
     ///
-    /// Registers exactly: `read`, `grep`, `find`, `agent`,
-    /// `list_agents`, `stop_agent`, `send_message`.
+    /// Registers exactly: `agent`, `list_agents`, `stop_agent`,
+    /// `send_message`.
     ///
-    /// `write`, `edit`, and `bash` are absent by design — orchestrator
-    /// mode plans and dispatches; it does not touch files or a shell
-    /// itself.
-    ///
-    /// `ls` is deliberately excluded too — D-03 and ROADMAP SC#2 both
-    /// enumerate the orchestrator tool set without it (research open
-    /// question 1, conservative resolution); adding it later is a
-    /// one-line change.
+    /// No file or shell tool (`read`, `grep`, `find`, `ls`, `write`,
+    /// `edit`, `bash`) is present by design — the orchestrator never
+    /// does concrete work itself, not even a quick look at a file; it
+    /// creates an agent for that and assigns the work to it.
     pub fn orchestrator() -> Self {
         let mut r = Self::new();
-        r.register(Arc::new(read::ReadTool));
-        r.register(Arc::new(grep::GrepTool));
-        r.register(Arc::new(find::FindTool));
         r.register(Arc::new(agent::AgentTool::new()));
         r.register(Arc::new(agent_ctl::ListAgentsTool::new()));
         r.register(Arc::new(agent_ctl::StopAgentTool::new()));
@@ -1312,19 +1305,15 @@ mod tests {
             r.names(),
             vec![
                 "agent",
-                "find",
-                "grep",
                 "list_agents",
-                "read",
                 "send_message",
                 "stop_agent",
             ]
         );
-        assert!(r.get("write").is_none());
-        assert!(r.get("edit").is_none());
-        assert!(r.get("bash").is_none());
-        assert!(r.get("ls").is_none());
-        assert_eq!(r.all_specs().len(), 7);
+        for t in ["write", "edit", "bash", "ls", "read", "grep", "find"] {
+            assert!(r.get(t).is_none(), "orchestrator must not have `{t}`");
+        }
+        assert_eq!(r.all_specs().len(), 4);
     }
 
     #[tokio::test]

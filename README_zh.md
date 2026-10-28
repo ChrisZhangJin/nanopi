@@ -43,6 +43,7 @@ Alpine 能跑，CentOS 6 能跑，`npm install` 跑不通的地方它也能跑�
 - 🛠 **流式工具调用** —— `read` / `write` / `edit` / `bash`，在 ratatui TUI 里实时渲染
 - 🪝 **Claude Code 协议的 hooks** —— JSON 走 stdin、退出码 2 表示拒绝的 shell 钩子，事件名沿用 PI 的命名（`tool_execution_start` / `tool_execution_end` / `input` / …）
 - 🧠 **Agent Skills** —— 遵循 [官方规范](https://agentskills.io/specification) 的 `SKILL.md` 发现 + `/skill:name` 展开
+- 🎛 **默认编排模式** —— TUI 里主 agent 自己不干活，每件事都派一个专属 agent 去做，运行状态实时显示在输入框下方
 
 ## 设计初衷 —— 为什么要做 nanopi
 
@@ -192,6 +193,44 @@ nanopi --fork <id>
 | `-C`, `--no-context-files` | false | 关闭 AGENTS.md / CLAUDE.md 自动发现 |
 | `--system-prompt <文本\|路径>` | — | 替换内置 system prompt |
 | `--append-system-prompt <文本\|路径>` | — | 追加到 system prompt 末尾（可重复） |
+
+## 编排模式（orchestrator）
+
+TUI 里主 agent 是一个**编排者**：它自己从不做具体的活儿——连"看一眼文件"
+都不做。它根本没有文件和 shell 工具，只有四个派发工具（`agent`、
+`list_agents`、`stop_agent`、`send_message`）。每件事都会变成一个专属
+agent：由它写 brief、派出去、盯着跑，最后把 report 汇总给你。
+
+agent 都在后台跑，所以编排者派完活就把这一轮还给你，而不是干等。正在跑
+的 agent 显示在 dock 最下方、footer 下面的一条 strip 里：
+
+```
+● main  3 agents working · Ctrl+G details
+○ yearning-dump        read raw.json                                 12s
+○ msg-framework-dev    bash cargo test                             1m05s
+○ write release notes  queued                                         0s
+```
+
+每一行是 agent 的名字、它最近一次工具调用（约每秒刷新一次）和已用时间。
+`Ctrl+G` 会把完整详情——活动历史、turns/tokens、worktree/分支、report
+路径——打印到 scrollback。agent 结束后就从 strip 里消失，它的 report 会
+注入到对话里，那才是看结果的地方。
+
+并行写代码的 agent 可以各自用一个 git worktree（`isolation: "worktree"`），
+结束后自动合并，有冲突则升级给你处理。
+
+想回到经典的单 agent 模式（主 agent 自己读文件、改文件、跑命令），在会话
+里用 `/orchestrator off`，或在启动时配置：
+
+```toml
+[experimental]
+orchestrator = false
+```
+
+状态行里的 `⎈ solo` 表示该模式已关闭；默认状态下不显示任何徽标。子 agent
+的各项上限在 `[agent]` 配置段里（见 `config.toml.example`）。这是 TUI 专属
+设置：`nanopi -p` 完全忽略它，始终保留全量工具集，脚本化运行不会被悄悄
+限制。
 
 ## Skills
 

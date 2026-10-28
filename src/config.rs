@@ -173,22 +173,30 @@ pub struct Config {
 
 /// `[experimental]` config: feature flags not yet promoted to a
 /// top-level, stable setting.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
-    /// Enables orchestrator mode (ORC-01..ORC-06): a restricted tool
+    /// Enables orchestrator mode (ORC-01..ORC-06): a dispatch-only tool
     /// registry plus a coordinator system prompt that plans and
-    /// delegates work to agents instead of editing files or running
-    /// shell commands directly.
+    /// delegates every concrete job to an agent instead of reading,
+    /// editing, or running shell commands itself.
     ///
-    /// TUI only — print mode (`nanopi -p`) ignores this flag and emits
-    /// a one-line stderr note if it is set (D-01). Default `false`.
+    /// TUI only — print mode (`nanopi -p`) ignores this flag entirely
+    /// (D-01), so a scripted run keeps its full tool set. Default
+    /// `true`: the interactive main flow is an orchestrator. Opt out
+    /// with:
     ///
     /// ```toml
     /// [experimental]
-    /// orchestrator = true
+    /// orchestrator = false
     /// ```
     pub orchestrator: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self { orchestrator: true }
+    }
 }
 
 /// `[agent]` config: caps for orchestrator-spawned `nanopi -p` children.
@@ -854,15 +862,15 @@ mod tests {
         assert_eq!(c.base_url, None);
     }
 
-    /// ORC-01: the orchestrator feature flag defaults off and only
-    /// flips on with an explicit `[experimental] orchestrator = true`.
+    /// ORC-01: orchestrator mode is the default main flow and only
+    /// turns off with an explicit `[experimental] orchestrator = false`.
     #[test]
-    fn experimental_orchestrator_defaults_false() {
+    fn experimental_orchestrator_defaults_true() {
         let empty: Config = toml::from_str("").unwrap();
-        assert!(!empty.experimental.orchestrator);
+        assert!(empty.experimental.orchestrator);
 
-        let on: Config = toml::from_str("[experimental]\norchestrator = true").unwrap();
-        assert!(on.experimental.orchestrator);
+        let off: Config = toml::from_str("[experimental]\norchestrator = false").unwrap();
+        assert!(!off.experimental.orchestrator);
     }
 
     #[test]

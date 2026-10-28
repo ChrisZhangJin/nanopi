@@ -5673,23 +5673,22 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         wrap_input_lines(app.input.lines(), input_width, app.input.cursor());
     let input_content_h = wrapped_rows.len().clamp(1, max_input_lines) as u16;
 
-    // Layout: [overlay/top-slack] + status(1) + strip(strip_h) +
-    // input(2 border+content) + footer(2) = DOCK_HEIGHT. `Min(0)` absorbs
-    // the slack at the top so the input box stays anchored just above the
-    // footer and grows upward; when an overlay is open it lands in that
-    // same top region. The strip sits between the status line and the
-    // input box per D-01, drawn from the row budget the input box would
-    // otherwise grow into (ratatui 0.29 cannot grow the fixed inline
-    // viewport per frame).
+    // Layout: [overlay/top-slack] + status(1) + input(2 border+content) +
+    // footer(2) + strip(strip_h) = DOCK_HEIGHT. `Min(0)` absorbs the slack
+    // at the top so the input box grows upward; when an overlay is open it
+    // lands in that same top region. The agents strip sits at the very
+    // bottom, under the footer (Claude Code style), drawn from the row
+    // budget the input box would otherwise grow into (ratatui 0.29 cannot
+    // grow the fixed inline viewport per frame).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),                      // palette / overlay / slack
             Constraint::Length(1),                   // status strip
-            Constraint::Length(strip_h),              // agents strip
             Constraint::Length(2 + input_content_h), // input box (borders + content)
             Constraint::Length(1),                   // cwd + branch
             Constraint::Length(1),                   // stats
+            Constraint::Length(strip_h),             // agents strip
         ])
         .split(area);
 
@@ -5715,7 +5714,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // Priority: tool running (blue bar) > turn thinking > blank.
     draw_status_strip(buf, chunks[1], app);
 
-    // ── Agents strip (UI-01, between status line and input box) ────
+    // ── Agents strip (UI-01, under the footer) ─────────────────────
     if strip_h > 0 {
         let toggle_key_label = app
             .bindings
@@ -5728,7 +5727,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             toggle_key_label,
             now: std::time::Instant::now(),
         };
-        agents_strip::draw_agents_strip(buf, chunks[2], &app.agents_view, &opts);
+        agents_strip::draw_agents_strip(buf, chunks[5], &app.agents_view, &opts);
     }
 
     // ── Input box ────────────────────────────────────────────────
@@ -5803,7 +5802,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     }
     let input_para = Paragraph::new(input_lines)
         .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
-    input_para.render(chunks[3], buf);
+    input_para.render(chunks[2], buf);
 
     // Line 1 of footer: cwd + branch + session
     let cwd_str = crate::render::status_line::cwd_display(&app.cwd);
@@ -5819,7 +5818,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         format!("  · session {}", sid_short),
         Style::default().fg(Color::DarkGray),
     ));
-    Paragraph::new(Line::from(l1)).render(chunks[4], buf);
+    Paragraph::new(Line::from(l1)).render(chunks[3], buf);
 
     // Line 2: tokens + cost + model + context ratio (PI-style)
     let mut l2: Vec<Span> = Vec::new();
@@ -5853,11 +5852,15 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             ));
         }
     }
-    // ORC-05: orchestrator-mode indicator, next to think:/vendor:.
-    if app.orchestrator {
+    // ORC-05: mode indicator, next to think:/vendor:. Orchestrator is
+    // the default main flow, so the badge marks the DEVIATION from it —
+    // `⎈ solo` means "this main agent edits and runs things itself".
+    // Showing a badge for the default would pin a permanent, no-signal
+    // segment to every status line.
+    if !app.orchestrator {
         l2.push(Span::raw(" · "));
         l2.push(Span::styled(
-            "⎈ orchestrator",
+            "⎈ solo",
             Style::default()
                 .fg(Color::Indexed(108))
                 .add_modifier(Modifier::ITALIC),
@@ -5894,7 +5897,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
                 .add_modifier(Modifier::ITALIC),
         ));
     }
-    Paragraph::new(Line::from(l2)).render(chunks[5], buf);
+    Paragraph::new(Line::from(l2)).render(chunks[4], buf);
 }
 
 /// Render the full tool output as an extension of the last tool card —
@@ -7902,11 +7905,11 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         draw_dock(&mut buf, area, &app);
-        // No "agents (" header anywhere in the buffer.
+        // No "● main" strip row anywhere in the buffer.
         let mut found = false;
         for y in 0..area.height {
             let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
-            if row.contains("agents (") {
+            if row.contains("● main") {
                 found = true;
             }
         }
@@ -7932,10 +7935,16 @@ mod tests {
             })
             .collect();
         let all = rows.join("\n");
-        assert!(all.contains("agents (2)"), "{all}");
-        assert!(all.contains("#a1"), "{all}");
-        assert!(all.contains("#a2"), "{all}");
-        assert!(all.contains("alpha") || all.contains("bravo"), "{all}");
+        assert!(all.contains("● main"), "{all}");
+        assert!(all.contains("2 agents working"), "{all}");
+        assert!(all.contains("○ alpha"), "{all}");
+        assert!(all.contains("○ bravo"), "{all}");
+        // The strip sits under the footer: `● main` comes after the input
+        // box and the last dock row is an agent row.
+        let main_idx = rows.iter().position(|r| r.contains("● main")).unwrap();
+        let input_idx = rows.iter().position(|r| r.starts_with("> ")).unwrap();
+        assert!(main_idx > input_idx + 2, "strip must be below the footer: {rows:#?}");
+        assert!(rows.last().unwrap().starts_with("○ "), "{rows:#?}");
     }
 
     #[test]
@@ -7986,8 +7995,8 @@ mod tests {
         // Palette renders (its own content, e.g. a slash command label).
         assert!(all.contains('/'), "palette should still render: {all}");
         // The strip must not show its full agent rows while the overlay
-        // is open — at most the header line ("agents (") may appear.
-        let header_count = rows.iter().filter(|r| r.contains("agents (")).count();
+        // is open — at most the "● main" line may appear.
+        let header_count = rows.iter().filter(|r| r.contains("● main")).count();
         assert!(header_count <= 1, "{all}");
     }
 
@@ -8028,16 +8037,12 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        let header_rows: Vec<&String> = rows.iter().filter(|r| r.contains("agents (")).collect();
+        let header_rows: Vec<&String> = rows.iter().filter(|r| r.contains("● main")).collect();
         assert_eq!(header_rows.len(), 1, "exactly one strip row: {rows:#?}");
-        // The row right after the header must not be an agent row
-        // (would start with the glyph/id, not blank/status/input chrome).
-        let header_idx = rows.iter().position(|r| r.contains("agents (")).unwrap();
-        assert!(
-            !rows[header_idx + 1].contains("#a1") && !rows[header_idx + 1].contains("#a2"),
-            "row after header must not be an agent row: {:?}",
-            rows[header_idx + 1]
-        );
+        // On a short terminal the `● main` row is the whole strip: it is
+        // the last dock row and no agent row is drawn.
+        assert!(rows.last().unwrap().starts_with("● main"), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.starts_with("○ ")), "no agent rows: {rows:#?}");
     }
 
     // ── Task 2: Ctrl+G toggle / Esc collapse / display-only ─────────
@@ -8243,10 +8248,7 @@ mod tests {
             after_names,
             vec![
                 "agent",
-                "find",
-                "grep",
                 "list_agents",
-                "read",
                 "send_message",
                 "stop_agent",
             ]
@@ -8392,10 +8394,7 @@ mod tests {
             live_names,
             vec![
                 "agent",
-                "find",
-                "grep",
                 "list_agents",
-                "read",
                 "send_message",
                 "stop_agent",
             ],
@@ -8478,10 +8477,13 @@ mod tests {
         assert_eq!(after_names, before_sorted, "registry must be left untouched");
     }
 
+    /// ORC-05: the status badge marks the deviation, not the default.
+    /// Orchestrator mode is the default main flow, so it gets NO badge;
+    /// turning it off surfaces `⎈ solo`.
     #[test]
-    fn status_line_shows_orchestrator_segment_when_on() {
+    fn status_line_shows_solo_segment_when_orchestrator_off() {
         let mut app = mkapp();
-        app.orchestrator = true;
+        app.orchestrator = false;
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         draw_dock(&mut buf, area, &app);
@@ -8493,18 +8495,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(all.contains("⎈ orchestrator"), "{all}");
+        assert!(all.contains("⎈ solo"), "{all}");
     }
 
     #[test]
-    fn status_line_omits_orchestrator_segment_when_off() {
+    fn status_line_omits_mode_segment_in_default_orchestrator_mode() {
         let app_on = {
             let mut a = mkapp();
             a.orchestrator = true;
             a
         };
-        let app_off = mkapp();
-        assert!(!app_off.orchestrator);
+        let app_off = {
+            let mut a = mkapp();
+            a.orchestrator = false;
+            a
+        };
         let area = Rect::new(0, 0, 80, 24);
 
         let mut buf_on = Buffer::empty(area);
@@ -8524,8 +8529,8 @@ mod tests {
         };
         let on_text = render(&buf_on);
         let off_text = render(&buf_off);
-        assert!(!off_text.contains("orchestrator"), "{off_text}");
-        assert!(on_text.contains("orchestrator"));
+        assert!(!on_text.contains('⎈'), "no badge in the default mode: {on_text}");
+        assert!(off_text.contains("⎈ solo"), "{off_text}");
     }
 }
 
