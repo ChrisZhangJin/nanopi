@@ -48,3 +48,37 @@ jobs:
         # hit intermittent spawn/wait races when everything runs in
         # parallel. Deterministic > fast on CI; local runs stay parallel.
         run: cargo test --all-targets -- --test-threads=1
+
+  # The release matrix ships a `windows-x86_64` binary, but every job
+  # above runs on Linux — so a `cfg`-gated break on Windows stayed
+  # invisible until a tag was pushed, and then only as one red job in a
+  # release that still uploaded its other nine assets. That is exactly
+  # how `libc::getppid()` reached `src/main.rs` unguarded in v0.13.0 and
+  # shipped two releases with no Windows binary at all.
+  #
+  # Scope matches what the release actually builds: lib + bin, no
+  # `--all-targets`. The test suite is Unix-centric by construction —
+  # it spawns shells, sends signals, and uses `std::os::unix` — so
+  # compiling it on Windows fails for reasons that say nothing about
+  # whether the shipped binary works.
+  #
+  # `RUSTFLAGS: -D warnings` rather than clippy: it promotes the two
+  # rustc diagnostics this class of bug produces (the unresolved-`libc`
+  # error and `signal_name`'s dead-code warning) without inheriting
+  # clippy's pre-existing, platform-independent opinions — those are
+  # why the Linux clippy step above is `continue-on-error`, and a new
+  # job that is red on day one teaches everyone to ignore it.
+  windows-check:
+    name: check (windows)
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check

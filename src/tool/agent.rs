@@ -1673,6 +1673,11 @@ impl ChildProgram {
 }
 
 /// Human name for a common signal number.
+///
+/// Unix-only: its sole caller sits inside a `cfg(unix)` block (a
+/// process cannot be "killed by a signal" on Windows), so without this
+/// gate it is dead code there and trips `-D warnings` in CI.
+#[cfg(unix)]
 fn signal_name(sig: i32) -> &'static str {
     match sig {
         1 => "SIGHUP",

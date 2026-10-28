@@ -221,25 +221,36 @@ async fn wait_for_term_signal() -> i32 {
 /// kernel delivers SIGKILL when the parent dies; the getppid check
 /// closes the race where the parent died before prctl ran. Returns
 /// false if the parent is already gone.
+///
+/// Windows has no `PDEATHSIG` equivalent and no `libc` in the
+/// dependency graph (it is declared under
+/// `[target.'cfg(unix)'.dependencies]`), so the whole body is unix-only
+/// and this is a no-op there. The `getppid` guard needs `cfg(unix)`
+/// rather than `cfg(target_os = "linux")` — it is POSIX, and macOS
+/// relies on it as its only parent-death check since `prctl` is
+/// Linux-only.
 fn install_parent_death_signal() -> bool {
-    let expected: Option<i32> = std::env::var("NANOPI_PARENT_PID")
-        .ok()
-        .and_then(|v| v.trim().parse().ok());
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(
-            libc::PR_SET_PDEATHSIG,
-            libc::SIGKILL as libc::c_ulong,
-            0,
-            0,
-            0,
-        );
-    }
-    if let Some(pid) = expected {
-        // SAFETY: getppid has no preconditions.
-        let ppid = unsafe { libc::getppid() };
-        if ppid != pid {
-            return false;
+    #[cfg(unix)]
+    {
+        let expected: Option<i32> = std::env::var("NANOPI_PARENT_PID")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
+        }
+        if let Some(pid) = expected {
+            // SAFETY: getppid has no preconditions.
+            let ppid = unsafe { libc::getppid() };
+            if ppid != pid {
+                return false;
+            }
         }
     }
     true
