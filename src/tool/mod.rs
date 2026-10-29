@@ -385,6 +385,29 @@ pub enum ExecutionMode {
 /// normalized further.
 pub const MCP_TOOL_PREFIX: &str = "mcp__";
 
+/// The stateless half of [`ToolRegistry::canonical_name`]: lowercase,
+/// then strip a trailing `_tool` unless the name is MCP-namespaced.
+///
+/// Exists as its own function because the rule has to be applied in two
+/// places — here, against the registry, and in `provider::openai`,
+/// which normalizes gateway-mangled names at the SSE source before any
+/// registry is in reach. Those were two independent copies, and they
+/// drifted the moment this MCP exception was added: the provider kept
+/// stripping unconditionally, so `mcp__github__search_tool` arrived as
+/// `mcp__github__search` and `canonical_name` then found an exact match
+/// for a *different* tool and dispatched it. One definition, two
+/// callers, so the next exception cannot reintroduce that.
+pub fn normalize_tool_name(name: &str) -> String {
+    let lowered = name.to_ascii_lowercase();
+    if lowered.starts_with(MCP_TOOL_PREFIX) {
+        return lowered;
+    }
+    lowered
+        .strip_suffix("_tool")
+        .map(str::to_string)
+        .unwrap_or(lowered)
+}
+
 /// Registry of tools, keyed by name.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -542,13 +565,13 @@ impl ToolRegistry {
         // nothing at the call site naming MCP as the reason — a silent
         // behaviour change nobody could trace back. The prefix is a
         // namespace we mint ourselves, so it stays ours to reason about.
-        let normalized = if lowered.starts_with(MCP_TOOL_PREFIX) {
-            lowered.as_str()
-        } else {
-            lowered.strip_suffix("_tool").unwrap_or(&lowered)
-        };
-        if self.tools.contains_key(normalized) {
-            return Some(normalized.to_string());
+        //
+        // The rule itself lives in `normalize_tool_name` because
+        // `provider::openai` has to apply the identical one at the SSE
+        // source; see that function's comment.
+        let normalized = normalize_tool_name(&lowered);
+        if self.tools.contains_key(&normalized) {
+            return Some(normalized);
         }
         None
     }

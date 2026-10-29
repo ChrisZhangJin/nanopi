@@ -179,14 +179,17 @@ fn json_error_message(v: &serde_json::Value) -> Option<String> {
 /// Undo the OpenAI-compat-gateway rewrite that turns Anthropic
 /// `tool_use.name = "bash"` into `"Bash_tool"` in the SSE
 /// `chat.completion.chunk.delta.tool_calls[].function.name` field.
-/// Lowercase + strip trailing `_tool`. Passes canonical names
-/// through unchanged.
+/// Passes already-canonical names through unchanged.
+///
+/// Delegates to [`crate::tool::normalize_tool_name`] so this and
+/// `ToolRegistry::canonical_name` cannot disagree. They used to be
+/// separate copies of the same rule, and drifted as soon as MCP added
+/// an exception to it — this path kept stripping unconditionally, so an
+/// MCP tool genuinely named `search_tool` arrived here as
+/// `mcp__github__search_tool`, left as `mcp__github__search`, and the
+/// registry then matched a *different* tool exactly and ran it.
 fn normalize_mangled_tool_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    lower
-        .strip_suffix("_tool")
-        .map(String::from)
-        .unwrap_or(lower)
+    crate::tool::normalize_tool_name(name)
 }
 
 use crate::provider::retry::{rand01, truncate};
@@ -922,6 +925,45 @@ mod tests {
     use super::*;
     use crate::agent::context::{ContextMessage, ToolSpec};
     use crate::event::AgentEvent;
+
+    /// The gateway-mangling fix-up here and
+    /// `ToolRegistry::canonical_name` must stay the same rule. They
+    /// were separate copies, and drifted the moment MCP added an
+    /// exception: this path still stripped `_tool` unconditionally, so
+    /// a server tool genuinely named `search_tool` arrived as
+    /// `mcp__github__search_tool`, was rewritten to
+    /// `mcp__github__search` before any registry saw it, and then
+    /// matched a *different* tool exactly — dispatched silently, with
+    /// the registry-side guard never consulted.
+    ///
+    /// Asserting equality against the shared function rather than
+    /// re-spelling the expected strings is deliberate: it fails if the
+    /// two ever diverge again, which is the actual invariant.
+    #[test]
+    fn mangled_name_fixup_matches_the_registry_rule() {
+        for name in [
+            "Bash_tool",
+            "ECHO_TOOL",
+            "read",
+            "mcp__github__search_tool",
+            "MCP__GITHUB__SEARCH_TOOL",
+            "mcp__x__y",
+        ] {
+            assert_eq!(
+                normalize_mangled_tool_name(name),
+                crate::tool::normalize_tool_name(name),
+                "diverged on {name:?}"
+            );
+        }
+
+        // The specific regression: an MCP name keeps its suffix.
+        assert_eq!(
+            normalize_mangled_tool_name("mcp__github__search_tool"),
+            "mcp__github__search_tool"
+        );
+        // ...while the mangling this fix-up exists for still works.
+        assert_eq!(normalize_mangled_tool_name("Bash_tool"), "bash");
+    }
 
     #[test]
     fn extract_error_from_plain_json() {
