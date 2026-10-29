@@ -376,6 +376,15 @@ pub enum ExecutionMode {
     Sequential,
 }
 
+/// Prefix every MCP-sourced tool is registered under:
+/// `mcp__<server>__<tool>`.
+///
+/// Named rather than spelled inline because two places have to agree on
+/// it: whatever registers MCP tools, and `canonical_name`, which uses it
+/// to recognise a name that is *already* canonical and must not be
+/// normalized further.
+pub const MCP_TOOL_PREFIX: &str = "mcp__";
+
 /// Registry of tools, keyed by name.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -500,14 +509,44 @@ impl ToolRegistry {
     /// history — otherwise the LLM sees a name in its own history that
     /// doesn't match the tools spec and thrashes with self-corrections.
     ///
-    /// Rule: lowercase, strip trailing `_tool`. If the result matches a
-    /// registered tool, return it; else None.
+    /// Rule: lowercase, strip trailing `_tool` — except for
+    /// [`MCP_TOOL_PREFIX`] names, which are never suffix-stripped. If
+    /// the result matches a registered tool, return it; else None.
     pub fn canonical_name(&self, name: &str) -> Option<String> {
         if self.tools.contains_key(name) {
             return Some(name.to_string());
         }
-        let normalized = name.to_ascii_lowercase();
-        let normalized = normalized.strip_suffix("_tool").unwrap_or(&normalized);
+        let lowered = name.to_ascii_lowercase();
+        // The two normalizations are not equally safe, so MCP keeps one
+        // and loses the other.
+        //
+        // Suffix-stripping *invents* a name the model never sent, and
+        // under MCP's `mcp__<server>__<tool>` scheme the invented name
+        // is a plausible other tool: a server's genuine `search_tool`
+        // arrives as `mcp__github__search_tool` and would resolve to
+        // `mcp__github__search` — a different tool, dispatched silently.
+        // Built-ins can't hit this (no built-in is a `_tool`-suffixed
+        // form of another built-in), which is why the rule only ever
+        // helped there.
+        //
+        // Lowercasing stays: it can only map to a name the registry
+        // already holds, so the failure mode is a miss, not a wrong
+        // dispatch. It does mean an MCP server exposing two tools
+        // differing only in case gets one unreachable by mangled name —
+        // acceptable against losing the `ECHO_TOOL` recovery this
+        // whole fallback exists for.
+        //
+        // Keyed on the `mcp__` prefix, not on "contains `__`". The
+        // broad rule would change behaviour for any plugin whose author
+        // happened to put a double underscore in a tool name, with
+        // nothing at the call site naming MCP as the reason — a silent
+        // behaviour change nobody could trace back. The prefix is a
+        // namespace we mint ourselves, so it stays ours to reason about.
+        let normalized = if lowered.starts_with(MCP_TOOL_PREFIX) {
+            lowered.as_str()
+        } else {
+            lowered.strip_suffix("_tool").unwrap_or(&lowered)
+        };
         if self.tools.contains_key(normalized) {
             return Some(normalized.to_string());
         }
@@ -768,6 +807,46 @@ mod tests {
         // Unrelated names must still miss.
         assert!(r.get("something_tool").is_none());
         assert!(r.get("random").is_none());
+    }
+
+    /// MCP registers tools as `mcp__<server>__<tool>`, so a server tool
+    /// genuinely named `search_tool` is a *registered* name ending in
+    /// `_tool`. The blanket suffix-strip rewrote it to
+    /// `mcp__x__search` — a different tool on the same server, which
+    /// then got dispatched with nothing in the output to say so.
+    #[test]
+    fn canonical_name_never_strips_tool_suffix_from_mcp_names() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakePluginTool {
+            name: "mcp__x__search_tool",
+        }));
+        r.register(Arc::new(FakePluginTool {
+            name: "mcp__x__search",
+        }));
+        assert_eq!(
+            r.canonical_name("mcp__x__search_tool").as_deref(),
+            Some("mcp__x__search_tool"),
+            "must round-trip, not collide with its sibling"
+        );
+
+        // Without the sibling the strip has nowhere wrong to land, but
+        // it must still not invent a name the server never exposed.
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakePluginTool {
+            name: "mcp__x__search",
+        }));
+        assert_eq!(r.canonical_name("mcp__x__search_tool"), None);
+
+        // Lowercasing is deliberately kept for MCP, prefix included —
+        // the gateways that upper-case names don't stop at `mcp__`.
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(FakePluginTool {
+            name: "mcp__x__search_tool",
+        }));
+        assert_eq!(
+            r.canonical_name("MCP__X__SEARCH_TOOL").as_deref(),
+            Some("mcp__x__search_tool")
+        );
     }
 
     /// v0.11.0: extensions register through `register_external`, which
