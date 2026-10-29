@@ -327,6 +327,17 @@ pub enum ToolSource {
     /// stem) plus the path it was loaded from, so a user who sees an
     /// unexpected tool can find the file that supplied it.
     Plugin { name: String, path: String },
+    /// A tool borrowed from an MCP server: the server's name as written
+    /// in `mcp.json`, plus where that server actually is.
+    ///
+    /// `endpoint` is the same "which file supplied this?" answer
+    /// `Plugin.path` gives, for a thing that is not a file: the command
+    /// line for a stdio server, the URL once a remote transport exists.
+    /// It matters more here than it does for plugins — a stdio server is
+    /// an unsandboxed subprocess with the user's full privileges
+    /// (`docs/mcp.md`), so "what am I actually running?" is a security
+    /// question, not a curiosity.
+    Mcp { server: String, endpoint: String },
 }
 
 #[async_trait]
@@ -613,7 +624,12 @@ impl ToolRegistry {
             .values()
             .filter_map(|t| match t.source() {
                 ToolSource::Plugin { name, .. } => Some(name),
-                ToolSource::Builtin => None,
+                // An MCP server is not a plugin and must not be returned
+                // here: the only caller feeds this straight into
+                // `unregister_plugin`, so an MCP server name leaking out
+                // would have the WASM reload path tear down tools it
+                // never loaded and cannot put back.
+                ToolSource::Mcp { .. } | ToolSource::Builtin => None,
             })
             .collect();
         n.sort();
@@ -1037,6 +1053,68 @@ mod tests {
                 path: "/tmp/my-plugin/my-plugin.component.wasm".into(),
             }
         );
+    }
+
+    /// Stands in for an MCP-supplied tool. Same shape as
+    /// `FakePluginTool`, different `source()` — which is the whole point.
+    struct FakeMcpTool {
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Tool for FakeMcpTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "from an MCP server".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+            unreachable!("not executed in these tests")
+        }
+        fn source(&self) -> ToolSource {
+            ToolSource::Mcp {
+                server: "github".into(),
+                endpoint: "npx -y @modelcontextprotocol/server-github".into(),
+            }
+        }
+    }
+
+    /// An MCP tool is attributed to its server, and is NOT a plugin.
+    ///
+    /// The second half is the one with teeth: `plugin_names()` feeds the
+    /// `/reload` path straight into `unregister_plugin`, so an MCP
+    /// server name leaking out of it would make a plugin reload silently
+    /// deregister tools it never loaded and has no way to restore.
+    #[test]
+    fn an_mcp_tool_is_attributed_to_its_server_and_is_not_a_plugin() {
+        let mut r = ToolRegistry::standard();
+        r.register_external(Arc::new(FakeMcpTool { name: "mcp__github__search" }))
+            .expect("the MCP name does not collide");
+        r.register_external(Arc::new(FakePluginTool { name: "greet" }))
+            .expect("greet does not collide");
+
+        let src = r
+            .entries()
+            .into_iter()
+            .find(|(spec, _)| spec.name == "mcp__github__search")
+            .map(|(_, src)| src)
+            .expect("the MCP tool is listed");
+        assert_eq!(
+            src,
+            ToolSource::Mcp {
+                server: "github".into(),
+                endpoint: "npx -y @modelcontextprotocol/server-github".into(),
+            }
+        );
+
+        assert_eq!(r.plugin_names(), vec!["my-plugin".to_string()]);
+        assert_eq!(r.plugin_tool_names(), vec!["greet".to_string()]);
+        assert!(
+            r.unregister_plugin("github").is_empty(),
+            "a plugin reload must not be able to unregister an MCP tool"
+        );
+        assert!(r.get("mcp__github__search").is_some(), "still callable");
     }
 
     /// Sorted, because the registry is a `HashMap` and an unsorted

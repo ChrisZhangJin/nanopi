@@ -157,9 +157,10 @@ fn load_extensions(
         let name = tool.spec().name.clone();
         let subject = match tool.source() {
             ToolSource::Plugin { path, .. } => path,
-            // Unreachable — these all came from `load_all` — but a
-            // built-in here should still be reported, not dropped.
-            ToolSource::Builtin => String::new(),
+            // Unreachable — these all came from `load_all`, so nothing
+            // built-in or MCP-sourced can arrive here — but one that did
+            // should still be reported, not dropped.
+            ToolSource::Mcp { .. } | ToolSource::Builtin => String::new(),
         };
         if let Err(collision) = registry.register_external(tool) {
             notices.push(Notice::warn(
@@ -639,7 +640,7 @@ impl Agent {
         for tool in summary.tools {
             let subject = match tool.source() {
                 ToolSource::Plugin { path, .. } => path,
-                ToolSource::Builtin => String::new(),
+                ToolSource::Mcp { .. } | ToolSource::Builtin => String::new(),
             };
             if let Err(collision) = self.registry.register_external(tool) {
                 report.notes.push(format!(
