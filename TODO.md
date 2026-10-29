@@ -25,7 +25,7 @@ against rather than a speculative one.
 
 ---
 
-## M0 — Fix `canonical_name()` before anything registers
+## ✅ M0 — Fix `canonical_name()` before anything registers
 
 `ToolRegistry::canonical_name()` (`src/tool/mod.rs`) lowercases and strips a
 `_tool` suffix. A server tool named `search_tool` would register as
@@ -38,7 +38,7 @@ prefix, or drop the suffix-stripping for external tools generally.
 **ACCEPTANCE** `canonical_name("mcp__x__search_tool")` round-trips unchanged;
 existing built-in canonicalisation tests still pass.
 
-## M1 — Protocol types and JSON-RPC codec
+## ✅ M1 — Protocol types and JSON-RPC codec
 
 New `src/mcp/protocol.rs`. Pure serde, no I/O.
 
@@ -52,7 +52,7 @@ New `src/mcp/protocol.rs`. Pure serde, no I/O.
 payload from the spec, including an unknown content-block type (must not fail
 the whole response) and a protocol error.
 
-## M2 — stdio transport
+## ✅ M2 — stdio transport
 
 New `src/mcp/stdio.rs`.
 
@@ -83,7 +83,7 @@ New `src/mcp/client.rs`.
 paginated `tools/list` returns every tool; a server that fails `initialize`
 ends `Failed` with the reason preserved, and does not abort startup.
 
-## M4 — Configuration
+## ✅ M4 — Configuration
 
 New `src/mcp/config.rs` + `paths::global_mcp_path()`.
 
@@ -104,7 +104,7 @@ Use the de-facto ecosystem shape so existing configs paste in unchanged:
 is left untouched, reports the line, and startup continues. Tests cover an
 empty `mcpServers`, an entry missing `command`, and a duplicate name.
 
-## M5 — Tool adapter
+## 🔶 M5 — Tool adapter (mapping done, `impl Tool` waits on M3)
 
 New `src/mcp/tool.rs`: `impl Tool for McpTool`, modelled on
 `impl Tool for WasmTool` (`src/wasm/host.rs`).
