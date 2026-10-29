@@ -127,6 +127,18 @@ pub fn global_models_path() -> Option<PathBuf> {
     nanopi_home().map(|h| h.join("models.json"))
 }
 
+/// The global `mcp.json` (see `crate::mcp::config`).
+///
+/// Global only, with no project-local sibling, for the same reason as
+/// [`global_models_path`] above: `trust::check_trust_status` returns
+/// `NoProjectResources` only while `<cwd>/.nanopi` does not exist, so a
+/// project-scoped `mcp.json` would flip every repo that adopted one to
+/// `NeedsPrompt` — which resolves as *untrusted* and silently disables
+/// that repo's skills, `SYSTEM.md` overrides and project agents.
+pub fn global_mcp_path() -> Option<PathBuf> {
+    nanopi_home().map(|h| h.join("mcp.json"))
+}
+
 /// Rustyline history file.
 pub fn history_path() -> Option<PathBuf> {
     nanopi_home().map(|h| h.join("history.txt"))

@@ -6,6 +6,7 @@ pub mod command;
 pub mod config;
 pub mod event;
 pub mod keys;
+pub mod mcp;
 pub mod paths;
 pub mod model_catalogue;
 pub mod models;
