@@ -12,3 +12,7 @@
 pub mod config;
 /// JSON-RPC envelope and the MCP wire types. Pure serde, no I/O.
 pub mod protocol;
+/// stdio transport: server as a child process over newline-delimited JSON.
+pub mod stdio;
+/// `Tool` adapter and `CallToolResult` -> `ToolOutput` mapping.
+pub mod tool;
