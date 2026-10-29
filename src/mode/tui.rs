@@ -3661,17 +3661,36 @@ async fn handle_action(
                 let g = agent_slot.lock().await;
                 g.as_ref().map(|a| a.registry.entries()).unwrap_or_default()
             };
+            // Counted per source rather than as "everything that is not
+            // built-in". The old summary read `N from plugins` off that
+            // negation, which was accurate while `Plugin` was the only
+            // external source and became a lie the moment an MCP server
+            // registered a tool — and the whole point of this listing is
+            // to answer "where did this tool come from?" truthfully.
             let plugin_count = entries
                 .iter()
-                .filter(|(_, src)| !matches!(src, crate::tool::ToolSource::Builtin))
+                .filter(|(_, src)| matches!(src, crate::tool::ToolSource::Plugin { .. }))
+                .count();
+            let mcp_count = entries
+                .iter()
+                .filter(|(_, src)| matches!(src, crate::tool::ToolSource::Mcp { .. }))
                 .count();
             insert_line(
                 term,
                 Line::from(vec![Span::styled(
                     format!(
-                        "Callable tools ({}, {} from plugins)",
+                        "Callable tools ({}, {} from plugins{})",
                         entries.len(),
-                        plugin_count
+                        plugin_count,
+                        if mcp_count > 0 {
+                            format!(", {mcp_count} from MCP")
+                        } else {
+                            // Silent when no server is configured: MCP
+                            // is opt-in, and `, 0 from MCP` on every
+                            // `/tools` would advertise a feature at the
+                            // cost of the line it is printed on.
+                            String::new()
+                        }
                     ),
                     Style::default()
                         .fg(Color::Indexed(108))
@@ -3682,6 +3701,7 @@ async fn handle_action(
                 let tag = match src {
                     crate::tool::ToolSource::Builtin => "[builtin]".to_string(),
                     crate::tool::ToolSource::Plugin { name, .. } => format!("[plugin:{name}]"),
+                    crate::tool::ToolSource::Mcp { server, .. } => format!("[mcp:{server}]"),
                 };
                 insert_line(
                     term,
@@ -3707,7 +3727,17 @@ async fn handle_action(
                         ),
                     ]),
                 )?;
-                if let crate::tool::ToolSource::Plugin { path, .. } = src {
+                // Second line: where the tool came from. `path` for a
+                // plugin, the command line or URL for an MCP server —
+                // the same question, and for MCP a security-relevant
+                // one, since a stdio server is an unsandboxed
+                // subprocess.
+                let origin = match src {
+                    crate::tool::ToolSource::Plugin { path, .. } => Some(path.clone()),
+                    crate::tool::ToolSource::Mcp { endpoint, .. } => Some(endpoint.clone()),
+                    crate::tool::ToolSource::Builtin => None,
+                };
+                if let Some(path) = origin {
                     insert_line(
                         term,
                         Line::from(vec![Span::styled(

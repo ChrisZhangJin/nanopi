@@ -265,6 +265,14 @@ fn call_tool_gated(
             "error: tool {name:?} is supplied by extension {owner:?} — \
              host-call-tool reaches built-in tools only"
         ),
+        // Refused for the same reason a plugin tool is, and then some: a
+        // stdio MCP server is an unsandboxed subprocess, so letting a
+        // sandboxed plugin reach one through this door would hand it the
+        // user's full privileges by proxy.
+        Some(crate::tool::ToolSource::Mcp { server, .. }) => format!(
+            "error: tool {name:?} is supplied by MCP server {server:?} — \
+             host-call-tool reaches built-in tools only"
+        ),
         Some(crate::tool::ToolSource::Builtin) => {
             let out = crate::plugin_tools::call_blocking(plugin_name, name, args_json);
             // A refusal is not a call. `call_blocking` returns the bare
