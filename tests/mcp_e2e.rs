@@ -62,6 +62,9 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home/.nanopi");
         std::fs::create_dir_all(&home).expect("home");
+        // Its own `$TMPDIR`, so the parent↔child socket directory this
+        // run creates is findable and nothing else's is in the way.
+        std::fs::create_dir_all(dir.join("tmp")).expect("tmp");
         let script = dir.join("server.sh");
         std::fs::write(&script, SERVER_SH).expect("script");
         let (server_pid, helper_pid) = (dir.join("server.pid"), dir.join("helper.pid"));
@@ -93,6 +96,7 @@ impl Fixture {
             .arg("go")
             .env("HOME", self.dir.join("home"))
             .env("NANOPI_HOME", self.dir.join("home/.nanopi"))
+            .env("TMPDIR", self.dir.join("tmp"))
             .env_remove("NANOPI_AGENT_ID")
             .env_remove("NANOPI_PARENT_PID")
             .stdin(Stdio::null())
@@ -102,6 +106,20 @@ impl Fixture {
             cmd.env(k, v);
         }
         cmd.spawn().expect("spawn nanopi")
+    }
+
+    /// The parent↔child channel's directory for this process
+    /// (`mcp::ipc`): `$TMPDIR/nanopi-<pid>`.
+    fn ipc_dir(&self, child: &std::process::Child) -> PathBuf {
+        self.dir.join("tmp").join(format!("nanopi-{}", child.id()))
+    }
+
+    /// The channel is created before the first model request, so a run
+    /// held mid-turn must already have it; this is what makes the
+    /// "gone afterwards" assertions mean something.
+    fn assert_ipc_socket_exists(&self, child: &std::process::Child) {
+        let socket = self.ipc_dir(child).join("mcp.sock");
+        assert!(socket.exists(), "no channel socket at {} while the run is live", socket.display());
     }
 
     /// Pids once the server has started. Waits on the file, not a clock.
@@ -334,6 +352,8 @@ fn a_print_run_calls_an_mcp_tool_and_leaves_no_server_behind() {
     let (server, helper) = fx.pids();
     assert_dies("MCP server", server);
     assert_dies("the helper the server backgrounded", helper);
+    // The socket and its directory go with the run.
+    assert!(!fx.ipc_dir(&child).exists(), "the channel directory survived a normal exit");
 }
 
 /// The Ctrl-C path. The run is held mid-turn by the model, so the
@@ -349,10 +369,15 @@ fn ctrl_c_stops_every_mcp_server_before_the_run_ends() {
     wait_in_flight(&model, &mut child);
     let (server, helper) = fx.pids();
     assert!(alive(server) && alive(helper));
+    fx.assert_ipc_socket_exists(&child);
 
     signal(&child, libc::SIGINT);
     assert_dies("MCP server", server);
     assert_dies("the helper the server backgrounded", helper);
+    // Removed by the interrupt itself, like the servers: the run is
+    // still alive here. Ordered before the servers stop, so by now it
+    // has happened.
+    assert!(!fx.ipc_dir(&child).exists(), "the channel directory survived Ctrl-C");
     assert!(
         child.try_wait().unwrap().is_none(),
         "the run is still mid-turn, so it was the interrupt that stopped the servers"
@@ -374,12 +399,15 @@ fn sigterm_leaves_no_mcp_server_behind() {
     let mut child = fx.spawn(model.port, &[], &[]);
     wait_in_flight(&model, &mut child);
     let (server, helper) = fx.pids();
+    fx.assert_ipc_socket_exists(&child);
 
     signal(&child, libc::SIGTERM);
     let status = wait_exit(&mut child);
     assert_eq!(status.code(), Some(143), "{status:?}");
     assert_dies("MCP server", server);
     assert_dies("the helper the server backgrounded", helper);
+    // Only a destructor runs on this path (the whole future is dropped).
+    assert!(!fx.ipc_dir(&child).exists(), "the channel directory survived SIGTERM");
     model.release.store(true, Ordering::SeqCst);
 }
 
@@ -447,6 +475,8 @@ fn a_spawned_child_agent_connects_to_no_mcp_server() {
     // The process has exited, so startup is entirely in the past: if it
     // were going to spawn the server it already has.
     assert!(!fx.server_pid.exists(), "a child agent started an MCP server");
+    // Nor does a child listen for other children: it has nothing to proxy.
+    assert!(!fx.ipc_dir(&child).exists(), "a child agent created a channel directory");
     let requests = model.requests.lock().unwrap().clone();
     assert!(!requests.is_empty());
     assert!(
