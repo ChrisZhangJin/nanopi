@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent_registry::ChildGuard;
 use crate::mcp::config::ServerConfig;
+use crate::mcp::protocol::method::{CANCELLED, INITIALIZE};
 use crate::mcp::protocol::{
     error_code, Incoming, Notification, Request, RequestId, Response, ResponsePayload, RpcError,
 };
@@ -451,41 +452,72 @@ impl StdioTransport {
         timeout: Duration,
     ) -> Result<Value, TransportError> {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::Relaxed));
+        // Encoded before anything is registered, so the two failures that
+        // are our fault (`Encode`, `Framing`) leave nothing to clean up
+        // and the connection stays usable.
+        let line = encode_line(&Request::new(id.clone(), method, params))?;
+
         let (tx, rx) = oneshot::channel();
         // Registered before the write, so a reply that arrives while we
         // are still inside `write_all` has somewhere to go.
         self.shared.register(id.clone(), tx)?;
 
-        let request = Request::new(id.clone(), method, params);
-        if let Err(e) = send_line(&self.stdin, &request).await {
-            match e {
-                // Our fault, not the server's: nothing reached the
-                // pipe and the connection is still usable.
-                e @ (TransportError::Encode(_) | TransportError::Framing) => {
+        // From here the request is in flight, and this future being
+        // dropped rather than finishing means the caller no longer wants
+        // the answer. See [`InFlight`].
+        let mut in_flight = InFlight {
+            id: id.clone(),
+            shared: Arc::clone(&self.shared),
+            stdin: Arc::clone(&self.stdin),
+            write: None,
+            // The spec forbids cancelling `initialize`; the only way it
+            // is ever abandoned is startup giving up on the server,
+            // which kills the process anyway.
+            cancellable: method != INITIALIZE,
+            armed: true,
+        };
+
+        // The write runs detached and is awaited through its handle. A
+        // `write_all` dropped half way leaves a partial line in the pipe
+        // and the next message is glued onto it — silent
+        // desynchronisation of every later request, for every other
+        // caller sharing this pipe. Abandoning a request is now an
+        // ordinary event (the parent↔child channel aborts proxied calls
+        // when a child goes away), so it must not be able to do that.
+        let stdin = Arc::clone(&self.stdin);
+        // The handle lives in `in_flight` while it is awaited, so a drop
+        // during the write still lets the cancellation queue behind it.
+        let write = in_flight
+            .write
+            .insert(tokio::spawn(async move { write_line(&stdin, &line).await }));
+        let written = match write.await {
+            Ok(result) => result,
+            Err(join) => Err(TransportError::Closed(format!("the write task failed: {join}"))),
+        };
+        in_flight.write = None;
+        if let Err(e) = written {
+            // The pipe is gone. `EPIPE` is simply how a server that
+            // has already exited presents itself on the write side,
+            // and the reader task is a moment away from reporting
+            // the same event with the exit status and the stderr
+            // attached. Waiting for that rather than returning the
+            // raw `Io` keeps "the server is dead" a single variant
+            // — M3 would otherwise have to treat two as one, and
+            // whichever it forgot would be the one users hit.
+            in_flight.disarm();
+            return match tokio::time::timeout(WRITE_FAILURE_GRACE, rx).await {
+                Ok(Ok(reply)) => reply,
+                _ => {
                     self.shared.forget(&id);
-                    return Err(e);
+                    Err(TransportError::Closed(e.to_string()))
                 }
-                // The pipe is gone. `EPIPE` is simply how a server that
-                // has already exited presents itself on the write side,
-                // and the reader task is a moment away from reporting
-                // the same event with the exit status and the stderr
-                // attached. Waiting for that rather than returning the
-                // raw `Io` keeps "the server is dead" a single variant
-                // — M3 would otherwise have to treat two as one, and
-                // whichever it forgot would be the one users hit.
-                e => {
-                    return match tokio::time::timeout(WRITE_FAILURE_GRACE, rx).await {
-                        Ok(Ok(reply)) => reply,
-                        _ => {
-                            self.shared.forget(&id);
-                            Err(TransportError::Closed(e.to_string()))
-                        }
-                    };
-                }
-            }
+            };
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        let outcome = tokio::time::timeout(timeout, rx).await;
+        // Whatever happened, the request is finished: nothing to cancel.
+        in_flight.disarm();
+        match outcome {
             Ok(Ok(reply)) => reply,
             // The sender was dropped without sending. `close` always
             // sends, so this is only reachable if the reader task died
@@ -833,14 +865,14 @@ async fn drain_stderr(
 // ------------------------------------------------------------- plumbing
 
 /// Serialise one message and write it as a single line.
-///
-/// The lock spans the payload *and* its newline: two concurrent
-/// `tools/call`s that interleaved would produce two unparseable lines
-/// and desynchronise the stream permanently.
 async fn send_line<T: Serialize>(
     stdin: &AsyncMutex<Option<ChildStdin>>,
     message: &T,
 ) -> Result<(), TransportError> {
+    write_line(stdin, &encode_line(message)?).await
+}
+
+fn encode_line<T: Serialize>(message: &T) -> Result<String, TransportError> {
     let line = serde_json::to_string(message)?;
     // The spec forbids an embedded newline because the newline *is* the
     // frame. `serde_json` escapes `\n` inside strings, so this holds
@@ -850,7 +882,16 @@ async fn send_line<T: Serialize>(
     if line.contains('\n') || line.contains('\r') {
         return Err(TransportError::Framing);
     }
+    Ok(line)
+}
 
+/// The lock spans the payload *and* its newline: two concurrent
+/// `tools/call`s that interleaved would produce two unparseable lines
+/// and desynchronise the stream permanently.
+async fn write_line(
+    stdin: &AsyncMutex<Option<ChildStdin>>,
+    line: &str,
+) -> Result<(), TransportError> {
     let mut guard = stdin.lock().await;
     let Some(writer) = guard.as_mut() else {
         return Err(TransportError::Closed(
@@ -861,6 +902,73 @@ async fn send_line<T: Serialize>(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// A request that has been (or is being) written and has not resolved.
+/// Dropping it while still armed means the future that owned the request
+/// was dropped before the reply — the caller gave up — and the server is
+/// told so with `notifications/cancelled`.
+///
+/// **This exists because the server otherwise keeps working.** The id of
+/// a request lives only inside
+/// [`StdioTransport::request_with_timeout`], so nobody outside it could
+/// ever name it in a cancellation. The consumer is the parent↔child
+/// channel (`mcp::ipc`): when a child agent is stopped, the proxied tool
+/// call it had in flight is dropped here, and without this a browser step
+/// or a long query runs to completion for nobody. It also removes the
+/// pending slot, which a dropped future used to leak.
+///
+/// Not armed for a timeout: the caller is still here and is told. A
+/// timed-out call is therefore still not cancelled server-side, which is
+/// the existing documented behaviour and is left alone.
+struct InFlight {
+    id: RequestId,
+    shared: Arc<Shared>,
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
+    /// The detached write of the request itself while it may still be
+    /// pending. The cancellation queues behind it so it cannot overtake
+    /// the request it refers to — a `cancelled` for an id the server has
+    /// not seen yet is ignored by spec, and the call would run anyway.
+    write: Option<JoinHandle<Result<(), TransportError>>>,
+    cancellable: bool,
+    armed: bool,
+}
+
+impl InFlight {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.shared.forget(&self.id);
+        if !self.cancellable {
+            return;
+        }
+        // No runtime means the process is tearing down: nobody is left to
+        // tell, and spawning would panic.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let write = self.write.take();
+        let stdin = Arc::clone(&self.stdin);
+        let params = serde_json::json!({
+            "requestId": self.id,
+            "reason": "the caller abandoned the request",
+        });
+        runtime.spawn(async move {
+            if let Some(write) = write {
+                let _ = write.await;
+            }
+            // Best effort: a dead pipe means the server is gone, which
+            // cancels the work just as well.
+            let _ = send_line(&stdin, &Notification::new(CANCELLED, Some(params))).await;
+        });
+    }
 }
 
 /// Poll for the child's exit for up to `grace`. `true` if it exited.
@@ -1233,6 +1341,114 @@ mod tests {
         // read loop and the `sleep` is definitely running.
         t.request("tools/list", None).await.unwrap();
 
+        assert_no_stray_process(t).await;
+    }
+
+    /// A server that logs every line it receives, and never answers.
+    #[cfg(unix)]
+    fn logging_server(log: &std::path::Path) -> ServerConfig {
+        config(&format!(
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done",
+            log.display()
+        ))
+    }
+
+    /// Wait for `log` to contain `needle`; the deadline only fires on a
+    /// genuine failure.
+    #[cfg(unix)]
+    async fn wait_for_log(log: &std::path::Path, needle: &str) -> String {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(Instant::now() < until, "never saw {needle:?} in {text:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The reason the transport exposes a request's id at all: a caller
+    /// that gives up must be able to stop the server's work, and only
+    /// the transport knows which id that is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoning_a_request_tells_the_server_to_cancel_it() {
+        let log = std::env::temp_dir().join(format!("nanopi-stdio-cancel-{}", crate::util::uuid::v7()));
+        let t = Arc::new(StdioTransport::spawn(&logging_server(&log)).await.unwrap());
+
+        let call = {
+            let t = Arc::clone(&t);
+            tokio::spawn(async move { t.request("tools/call", Some(json!({"name": "slow"}))).await })
+        };
+        // The server has the request: the cancellation has something to
+        // refer to, and the abort below lands mid-wait rather than
+        // before the write.
+        let text = wait_for_log(&log, "\"tools/call\"").await;
+        let sent: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        call.abort();
+        let _ = call.await;
+
+        let text = wait_for_log(&log, "notifications/cancelled").await;
+        let cancelled: serde_json::Value =
+            serde_json::from_str(text.lines().find(|l| l.contains("cancelled")).unwrap()).unwrap();
+        assert_eq!(cancelled["params"]["requestId"], sent["id"], "named the wrong request");
+        assert!(cancelled.get("id").is_none(), "a notification carries no id");
+
+        // The abandoned slot is gone, and the connection still works.
+        assert!(t.close_reason().is_none());
+        let _ = std::fs::remove_file(&log);
+        let t = Arc::try_unwrap(t).expect("the aborted task released its handle");
+        assert_no_stray_process(t).await;
+    }
+
+    /// A timeout is not an abandonment: the caller is told, and the
+    /// documented behaviour (no server-side cancel) is unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_request_is_not_cancelled() {
+        let log = std::env::temp_dir().join(format!("nanopi-stdio-nocancel-{}", crate::util::uuid::v7()));
+        let t = StdioTransport::spawn(&logging_server(&log)).await.unwrap();
+
+        let err = t
+            .request_with_timeout("tools/call", None, Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Timeout { .. }), "{err:?}");
+        // A later request round-trips through the same pipe, so by the
+        // time its line is logged anything the timeout had queued would
+        // be too.
+        let probe = t.notify("probe", None).await;
+        assert!(probe.is_ok());
+        let text = wait_for_log(&log, "\"probe\"").await;
+        assert!(!text.contains("cancelled"), "{text}");
+
+        let _ = std::fs::remove_file(&log);
+        assert_no_stray_process(t).await;
+    }
+
+    /// The spec forbids cancelling `initialize`; the only way it is
+    /// abandoned is startup giving up, and the server dies anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initialize_is_never_cancelled() {
+        let log = std::env::temp_dir().join(format!("nanopi-stdio-init-{}", crate::util::uuid::v7()));
+        let t = Arc::new(StdioTransport::spawn(&logging_server(&log)).await.unwrap());
+
+        let init = {
+            let t = Arc::clone(&t);
+            tokio::spawn(async move { t.request("initialize", None).await })
+        };
+        wait_for_log(&log, "\"initialize\"").await;
+        init.abort();
+        let _ = init.await;
+        let probe = t.notify("probe", None).await;
+        assert!(probe.is_ok());
+        let text = wait_for_log(&log, "\"probe\"").await;
+        assert!(!text.contains("cancelled"), "{text}");
+
+        let _ = std::fs::remove_file(&log);
+        let t = Arc::try_unwrap(t).expect("the aborted task released its handle");
         assert_no_stray_process(t).await;
     }
 

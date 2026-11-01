@@ -273,6 +273,11 @@ pub async fn run_print_mode(
     // (`main.rs` drops this whole future) and every early return. See
     // `McpManager::kill_now` for why drop-based cleanup is not enough.
     let _mcp_kill_guard = mcp.kill_on_drop();
+    // The socket child agents reach those servers through (`mcp::ipc`).
+    // `None` for a child itself, whose manager is empty. Held so SIGTERM
+    // and early returns remove it too.
+    #[cfg(unix)]
+    let _mcp_ipc = crate::mcp::ipc::start_for_session(&mcp);
 
     // D-01: print mode never restricts its tool registry or prompt based
     // on `experimental.orchestrator` (on by default for the TUI) — a
@@ -427,6 +432,10 @@ pub async fn run_print_mode(
                 if let Some(reg) = crate::agent_registry::global() {
                     reg.stop_all();
                 }
+                // Channel first, so nothing starts a call into servers
+                // that are about to stop.
+                #[cfg(unix)]
+                crate::mcp::ipc::shutdown_global();
                 // Servers die with the agents, not whenever the turn
                 // happens to finish: this listener replaces the default
                 // SIGINT disposition, so nothing else on this path
@@ -599,6 +608,10 @@ pub async fn run_print_mode(
     // Normal completion. After the agent task, not inside it: the
     // drain's one extra turn may still call MCP tools. Early returns
     // above this line are covered by the transports' drop guards.
+    // Channel first: no child may start a call into servers being
+    // stopped, and in-flight proxied calls are cancelled with it.
+    #[cfg(unix)]
+    crate::mcp::ipc::shutdown_global();
     mcp.shutdown().await;
     // The listener's only job was flipping `ctrl_c_interrupted` for the
     // agent task above; nothing reads it after this point, and leaving it
