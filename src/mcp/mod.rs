@@ -10,6 +10,9 @@
 
 /// Handshake, tool listing/calls and connection state over a transport.
 pub mod client;
+/// Child→parent channel for proxied MCP calls. Unix only; see `docs/mcp-ipc.md`.
+#[cfg(unix)]
+pub mod ipc;
 /// Owns all server connections: concurrent connect, registration, shutdown.
 pub mod manager;
 /// Server definitions read from `<nanopi_home>/mcp.json`.
