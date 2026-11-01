@@ -202,6 +202,18 @@ impl Tool for StopAgentTool {
     }
 }
 
+/// Said when a continued agent had MCP tools but its grant is not ours.
+const MCP_NOT_CARRIED_OVER: &str = "this agent was dispatched with MCP tools by an earlier nanopi \
+process; MCP grants do not carry over between processes, so it continues without them. Dispatch a \
+new agent with those tools if it needs them.";
+
+/// Whether a brief's front matter lists an MCP tool. Only ever used to
+/// decide whether to *mention* something — never to grant anything.
+fn brief_listed_mcp_tools(brief_text: &str) -> bool {
+    brief::front_matter_get(brief_text, "tools")
+        .is_some_and(|t| t.to_ascii_lowercase().contains(crate::tool::MCP_TOOL_PREFIX))
+}
+
 /// `send_message` (CTL-02/CTL-06): amend a running agent's brief, or
 /// continue a finished one under the same id. An id absent from this
 /// process's in-memory registry is adopted from
@@ -306,7 +318,17 @@ impl Tool for SendMessageTool {
         let prepared = agent::prepare_continue(&l, &id, &entry.dir, &ctx.cwd);
         agent::spawn_continue_background(&reg, prepared);
 
-        Ok(ok_json(json!({ "id": id, "delivered": "continuing" })))
+        let mut result = json!({ "id": id, "delivered": "continuing" });
+        // An agent adopted from an earlier process was granted its MCP
+        // tools by *that* process's channel, which is gone with its
+        // servers, and nothing is carried over from `brief.md` (the agent
+        // can write that file, so it cannot be where authority is read
+        // from). Continuing it without them silently would leave the
+        // model to wonder why the tools vanished.
+        if reg.recorded_agent_tools(&id).is_none() && brief_listed_mcp_tools(&existing) {
+            result["note"] = json!(MCP_NOT_CARRIED_OVER);
+        }
+        Ok(ok_json(result))
     }
 }
 
@@ -357,6 +379,19 @@ mod tests {
             std::fs::write(dir.join("report.md"), report).unwrap();
         }
         dir
+    }
+
+    /// The note for an adopted agent keys off what the brief *says* — a
+    /// pointer for the model, never an authority.
+    #[test]
+    fn the_adoption_note_is_triggered_by_mcp_names_in_the_brief_front_matter() {
+        let with = "---\nid: a1\ntools: read, mcp__demo__echo\n---\n\n# Brief\n";
+        let without = "---\nid: a1\ntools: read, grep\n---\n\n# Brief\n";
+        let all = "---\nid: a1\ntools: (all)\n---\n\n# Brief\n";
+        assert!(brief_listed_mcp_tools(with));
+        assert!(!brief_listed_mcp_tools(without));
+        assert!(!brief_listed_mcp_tools(all));
+        assert!(!brief_listed_mcp_tools("no front matter, tools: mcp__x__y"));
     }
 
     #[tokio::test]

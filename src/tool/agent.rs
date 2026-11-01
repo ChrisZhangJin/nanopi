@@ -676,19 +676,46 @@ pub(crate) const CONTROL_TOOLS: &[&str] = &["send_message", "stop_agent", "list_
 /// Canonicalize and validate an inline `tools` override before spawn
 /// (D-04). Rejects deny-listed names (`agent`/`subagent`, elevation of
 /// privilege) and unknown names, listing the allowed set. Returns the
-/// canonical names, deduplicated in input order. Pure.
+/// canonical names, deduplicated in input order.
+///
+/// `mcp__…` names are accepted when the parent's channel serves them
+/// (`mcp::catalogue`, which reads `ipc::global()` — the dispatch path has
+/// no handle on the session's manager, and a global was already there for
+/// `build_child_env`). That is also why this is not threaded a parameter:
+/// every dispatch shape (single, parallel, chain, background) funnels
+/// through here. An unknown MCP name is an error that lists the ones
+/// that do exist.
 fn validate_tools(tools: &[String]) -> Result<Vec<String>, String> {
+    validate_tools_with(tools, &crate::mcp::catalogue::available_names())
+}
+
+/// [`validate_tools`] with the MCP names that exist given explicitly,
+/// which is what lets it stay pure and be tested without a live channel.
+fn validate_tools_with(tools: &[String], mcp_available: &[String]) -> Result<Vec<String>, String> {
     let registry = crate::tool::ToolRegistry::standard();
     let allowed: Vec<String> = registry
         .names()
         .into_iter()
         .filter(|n| !DENIED_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(n)))
+        .chain(mcp_available.iter().cloned())
         .collect();
     let mut bad: Vec<String> = Vec::new();
+    let mut bad_mcp: Vec<String> = Vec::new();
     let mut out: Vec<String> = Vec::new();
     for t in tools {
         if DENIED_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(t)) {
             bad.push(t.clone());
+            continue;
+        }
+        if crate::mcp::proxy::is_mcp_name(t) {
+            // Registered names are always lowercase, so that is the form
+            // the grant must carry: it is matched exactly.
+            let name = t.trim().to_ascii_lowercase();
+            if !mcp_available.contains(&name) {
+                bad_mcp.push(t.clone());
+            } else if !out.contains(&name) {
+                out.push(name);
+            }
             continue;
         }
         match registry.canonical_name(t) {
@@ -706,12 +733,33 @@ fn validate_tools(tools: &[String]) -> Result<Vec<String>, String> {
             None => bad.push(t.clone()),
         }
     }
+    let mut errors: Vec<String> = Vec::new();
     if !bad.is_empty() {
-        return Err(format!(
+        errors.push(format!(
             "unknown or denied tool(s): {}. Allowed tools: {}",
             bad.join(", "),
             allowed.join(", ")
         ));
+    }
+    if !bad_mcp.is_empty() {
+        errors.push(if mcp_available.is_empty() {
+            // No channel means no MCP tool can be given to an agent:
+            // none configured, the servers did not start, or this
+            // platform has no parent-child channel yet.
+            format!(
+                "unknown MCP tool(s): {}. No MCP tools are available to agents in this session",
+                bad_mcp.join(", ")
+            )
+        } else {
+            format!(
+                "unknown MCP tool(s): {}. Available MCP tools: {}",
+                bad_mcp.join(", "),
+                mcp_available.join(", ")
+            )
+        });
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
     }
     Ok(out)
 }
@@ -1282,6 +1330,95 @@ pub(crate) struct PreparedRun {
     /// ISO-01: isolation was requested but ignored (not a git repo / no
     /// `git` on PATH, D-08) — surfaced to the model as a warning.
     warning: Option<String>,
+    /// The MCP tools this run's agent may call through the parent. Granted
+    /// in `run_body`, which both dispatch paths and `send_message`
+    /// continuation reach, so there is one place that has to be right.
+    mcp: McpAccess,
+}
+
+/// The MCP tools an agent was dispatched with, and the channel that will
+/// enforce them.
+///
+/// The channel is looked up when the run is *prepared* and carried along,
+/// rather than looked up in `run_body`, so a test can hand a run its own
+/// server instead of installing the process-wide one (which would race
+/// every other test that asserts there is none).
+struct McpAccess {
+    /// Registered names (`mcp__server__tool`), lowercase.
+    tools: Vec<String>,
+    #[cfg(unix)]
+    server: Option<Arc<crate::mcp::ipc::IpcServer>>,
+}
+
+impl McpAccess {
+    /// What `tools` (an agent's whole `tools` list) asks of the channel:
+    /// just its `mcp__…` names. The list was validated against the
+    /// channel by `validate_tools` when the model supplied it inline;
+    /// an agent *file's* own list is not validated, and a name the channel
+    /// does not serve is harmless — it is granted, and can never be
+    /// listed or called.
+    fn for_tools(tools: &[String]) -> Self {
+        Self {
+            tools: tools
+                .iter()
+                .filter(|t| crate::mcp::proxy::is_mcp_name(t))
+                .map(|t| t.trim().to_ascii_lowercase())
+                .collect(),
+            #[cfg(unix)]
+            server: crate::mcp::ipc::global(),
+        }
+    }
+}
+
+/// An agent's grant on the parent's channel, held for as long as its
+/// process can run. Dropping it revokes — on normal exit, and when the
+/// dispatch future is dropped (a stop, Ctrl-C), so a finished or killed
+/// agent's id can never be used again.
+struct McpGrant {
+    #[cfg(unix)]
+    held: Option<(Arc<crate::mcp::ipc::IpcServer>, String)>,
+}
+
+impl McpGrant {
+    /// Grant *before* the child is spawned: the child connects as soon as
+    /// it starts, and an id with no grant is refused at the handshake.
+    /// Nothing is granted to an agent with no MCP tools, so the channel
+    /// refuses it outright rather than serving it an empty list.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn acquire(access: &McpAccess, id: &str) -> Self {
+        #[cfg(unix)]
+        {
+            if let (false, Some(server)) = (access.tools.is_empty(), &access.server) {
+                server.grant(id, access.tools.iter().cloned());
+                return Self { held: Some((Arc::clone(server), id.to_string())) };
+            }
+            Self { held: None }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Tie the grant to the spawned process, right after the spawn
+    /// returns (see `IpcServer::bind_process`): a sibling that learned
+    /// this agent's id cannot then use its tools.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn bind(&self, pid: u32) {
+        #[cfg(unix)]
+        if let Some((server, id)) = &self.held {
+            server.bind_process(id, pid);
+        }
+    }
+}
+
+impl Drop for McpGrant {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some((server, id)) = self.held.take() {
+            server.revoke(&id);
+        }
+    }
 }
 
 impl PreparedRun {
@@ -1379,6 +1516,13 @@ fn prepare_run(
         }
     }
 
+    let mcp = McpAccess::for_tools(&tools);
+    if !mcp.tools.is_empty() {
+        // For `send_message` on this agent once it has finished: see
+        // `prepare_continue`.
+        reg.record_agent_tools(&id, tools.clone());
+    }
+
     let mut command = l.program.command();
     command
         .args(build_child_args(
@@ -1400,6 +1544,7 @@ fn prepare_run(
         timeout: l.spec.timeout,
         worktree,
         warning,
+        mcp,
     })
 }
 
@@ -1416,6 +1561,7 @@ pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> Tool
         timeout,
         worktree,
         warning,
+        mcp,
     } = prepared;
     let mut sg = StateGuard {
         reg,
@@ -1429,8 +1575,22 @@ pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> Tool
     let _permit = reg.acquire_run().await;
     reg.set_state(&id, AgentState::Running);
 
-    let mut out =
-        spawn_and_collect_with(command, timeout, |pid| reg.set_pid(&id, pid)).await;
+    // Declared after `sg`, so a cancelled dispatch revokes before `sg`
+    // marks the agent Stopped (and so continuable): the other order would
+    // let a continuation's fresh grant be revoked by this one's drop.
+    // Taken here, not at dispatch, so an agent still queued behind
+    // `max_concurrency` holds no authority.
+    let grant = McpGrant::acquire(&mcp, &id);
+    let mut out = spawn_and_collect_with(command, timeout, |pid| {
+        reg.set_pid(&id, pid);
+        grant.bind(pid);
+    })
+    .await;
+    // The process is gone, so the authority goes with it — explicitly,
+    // and *before* the state below becomes terminal: from that instant a
+    // `send_message` may continue this agent and grant it afresh, and a
+    // revoke arriving afterwards would take that grant away.
+    drop(grant);
 
     let status = out
         .metadata
@@ -1588,9 +1748,18 @@ or sleep for it: tell the user it has started and end your turn.";
 /// carries the amendment appended by the caller). Pure apart from
 /// reading `l`'s resolved spec/program.
 pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -> PreparedRun {
+    // A continued agent is spawned afresh, so it needs its MCP grant
+    // afresh too — `run_body` revoked the last one when the agent ended —
+    // and its `--tools`, or the new child would have no proxies for them.
+    // Both come from what *this process* recorded at dispatch, never from
+    // `brief.md`, which the agent can edit. An agent without MCP tools was
+    // not recorded and continues exactly as it always did; one adopted
+    // from an earlier process was never recorded here and continues
+    // without MCP (the caller says so).
+    let tools = l.registry.recorded_agent_tools(id).unwrap_or_default();
     let mut command = l.program.command();
     command
-        .args(build_child_args(&l.spec, dir, &[], None))
+        .args(build_child_args(&l.spec, dir, &tools, None))
         .envs(build_child_env(&l.spec, id))
         // CTL-06 T-04-06-04: see the same env_remove in prepare_run.
         .env_remove("NANOPI_RUN_ID")
@@ -1602,6 +1771,7 @@ pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -
         timeout: l.spec.timeout,
         worktree: None,
         warning: None,
+        mcp: McpAccess::for_tools(&tools),
     }
 }
 
@@ -2310,6 +2480,57 @@ mod tests {
         assert!(validate_tools(&["agent_tool".into()]).is_err());
         assert!(validate_tools(&["AGENT_TOOL".into()]).is_err());
         assert!(validate_tools(&["Agent_Tool".into()]).is_err());
+    }
+
+    fn mcp_names() -> Vec<String> {
+        vec!["mcp__demo__echo".to_string(), "mcp__demo__other".to_string()]
+    }
+
+    #[test]
+    fn validate_tools_accepts_an_mcp_name_the_channel_serves() {
+        let out = validate_tools_with(
+            &["read".into(), "MCP__Demo__Echo".into(), "mcp__demo__echo".into()],
+            &mcp_names(),
+        )
+        .unwrap();
+        // Lowercase, deduplicated, in input order, beside the built-ins.
+        assert_eq!(out, vec!["read".to_string(), "mcp__demo__echo".to_string()]);
+    }
+
+    #[test]
+    fn validate_tools_rejects_an_unknown_mcp_name_and_lists_the_available_ones() {
+        let err = validate_tools_with(&["mcp__demo__nope".into()], &mcp_names()).unwrap_err();
+        assert!(err.contains("mcp__demo__nope"), "{err}");
+        assert!(err.contains("mcp__demo__echo") && err.contains("mcp__demo__other"), "{err}");
+        // A name that merely looks like another tool's is not accepted by
+        // prefix or by `_tool` stripping.
+        assert!(validate_tools_with(&["mcp__demo__echo_tool".into()], &mcp_names()).is_err());
+    }
+
+    #[test]
+    fn validate_tools_says_so_when_no_mcp_tool_exists_at_all() {
+        let err = validate_tools_with(&["mcp__demo__echo".into()], &[]).unwrap_err();
+        assert!(err.contains("No MCP tools are available"), "{err}");
+    }
+
+    #[test]
+    fn validate_tools_still_denies_agent_next_to_mcp_names() {
+        let err = validate_tools_with(
+            &["mcp__demo__echo".into(), "agent".into(), "mcp__demo__nope".into()],
+            &mcp_names(),
+        )
+        .unwrap_err();
+        // Both complaints survive, and neither hides the other.
+        assert!(err.contains("unknown or denied tool(s): agent"), "{err}");
+        assert!(err.contains("unknown MCP tool(s): mcp__demo__nope"), "{err}");
+    }
+
+    #[test]
+    fn validate_tools_lists_mcp_names_among_the_allowed_for_a_typo() {
+        let err = validate_tools_with(&["raed".into()], &mcp_names()).unwrap_err();
+        let allowed = err.split("Allowed tools: ").nth(1).unwrap();
+        assert!(allowed.contains("mcp__demo__echo"), "{err}");
+        assert!(!allowed.split(", ").any(|n| n == "agent"), "{err}");
     }
 
     #[test]
@@ -3272,5 +3493,205 @@ mod tests {
         assert!(!wt.path.exists() || report.contains("merged") || report.contains("CONFLICT"));
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The parent's side of MCP for agents: a real channel in front of a
+    /// real (fake) server, and children that are `sh` scripts.
+    #[cfg(unix)]
+    mod mcp_grants {
+        use super::*;
+        use crate::mcp::ipc::{IpcClient, IpcError, IpcServer};
+        use crate::mcp::manager::{testing::fake_server, ManagerOptions, McpManager};
+        use std::time::Instant;
+
+        const TOOL: &str = "mcp__fake__echo";
+
+        /// Records its argv, announces itself, then waits for a release
+        /// file in its own agent dir — long enough for the test to look.
+        fn waiting_script() -> String {
+            format!(
+                "d=\"$(dirname \"$4\")\"; echo \"$*\" >> \"$d/argv.log\"; touch \"$d/started\"; \
+                 while [ ! -f \"$d/release\" ]; do sleep 0.01; done; echo '{OK_ENV}'"
+            )
+        }
+
+        struct World {
+            manager: McpManager,
+            server: Arc<IpcServer>,
+            cwd: PathBuf,
+            l: Launcher,
+        }
+
+        impl World {
+            async fn new(tag: &str) -> Self {
+                let cwd = tmp(tag);
+                let cfg = fake_server("fake", "", &["echo"]);
+                let manager = McpManager::connect(vec![cfg], ManagerOptions::default()).await;
+                assert_eq!(manager.tool_count(), 1, "{:?}", manager.status());
+                let server = IpcServer::start_in(&cwd, &manager).expect("channel");
+                let l = launcher(&waiting_script(), 8, 4);
+                Self { manager, server, cwd, l }
+            }
+
+            fn agent(&self) -> AgentConfig {
+                AgentConfig {
+                    tools: Some(vec!["read".into(), TOOL.into()]),
+                    ..agent_fixture()
+                }
+            }
+
+            fn dir(&self, id: &str) -> PathBuf {
+                self.cwd.join(".nanopi/agents").join(self.l.registry.run_id()).join(id)
+            }
+
+            /// Run `prepared` to completion on its own task, with this
+            /// world's channel in front of it.
+            fn run(&self, mut prepared: PreparedRun) -> tokio::task::JoinHandle<ToolOutput> {
+                prepared.mcp.server = Some(Arc::clone(&self.server));
+                let reg = Arc::clone(&self.l.registry);
+                tokio::spawn(async move { run_body(&reg, prepared).await })
+            }
+
+            async fn finish(self) {
+                self.server.shutdown();
+                self.manager.shutdown().await;
+                let _ = std::fs::remove_dir_all(&self.cwd);
+            }
+        }
+
+        /// Wait on the fact, not a clock; the deadline only fires when
+        /// something is genuinely broken.
+        async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !cond() {
+                assert!(Instant::now() < deadline, "never saw: {what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn granted(w: &World, id: &str) -> Option<Vec<String>> {
+            w.server.granted_tools(id)
+        }
+
+        /// One run, start to finish: granted before the child exists,
+        /// bound to the child's pid, revoked when it ends.
+        async fn one_run(w: &World, id: &str, prepared: PreparedRun) -> ToolOutput {
+            let dir = w.dir(id);
+            let _ = std::fs::remove_file(dir.join("started"));
+            let _ = std::fs::remove_file(dir.join("release"));
+            let run = w.run(prepared);
+
+            until("the child to start", || dir.join("started").exists()).await;
+            // The child is up, so the grant must already be there: it was
+            // made before the spawn, not after.
+            assert_eq!(granted(w, id), Some(vec![TOOL.to_string()]), "grant before spawn");
+
+            // The grant is bound to the spawned process: this test
+            // process is not that process, so it cannot use the id.
+            match IpcClient::connect(w.server.socket_path(), id).await {
+                Err(IpcError::Refused(_)) => {}
+                Ok(_) => panic!("a stranger connected as {id}: the grant was not bound to the child's pid"),
+                Err(e) => panic!("unexpected: {e}"),
+            }
+
+            std::fs::write(dir.join("release"), "").unwrap();
+            let out = run.await.expect("run_body");
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(granted(w, id), None, "revoked once the agent ended");
+            out
+        }
+
+        #[tokio::test]
+        async fn a_dispatched_agent_is_granted_before_spawn_and_revoked_when_it_ends() {
+            let w = World::new("grant-basic").await;
+            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None).unwrap();
+            one_run(&w, "a1", prepared).await;
+
+            let argv = std::fs::read_to_string(w.dir("a1").join("argv.log")).unwrap();
+            assert!(argv.contains(&format!("--tools read,{TOOL}")), "{argv}");
+            w.finish().await;
+        }
+
+        /// The continuation that used to lose MCP silently: the agent is
+        /// spawned a second time and needs a fresh grant *and* the same
+        /// `--tools`.
+        #[tokio::test]
+        async fn a_continued_agent_gets_a_fresh_grant_and_its_tools() {
+            let w = World::new("grant-continue").await;
+            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None).unwrap();
+            one_run(&w, "a1", prepared).await;
+            assert_eq!(granted(&w, "a1"), None);
+
+            // What `send_message` does for a finished agent.
+            w.l.registry.reactivate("a1").unwrap();
+            let again = prepare_continue(&w.l, "a1", &w.dir("a1"), &w.cwd);
+            assert_eq!(again.mcp.tools, vec![TOOL.to_string()]);
+            one_run(&w, "a1", again).await;
+
+            let argv = std::fs::read_to_string(w.dir("a1").join("argv.log")).unwrap();
+            let runs: Vec<&str> = argv.lines().collect();
+            assert_eq!(runs.len(), 2, "{argv}");
+            assert!(
+                runs[1].contains(&format!("--tools read,{TOOL}")),
+                "the continued child must be launched with its tools, or it has no proxies: {}",
+                runs[1]
+            );
+            w.finish().await;
+        }
+
+        /// A continued agent that never had MCP tools is launched exactly
+        /// as before: no `--tools`, no grant.
+        #[tokio::test]
+        async fn continuing_an_agent_without_mcp_tools_is_unchanged() {
+            let w = World::new("grant-none").await;
+            let plain = agent_fixture();
+            let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None).unwrap();
+            assert!(prepared.mcp.tools.is_empty());
+            drop(prepared);
+            w.l.registry.reactivate("a1").ok();
+            let again = prepare_continue(&w.l, "a1", &w.dir("a1"), &w.cwd);
+            assert!(again.mcp.tools.is_empty());
+            let args: Vec<String> = again
+                .command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(!args.iter().any(|a| a == "--tools"), "{args:?}");
+            w.finish().await;
+        }
+
+        /// What an agent could do by editing its own `brief.md`: nothing.
+        /// The record a continuation reads is the parent's memory.
+        #[tokio::test]
+        async fn a_continuation_ignores_the_tools_an_agent_wrote_into_its_brief() {
+            let w = World::new("grant-forged").await;
+            let plain = agent_fixture();
+            let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None).unwrap();
+            drop(prepared);
+            let brief = w.dir("a1").join("brief.md");
+            let text = std::fs::read_to_string(&brief).unwrap();
+            std::fs::write(&brief, text.replace("tools: read, grep", &format!("tools: read, {TOOL}"))).unwrap();
+            w.l.registry.reactivate("a1").ok();
+            let again = prepare_continue(&w.l, "a1", &w.dir("a1"), &w.cwd);
+            assert!(again.mcp.tools.is_empty(), "{:?}", again.mcp.tools);
+            w.finish().await;
+        }
+
+        /// Stopping an agent drops the dispatch future; the grant must go
+        /// with it, or a killed agent's id stays usable.
+        #[tokio::test]
+        async fn a_stopped_agent_is_revoked() {
+            let w = World::new("grant-stop").await;
+            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None).unwrap();
+            let run = w.run(prepared);
+            until("the child to start", || w.dir("a1").join("started").exists()).await;
+            assert!(granted(&w, "a1").is_some());
+
+            run.abort();
+            let _ = run.await;
+            until("the grant to be revoked", || granted(&w, "a1").is_none()).await;
+            w.finish().await;
+        }
     }
 }
