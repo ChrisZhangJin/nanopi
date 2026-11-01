@@ -168,7 +168,7 @@ result; parent death fails the call cleanly rather than hanging the child;
 no new orphan processes. Design note: `docs/mcp-ipc.md` (unix socket under `$TMPDIR`, mode 0700; reuses
 `mcp::protocol`; per-agent allowlist enforced by the parent; unix-only first).
 
-## M10 — Complete option C (design: docs/mcp-ipc.md)
+## ✅ M10 — Complete option C (design: docs/mcp-ipc.md)
 
 - Orchestrator gets the MCP tool **list** (names + descriptions) so it can name
   them in a brief, without being able to call them
@@ -179,6 +179,17 @@ no new orphan processes. Design note: `docs/mcp-ipc.md` (unix socket under `$TMP
 **ACCEPTANCE** An orchestrator dispatches an agent that successfully calls an
 MCP tool; process count is one parent plus one per server regardless of
 `agent.max_concurrency`.
+
+As built (`tests/mcp_agent_e2e.rs` drives it through a print-mode parent,
+since orchestrator mode is TUI-only): the `agent` tool's `tools` field takes
+`mcp__…` names (`validate_tools`); `tool::agent::run_body` grants before the
+spawn, binds the pid right after and revokes on exit or stop — both dispatch
+paths and `send_message` continuation go through it; the child builds proxy
+tools from `--tools` (`mcp::proxy`); the orchestrator's prompt carries a
+capped catalogue (`mcp::catalogue`, applied by the TUI's one recompose
+helper). Known gap: a `send_message` continuation of an agent adopted from an
+*earlier process* continues without its MCP tools (the grants lived in that
+process's channel) and says so in its result.
 
 ## M11 — `/mcp` interactive
 

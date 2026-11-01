@@ -338,6 +338,43 @@ impl IpcServer {
         self.inner.state.lock().unwrap().grants.remove(agent_id);
     }
 
+    /// Registered names of every tool the channel can serve, sorted.
+    /// What `validate_tools` checks an `agent` dispatch against.
+    pub fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.inner.tools.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Registered name and description of every tool, sorted by name:
+    /// the orchestrator's catalogue. Descriptions are the server's own
+    /// text and come back unbounded; capping them is the caller's job
+    /// (`mcp::catalogue`), because what is safe to show a model is a
+    /// property of the prompt, not of the channel.
+    pub fn catalogue(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .inner
+            .tools
+            .values()
+            .map(|t| {
+                let def = t.definition();
+                (def.name, def.description.unwrap_or_default())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The tools `agent_id` is currently granted, sorted; `None` when it
+    /// has no grant. For tests and diagnostics.
+    pub fn granted_tools(&self, agent_id: &str) -> Option<Vec<String>> {
+        let state = self.inner.state.lock().unwrap();
+        let grant = state.grants.get(agent_id)?;
+        let mut tools: Vec<String> = grant.mcp_tools.iter().cloned().collect();
+        tools.sort();
+        Some(tools)
+    }
+
     /// Ids with a live connection. For tests and diagnostics.
     pub fn connected_agents(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.inner.state.lock().unwrap().connected.iter().cloned().collect();

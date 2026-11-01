@@ -212,8 +212,19 @@ pub async fn run_print_mode(
     // `--tools`: built-in names restrict the standard set; any other
     // name may be a WASM plugin tool, resolved once extensions load
     // (D-14). Unlisted plugin tools are never registered.
+    //
+    // `mcp__…` names are split off first and never reach that routing: they
+    // would be filed as plugin candidates, and one that no loaded plugin
+    // supplies is a hard "unknown tool" error below. Only a spawned child
+    // honours them (its tools come from the parent over `mcp::ipc`); in
+    // any other run they stay where they were, an unknown name.
+    let (mcp_allow, non_mcp_allow) = if child.agent_mode {
+        crate::mcp::proxy::split_mcp_names(&tools_allow)
+    } else {
+        (Vec::new(), tools_allow.clone())
+    };
     let (builtin_allow, _, plugin_candidates) =
-        crate::tool::split_tool_allowlist(&tools_allow, &[]);
+        crate::tool::split_tool_allowlist(&non_mcp_allow, &[]);
     let mut registry = if tools_allow.is_empty() {
         if child.agent_mode {
             ToolRegistry::standard()
@@ -226,7 +237,13 @@ pub async fn run_print_mode(
         ToolRegistry::standard_with_allowlist(&builtin_allow).map_err(|e| anyhow::anyhow!("{e}"))?
     };
     if !tools_allow.is_empty() {
-        registry.set_plugin_allowlist(&plugin_candidates);
+        // The MCP names ride along in the allowlist because
+        // `register_external` is also how the proxies below get in, and
+        // it drops anything the allowlist does not name. `--tools` listed
+        // them, so that is what the allowlist should say.
+        let mut allowed = plugin_candidates.clone();
+        allowed.extend(mcp_allow.iter().cloned());
+        registry.set_plugin_allowlist(&allowed);
     }
     // Depth 1 (D-05): a child never gets the agent tool, even if the
     // parent listed it. CTL control tools (T-04-06) are stripped the
@@ -269,6 +286,11 @@ pub async fn run_print_mode(
     )
     .await;
     mcp.register_into(&mut registry);
+    // A child's MCP tools: stand-ins that call through the parent. After
+    // the allowlist is set (they pass it) and before the registry moves
+    // into the Agent. A child with *only* MCP tools has no built-ins by
+    // here: `builtin_allow` is empty, so the registry started empty.
+    crate::mcp::proxy::register_proxies(&mut registry, &mcp_allow).await;
     // Covers the exits that never reach the `shutdown` below: SIGTERM
     // (`main.rs` drops this whole future) and every early return. See
     // `McpManager::kill_now` for why drop-based cleanup is not enough.

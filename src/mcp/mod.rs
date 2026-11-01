@@ -8,6 +8,8 @@
 //! already in the tree), so a feature gate would buy nothing but a
 //! second build configuration to keep green.
 
+/// The tool list the orchestrator's system prompt carries (names and capped descriptions).
+pub mod catalogue;
 /// Handshake, tool listing/calls and connection state over a transport.
 pub mod client;
 /// Child→parent channel for proxied MCP calls. Unix only; see `docs/mcp-ipc.md`.
@@ -15,6 +17,8 @@ pub mod client;
 pub mod ipc;
 /// Owns all server connections: concurrent connect, registration, shutdown.
 pub mod manager;
+/// A child agent's MCP tools: `Tool`s that forward each call to the parent.
+pub mod proxy;
 /// Server definitions read from `<nanopi_home>/mcp.json`.
 pub mod config;
 /// JSON-RPC envelope and the MCP wire types. Pure serde, no I/O.

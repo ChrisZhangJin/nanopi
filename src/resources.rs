@@ -505,7 +505,7 @@ pub fn format_skills_for_prompt_mode(skills: &[Skill], delegating: bool) -> Stri
     out
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

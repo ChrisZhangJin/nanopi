@@ -143,7 +143,7 @@ fn fnv1a32(server: &str, tool: &str) -> u32 {
 /// right); anything else non-object is replaced by the permissive
 /// schema, since passing it on would only move the failure to the
 /// provider.
-fn parameters_schema(schema: Value) -> Value {
+pub(crate) fn parameters_schema(schema: Value) -> Value {
     match schema {
         Value::Object(mut m) => match m.get("type") {
             Some(Value::String(t)) if t == "object" => Value::Object(m),
@@ -361,9 +361,9 @@ impl Tool for McpTool {
 /// How much of a server-supplied error string reaches the model. An RPC
 /// message or a transport reason can embed a stack trace or a stderr
 /// dump, and one failed call should not spend the context on it.
-const ERROR_DETAIL_BYTES: usize = 1_000;
+pub(crate) const ERROR_DETAIL_BYTES: usize = 1_000;
 
-fn failure(kind: &str, message: String, code: Option<i32>) -> ToolOutput {
+pub(crate) fn failure(kind: &str, message: String, code: Option<i32>) -> ToolOutput {
     let mut meta = json!({ "mcp_error": kind });
     if let Some(code) = code {
         meta["code"] = json!(code);
@@ -371,7 +371,7 @@ fn failure(kind: &str, message: String, code: Option<i32>) -> ToolOutput {
     ToolOutput { content: message, is_error: true, metadata: Some(meta), images: Vec::new() }
 }
 
-fn json_kind(v: &Value) -> &'static str {
+pub(crate) fn json_kind(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
@@ -684,7 +684,7 @@ fn truncate_on_boundary(s: &mut String, max: usize) {
 /// `cap` for a single block, with an inline marker instead of a trailing
 /// one — the next block's text follows immediately, so a bare
 /// `[output truncated]` would read as applying to the wrong thing.
-fn elide(s: &str, max: usize) -> String {
+pub(crate) fn elide(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
