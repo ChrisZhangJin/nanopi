@@ -633,6 +633,11 @@ pub async fn run_tui_mode(
     // between here and `run_app`, a panic that unwinds — still kills the
     // servers' process groups. See `McpManager::kill_now`.
     let _mcp_kill_guard = mcp.kill_on_drop();
+    // The socket child agents reach those servers through (`mcp::ipc`).
+    // Held for the whole session so a drop on any exit path removes the
+    // socket; the explicit stop is below, ahead of the servers'.
+    #[cfg(unix)]
+    let _mcp_ipc = crate::mcp::ipc::start_for_session(&mcp);
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.
@@ -809,6 +814,10 @@ pub async fn run_tui_mode(
         reg.kill_all();
     }
     let _ = teardown_terminal(&mut terminal);
+    // Channel first: a child must not start a call into a server that is
+    // being stopped, and this also cancels the calls already in flight.
+    #[cfg(unix)]
+    crate::mcp::ipc::shutdown_global();
     // After the terminal is restored, not before: stopping a server that
     // ignores stdin EOF can take a second or two, and doing it under the
     // alt screen makes quitting look hung.
