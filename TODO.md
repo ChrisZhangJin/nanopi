@@ -152,7 +152,7 @@ on the Ctrl-C path. This is the same failure mode
 > **Milestone: MCP works in solo mode.** Worth shipping and using before
 > starting M9.
 
-## M9 — Parent↔child channel (design: docs/mcp-ipc.md)
+## ✅ M9 — Parent↔child channel (design: docs/mcp-ipc.md)
 
 The prerequisite for option C, and the largest single piece. Today parent and
 child communicate only through `brief.md` / `report.md` at turn boundaries —
