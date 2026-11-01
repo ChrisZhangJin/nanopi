@@ -10,6 +10,8 @@
 
 /// Handshake, tool listing/calls and connection state over a transport.
 pub mod client;
+/// Owns all server connections: concurrent connect, registration, shutdown.
+pub mod manager;
 /// Server definitions read from `<nanopi_home>/mcp.json`.
 pub mod config;
 /// JSON-RPC envelope and the MCP wire types. Pure serde, no I/O.
