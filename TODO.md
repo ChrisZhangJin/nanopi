@@ -6,22 +6,18 @@ Ordered so the tree compiles and the suite stays green at every step, in the
 style of `docs/PLAN.md`. Each task ends with **ACCEPTANCE** — what must pass
 before moving on.
 
-## Sequencing note (revises the "IPC first" framing in docs/mcp.md)
+## Sequencing note (revised)
 
-`docs/mcp.md` says the parent↔child IPC channel is a prerequisite. That is true
-**for orchestrator mode**, and it made the whole feature look like it had to
-start with a large, risky, user-invisible project.
+An earlier version of this note put the parent↔child channel last, on the
+reasoning that solo mode needs no IPC. That was the wrong priority: orchestrator
+mode is the **default**, so M1–M8 alone leave a default user with MCP servers
+that start but whose tools nobody can call. The owner's requirement is that
+using MCP must not require turning the orchestrator off.
 
-It doesn't. In **solo mode** (`[experimental] orchestrator = false`) the main
-agent legitimately does the work itself and there are no children to proxy for,
-so MCP tools belong in its registry — that is not "option A", it is just the
-case where the ownership question does not arise.
-
-So M1–M8 deliver working MCP for solo users with no IPC at all. Orchestrator
-mode is unchanged throughout (it keeps its four dispatch tools and simply has
-no MCP yet — no regression, just not finished). M9–M10 then build the IPC
-channel and complete option C, with a working, tested MCP client to integrate
-against rather than a speculative one.
+So **M9 and M10 are the mainline**, designed in
+[`docs/mcp-ipc.md`](docs/mcp-ipc.md). M1–M8 are the foundation they build on,
+and the manager already connecting in orchestrator mode is exactly what M9 needs
+to proxy. M7 (`/mcp`) is secondary.
 
 ---
 
@@ -156,7 +152,7 @@ on the Ctrl-C path. This is the same failure mode
 > **Milestone: MCP works in solo mode.** Worth shipping and using before
 > starting M9.
 
-## M9 — Parent↔child IPC channel
+## M9 — Parent↔child channel (design: docs/mcp-ipc.md)
 
 The prerequisite for option C, and the largest single piece. Today parent and
 child communicate only through `brief.md` / `report.md` at turn boundaries —
@@ -169,9 +165,10 @@ be general, but MCP should be its only caller at first).
 
 **ACCEPTANCE** A child can invoke a parent-held capability and receive the
 result; parent death fails the call cleanly rather than hanging the child;
-no new orphan processes. Needs its own design note before coding.
+no new orphan processes. Design note: `docs/mcp-ipc.md` (unix socket under `$TMPDIR`, mode 0700; reuses
+`mcp::protocol`; per-agent allowlist enforced by the parent; unix-only first).
 
-## M10 — Complete option C
+## M10 — Complete option C (design: docs/mcp-ipc.md)
 
 - Orchestrator gets the MCP tool **list** (names + descriptions) so it can name
   them in a brief, without being able to call them
