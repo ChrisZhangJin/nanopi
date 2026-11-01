@@ -35,6 +35,7 @@ pub mod method {
     pub const INITIALIZED: &str = "notifications/initialized";
     pub const TOOLS_LIST: &str = "tools/list";
     pub const TOOLS_CALL: &str = "tools/call";
+    pub const CANCELLED: &str = "notifications/cancelled";
 }
 
 /// The reserved JSON-RPC 2.0 range. MCP adds no codes of its own; a
