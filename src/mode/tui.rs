@@ -2185,16 +2185,33 @@ fn apply_orchestrator_mode(app: &mut App, agent: &mut Agent, on: bool) {
         );
     }
     agent.context.tools = agent.registry.all_specs();
+    let prompt = orchestrator_aware_base_prompt(agent, on);
+    agent.set_system_base(prompt);
+}
+
+/// The system prompt base for `agent` as its registry stands, in the
+/// given mode — **the one place the TUI recomposes it**, so the MCP
+/// catalogue is applied by construction wherever that happens.
+///
+/// Every path that changes the orchestrator mode or the registry ends
+/// here: startup, `/orchestrator`, `/new`, `/resume`, `/import` and
+/// `/fork` (each rebuilds the Agent and then calls
+/// `apply_orchestrator_mode`) and `/reload` (which recomposes in place).
+/// They used to carry their own copies of this call, and `/reload`'s once
+/// drifted from the others; the catalogue would have drifted the same
+/// way. Read at call time, not cached: it is whatever the channel serves
+/// now.
+fn orchestrator_aware_base_prompt(agent: &Agent, orchestrator: bool) -> String {
     let tool_names = agent.registry.names();
-    let prompt = crate::agent::build::compose_system_prompt_mode(
+    crate::agent::build::compose_system_prompt_mode(
         &agent.cwd,
         &tool_names,
         &agent.skills,
         agent.no_context_files,
         &agent.prompt_overrides,
-        on,
-    );
-    agent.set_system_base(prompt);
+        orchestrator,
+        &crate::mcp::catalogue::available(),
+    )
 }
 
 /// Outcome of attempting to flip `app.orchestrator`, pulled out as a pure
@@ -4752,7 +4769,7 @@ async fn handle_reload(
             if let Some(ref h) = hooks_new {
                 a.hooks = h.clone();
             }
-            // BEFORE `registry.names()` below, the same ordering
+            // BEFORE the prompt is recomposed below, the same ordering
             // constraint both Agent construction paths carry: the
             // system prompt's tool list has to describe the registry
             // as it is after the reload, or a plugin tool added by this
@@ -4760,29 +4777,22 @@ async fn handle_reload(
             if let Some(ref exts) = extensions {
                 ext_report = Some(reload_extensions_guarded(app, a, exts));
             }
-            let tool_names = a.registry.names();
             // Through `set_system_base`, not a direct assignment to
             // `context.system`: this replaces the BASE, and an active
             // plugin context contribution survives the reload (see the
             // doc comment above — `[[extensions]]` is not reloaded
             // either).
             //
-            // Must go through `compose_system_prompt_mode` with
-            // `app.orchestrator`, not the plain `compose_system_prompt`:
+            // Must go through `orchestrator_aware_base_prompt` (which uses
+            // `compose_system_prompt_mode` with `app.orchestrator` and the MCP
+            // catalogue), not the plain `compose_system_prompt`:
             // `/reload` does not rebuild `a.registry` from scratch, so if
             // orchestrator mode is active the registry here is still the
             // restricted one — a prompt composed with the non-orchestrator
             // template would describe `write`/`edit`/`bash` as available
             // and drop the orchestrator workflow instructions, breaking
             // the registry/prompt sync invariant (T-06-04/T-06-06).
-            let base = crate::agent::build::compose_system_prompt_mode(
-                &a.cwd,
-                &tool_names,
-                &a.skills,
-                a.no_context_files,
-                &a.prompt_overrides,
-                app.orchestrator,
-            );
+            let base = orchestrator_aware_base_prompt(a, app.orchestrator);
             a.set_system_base(base);
             let h = &a.hooks;
             h.tool_execution_start.len()
@@ -8645,14 +8655,8 @@ mod tests {
         app.orchestrator = true;
 
         let tool_names = agent.registry.names();
-        let base = crate::agent::build::compose_system_prompt_mode(
-            &agent.cwd,
-            &tool_names,
-            &agent.skills,
-            agent.no_context_files,
-            &agent.prompt_overrides,
-            app.orchestrator,
-        );
+        // The helper `handle_reload` calls, not a copy of its body.
+        let base = orchestrator_aware_base_prompt(&agent, app.orchestrator);
         let non_orchestrator_base = crate::agent::build::compose_system_prompt(
             &agent.cwd,
             &tool_names,
@@ -8664,6 +8668,53 @@ mod tests {
             base, non_orchestrator_base,
             "orchestrator-mode reload must not fall back to the plain template"
         );
+    }
+
+    fn echo_catalogue() -> Vec<crate::mcp::catalogue::CatalogueEntry> {
+        vec![crate::mcp::catalogue::CatalogueEntry {
+            name: "mcp__demo__echo".to_string(),
+            description: "Echoes its input.".to_string(),
+        }]
+    }
+
+    /// Every path that recomposes the orchestrator prompt must carry the
+    /// MCP catalogue. `/new`, `/resume`, `/import`, `/fork` and startup
+    /// all rebuild the Agent and then run `apply_orchestrator_mode`;
+    /// `/reload` recomposes through the same helper. So: the toggle on,
+    /// a toggle off and back on, and the reload expression.
+    #[test]
+    fn every_orchestrator_recompose_carries_the_mcp_catalogue() {
+        crate::mcp::catalogue::with_catalogue(echo_catalogue(), || {
+            let dir = tmp_dir();
+            let mut agent = agent_with_id(&dir, "sess-mcp-cat", HooksConfig::default());
+            agent.context.tools = agent.registry.all_specs();
+            let mut app = mkapp();
+
+            apply_orchestrator_mode(&mut app, &mut agent, true);
+            assert!(
+                agent.context.system.as_deref().unwrap().contains("mcp__demo__echo"),
+                "startup / new / resume / import / fork: {:?}",
+                agent.context.system
+            );
+            // The registry is still exactly the four dispatch tools: the
+            // catalogue is text for the model, never a callable.
+            assert_eq!(
+                agent.registry.names(),
+                vec!["agent", "list_agents", "send_message", "stop_agent"]
+            );
+
+            // /reload: same registry, recomposed in place.
+            agent.set_system_base(String::from("stale"));
+            let base = orchestrator_aware_base_prompt(&agent, true);
+            agent.set_system_base(base);
+            assert!(agent.context.system.as_deref().unwrap().contains("mcp__demo__echo"));
+
+            // Out of orchestrator mode the agent has the tools itself.
+            apply_orchestrator_mode(&mut app, &mut agent, false);
+            assert!(!agent.context.system.as_deref().unwrap().contains("mcp__demo__echo"));
+            apply_orchestrator_mode(&mut app, &mut agent, true);
+            assert!(agent.context.system.as_deref().unwrap().contains("mcp__demo__echo"));
+        });
     }
 
     #[test]

@@ -8,6 +8,8 @@
 //! already in the tree), so a feature gate would buy nothing but a
 //! second build configuration to keep green.
 
+/// The tool list the orchestrator's system prompt carries (names and capped descriptions).
+pub mod catalogue;
 /// Handshake, tool listing/calls and connection state over a transport.
 pub mod client;
 /// Child→parent channel for proxied MCP calls. Unix only; see `docs/mcp-ipc.md`.

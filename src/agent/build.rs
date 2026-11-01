@@ -779,7 +779,7 @@ pub fn compose_system_prompt(
     no_context_files: bool,
     overrides: &PromptOverrides,
 ) -> String {
-    compose_system_prompt_mode(cwd, tool_names, skills, no_context_files, overrides, false)
+    compose_system_prompt_mode(cwd, tool_names, skills, no_context_files, overrides, false, &[])
 }
 
 /// Mode-aware variant of [`compose_system_prompt`] (ORC-03/ORC-04).
@@ -790,6 +790,15 @@ pub fn compose_system_prompt(
 /// base prompt for [`system_prompt::build_orchestrator`]; a custom
 /// prompt override still wins in both modes, since the user asked for
 /// specific wording either way.
+///
+/// `mcp` is the MCP tool catalogue (`mcp::catalogue::available`). It is a
+/// parameter rather than something read from a global here so that every
+/// caller has to decide, and so a compile error — not a forgotten line —
+/// is what a new recompose site gets: `/reload` once recomposed this
+/// prompt without the orchestrator wording, and a prompt that quietly
+/// lacks the catalogue after one of those would be the same bug. Callers
+/// that rebuild an *agent's own* prompt pass `&[]`; the block is only
+/// ever added for an agent that delegates without being able to `read`.
 pub fn compose_system_prompt_mode(
     cwd: &Path,
     tool_names: &[String],
@@ -797,6 +806,7 @@ pub fn compose_system_prompt_mode(
     no_context_files: bool,
     overrides: &PromptOverrides,
     orchestrator: bool,
+    mcp: &[crate::mcp::catalogue::CatalogueEntry],
 ) -> String {
     let resolved = overrides.resolve(cwd);
 
@@ -831,6 +841,13 @@ pub fn compose_system_prompt_mode(
         prompt.push_str(&crate::resources::format_skills_for_prompt_mode(
             skills, !has_read,
         ));
+    }
+    // Same condition as the skills' delegating wording: an agent that can
+    // dispatch but not read is the orchestrator, and MCP tools are, for
+    // it, something to name in a brief. An agent with its own `read` has
+    // the MCP tools in its registry instead and needs no catalogue.
+    if can_delegate && !has_read {
+        prompt.push_str(&crate::mcp::catalogue::format_for_prompt(mcp));
     }
     prompt
 }
@@ -896,6 +913,7 @@ mod tests {
             true,
             &PromptOverrides::default(),
             false,
+            &[],
         );
         assert_eq!(a, b);
         std::fs::remove_dir_all(&cwd).ok();
@@ -913,6 +931,7 @@ mod tests {
             true,
             &PromptOverrides::default(),
             true,
+            &[],
         );
         assert!(
             composed.starts_with(&base),
@@ -923,7 +942,7 @@ mod tests {
         let overrides =
             PromptOverrides::from_cli(Some("You are Bob".to_string()), vec![], true);
         let composed_custom =
-            compose_system_prompt_mode(&cwd, &names, &[], true, &overrides, true);
+            compose_system_prompt_mode(&cwd, &names, &[], true, &overrides, true, &[]);
         assert!(composed_custom.starts_with("You are Bob"));
         assert!(!composed_custom.contains("orchestrator mode"));
 
@@ -948,6 +967,7 @@ mod tests {
             true,
             &PromptOverrides::default(),
             true,
+            &[],
         );
         assert!(composed.contains("<available_skills>"), "{composed}");
         assert!(composed.contains("demo"), "{composed}");
@@ -969,6 +989,7 @@ mod tests {
             true,
             &PromptOverrides::default(),
             false,
+            &[],
         );
         assert!(solo.contains("Use the read tool to load"), "{solo}");
 
@@ -981,9 +1002,91 @@ mod tests {
             true,
             &PromptOverrides::default(),
             false,
+            &[],
         );
         assert!(!blind.contains("<available_skills>"), "{blind}");
 
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    fn catalogue() -> Vec<crate::mcp::catalogue::CatalogueEntry> {
+        vec![crate::mcp::catalogue::CatalogueEntry {
+            name: "mcp__demo__echo".to_string(),
+            description: "Echoes its input.".to_string(),
+        }]
+    }
+
+    /// The orchestrator names MCP tools in a brief without being able to
+    /// call them, so it must see them and be told how to hand one over.
+    #[test]
+    fn orchestrator_prompt_carries_the_mcp_catalogue() {
+        let cwd = tmpdir("orch-mcp");
+        let names = vec!["agent".to_string(), "list_agents".to_string()];
+        let composed = compose_system_prompt_mode(
+            &cwd,
+            &names,
+            &[],
+            true,
+            &PromptOverrides::default(),
+            true,
+            &catalogue(),
+        );
+        assert!(composed.contains("mcp__demo__echo"), "{composed}");
+        assert!(composed.contains("Echoes its input."), "{composed}");
+        assert!(composed.contains("`tools` field of the `agent` call"), "{composed}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// No MCP tools must mean the prompt is the one that shipped before
+    /// MCP existed, byte for byte, in every mode and with skills too.
+    #[test]
+    fn an_empty_catalogue_leaves_every_prompt_byte_identical() {
+        let cwd = tmpdir("orch-mcp-empty");
+        let skills = vec![one_skill()];
+        // Expected values are assembled from the pieces that existed
+        // before the catalogue, so this fails if the empty case ever adds
+        // so much as a newline.
+        let orch_names = vec!["agent".to_string(), "list_agents".to_string()];
+        let composed = compose_system_prompt_mode(
+            &cwd, &orch_names, &skills, true, &PromptOverrides::default(), true, &[],
+        );
+        assert_eq!(
+            composed,
+            format!(
+                "{}{}",
+                crate::agent::system_prompt::build_orchestrator(&cwd, &orch_names),
+                crate::resources::format_skills_for_prompt_mode(&skills, true)
+            )
+        );
+        let solo_names = vec!["read".to_string(), "bash".to_string(), "agent".to_string()];
+        let composed = compose_system_prompt_mode(
+            &cwd, &solo_names, &skills, true, &PromptOverrides::default(), false, &[],
+        );
+        assert_eq!(
+            composed,
+            format!(
+                "{}{}",
+                crate::agent::system_prompt::build(&cwd, &solo_names),
+                crate::resources::format_skills_for_prompt_mode(&skills, false)
+            )
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// A solo agent has the MCP tools in its own registry, and an agent
+    /// that cannot delegate could not use a catalogue: neither gets one.
+    #[test]
+    fn only_a_delegating_agent_without_read_gets_the_catalogue() {
+        let cwd = tmpdir("orch-mcp-who");
+        for names in [
+            vec!["read".to_string(), "bash".to_string(), "agent".to_string()],
+            vec!["write".to_string()],
+        ] {
+            let p = compose_system_prompt_mode(
+                &cwd, &names, &[], true, &PromptOverrides::default(), false, &catalogue(),
+            );
+            assert!(!p.contains("mcp__demo__echo"), "{names:?}: {p}");
+        }
         std::fs::remove_dir_all(&cwd).ok();
     }
 
