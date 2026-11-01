@@ -251,6 +251,29 @@ pub async fn run_print_mode(
     // effect. The TUI owns materialising it.
     crate::model_catalogue::init(false);
 
+    // Connect `mcp.json` servers and register their tools. A spawned
+    // child agent is told apart by `agent_mode` (`--brief` /
+    // `NANOPI_AGENT_ID`, both always set by `tool::agent`'s spawn) and
+    // gets an empty manager: connecting from every child would start
+    // `max_concurrency x servers` processes (option B in `docs/mcp.md`,
+    // rejected). `--tools` also gets an empty manager — see
+    // `manager::skip_reason`. Registered into the standard registry only;
+    // print mode never applies orchestrator mode (D-01).
+    let mcp = crate::mcp::manager::McpManager::start_for_session(
+        if child.agent_mode {
+            crate::mcp::manager::SessionKind::ChildAgent
+        } else {
+            crate::mcp::manager::SessionKind::Print
+        },
+        &tools_allow,
+    )
+    .await;
+    mcp.register_into(&mut registry);
+    // Covers the exits that never reach the `shutdown` below: SIGTERM
+    // (`main.rs` drops this whole future) and every early return. See
+    // `McpManager::kill_now` for why drop-based cleanup is not enough.
+    let _mcp_kill_guard = mcp.kill_on_drop();
+
     // D-01: print mode never restricts its tool registry or prompt based
     // on `experimental.orchestrator` (on by default for the TUI) — a
     // scripted `-p` run must never be silently limited to the
@@ -394,6 +417,7 @@ pub async fn run_print_mode(
     let ctrl_c_interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ctrl_c_task = {
         let flag = ctrl_c_interrupted.clone();
+        let mcp = mcp.clone();
         tokio::spawn(async move {
             loop {
                 if tokio::signal::ctrl_c().await.is_err() {
@@ -403,6 +427,15 @@ pub async fn run_print_mode(
                 if let Some(reg) = crate::agent_registry::global() {
                     reg.stop_all();
                 }
+                // Servers die with the agents, not whenever the turn
+                // happens to finish: this listener replaces the default
+                // SIGINT disposition, so nothing else on this path
+                // would stop them, and a Ctrl-C that left a browser or
+                // database process running would be the same bug
+                // `stop_all` exists to prevent for agents. A tool call
+                // still in flight then fails in-band instead of
+                // blocking an interrupted run.
+                mcp.shutdown().await;
             }
         })
     };
@@ -563,6 +596,10 @@ pub async fn run_print_mode(
         interrupted,
         extra_reports_appendix,
     ) = agent_task.await?;
+    // Normal completion. After the agent task, not inside it: the
+    // drain's one extra turn may still call MCP tools. Early returns
+    // above this line are covered by the transports' drop guards.
+    mcp.shutdown().await;
     // The listener's only job was flipping `ctrl_c_interrupted` for the
     // agent task above; nothing reads it after this point, and leaving it
     // running would hold an extra `ctrl_c()` registration for the rest of

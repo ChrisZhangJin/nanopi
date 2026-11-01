@@ -480,16 +480,52 @@ fn startup_orchestrator_decision(
 /// allowlist it gets the main-process-only control tools
 /// (CTL-02/03/04/06) on top of the standard set. Every site that
 /// rebuilds the registry mid-session — `/new`, `/resume`, `/import`,
-/// `/fork`, `/orchestrator off` — must go through here: calling
+/// `/fork` — must go through here (via [`rebuild_registry`]): calling
 /// `standard_with_allowlist(&[])` directly returns the bare standard
 /// set, which silently drops `list_agents`/`stop_agent`/`send_message`
 /// for the rest of the session.
-fn tui_registry(tools_allow: &[String]) -> Result<ToolRegistry, String> {
-    if tools_allow.is_empty() {
-        Ok(ToolRegistry::standard_with_control())
+///
+/// **MCP tools are registered here, for the same reason.** A fresh
+/// registry has none, so a rebuild that skipped this step would make
+/// every MCP tool vanish at `/new` with nothing to say why. The
+/// connections are the manager's and are made once; this only copies
+/// the already-built tools in. It must stay a step of *this* function
+/// rather than something the callers remember, and it runs before the
+/// registry reaches `apply_orchestrator_mode`, which saves the registry
+/// it is handed: tools registered earlier come back on
+/// `/orchestrator off`, tools registered into the live registry later
+/// would leak into the orchestrator's closed four-tool list.
+fn tui_registry(
+    tools_allow: &[String],
+    mcp: Option<&crate::mcp::manager::McpManager>,
+) -> Result<ToolRegistry, String> {
+    let mut registry = if tools_allow.is_empty() {
+        ToolRegistry::standard_with_control()
     } else {
-        ToolRegistry::standard_with_allowlist(tools_allow)
+        ToolRegistry::standard_with_allowlist(tools_allow)?
+    };
+    // An allowlist excludes MCP outright (see `manager::skip_reason`,
+    // which already declines to connect). Checked here as well because
+    // `standard_with_allowlist` builds a registry with no plugin
+    // allowlist set, so `register_external` would accept everything:
+    // an allowlist must only ever narrow, and this is the line that
+    // keeps a manager reaching this point from widening it.
+    //
+    // Refusals (a name already taken) are dropped: the manager makes
+    // MCP names collide-free among themselves, and `mcp__`-prefixed
+    // names do not occur among built-ins, so the only possible clash is
+    // a plugin tool, which reports it from its side.
+    if let (true, Some(mcp)) = (tools_allow.is_empty(), mcp) {
+        mcp.register_into(&mut registry);
     }
+    Ok(registry)
+}
+
+/// The registry for a mid-session rebuild. The one thing the
+/// rebuild sites call, so that none of them can forget MCP.
+fn rebuild_registry(app: &App) -> ToolRegistry {
+    tui_registry(&app.tools_allow, Some(&app.mcp))
+        .unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control())
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -569,7 +605,10 @@ pub async fn run_tui_mode(
     // TUI is always the top-level, interactive process (never a spawned
     // child): wire up CTL-02/03/04/06's main-process-only control tools
     // (only meaningful with the unrestricted default set).
-    let registry = tui_registry(&tools_allow).map_err(|e| anyhow::anyhow!("{e}"))?;
+    //
+    // Validated before anything is spawned: a typo'd `--tools` must fail
+    // without first paying for every MCP server's startup.
+    let mut registry = tui_registry(&tools_allow, None).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Merge `<nanopi_home>/models.json` over the compiled catalogue,
     // creating or refreshing it as needed. Must run before the Agent is
@@ -578,6 +617,22 @@ pub async fn run_tui_mode(
     // first turn. Writes are allowed here (interactive); print mode
     // passes false.
     crate::model_catalogue::init(true);
+
+    // Connect every `mcp.json` server and register their tools into the
+    // standard registry. Before the Agent is built, so the tools are in
+    // the prompt and the `tools` array from the first turn, and before
+    // orchestrator mode can save the registry (see `tui_registry`).
+    // Servers are stopped after the terminal is restored, below.
+    let mcp = crate::mcp::manager::McpManager::start_for_session(
+        crate::mcp::manager::SessionKind::Tui,
+        &tools_allow,
+    )
+    .await;
+    mcp.register_into(&mut registry);
+    // Any exit before the graceful `shutdown` at the bottom — the `?`s
+    // between here and `run_app`, a panic that unwinds — still kills the
+    // servers' process groups. See `McpManager::kill_now`.
+    let _mcp_kill_guard = mcp.kill_on_drop();
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.
@@ -692,6 +747,7 @@ pub async fn run_tui_mode(
         .max_replay_entries
         .unwrap_or(DEFAULT_MAX_REPLAY_ENTRIES);
     app.inline_think_tags = inline_think_tags;
+    app.mcp = mcp;
     // ORC-02: seed from config.toml's `[experimental] orchestrator`
     // (single source of truth, Pitfall 4) and apply the swap to the
     // initial agent before the first turn if it's on by default.
@@ -753,6 +809,10 @@ pub async fn run_tui_mode(
         reg.kill_all();
     }
     let _ = teardown_terminal(&mut terminal);
+    // After the terminal is restored, not before: stopping a server that
+    // ignores stdin EOF can take a second or two, and doing it under the
+    // alt screen makes quitting look hung.
+    app.mcp.shutdown().await;
 
     // Session-end hook.
     {
@@ -1092,6 +1152,10 @@ struct App {
     /// built registry before re-applying the mode, so toggling off
     /// after a rebuild restores the NEW registry, not a stale one.
     saved_registry: Option<crate::tool::ToolRegistry>,
+    /// Owns every MCP server connection for the life of the process.
+    /// Here, not in the registry: registries are rebuilt and dropped at
+    /// `/new` and friends, connections must not be.
+    mcp: Arc<crate::mcp::manager::McpManager>,
 }
 
 impl App {
@@ -1162,6 +1226,7 @@ impl App {
             term_rows: 24,
             orchestrator: false,
             saved_registry: None,
+            mcp: Arc::new(crate::mcp::manager::McpManager::empty()),
         }
     }
 }
@@ -2754,7 +2819,7 @@ async fn handle_action(
                 }
             };
             let _ = session::set_active_session(&cwd, &new_path);
-            let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
+            let registry = rebuild_registry(app);
             // `/new` rebuilds the agent from scratch, so re-read
             // config for exec mode + extensions the same way startup
             // does. Picks up an edited config.toml without a restart.
@@ -2929,7 +2994,7 @@ async fn handle_action(
                 }
             };
             let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-            let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
+            let registry = rebuild_registry(app);
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
                 provider,
@@ -3490,7 +3555,7 @@ async fn handle_action(
                 }
             };
             let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-            let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
+            let registry = rebuild_registry(app);
             new_agent.context.tools = registry.all_specs();
             let diags = new_agent.hydrate_resumed(
                 provider,
@@ -4401,7 +4466,7 @@ async fn execute_fork(
         }
     };
     let provider = crate::provider::build(app.api_kind, &base_url, &api_key, &model, Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)), app.inline_think_tags);
-    let registry = tui_registry(&app.tools_allow).unwrap_or_else(|_| crate::tool::ToolRegistry::standard_with_control());
+    let registry = rebuild_registry(app);
     new_agent.context.tools = registry.all_specs();
     let diags = new_agent.hydrate_resumed(
         provider,
@@ -8781,7 +8846,7 @@ mod tests {
     /// then never list or stop them.
     #[test]
     fn tui_registry_keeps_control_tools_when_no_allowlist() {
-        let built = tui_registry(&[]).expect("empty allowlist is always valid");
+        let built = tui_registry(&[], None).expect("empty allowlist is always valid");
         assert_eq!(
             built.names(),
             crate::tool::ToolRegistry::standard_with_control().names(),
@@ -8797,11 +8862,132 @@ mod tests {
     /// user asked for exactly these tools.
     #[test]
     fn tui_registry_honours_an_explicit_allowlist() {
-        let built = tui_registry(&["read".to_string(), "grep".to_string()])
+        let built = tui_registry(&["read".to_string(), "grep".to_string()], None)
             .expect("known tool names");
         assert_eq!(built.names(), vec!["grep", "read"]);
         assert!(built.get("send_message").is_none());
         assert!(built.get("agent").is_none());
+    }
+
+    // ── MCP wiring ──────────────────────────────────────────────────
+    //
+    // These need real connections (the manager owns processes), so they
+    // run a small runtime of their own: the tests are synchronous like
+    // the rest of this module, and the runtime must outlive the clients'
+    // reader tasks.
+
+    #[cfg(unix)]
+    fn mcp_fixture(rt: &tokio::runtime::Runtime) -> Arc<crate::mcp::manager::McpManager> {
+        use crate::mcp::manager::{testing::fake_server, ManagerOptions, McpManager};
+        Arc::new(rt.block_on(McpManager::connect(
+            vec![fake_server("fs", "", &["read_file", "write.file"])],
+            ManagerOptions::default(),
+        )))
+    }
+
+    #[cfg(unix)]
+    const MCP_NAMES: [&str; 2] = ["mcp__fs__read_file", "mcp__fs__write_file"];
+
+    #[cfg(unix)]
+    fn names_with_mcp(registry: &ToolRegistry) -> Vec<String> {
+        registry
+            .names()
+            .into_iter()
+            .filter(|n| n.starts_with("mcp__"))
+            .collect()
+    }
+
+    /// Trap 1. MCP tools are registered before orchestrator mode saves
+    /// the registry, so: on → exactly the four dispatch tools (the
+    /// closed list, untouched); off → the MCP tools are back; and again.
+    #[cfg(unix)]
+    #[test]
+    fn mcp_tools_stay_out_of_orchestrator_mode_and_survive_leaving_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = mkapp();
+        app.mcp = mcp_fixture(&rt);
+
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-mcp-orch", HooksConfig::default());
+        agent.registry = rebuild_registry(&app);
+        assert_eq!(names_with_mcp(&agent.registry), MCP_NAMES);
+
+        for _ in 0..2 {
+            apply_orchestrator_mode(&mut app, &mut agent, true);
+            assert_eq!(
+                agent.registry.names(),
+                vec!["agent", "list_agents", "send_message", "stop_agent"],
+                "orchestrator mode must stay exactly the closed list"
+            );
+            assert!(agent.context.tools.iter().all(|t| !t.name.starts_with("mcp__")));
+
+            apply_orchestrator_mode(&mut app, &mut agent, false);
+            assert_eq!(names_with_mcp(&agent.registry), MCP_NAMES);
+            assert!(agent.registry.get("bash").is_some());
+            assert!(agent.context.tools.iter().any(|t| t.name == "mcp__fs__read_file"));
+        }
+        rt.block_on(app.mcp.shutdown());
+    }
+
+    /// Trap 2. The five rebuild sites (`/new`, `/resume`, `/import`,
+    /// `/fork`, startup resume) all call `rebuild_registry`; this is the
+    /// behaviour they depend on — a rebuild keeps MCP tools and keeps
+    /// the control tools — and the next test pins that nobody bypasses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuilt_registry_keeps_mcp_and_control_tools() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = mkapp();
+        app.mcp = mcp_fixture(&rt);
+        let pids = app.mcp.pids();
+
+        for _ in 0..3 {
+            let rebuilt = rebuild_registry(&app);
+            assert_eq!(names_with_mcp(&rebuilt), MCP_NAMES);
+            assert!(rebuilt.get("list_agents").is_some(), "control tools must survive too");
+        }
+        assert_eq!(app.mcp.pids(), pids, "a rebuild must reuse the connections");
+
+        // And with orchestrator on at the time of the rebuild, the way
+        // `/new` does it: reset the saved registry, rebuild, re-apply.
+        app.orchestrator = true;
+        let dir = tmp_dir();
+        let mut agent = agent_with_id(&dir, "sess-mcp-new", HooksConfig::default());
+        agent.registry = rebuild_registry(&app);
+        app.saved_registry = None;
+        apply_orchestrator_mode(&mut app, &mut agent, true);
+        apply_orchestrator_mode(&mut app, &mut agent, false);
+        assert_eq!(names_with_mcp(&agent.registry), MCP_NAMES);
+        rt.block_on(app.mcp.shutdown());
+    }
+
+    /// Why the previous test is enough: the only way to lose MCP at a
+    /// rebuild is a site that builds the registry some other way. The
+    /// call below is the old per-site shape, which no site may use.
+    #[test]
+    fn no_rebuild_site_calls_tui_registry_directly() {
+        let src = include_str!("tui.rs");
+        let production = &src[..src.find("#[cfg(test)]\nmod tests").expect("test module marker")];
+        let needle = ["tui_registry(", "&app"].concat();
+        assert_eq!(
+            production.matches(&needle).count(),
+            1,
+            "only `rebuild_registry` may call tui_registry with the app's state; \
+             any other rebuild site silently drops MCP tools"
+        );
+    }
+
+    /// Trap 4. An allowlist narrows: it never gains MCP tools, even if
+    /// a connected manager reaches `tui_registry`.
+    #[cfg(unix)]
+    #[test]
+    fn a_tools_allowlist_never_gains_mcp_tools() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mcp = mcp_fixture(&rt);
+        let built = tui_registry(&["read".to_string(), "grep".to_string()], Some(&mcp))
+            .expect("known tool names");
+        assert_eq!(built.names(), vec!["grep", "read"]);
+        rt.block_on(mcp.shutdown());
     }
 
     /// The stats row shows a usage bar beside the context percentage,

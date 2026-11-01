@@ -104,7 +104,7 @@ Use the de-facto ecosystem shape so existing configs paste in unchanged:
 is left untouched, reports the line, and startup continues. Tests cover an
 empty `mcpServers`, an entry missing `command`, and a duplicate name.
 
-## 🔶 M5 — Tool adapter (mapping done, `impl Tool` waits on M3)
+## ✅ M5 — Tool adapter
 
 New `src/mcp/tool.rs`: `impl Tool for McpTool`, modelled on
 `impl Tool for WasmTool` (`src/wasm/host.rs`).
@@ -121,7 +121,7 @@ New `src/mcp/tool.rs`: `impl Tool for McpTool`, modelled on
 `content[]` array and an empty one. A dead server surfaces as a failed tool
 result, not a panic.
 
-## M6 — Startup wiring (solo mode)
+## ✅ M6 — Startup wiring (solo mode)
 
 Connect in `src/mode/tui.rs` and `src/mode/print.rs` beside the existing
 `model_catalogue::init`, register via `ToolRegistry::register_external` so
@@ -144,7 +144,7 @@ reason when `Failed`. Mirrors `/tools` and `/skills` formatting.
 **ACCEPTANCE** Renders connected, failed and not-configured states. Credentials
 from `env` never appear in the output.
 
-## M8 — Shutdown hygiene
+## ✅ M8 — Shutdown hygiene
 
 Terminate every server on TUI exit and on print-mode completion: close stdin,
 then SIGTERM, then SIGKILL.
