@@ -21,6 +21,7 @@
 //! cancel-safe (the transport's `ChildGuard` reaps on drop), which is
 //! what makes cutting it off sound rather than a leak.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,13 +145,23 @@ pub struct McpManager {
     /// One line each, already first-line-only. Kept so the caller —
     /// which knows whether the terminal is ready — decides where they go.
     notices: Vec<String>,
+    /// Set once [`shutdown`](Self::shutdown) has reaped every server.
+    /// Read by [`kill_now`](Self::kill_now), which must not signal a
+    /// process group whose leader has been reaped: the pid is free for
+    /// reuse by then.
+    stopped: AtomicBool,
 }
 
 impl McpManager {
     /// No servers. What a session that must not connect holds, so
     /// callers need no `Option`.
     pub fn empty() -> Self {
-        Self { servers: Vec::new(), tools: Vec::new(), notices: Vec::new() }
+        Self {
+            servers: Vec::new(),
+            tools: Vec::new(),
+            notices: Vec::new(),
+            stopped: AtomicBool::new(false),
+        }
     }
 
     /// The one startup call: decide whether this session connects, load
@@ -335,7 +346,56 @@ impl McpManager {
             .iter()
             .filter_map(|s| s.client.as_ref())
             .map(|c| c.shutdown());
-        let _ = tokio::time::timeout(SHUTDOWN_BUDGET, join_all(stops)).await;
+        if tokio::time::timeout(SHUTDOWN_BUDGET, join_all(stops)).await.is_ok() {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// SIGKILL every server's process group, synchronously. The last
+    /// resort for exits that cannot `await` [`shutdown`](Self::shutdown):
+    /// a dropped future, an early `?` return, a signal handler.
+    ///
+    /// **This exists because drop-based cleanup does not run here.** The
+    /// transports carry a `ChildGuard` for exactly this, but a clone of
+    /// the live registry — and so of every `McpTool` and its client — is
+    /// parked in `plugin_tools`' process-wide dispatch, so the clients
+    /// are never dropped before the process exits. Left to the guards, a
+    /// SIGTERM'd `nanopi -p` kept its servers' backgrounded helpers
+    /// (only the server itself died, to `PDEATHSIG`, which does not
+    /// reach grandchildren — and with `npx`, the grandchild is the real
+    /// server). Nothing signals once `shutdown` has completed; see
+    /// `stopped`. The pid-reuse window before that is the one
+    /// `agent_registry::kill_group` already accepts.
+    pub fn kill_now(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // Ready servers only. A client that failed its handshake was
+        // already shut down and reaped by `connect`, so its pid may
+        // belong to someone else now.
+        #[cfg(unix)]
+        for pid in self
+            .servers
+            .iter()
+            .filter_map(|s| s.client.as_ref())
+            .filter(|c| c.state() == ConnectionState::Ready)
+            .filter_map(|c| c.pid())
+        {
+            if pid > 1 {
+                // SAFETY: a plain syscall; no memory is touched.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// A guard that runs [`kill_now`](Self::kill_now) when dropped.
+    /// Hold it for the life of the session: it covers every way the
+    /// session's future can end without reaching an explicit
+    /// `shutdown` — and does nothing on the paths that do.
+    pub fn kill_on_drop(self: &Arc<Self>) -> KillOnDrop {
+        KillOnDrop(Arc::clone(self))
     }
 
     /// Pids of every live server process, for tests that must prove
@@ -345,6 +405,15 @@ impl McpManager {
             .iter()
             .filter_map(|s| s.client.as_ref().and_then(|c| c.pid()))
             .collect()
+    }
+}
+
+/// See [`McpManager::kill_on_drop`].
+pub struct KillOnDrop(Arc<McpManager>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.0.kill_now();
     }
 }
 
@@ -747,6 +816,30 @@ mod tests {
             assert_eq!(m.tool_count(), 1);
             assert_eq!(m.notices().len(), 1);
             m.shutdown().await;
+        }
+
+        /// The synchronous last resort, for exits that cannot await:
+        /// the whole group goes, including what the server backgrounded.
+        #[tokio::test]
+        async fn kill_now_reaps_the_server_and_its_helper_without_awaiting() {
+            let server_pid = tmp_file("ksrv");
+            let helper_pid = tmp_file("khelper");
+            let preamble = format!(
+                "echo $$ > {}; sleep 300 & echo $! > {}",
+                server_pid.display(),
+                helper_pid.display()
+            );
+            let m = McpManager::connect(vec![cfg("s", &preamble, &["t"])], ManagerOptions::default()).await;
+            let (sp, hp) = (read_pid(&server_pid), read_pid(&helper_pid));
+
+            // Dropping the guard is the whole call.
+            drop(Arc::new(m).kill_on_drop());
+
+            let until = StdInstant::now() + Duration::from_secs(10);
+            while alive(sp) || alive(hp) {
+                assert!(StdInstant::now() < until, "server {sp} / helper {hp} survived kill_now");
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
 
         #[tokio::test]

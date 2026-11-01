@@ -14,7 +14,6 @@
 //! ever fires when something is genuinely broken.
 
 #![cfg(unix)]
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -303,9 +302,10 @@ fn signal(child: &std::process::Child, sig: libc::c_int) {
 // ------------------------------------------------------------- tests
 
 /// The feature, end to end: the model sees the tool under its
-/// registered name, calls it, and gets the server's answer.
+/// registered name, calls it, gets the server's answer — and once the
+/// run completes, neither the server nor what it backgrounded survives.
 #[test]
-fn a_print_run_offers_and_calls_an_mcp_tool() {
+fn a_print_run_calls_an_mcp_tool_and_leaves_no_server_behind() {
     let fx = Fixture::new("normal");
     let model = spawn_model(vec![call("mcp__fake__ping"), text("all done")], false);
 
@@ -330,6 +330,79 @@ fn a_print_run_offers_and_calls_an_mcp_tool() {
     // Credentials in `env` are the server's business alone.
     assert!(!stdout.contains("s3cr3t-do-not-print") && !stderr.contains("s3cr3t-do-not-print"));
     assert!(!requests.iter().any(|r| r.contains("s3cr3t-do-not-print")));
+
+    let (server, helper) = fx.pids();
+    assert_dies("MCP server", server);
+    assert_dies("the helper the server backgrounded", helper);
+}
+
+/// The Ctrl-C path. The run is held mid-turn by the model, so the
+/// signal provably lands while the server is up. The servers must die
+/// from the interrupt itself — checked while the parent is still alive —
+/// not merely when the parent eventually exits.
+#[test]
+fn ctrl_c_stops_every_mcp_server_before_the_run_ends() {
+    let fx = Fixture::new("ctrlc");
+    let model = spawn_model(vec![text("finished")], true);
+
+    let mut child = fx.spawn(model.port, &[], &[]);
+    wait_in_flight(&model, &mut child);
+    let (server, helper) = fx.pids();
+    assert!(alive(server) && alive(helper));
+
+    signal(&child, libc::SIGINT);
+    assert_dies("MCP server", server);
+    assert_dies("the helper the server backgrounded", helper);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the run is still mid-turn, so it was the interrupt that stopped the servers"
+    );
+
+    model.release.store(true, Ordering::SeqCst);
+    let status = wait_exit(&mut child);
+    let (stdout, stderr) = output_of(&mut child);
+    assert!(status.code().is_some(), "{status:?}\nstdout={stdout}\nstderr={stderr}");
+}
+
+/// SIGTERM drops the whole print future (`main.rs`); the servers must
+/// go with it.
+#[test]
+fn sigterm_leaves_no_mcp_server_behind() {
+    let fx = Fixture::new("sigterm");
+    let model = spawn_model(vec![text("finished")], true);
+
+    let mut child = fx.spawn(model.port, &[], &[]);
+    wait_in_flight(&model, &mut child);
+    let (server, helper) = fx.pids();
+
+    signal(&child, libc::SIGTERM);
+    let status = wait_exit(&mut child);
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    assert_dies("MCP server", server);
+    assert_dies("the helper the server backgrounded", helper);
+    model.release.store(true, Ordering::SeqCst);
+}
+
+/// A hard kill runs no destructor at all; only the kernel's
+/// parent-death signal (set in `stdio.rs`) can reap the server. Linux
+/// has it; elsewhere this is the documented gap.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hard_killed_nanopi_does_not_orphan_its_mcp_server() {
+    let fx = Fixture::new("sigkill");
+    let model = spawn_model(vec![text("finished")], true);
+
+    let mut child = fx.spawn(model.port, &[], &[]);
+    wait_in_flight(&model, &mut child);
+    let (server, _helper) = fx.pids();
+
+    signal(&child, libc::SIGKILL);
+    let _ = wait_exit(&mut child);
+    // The server itself is signalled by the kernel. Its backgrounded
+    // helper is not in the parent-death signal's reach (it has no
+    // `PDEATHSIG` of its own), which is why only the server is asserted.
+    assert_dies("MCP server", server);
+    model.release.store(true, Ordering::SeqCst);
 }
 
 /// Trap 3. A spawned child agent is told apart by `--brief` /
@@ -346,12 +419,8 @@ fn a_spawned_child_agent_connects_to_no_mcp_server() {
     let mut control = fx.spawn(model.port, &[], &[]);
     assert!(wait_exit(&mut control).success());
     let (server, helper) = fx.pids();
-    for pid in [server, helper] {
-        // SAFETY: pids read from files this test's own server wrote.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
+    assert_dies("control run's server", server);
+    assert_dies("control run's helper", helper);
     std::fs::remove_file(&fx.server_pid).unwrap();
     std::fs::remove_file(&fx.helper_pid).unwrap();
 

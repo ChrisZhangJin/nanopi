@@ -622,12 +622,17 @@ pub async fn run_tui_mode(
     // standard registry. Before the Agent is built, so the tools are in
     // the prompt and the `tools` array from the first turn, and before
     // orchestrator mode can save the registry (see `tui_registry`).
+    // Servers are stopped after the terminal is restored, below.
     let mcp = crate::mcp::manager::McpManager::start_for_session(
         crate::mcp::manager::SessionKind::Tui,
         &tools_allow,
     )
     .await;
     mcp.register_into(&mut registry);
+    // Any exit before the graceful `shutdown` at the bottom — the `?`s
+    // between here and `run_app`, a panic that unwinds — still kills the
+    // servers' process groups. See `McpManager::kill_now`.
+    let _mcp_kill_guard = mcp.kill_on_drop();
 
     // v0.11.0: `tool_exec_mode` + `[[extensions]]` come from
     // config.toml, which isn't in this function's parameter list.
@@ -804,6 +809,10 @@ pub async fn run_tui_mode(
         reg.kill_all();
     }
     let _ = teardown_terminal(&mut terminal);
+    // After the terminal is restored, not before: stopping a server that
+    // ignores stdin EOF can take a second or two, and doing it under the
+    // alt screen makes quitting look hung.
+    app.mcp.shutdown().await;
 
     // Session-end hook.
     {
