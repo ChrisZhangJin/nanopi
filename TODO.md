@@ -104,7 +104,7 @@ Use the de-facto ecosystem shape so existing configs paste in unchanged:
 is left untouched, reports the line, and startup continues. Tests cover an
 empty `mcpServers`, an entry missing `command`, and a duplicate name.
 
-## 🔶 M5 — Tool adapter (mapping done, `impl Tool` waits on M3)
+## ✅ M5 — Tool adapter
 
 New `src/mcp/tool.rs`: `impl Tool for McpTool`, modelled on
 `impl Tool for WasmTool` (`src/wasm/host.rs`).

@@ -1,13 +1,14 @@
 //! Adapting an MCP tool to nanopi's `Tool` trait, and its multimodal
 //! `CallToolResult` to the flat `ToolOutput`.
 //!
-//! This half is pure: [`to_tool_output`] is a total function from a
-//! parsed result to a `ToolOutput`, with no transport in reach. That is
-//! deliberate — every interesting case here (a block type nanopi cannot
-//! render, an empty result, a 4 MB wall of text) is a property of the
-//! *payload*, and pinning those against a live server would mean owning
-//! a server that can be made to emit them on demand. `impl Tool for
-//! McpTool` lands with the client in M3 and calls straight into this.
+//! Two halves, kept apart on purpose. [`to_tool_output`] is pure: a
+//! total function from a parsed result to a `ToolOutput`, with no
+//! transport in reach. Every interesting case there (a block type
+//! nanopi cannot render, an empty result, a 4 MB wall of text) is a
+//! property of the *payload*, and pinning those against a live server
+//! would mean owning a server that can be made to emit them on demand.
+//! [`McpTool`] is the other half: it owns the name the model sees and
+//! the call into the client, and calls straight into the first.
 //!
 //! **The shapes do not line up, and the gap is lossy in one direction.**
 //! `CallToolResult.content` is an ordered, heterogeneous array;
@@ -18,10 +19,369 @@
 //! So every block produces at least one line of output. There is no
 //! silent-drop path in this file.
 
-use base64::Engine as _;
+use std::sync::Arc;
 
-use crate::mcp::protocol::{CallToolResult, ContentBlock, ResourceContents};
-use crate::tool::{ImageAttachment, ToolOutput};
+use async_trait::async_trait;
+use base64::Engine as _;
+use serde_json::{json, Map, Value};
+
+use crate::agent::context::ToolSpec;
+use crate::mcp::client::{ClientError, McpClient};
+use crate::mcp::protocol::{
+    CallToolResult, ContentBlock, ResourceContents, Tool as McpToolDef,
+};
+use crate::tool::{
+    ExecutionMode, ImageAttachment, Tool, ToolContext, ToolError, ToolOutput, ToolSource,
+    MCP_TOOL_PREFIX,
+};
+
+// ------------------------------------------------------------- naming
+
+/// Longest tool name both OpenAI and Anthropic accept
+/// (`^[a-zA-Z0-9_-]{1,64}$`).
+///
+/// Enforced here rather than left to the provider because the provider's
+/// answer is a 400 on the *whole* request: one over-long name from one
+/// server would fail every turn for the rest of the session, including
+/// turns that never touch MCP. `mcp__<server>__<tool>` overruns it
+/// easily — a 30-character server name plus a verbose tool name is
+/// enough.
+pub const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// Characters of hash appended to a shortened name. 8 hex digits is 32
+/// bits: collisions need tens of thousands of tools sharing a prefix to
+/// become likely, and `register_external` still refuses one that
+/// happens anyway.
+const HASH_LEN: usize = 8;
+
+/// The name the model will call this tool by: `mcp__<server>__<tool>`,
+/// restricted to what providers accept and at most
+/// [`MAX_TOOL_NAME_LEN`] long.
+///
+/// **Lowercased as well as sanitised**, which the naming rule alone does
+/// not ask for. The OpenAI provider lowercases every tool name at the
+/// SSE source (`normalize_tool_name`, for gateways that return
+/// `Bash_tool`), so a registered `mcp__GitHub__Search` could never be
+/// matched: the model calls it, the provider hands the loop
+/// `mcp__github__search`, and the registry — keyed by the mixed-case
+/// name — reports "tool not found". Registering the lowercase form
+/// makes that rewrite the identity for every MCP name. The cost is that
+/// tools differing only in case collide; the manager reports the second
+/// and keeps the first, which is the right outcome for names the
+/// model's own gateway cannot tell apart.
+///
+/// **Shortening is deterministic and hash-suffixed.** A name that fits
+/// is returned as is, so the common case reads naturally. One that does
+/// not is cut to the budget and ends in `_<8 hex>` of a hash over the
+/// *original* server and tool names. Truncation alone would map two
+/// tools sharing a long prefix to one name; hashing the unsanitised
+/// input also separates names that sanitising would merge (`a.b` and
+/// `a_b`) once they are long enough to be cut. It is FNV-1a written out
+/// here rather than `DefaultHasher`, whose output is explicitly not
+/// stable across Rust releases — a name that changed with the toolchain
+/// would orphan every session transcript that recorded it. The budget
+/// is split so neither part can crowd the other out: each keeps up to
+/// half, and a part shorter than that donates the rest.
+pub fn registered_tool_name(server: &str, tool: &str) -> String {
+    let (s, t) = (sanitise(server), sanitise(tool));
+    let name = format!("{MCP_TOOL_PREFIX}{s}__{t}");
+    if name.len() <= MAX_TOOL_NAME_LEN {
+        return name;
+    }
+
+    // Both parts are ASCII after `sanitise`, so byte slicing below is
+    // on character boundaries.
+    let budget = MAX_TOOL_NAME_LEN - MCP_TOOL_PREFIX.len() - 2 - 1 - HASH_LEN;
+    let half = budget / 2;
+    let (s_take, t_take) = if s.len() <= half {
+        (s.len(), budget - s.len())
+    } else if t.len() <= half {
+        (budget - t.len(), t.len())
+    } else {
+        (half, budget - half)
+    };
+    format!(
+        "{MCP_TOOL_PREFIX}{}__{}_{:08x}",
+        &s[..s_take],
+        &t[..t_take],
+        fnv1a32(server, tool)
+    )
+}
+
+fn sanitise(part: &str) -> String {
+    part.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Low 32 bits of 64-bit FNV-1a over `server 0xFF tool`. `0xFF` never
+/// occurs in UTF-8, so `("ab","c")` and `("a","bc")` cannot hash the
+/// same bytes.
+fn fnv1a32(server: &str, tool: &str) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in server.bytes().chain(std::iter::once(0xff)).chain(tool.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h as u32
+}
+
+/// A server-supplied `inputSchema` made safe to hand to a provider.
+///
+/// Providers require the top-level schema to be `type: "object"`, and a
+/// rejection is — like an over-long name — a 400 on the whole request,
+/// not on the one tool. The spec requires an object schema, but
+/// `protocol.rs` parses leniently on purpose so one sloppy server does
+/// not void a whole `tools/list`; this is where that leniency has to
+/// stop. A missing `type` is filled in (the properties are usually
+/// right); anything else non-object is replaced by the permissive
+/// schema, since passing it on would only move the failure to the
+/// provider.
+fn parameters_schema(schema: Value) -> Value {
+    match schema {
+        Value::Object(mut m) => match m.get("type") {
+            Some(Value::String(t)) if t == "object" => Value::Object(m),
+            None => {
+                m.insert("type".into(), json!("object"));
+                Value::Object(m)
+            }
+            Some(_) => json!({ "type": "object" }),
+        },
+        _ => json!({ "type": "object" }),
+    }
+}
+
+// --------------------------------------------------------------- tool
+
+/// One MCP server tool, callable by the model.
+///
+/// Holds an `Arc<McpClient>` shared with every sibling tool of the same
+/// server, which is what the client's `&self` API was shaped for:
+/// concurrent calls multiplex over the one pipe.
+pub struct McpTool {
+    client: Arc<McpClient>,
+    server: String,
+    endpoint: String,
+    /// The server's own name for the tool. Kept apart from `spec.name`
+    /// because the two differ whenever sanitising, lowercasing or
+    /// shortening changed anything, and `tools/call` must carry the
+    /// server's: sending the registered name would be an "unknown tool"
+    /// error for exactly the tools whose names had to be adjusted.
+    remote_name: String,
+    spec: ToolSpec,
+    read_only: bool,
+}
+
+impl McpTool {
+    /// `endpoint` is what `/tools` shows as the tool's origin. The
+    /// caller builds it (see `manager::endpoint_of`) because it must
+    /// never carry the server's `env`, and only the caller has the
+    /// config.
+    pub fn new(client: Arc<McpClient>, endpoint: impl Into<String>, def: McpToolDef) -> Self {
+        let server = client.name().to_string();
+        let description = def
+            .description
+            .filter(|d| !d.trim().is_empty())
+            .or_else(|| def.title.filter(|t| !t.trim().is_empty()))
+            .unwrap_or_else(|| format!("Tool \"{}\" from MCP server \"{server}\".", def.name));
+        let read_only = def
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        Self {
+            spec: ToolSpec {
+                name: registered_tool_name(&server, &def.name),
+                description,
+                parameters: parameters_schema(def.input_schema),
+            },
+            remote_name: def.name,
+            endpoint: endpoint.into(),
+            server,
+            client,
+            read_only,
+        }
+    }
+
+    /// The name `tools/call` carries.
+    pub fn remote_name(&self) -> &str {
+        &self.remote_name
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::Mcp { server: self.server.clone(), endpoint: self.endpoint.clone() }
+    }
+
+    /// **Sequential, unless the server declares `readOnlyHint`.**
+    ///
+    /// An MCP tool is as opaque as `bash`: nothing nanopi can inspect
+    /// says what it touches, and `mutation_key` only understands `edit`
+    /// and `write`. A filesystem server's `write_file` run beside
+    /// another call on the same path loses an update, and — as with
+    /// parallel `bash` — both calls report success, so the loss never
+    /// reaches the model. Parallel is therefore the wrong default.
+    ///
+    /// Sequential is not free: it serialises the *whole* batch (see
+    /// `ExecutionMode`), including unrelated `read`s, so a blanket
+    /// default would tax every model that fans out three searches
+    /// against one network server. `readOnlyHint` is the way out.
+    /// `docs/mcp.md` rules the annotation out as a *security boundary*,
+    /// and this is not one: nothing is granted or withheld on its
+    /// strength, a server that lies only races its own calls, and every
+    /// configured server already runs with the user's full privileges.
+    /// A wrong hint costs a possible lost update; a missing one costs
+    /// latency.
+    fn execution_mode(&self) -> ExecutionMode {
+        if self.read_only {
+            ExecutionMode::Parallel
+        } else {
+            ExecutionMode::Sequential
+        }
+    }
+
+    /// Every failure is an in-band `is_error` result, never `Err`: the
+    /// model can read it and recover, whereas an `Err` is nanopi's own
+    /// failure channel. This matches `WasmTool` and `tool/agent.rs`'s
+    /// soft errors — a dead server must cost one tool call, not the
+    /// turn.
+    ///
+    /// The ways a call can fail stay distinguishable in the message and
+    /// in `metadata.mcp_error`, because they call for different
+    /// reactions: `isError: true` is the tool's own answer, passed
+    /// through untouched by [`to_tool_output`]; an RPC error means the
+    /// server refused the request, so repeating it unchanged gets the
+    /// same answer; a transport failure means the server may be gone,
+    /// so retrying is pointless until it is back.
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        // `null` is what a provider sends for a tool called with no
+        // arguments; anything else non-object is a model error, refused
+        // here rather than shipped to a server that would answer with a
+        // less readable one.
+        let arguments: Map<String, Value> = match args {
+            Value::Object(m) => m,
+            Value::Null => Map::new(),
+            other => {
+                return Ok(failure(
+                    "invalid_arguments",
+                    format!(
+                        "MCP tool \"{}\" takes a JSON object of arguments, got {}",
+                        self.spec.name,
+                        json_kind(&other)
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        Ok(match self.client.call_tool(&self.remote_name, arguments).await {
+            Ok(result) => to_tool_output(result),
+            Err(ClientError::Rpc(e)) => failure(
+                "rpc",
+                format!(
+                    "MCP server \"{}\" rejected the call to \"{}\": {}",
+                    self.server,
+                    self.remote_name,
+                    elide(&e.to_string(), ERROR_DETAIL_BYTES)
+                ),
+                Some(e.code),
+            ),
+            // The message already names the server and carries only the
+            // headline of its failure; the stderr tail stays out of the
+            // model's context (see `ClientError::NotReady`).
+            Err(e @ ClientError::NotReady { .. }) => {
+                failure("not_ready", elide(&e.to_string(), ERROR_DETAIL_BYTES), None)
+            }
+            Err(ClientError::Transport(e)) => failure(
+                "transport",
+                format!(
+                    "MCP server \"{}\" failed during the call to \"{}\": {}",
+                    self.server,
+                    self.remote_name,
+                    elide(&e.to_string(), ERROR_DETAIL_BYTES)
+                ),
+                None,
+            ),
+            Err(ClientError::Protocol(m)) => failure(
+                "protocol",
+                format!(
+                    "MCP server \"{}\" sent an unusable reply to \"{}\": {}",
+                    self.server,
+                    self.remote_name,
+                    elide(&m, ERROR_DETAIL_BYTES)
+                ),
+                None,
+            ),
+        })
+    }
+}
+
+/// How much of a server-supplied error string reaches the model. An RPC
+/// message or a transport reason can embed a stack trace or a stderr
+/// dump, and one failed call should not spend the context on it.
+const ERROR_DETAIL_BYTES: usize = 1_000;
+
+fn failure(kind: &str, message: String, code: Option<i32>) -> ToolOutput {
+    let mut meta = json!({ "mcp_error": kind });
+    if let Some(code) = code {
+        meta["code"] = json!(code);
+    }
+    ToolOutput { content: message, is_error: true, metadata: Some(meta), images: Vec::new() }
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// First line of `s`, control characters flattened and capped at `max`
+/// characters — for status rows and startup notices.
+///
+/// Control characters are replaced rather than kept because the source
+/// is a server's stderr, written to the user's terminal as-is: a server
+/// that colours its logs would otherwise inject escape sequences into
+/// nanopi's own output, and a hostile one could rewrite the screen.
+pub fn first_line(s: &str, max: usize) -> String {
+    let line: String = s
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = line.trim();
+    if line.chars().count() <= max {
+        line.to_string()
+    } else {
+        let mut out: String = line.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+// ------------------------------------------------------ result mapping
 
 /// Caps on the assembled text, matching `tool/bash.rs`'s 30 KB / 2000
 /// lines rather than `tool/read.rs`'s 50 KB / 2000.
@@ -606,5 +966,317 @@ mod tests {
         let out = to_tool_output(parsed);
         assert!(out.content.starts_with("Current weather in New York:"));
         assert!(!out.is_error);
+    }
+
+    // ------------------------------------------------------- naming
+
+    fn valid_provider_name(n: &str) -> bool {
+        !n.is_empty()
+            && n.len() <= 64
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn sanitising_replaces_every_character_a_provider_would_reject() {
+        assert_eq!(registered_tool_name("my server", "do.thing/now"), "mcp__my_server__do_thing_now");
+        // One underscore per *character*, not per byte: a CJK name must
+        // not balloon past the limit on its encoded length.
+        assert_eq!(registered_tool_name("服务", "查询"), "mcp________");
+        assert!(valid_provider_name(&registered_tool_name("服务", "查询")));
+        assert_eq!(registered_tool_name("gh", "search-code_v2"), "mcp__gh__search-code_v2");
+    }
+
+    /// The OpenAI provider lowercases tool names at the SSE source, so
+    /// a mixed-case registered name could never be dispatched.
+    #[test]
+    fn registered_names_are_lowercase_so_the_provider_rewrite_is_the_identity() {
+        let name = registered_tool_name("GitHub", "SearchCode");
+        assert_eq!(name, "mcp__github__searchcode");
+        assert_eq!(crate::tool::normalize_tool_name(&name), name);
+    }
+
+    #[test]
+    fn a_name_exactly_at_the_limit_is_left_alone() {
+        let tool = "t".repeat(MAX_TOOL_NAME_LEN - "mcp__s__".len());
+        let name = registered_tool_name("s", &tool);
+        assert_eq!(name.len(), MAX_TOOL_NAME_LEN);
+        assert_eq!(name, format!("mcp__s__{tool}"), "no hash when it already fits");
+    }
+
+    #[test]
+    fn an_over_long_name_is_cut_to_exactly_the_provider_limit() {
+        for (s, t) in [
+            ("s".to_string(), "t".repeat(200)),
+            ("s".repeat(200), "t".to_string()),
+            ("server".repeat(10), "tool".repeat(30)),
+            ("x".to_string(), "日本語".repeat(40)),
+        ] {
+            let name = registered_tool_name(&s, &t);
+            assert_eq!(name.len(), MAX_TOOL_NAME_LEN, "{name}");
+            assert!(valid_provider_name(&name), "{name}");
+            assert!(name.starts_with("mcp__"), "{name}");
+        }
+    }
+
+    /// Neither half may be starved: a long server name still leaves
+    /// room to tell its tools apart, and vice versa.
+    #[test]
+    fn a_long_part_cannot_crowd_the_other_out() {
+        let long_server = registered_tool_name(&"s".repeat(100), "search");
+        assert!(long_server.contains("__search_"), "{long_server}");
+        let long_tool = registered_tool_name("github", &"t".repeat(100));
+        assert!(long_tool.starts_with("mcp__github__t"), "{long_tool}");
+    }
+
+    #[test]
+    fn shortening_is_deterministic_and_separates_shared_prefixes() {
+        let a = registered_tool_name("srv", &format!("{}a", "x".repeat(80)));
+        let b = registered_tool_name("srv", &format!("{}b", "x".repeat(80)));
+        assert_eq!(a, registered_tool_name("srv", &format!("{}a", "x".repeat(80))));
+        // Same 48-char prefix, differ only past the cut: the hash is the
+        // only thing keeping them apart.
+        assert_ne!(a, b);
+    }
+
+    /// Sanitising merges `a.b` and `a_b`; once the name is long enough
+    /// to be shortened, the hash over the *original* strings still
+    /// tells them apart, so the long form is collision-free where the
+    /// short form is not.
+    #[test]
+    fn names_that_sanitise_alike_stay_distinct_once_shortened() {
+        let pad = "p".repeat(80);
+        assert_eq!(
+            registered_tool_name("s", "a.b"),
+            registered_tool_name("s", "a_b"),
+            "short names merge, which is why the manager must report the second"
+        );
+        assert_ne!(
+            registered_tool_name("s", &format!("a.b{pad}")),
+            registered_tool_name("s", &format!("a_b{pad}"))
+        );
+    }
+
+    #[test]
+    fn a_name_is_never_reshaped_by_the_registrys_canonicalisation() {
+        // `search_tool` is a real server tool name; M0's guarantee must
+        // hold for the names this module actually produces.
+        let name = registered_tool_name("github", "search_tool");
+        let mut r = crate::tool::ToolRegistry::new();
+        r.register_external(Arc::new(DeadTool(name.clone()))).unwrap();
+        assert_eq!(r.canonical_name(&name).as_deref(), Some(name.as_str()));
+    }
+
+    /// Minimal `Tool` for registry-facing assertions.
+    struct DeadTool(String);
+    #[async_trait]
+    impl Tool for DeadTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec { name: self.0.clone(), description: String::new(), parameters: json!({}) }
+        }
+        async fn execute(&self, _: Value, _: &ToolContext) -> Result<ToolOutput, ToolError> {
+            unreachable!()
+        }
+    }
+
+    // ------------------------------------------------------ schema
+
+    #[test]
+    fn a_non_object_input_schema_cannot_reach_a_provider() {
+        assert_eq!(parameters_schema(json!(true)), json!({"type": "object"}));
+        assert_eq!(parameters_schema(json!({"type": "string"})), json!({"type": "object"}));
+        assert_eq!(parameters_schema(json!({"type": ["object", "null"]})), json!({"type": "object"}));
+        assert_eq!(
+            parameters_schema(json!({"properties": {"q": {"type": "string"}}})),
+            json!({"type": "object", "properties": {"q": {"type": "string"}}})
+        );
+        let ok = json!({"type": "object", "properties": {}});
+        assert_eq!(parameters_schema(ok.clone()), ok);
+    }
+
+    #[test]
+    fn first_line_is_one_capped_line_with_no_control_characters() {
+        assert_eq!(first_line("boom\nsecond", 100), "boom");
+        assert_eq!(first_line("\x1b[31mred\x1b[0m", 100), "[31mred [0m");
+        assert_eq!(first_line(&"x".repeat(50), 10), format!("{}…", "x".repeat(10)));
+        assert_eq!(first_line("", 10), "");
+    }
+
+    // ---------------------------------------------- against a server
+
+    #[cfg(unix)]
+    mod live {
+        use super::*;
+        use crate::mcp::config::ServerConfig;
+        use crate::mcp::protocol::ToolAnnotations;
+        use std::collections::BTreeMap;
+
+        /// Answers the handshake, then `tools/call` by the tool's name:
+        /// `echo` reports the name it was called with, `bad` is a tool
+        /// that ran and failed (`isError`), `refuse` is a protocol
+        /// error, `die` kills the server mid-call.
+        const SERVER: &str = r#"
+            while IFS= read -r line; do
+                id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                case "$line" in
+                    *'"method":"initialize"'*)
+                        printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+                    *'"method":"tools/call"'*)
+                        name=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+                        case "$name" in
+                            bad) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ENOENT"}],"isError":true}}\n' "$id" ;;
+                            refuse) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Unknown tool"}}\n' "$id" ;;
+                            die) echo "kaboom: out of memory" >&2; exit 3 ;;
+                            *) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"called %s"}]}}\n' "$id" "$name" ;;
+                        esac ;;
+                esac
+            done
+        "#;
+
+        async fn client(script: &str) -> Arc<McpClient> {
+            let c = McpClient::connect(&ServerConfig {
+                name: "fake".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: BTreeMap::new(),
+            })
+            .await;
+            Arc::new(c)
+        }
+
+        fn def(name: &str) -> McpToolDef {
+            McpToolDef {
+                name: name.to_string(),
+                title: None,
+                description: None,
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: None,
+            }
+        }
+
+        fn ctx() -> ToolContext {
+            ToolContext { cwd: std::env::temp_dir() }
+        }
+
+        /// The server only knows `a.b`; the model only knows
+        /// `mcp__fake__a_b`. The adapter is the translation between
+        /// them, and sending the wrong one is an "unknown tool" for
+        /// exactly the tools whose names had to change.
+        #[tokio::test]
+        async fn the_call_carries_the_servers_name_not_the_registered_one() {
+            let tool = McpTool::new(client(SERVER).await, "sh", def("a.b"));
+            assert_eq!(tool.spec().name, "mcp__fake__a_b");
+            assert_eq!(tool.remote_name(), "a.b");
+            let out = tool.execute(json!({}), &ctx()).await.unwrap();
+            assert!(!out.is_error, "{out:?}");
+            assert_eq!(out.content, "called a.b");
+        }
+
+        /// Same, for a name that had to be shortened.
+        #[tokio::test]
+        async fn a_shortened_tool_still_calls_the_full_remote_name() {
+            let long = format!("t{}", "x".repeat(100));
+            let tool = McpTool::new(client(SERVER).await, "sh", def(&long));
+            assert_eq!(tool.spec().name.len(), MAX_TOOL_NAME_LEN);
+            let out = tool.execute(Value::Null, &ctx()).await.unwrap();
+            assert_eq!(out.content, format!("called {long}"));
+        }
+
+        #[tokio::test]
+        async fn a_tool_that_ran_and_failed_is_passed_through_as_its_own_answer() {
+            let tool = McpTool::new(client(SERVER).await, "sh", def("bad"));
+            let out = tool.execute(json!({}), &ctx()).await.unwrap();
+            assert!(out.is_error);
+            assert_eq!(out.content, "ENOENT");
+            // The server's own result: no adapter tag, which is what
+            // keeps it distinct from the protocol failure below.
+            assert!(out.metadata.is_none(), "{:?}", out.metadata);
+        }
+
+        #[tokio::test]
+        async fn a_protocol_error_is_an_in_band_failure_distinct_from_is_error() {
+            let tool = McpTool::new(client(SERVER).await, "sh", def("refuse"));
+            let out = tool.execute(json!({}), &ctx()).await.unwrap();
+            assert!(out.is_error);
+            assert!(out.content.contains("rejected"), "{}", out.content);
+            assert!(out.content.contains("Unknown tool"), "{}", out.content);
+            assert!(out.content.contains("fake"), "must name the server: {}", out.content);
+            let meta = out.metadata.expect("tagged");
+            assert_eq!(meta["mcp_error"], "rpc");
+            assert_eq!(meta["code"], -32602);
+        }
+
+        /// A server dying mid-call costs one tool result, not the turn,
+        /// and the next call says the server is down rather than hanging.
+        #[tokio::test]
+        async fn a_server_that_dies_mid_call_is_an_in_band_failure_naming_it() {
+            let client = client(SERVER).await;
+            let die = McpTool::new(client.clone(), "sh", def("die"));
+            let out = die.execute(json!({}), &ctx()).await.unwrap();
+            assert!(out.is_error, "{out:?}");
+            assert!(out.content.contains("fake"), "{}", out.content);
+            assert_eq!(out.metadata.unwrap()["mcp_error"], "transport");
+
+            let echo = McpTool::new(client, "sh", def("echo"));
+            let out = echo.execute(json!({}), &ctx()).await.unwrap();
+            assert!(out.is_error);
+            assert!(out.content.contains("not ready"), "{}", out.content);
+            assert!(out.content.contains("\"fake\""), "{}", out.content);
+            assert_eq!(out.metadata.unwrap()["mcp_error"], "not_ready");
+            // The headline only: the stderr tail is for `/mcp`, not for
+            // the model's context.
+            assert!(!out.content.contains('\n'), "{}", out.content);
+        }
+
+        #[tokio::test]
+        async fn a_client_that_never_started_fails_the_call_instead_of_panicking() {
+            let c = Arc::new(
+                McpClient::connect(&ServerConfig {
+                    name: "ghost".to_string(),
+                    command: "/definitely/not/a/real/binary".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                })
+                .await,
+            );
+            let tool = McpTool::new(c, "ghost", def("anything"));
+            let out = tool.execute(json!({}), &ctx()).await.unwrap();
+            assert!(out.is_error);
+            assert!(out.content.contains("ghost"), "{}", out.content);
+        }
+
+        #[tokio::test]
+        async fn non_object_arguments_are_refused_without_calling_the_server() {
+            let tool = McpTool::new(client(SERVER).await, "sh", def("echo"));
+            let out = tool.execute(json!([1, 2]), &ctx()).await.unwrap();
+            assert!(out.is_error);
+            assert!(out.content.contains("an array"), "{}", out.content);
+        }
+
+        /// Opaque by default, like `bash`; the server's own read-only
+        /// declaration is the only thing that buys parallelism.
+        #[tokio::test]
+        async fn execution_mode_is_sequential_unless_declared_read_only() {
+            let c = client(SERVER).await;
+            let opaque = McpTool::new(c.clone(), "sh", def("w"));
+            assert_eq!(opaque.execution_mode(), ExecutionMode::Sequential);
+
+            let mut ro = def("r");
+            ro.annotations = Some(ToolAnnotations { read_only_hint: Some(true), ..Default::default() });
+            assert_eq!(McpTool::new(c.clone(), "sh", ro).execution_mode(), ExecutionMode::Parallel);
+
+            let mut not_ro = def("n");
+            not_ro.annotations = Some(ToolAnnotations { read_only_hint: Some(false), ..Default::default() });
+            assert_eq!(McpTool::new(c, "sh", not_ro).execution_mode(), ExecutionMode::Sequential);
+        }
+
+        #[tokio::test]
+        async fn source_names_the_server_and_endpoint() {
+            let tool = McpTool::new(client(SERVER).await, "npx -y thing", def("t"));
+            assert_eq!(
+                tool.source(),
+                ToolSource::Mcp { server: "fake".into(), endpoint: "npx -y thing".into() }
+            );
+        }
     }
 }
