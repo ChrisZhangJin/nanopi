@@ -338,14 +338,6 @@ mod tests {
         assert!(matches!(tools[0].source(), ToolSource::Mcp { ref server, .. } if server == "demo"));
     }
 
-    #[tokio::test]
-    async fn a_non_object_argument_is_refused_in_band() {
-        let tool = build(&s(&["mcp__demo__echo"]), &Link::Down("x".into())).remove(0);
-        let out = tool.execute(json!([1]), &ToolContext { cwd: std::env::temp_dir() }).await.unwrap();
-        assert!(out.is_error);
-        assert!(out.content.contains("an array"), "{}", out.content);
-    }
-
     /// Real parent, real server, real socket: what a child's registry
     /// does when the channel is up.
     #[cfg(unix)]
@@ -439,6 +431,18 @@ mod tests {
             assert!(out.is_error);
             assert!(out.content.contains("was not granted"), "{}", out.content);
             assert_eq!(out.metadata.unwrap()["mcp_error"], "denied");
+            p.finish().await;
+        }
+
+        #[tokio::test]
+        async fn a_non_object_argument_is_refused_in_band() {
+            let p = Parent::new().await;
+            p.server.grant("a1", ["mcp__fake__echo"]);
+            let names = s(&["mcp__fake__echo"]);
+            let tool = build(&names, &p.link("a1").await).remove(0);
+            let out = tool.execute(json!([1]), &ctx()).await.unwrap();
+            assert!(out.is_error);
+            assert!(out.content.contains("an array"), "{}", out.content);
             p.finish().await;
         }
 
