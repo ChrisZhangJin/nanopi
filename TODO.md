@@ -197,11 +197,74 @@ Reconnect, enable/disable a server for this session.
 
 ---
 
+## Streamable HTTP (design: [`docs/mcp-http.md`](docs/mcp-http.md))
+
+Motivating case: the `playwright-mcp` container already running at
+`http://127.0.0.1:8931/mcp`, which nanopi cannot use today. Order matters: H1 is
+a behaviour-preserving refactor and must land alone.
+
+### H1 — Transport seam (pure refactor)
+
+`enum Transport { Stdio, Http }` with the surface `McpClient` already uses
+(`request_with_timeout`, `notify`, `shutdown`, `close_reason`, `diagnostics`,
+`pid`); `ServerConfig` becomes `{ name, spec: ServerSpec }`
+(`Stdio { command, args, env }` / `Http { url, headers }`); `config.rs` parses
+`url` / `type` / `headers` and reports `sse`/`ws` as unsupported by name. Declare
+`src/mcp/transport.rs` and `src/mcp/http.rs` (placeholder) up front.
+
+**ACCEPTANCE** Every existing test passes with no assertion changed. stdio
+behaviour is byte-identical. An `http` entry now parses into `ServerSpec::Http`
+(and is skipped with a "not implemented" diagnostic until H2).
+
+### H2 — HTTP transport core
+
+`src/mcp/http.rs`: POST over `net::client_builder()`; parse **both**
+`application/json` and `text/event-stream` responses (the real server answers
+every POST as SSE) via `provider::sse::SseStream`, matching on `id`; `Mcp-Session-Id`
+and `MCP-Protocol-Version` replay; `202` for notifications; `-32601` reply to
+server-initiated requests; own per-request timeout and **no** whole-request
+reqwest timeout; redirects disabled; loopback bypasses any proxy.
+
+**ACCEPTANCE** Tests against a hand-rolled local HTTP server: JSON response, SSE
+response, `202`, `400`/`404`/`401`/`5xx` mapped to typed errors, a redirect
+refused, a stream closing before the matching id, a server request on the stream.
+No new dependency. Windows check clean.
+
+### H3 — Session lifecycle
+
+`404` with a session id → re-`initialize` once and retry (only `404`; never
+timeouts or `5xx`, where a `tools/call` may have run); `DELETE` on shutdown with a
+short timeout; `pid()` is `None` and `manager.pids()` / `kill_on_drop` treat that
+as normal.
+
+**ACCEPTANCE** A server that drops its session mid-run is recovered from
+transparently; shutdown sends `DELETE` (asserted on the fake server); a dead host
+fails fast rather than waiting out the call timeout.
+
+### H4 — Credentials
+
+`headers` support; `endpoint_of` masks URL userinfo and credential-looking query
+parameters and shows header names at most; `401`/`403` get distinct errors;
+cleartext `http://` with credentials to a non-loopback host is refused with a
+diagnostic. `${VAR}` expansion per the open question in the design doc.
+
+**ACCEPTANCE** No header value appears in `/tools`, notices, errors or anything
+sent toward a child (test it); the refusal and the masking each have a test.
+
+### H5 — Wiring and live check
+
+Manager/status/`/tools` show the masked URL; the IPC path is unchanged because
+children never see how a server is reached. Docs (`README`, `config.toml.example`).
+
+**ACCEPTANCE** Against the real `playwright-mcp` at `127.0.0.1:8931`: connect,
+list the 23 tools, call `browser_navigate` and `browser_snapshot`, and confirm
+the session is `DELETE`d on exit. Full suite, Windows and wasm checks clean.
+
 ## Later, explicitly out of scope for now
 
-- **Streamable HTTP transport.** Reuse `SseStream` (`src/provider/sse.rs`),
-  `MCP-Protocol-Version: 2025-06-18` header, `Mcp-Session-Id` session. The
-  older HTTP+SSE transport is deprecated — do not implement it.
+- **Legacy HTTP+SSE transport** — deprecated; do not implement unless a server
+  the owner actually uses requires it.
+- **Standing `GET` stream** and resumability for Streamable HTTP.
 - **`prompts/*`** — maps naturally onto skills / slash commands
   (`/mcp:<server>:<prompt>`).
 - **`resources/*`**.
