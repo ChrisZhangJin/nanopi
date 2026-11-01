@@ -251,6 +251,25 @@ pub async fn run_print_mode(
     // effect. The TUI owns materialising it.
     crate::model_catalogue::init(false);
 
+    // Connect `mcp.json` servers and register their tools. A spawned
+    // child agent is told apart by `agent_mode` (`--brief` /
+    // `NANOPI_AGENT_ID`, both always set by `tool::agent`'s spawn) and
+    // gets an empty manager: connecting from every child would start
+    // `max_concurrency x servers` processes (option B in `docs/mcp.md`,
+    // rejected). `--tools` also gets an empty manager — see
+    // `manager::skip_reason`. Registered into the standard registry only;
+    // print mode never applies orchestrator mode (D-01).
+    let mcp = crate::mcp::manager::McpManager::start_for_session(
+        if child.agent_mode {
+            crate::mcp::manager::SessionKind::ChildAgent
+        } else {
+            crate::mcp::manager::SessionKind::Print
+        },
+        &tools_allow,
+    )
+    .await;
+    mcp.register_into(&mut registry);
+
     // D-01: print mode never restricts its tool registry or prompt based
     // on `experimental.orchestrator` (on by default for the TUI) — a
     // scripted `-p` run must never be silently limited to the
