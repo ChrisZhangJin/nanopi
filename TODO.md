@@ -69,7 +69,7 @@ New `src/mcp/stdio.rs`.
 canned JSON) covers: normal round-trip, server exits mid-request, server writes
 garbage to stdout, request times out. No test leaves a stray process.
 
-## M3 — Client and lifecycle
+## ✅ M3 — Client and lifecycle
 
 New `src/mcp/client.rs`.
 
