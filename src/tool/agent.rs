@@ -1018,6 +1018,19 @@ pub fn build_child_env(spec: &ChildLaunchSpec, agent_id: &str) -> Vec<(String, S
     if let Some(k) = &spec.api_key {
         e.push(("OPENAI_API_KEY".to_string(), k.clone()));
     }
+    // Every child gets the path, granted or not: the parent decides who
+    // may do what at the handshake (`mcp::ipc`), and a child with no grant
+    // is refused there with a clear message rather than by a variable
+    // that silently is not set. Absent when the session started no
+    // channel (no MCP servers) and on platforms without Unix sockets,
+    // where the child's lookup fails fast with the same kind of message.
+    #[cfg(unix)]
+    if let Some(server) = crate::mcp::ipc::global() {
+        e.push((
+            crate::mcp::ipc::SOCKET_ENV.to_string(),
+            server.socket_path().to_string_lossy().into_owned(),
+        ));
+    }
     e
 }
 

@@ -328,6 +328,13 @@ impl McpManager {
         self.servers.is_empty()
     }
 
+    /// The tools held, for the parent↔child channel, which serves a
+    /// child's calls from here rather than from a registry: a child's
+    /// registry is never the parent's.
+    pub fn tools(&self) -> &[Arc<McpTool>] {
+        &self.tools
+    }
+
     /// Total tools held, across servers.
     pub fn tool_count(&self) -> usize {
         self.tools.len()

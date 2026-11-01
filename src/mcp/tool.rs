@@ -217,6 +217,32 @@ impl McpTool {
     pub fn server(&self) -> &str {
         &self.server
     }
+
+    /// The tool as the parent↔child channel shows it to a child agent:
+    /// the *registered* name (the one a child asks for and the allowlist
+    /// holds), the description and the schema, and nothing about where it
+    /// came from. The endpoint and the server's `env` are deliberately
+    /// not reachable from here — a child is model-driven and must not be
+    /// able to learn how a server was launched.
+    pub fn definition(&self) -> McpToolDef {
+        McpToolDef {
+            name: self.spec.name.clone(),
+            title: None,
+            description: Some(self.spec.description.clone()),
+            input_schema: self.spec.parameters.clone(),
+            output_schema: None,
+            annotations: None,
+        }
+    }
+
+    /// The call without the `ToolOutput` flattening, for the channel that
+    /// must hand a child the same `CallToolResult` shape the parent got.
+    pub async fn call_raw(
+        &self,
+        arguments: Map<String, Value>,
+    ) -> Result<CallToolResult, ClientError> {
+        self.client.call_tool(&self.remote_name, arguments).await
+    }
 }
 
 #[async_trait]
