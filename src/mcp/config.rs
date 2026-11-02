@@ -31,22 +31,129 @@ use std::path::{Path, PathBuf};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-/// One validated stdio server, ready for the transport in M2 to spawn.
+/// One validated server, ready for a transport to connect.
 ///
 /// `name` is carried in the struct rather than left as a map key so the
 /// loaded set is an ordered `Vec`: diagnostics, `/mcp` and connection
 /// order then follow the order the user wrote in the file instead of a
 /// hash or alphabetical order they never chose.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand: a derived one prints every `env` and
+/// `headers` value, and a `{:?}` of a config in a log line or a panic
+/// message is exactly how a bearer token ends up in a bug report.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    /// Extra environment for the child process. Values are used
-    /// **verbatim**: `${VAR}` is not interpolated — see `validate` for
-    /// why that decision is deferred to the code that builds the child
-    /// process rather than made here.
-    pub env: BTreeMap<String, String>,
+    pub spec: ServerSpec,
+}
+
+/// How to reach a server. An enum rather than optional fields on
+/// [`ServerConfig`]: `command` empty-means-HTTP would let a config that
+/// is neither (or both) compile, and every consumer would have to
+/// re-derive which one it holds.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ServerSpec {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// Extra environment for the child process. Values are used
+        /// **verbatim**: `${VAR}` is not interpolated — see `validate`
+        /// for why that decision is deferred to the code that builds the
+        /// child process rather than made here.
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        url: String,
+        /// Sent on every request. **Secrets** (`Authorization` lives
+        /// here): never printed, never part of an endpoint string.
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl ServerConfig {
+    pub fn stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            spec: ServerSpec::Stdio { command: command.into(), args, env },
+        }
+    }
+
+    pub fn http(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        headers: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            spec: ServerSpec::Http { url: url.into(), headers },
+        }
+    }
+}
+
+/// Keys shown, values hidden: which variables or headers are set is
+/// what anyone debugging a config needs, and the values are the secret.
+struct Redacted<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ServerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `args` stay verbatim, as they were under the derive:
+            // unlike `env` they are not a conventional place for
+            // secrets, and the heuristic masking `endpoint_of` applies
+            // would make a debug dump misleading about what is run.
+            ServerSpec::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("env", &Redacted(env))
+                .finish(),
+            ServerSpec::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", &redact_url(url))
+                .field("headers", &Redacted(headers))
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("name", &self.name)
+            .field("spec", &self.spec)
+            .finish()
+    }
+}
+
+/// A URL that is safe to print: userinfo (`user:pass@`) masked and any
+/// query or fragment replaced, because tokens ride in both
+/// (`?api_key=…`) and telling a credential from a harmless parameter by
+/// name is a guess a log line should not depend on.
+pub(crate) fn redact_url(url: &str) -> String {
+    let (base, tail) = match url.find(['?', '#']) {
+        Some(i) => (&url[..i], "?***"),
+        None => (url, ""),
+    };
+    let masked = base.find("://").and_then(|i| {
+        let (head, rest) = base.split_at(i + 3);
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let at = rest[..authority_end].rfind('@')?;
+        Some(format!("{head}***@{}", &rest[at + 1..]))
+    });
+    format!("{}{tail}", masked.unwrap_or_else(|| base.to_string()))
 }
 
 /// A problem that did not stop startup. Mirrors
@@ -222,10 +329,10 @@ fn validate(name: &str, raw: RawServer) -> Result<ServerConfig, String> {
         return Err(format!("server \"{name}\" has no \"command\"; skipped"));
     }
 
-    Ok(ServerConfig {
-        name: name.to_string(),
-        command: command.to_string(),
-        args: raw.args,
+    Ok(ServerConfig::stdio(
+        name,
+        command,
+        raw.args,
         // Not expanded. `${VAR}` is left verbatim for now: expansion
         // needs a decided syntax (`${VAR}` vs `$VAR`), an escape for a
         // literal `$` — Postgres and GitHub tokens contain one — and a
@@ -234,8 +341,8 @@ fn validate(name: &str, raw: RawServer) -> Result<ServerConfig, String> {
         // a credential. It also belongs next to the code that actually
         // builds the child's environment and decides whether the parent
         // env is inherited at all, which is M2's spawn path, not here.
-        env: raw.env,
-    })
+        raw.env,
+    ))
 }
 
 /// Print load diagnostics, mirroring `model_catalogue::print_diagnostics`.
@@ -266,6 +373,14 @@ mod tests {
         let d = std::env::temp_dir().join(format!("nanopi-mcp-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&d).unwrap();
         d.join("mcp.json")
+    }
+
+    /// The stdio fields of a server these tests expect to be stdio.
+    fn stdio(c: &ServerConfig) -> (&str, &[String], &BTreeMap<String, String>) {
+        match &c.spec {
+            ServerSpec::Stdio { command, args, env } => (command, args, env),
+            other => panic!("expected a stdio server, got {other:?}"),
+        }
     }
 
     fn write(body: &str) -> PathBuf {
@@ -313,12 +428,12 @@ mod tests {
         assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
         assert_eq!(
             res.servers,
-            vec![ServerConfig {
-                name: "github".into(),
-                command: "npx".into(),
-                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
-                env: BTreeMap::from([("GITHUB_TOKEN".to_string(), "t0ken".to_string())]),
-            }]
+            vec![ServerConfig::stdio(
+                "github",
+                "npx",
+                vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                BTreeMap::from([("GITHUB_TOKEN".to_string(), "t0ken".to_string())]),
+            )]
         );
     }
 
@@ -327,8 +442,8 @@ mod tests {
         let res = load(&write(r#"{ "mcpServers": { "x": { "command": "run-me" } } }"#));
         assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
         assert_eq!(res.servers.len(), 1);
-        assert!(res.servers[0].args.is_empty());
-        assert!(res.servers[0].env.is_empty());
+        assert!(stdio(&res.servers[0]).1.is_empty());
+        assert!(stdio(&res.servers[0]).2.is_empty());
     }
 
     /// Later transports put `type`, `url` and `headers` here. Loading
@@ -397,7 +512,7 @@ mod tests {
                } }"#,
         ));
         assert_eq!(res.servers.len(), 1);
-        assert_eq!(res.servers[0].command, "second", "last definition wins");
+        assert_eq!(stdio(&res.servers[0]).0, "second", "last definition wins");
         assert_eq!(res.diagnostics.len(), 1);
         assert!(res.diagnostics[0].message.contains("more than once"), "{:?}", res.diagnostics);
     }
@@ -439,6 +554,42 @@ mod tests {
         let res = load(&write(
             r#"{ "mcpServers": { "x": { "command": "run-me", "env": { "T": "${HOME}" } } } }"#,
         ));
-        assert_eq!(res.servers[0].env["T"], "${HOME}");
+        assert_eq!(stdio(&res.servers[0]).2["T"], "${HOME}");
+    }
+
+    /// A `{:?}` of a config lands in logs and panic messages, so a
+    /// derived `Debug` would print every token. Keys stay: which
+    /// variables or headers are set is what a debugger needs.
+    #[test]
+    fn debug_hides_env_and_header_values_but_keeps_the_keys() {
+        let stdio = ServerConfig::stdio(
+            "db",
+            "npx",
+            vec!["-y".into()],
+            BTreeMap::from([("API_KEY".to_string(), "sk-live-xyz".to_string())]),
+        );
+        let http = ServerConfig::http(
+            "gw",
+            "https://user:hunter2@example.com/mcp?api_key=abc123",
+            BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
+        );
+        for (cfg, secrets, key) in [
+            (&stdio, ["sk-live-xyz", "", ""], "API_KEY"),
+            (&http, ["s3cret", "hunter2", "abc123"], "Authorization"),
+        ] {
+            for text in [format!("{cfg:?}"), format!("{cfg:#?}"), format!("{:?}", cfg.spec)] {
+                for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                    assert!(!text.contains(secret), "{secret} leaked: {text}");
+                }
+                assert!(text.contains(key), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_url_masks_userinfo_and_query_and_leaves_the_rest() {
+        assert_eq!(redact_url("http://127.0.0.1:8931/mcp"), "http://127.0.0.1:8931/mcp");
+        assert_eq!(redact_url("https://u:p@h.example/mcp"), "https://***@h.example/mcp");
+        assert_eq!(redact_url("https://h.example/mcp?token=abc#frag"), "https://h.example/mcp?***");
     }
 }

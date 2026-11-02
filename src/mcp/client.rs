@@ -555,12 +555,7 @@ mod tests {
     use std::time::Instant;
 
     fn config(script: &str) -> ServerConfig {
-        ServerConfig {
-            name: "fake".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
-            env: BTreeMap::new(),
-        }
+        ServerConfig::stdio("fake", "sh", vec!["-c".to_string(), script.to_string()], BTreeMap::new())
     }
 
     /// Short timeouts so a hung server costs a test a fraction of a
@@ -772,8 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_that_cannot_be_spawned_is_failed_not_fatal() {
-        let mut cfg = config("");
-        cfg.command = "definitely-not-a-program-xyz".to_string();
+        let cfg = ServerConfig::stdio("fake", "definitely-not-a-program-xyz", Vec::new(), BTreeMap::new());
         let client = McpClient::connect_with(&cfg, quick()).await;
 
         let reason = failed_reason(&client);

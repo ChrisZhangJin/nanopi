@@ -32,7 +32,7 @@
 //! hard crash still reaps it, and [`ChildGuard`] so an early return or
 //! a cancelled future does too.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,7 +46,7 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::agent_registry::ChildGuard;
-use crate::mcp::config::ServerConfig;
+use crate::mcp::config::{ServerConfig, ServerSpec};
 use crate::mcp::protocol::method::{CANCELLED, INITIALIZE};
 use crate::mcp::protocol::{
     error_code, Incoming, Notification, Request, RequestId, Response, ResponsePayload, RpcError,
@@ -130,6 +130,9 @@ pub enum TransportError {
     Io(#[from] std::io::Error),
     #[error("encoding a JSON-RPC message: {0}")]
     Encode(#[from] serde_json::Error),
+    /// This transport cannot serve the server it was handed.
+    #[error("{0}")]
+    Unsupported(String),
     /// Unreachable in practice — see [`send_line`].
     #[error("a serialised message contained a newline, which would desynchronise the framing")]
     Framing,
@@ -360,9 +363,18 @@ impl StdioTransport {
         config: &ServerConfig,
         options: TransportOptions,
     ) -> Result<Self, TransportError> {
-        let mut command = build_command(config);
+        let ServerSpec::Stdio { command: program, args, env } = &config.spec else {
+            // Unreachable through `Transport::connect`, which dispatches on
+            // the spec; here so a direct caller gets an error, not a spawn
+            // of nothing.
+            return Err(TransportError::Unsupported(format!(
+                "server \"{}\" is not a stdio server",
+                config.name
+            )));
+        };
+        let mut command = build_command(program, args, env);
         let mut child = command.spawn().map_err(|source| TransportError::Spawn {
-            command: config.command.clone(),
+            command: program.clone(),
             source,
         })?;
         let pid = child.id();
@@ -641,11 +653,11 @@ impl Drop for StdioTransport {
 /// this run's agent registry and write into its archive. Both are
 /// present in the environment whenever nanopi is itself a child agent,
 /// which M6 makes a normal case.
-fn build_command(config: &ServerConfig) -> Command {
-    let mut command = Command::new(&config.command);
+fn build_command(program: &str, args: &[String], env: &BTreeMap<String, String>) -> Command {
+    let mut command = Command::new(program);
     command
-        .args(&config.args)
-        .envs(&config.env)
+        .args(args)
+        .envs(env)
         .env_remove("NANOPI_PARENT_PID")
         .env_remove("NANOPI_RUN_ID")
         .stdin(Stdio::piped())
@@ -1080,12 +1092,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn config(script: &str) -> ServerConfig {
-        ServerConfig {
-            name: "fake".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
-            env: BTreeMap::new(),
-        }
+        ServerConfig::stdio(
+            "fake",
+            "sh",
+            vec!["-c".to_string(), script.to_string()],
+            BTreeMap::new(),
+        )
     }
 
     /// Echo every request back as a success whose `result` carries the
@@ -1471,12 +1483,7 @@ mod tests {
     }
 
     fn config_for(command: &str) -> ServerConfig {
-        ServerConfig {
-            name: "missing".to_string(),
-            command: command.to_string(),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-        }
+        ServerConfig::stdio("missing", command, Vec::new(), BTreeMap::new())
     }
 
     /// The framing invariant, asserted rather than assumed: a newline
