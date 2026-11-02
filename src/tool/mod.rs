@@ -332,7 +332,8 @@ pub enum ToolSource {
     ///
     /// `endpoint` is the same "which file supplied this?" answer
     /// `Plugin.path` gives, for a thing that is not a file: the command
-    /// line for a stdio server, the URL once a remote transport exists.
+    /// line for a stdio server, the masked URL for an HTTP one (userinfo
+    /// and everything after `?` hidden; never a header).
     /// It matters more here than it does for plugins — a stdio server is
     /// an unsandboxed subprocess with the user's full privileges
     /// (`docs/mcp.md`), so "what am I actually running?" is a security

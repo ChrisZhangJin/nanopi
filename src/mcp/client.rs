@@ -25,7 +25,7 @@
 //! closed for good (`Transport::close_reason`), so a `Failed`
 //! client is terminal. Recovering means building a new client from the
 //! same `ServerConfig`; nothing here holds anything that would prevent
-//! that, and the old client's `Drop` reaps its process group.
+//! that, and a stdio client's `Drop` reaps its process group.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -253,7 +253,8 @@ struct SessionRecovery {
 }
 
 impl McpClient {
-    /// Spawn the server and run the handshake, with default options.
+    /// Spawn the server (stdio) or open the session (HTTP) and run the
+    /// handshake, with default options.
     ///
     /// Always returns a client; check [`state`](Self::state). It is not
     /// a `Result` because a server that will not start must not abort

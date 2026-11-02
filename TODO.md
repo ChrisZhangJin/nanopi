@@ -269,10 +269,21 @@ an unset variable skips that server with a diagnostic and is never sent literall
 **ACCEPTANCE** No header value appears in `/tools`, notices, errors or anything
 sent toward a child (test it); the refusal and the masking each have a test.
 
-### H5 — Wiring and live check
+### ✅ H5 — Wiring and live check
 
 Manager/status/`/tools` show the masked URL; the IPC path is unchanged because
 children never see how a server is reached. Docs (`README`, `config.toml.example`).
+
+Done: the wiring was already complete after H1–H4 (config → manager → registry →
+catalogue → IPC), so H5 added the proof and the docs. Tests: a url-only entry
+through load → manager → registry source → IPC catalogue
+(`http::tests::lifecycle`), and in `tests/mcp_agent_e2e.rs` an agent calling an
+HTTP tool through the parent (one session, no header value anywhere a child could
+see it, one `DELETE`) plus the `DELETE` on SIGTERM and SIGINT. `README` (both
+languages) and `docs/mcp.md` document the config; `config.toml.example` does not
+mention MCP and is unchanged. Live check against `playwright-mcp` passed (see
+`docs/mcp-http.md`, "Verification"). Known gap: SIGTERM to the TUI installs no
+handler, so it ends no HTTP session.
 
 **ACCEPTANCE** Against the real `playwright-mcp` at `127.0.0.1:8931`: connect,
 list the 23 tools, call `browser_navigate` and `browser_snapshot`, and confirm

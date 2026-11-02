@@ -290,6 +290,83 @@ gets no badge. Caps for the spawned children live under `[agent]` (see
 entirely and always keeps its full tool set, so scripted runs are never
 silently restricted.
 
+## MCP servers
+
+nanopi is an [MCP](https://modelcontextprotocol.io) client: tools served by
+external MCP servers show up as ordinary tools named `mcp__<server>__<tool>`.
+Servers are listed in `~/.nanopi/mcp.json` (under `NANOPI_HOME` if you set it) in
+the same `mcpServers` shape Claude Code and most other clients use, so an
+existing block pastes in unchanged. The file is global only and nanopi never
+writes it.
+
+```json
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/projects"],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "playwright": { "type": "http", "url": "http://127.0.0.1:8931/mcp" },
+    "gateway": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${GATEWAY_TOKEN}" }
+    }
+  }
+}
+```
+
+**stdio** (`command`, `args`, `env`): nanopi launches the server as a subprocess.
+That subprocess runs with your full privileges — unlike a WASM plugin it is not
+sandboxed — so only list servers you would run by hand. `env` values are used
+verbatim; `${VAR}` is not expanded there.
+
+**Streamable HTTP** (`url`, optional `headers`): nanopi connects to a server that
+is already running (a shared browser, a team gateway). `"type": "http"` is
+optional when `url` is present. A server may answer as plain JSON or as an SSE
+stream; both work.
+
+- `${VAR}` in `headers` values and in `url` is replaced from the environment,
+  so a token lives in your shell, not in `mcp.json`. An unset variable skips
+  that server with a diagnostic (the literal `${VAR}` is never sent); an empty
+  one expands to nothing. `$${` writes a literal `${`. Nothing else is expanded.
+- **Cleartext is loopback-only for credentials.** `http://` to a host that is not
+  loopback (`127.0.0.0/8`, `::1`, `localhost`) is refused when the server carries
+  any header, URL userinfo, or a credential-looking query parameter; use
+  `https://`. `http://` to loopback is fine, and so is `http://` to a remote host
+  with no credentials at all.
+- `/tools` (with the orchestrator off) shows each tool's origin. For an HTTP server that is the URL with
+  userinfo shown as `***@` and everything after `?` shown as `?***`; header
+  names and values are never printed.
+- **Sessions are ended on exit.** The server's `Mcp-Session-Id` session is closed
+  with an HTTP `DELETE` when the TUI quits, when a `-p` run ends, and on Ctrl-C
+  or SIGTERM in a `-p` run. SIGTERM to the TUI and `kill -9` cannot, and leave the
+  session for the server to expire. A server that drops the session mid-run (`404`) is re-initialized once and the
+  failed call retried.
+- Redirects are not followed, and loopback targets bypass `http_proxy`.
+
+Not supported yet: the older HTTP+SSE transport (`"type": "sse"` is reported and
+skipped), OAuth (static `headers` only), the standing `GET` stream that carries
+server-initiated messages (so a server's `tools/list_changed` is not seen; the
+tool list is read once at startup), WebSocket, and MCP `prompts`/`resources`.
+
+All servers connect concurrently at startup under one 15 s budget. A server that
+fails to start, or an entry that is invalid, is reported and skipped; it never
+stops nanopi from starting or hides the others. `--tools` restricts the tool set,
+which excludes MCP tools.
+
+**With the orchestrator** the main agent has no MCP tools of its own, but it sees
+their names and descriptions and can grant them to the agents it dispatches by
+naming them in the `agent` tool's `tools` list. Those agents are separate
+processes that never connect to a server themselves: every call goes through the
+main process, which holds the one connection (one session, for HTTP), checks the
+grant, and returns the result. A child never learns how a server is reached, so a
+server's `env`, URL and `headers` stay with the parent. This channel is Unix-only;
+on Windows the servers work in the main process but agents cannot be granted
+their tools. With `/orchestrator off` (or in `nanopi -p`) the tools are simply in
+the main agent's tool set.
+
 ## Skills
 
 Nanopi implements the [Agent Skills spec](https://agentskills.io/specification). Drop a `SKILL.md` into `~/.nanopi/skills/<name>/`:

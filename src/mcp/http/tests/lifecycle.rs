@@ -628,6 +628,65 @@ async fn http_servers_have_no_pid_and_that_is_normal() {
     McpManager::empty().kill_now();
 }
 
+// ------------------------------------------------------- config → wiring
+
+/// An `mcp.json` entry with a `url` and nothing else (no `type`) goes the
+/// whole way a stdio entry does: it connects, its tools register as
+/// `mcp__<server>__<tool>`, `/tools` would show the *masked* endpoint, and
+/// the orchestrator's catalogue (the channel's) lists the tool. The query
+/// is the secret here; nothing of it may surface anywhere.
+#[test]
+fn a_url_only_entry_is_wired_like_a_stdio_one() {
+    multi().block_on(async {
+        let state = Sessions::new();
+        let fake = Fake::start(session_server(&state, standard)).await;
+
+        let dir = std::env::temp_dir().join(format!("nanopi-h5-wire-{}", crate::util::uuid::v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp.json");
+        let url = format!("{}?access=hunter2", fake.url());
+        std::fs::write(&path, json!({"mcpServers": {"web": {"url": url}}}).to_string()).unwrap();
+        let loaded = crate::mcp::config::load(&path);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.servers.len(), 1);
+
+        let manager = McpManager::connect(loaded.servers, ManagerOptions::default()).await;
+        let masked = format!("{}?***", fake.url());
+        let row = &manager.status()[0];
+        assert!(row.connected && row.tool_count == 1, "{row:?}");
+        assert_eq!(row.endpoint, masked);
+
+        // What `/tools` prints: the registered name, grouped under the
+        // server, with the masked endpoint as its origin.
+        let mut registry = crate::tool::ToolRegistry::new();
+        assert!(manager.register_into(&mut registry).is_empty());
+        let entries = registry.entries();
+        let (_, source) = entries
+            .iter()
+            .find(|(spec, _)| spec.name == "mcp__web__a")
+            .expect("the HTTP server's tool is registered");
+        assert_eq!(
+            *source,
+            crate::tool::ToolSource::Mcp { server: "web".into(), endpoint: masked.clone() }
+        );
+
+        #[cfg(unix)]
+        {
+            let channel = crate::mcp::ipc::IpcServer::start_in(&dir, &manager).expect("channel");
+            let names: Vec<String> = channel.catalogue().into_iter().map(|(n, _)| n).collect();
+            assert_eq!(names, vec!["mcp__web__a"]);
+            channel.shutdown();
+        }
+
+        let everything = format!("{:?} {:?} {source:?}", manager.status(), manager.notices());
+        assert!(!everything.contains("hunter2"), "{everything}");
+
+        manager.shutdown().await;
+        assert_eq!(deletes(&fake).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 // ------------------------------------------------------------ dead host
 
 #[tokio::test]

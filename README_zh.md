@@ -268,6 +268,73 @@ orchestrator = false
 设置：`nanopi -p` 完全忽略它，始终保留全量工具集，脚本化运行不会被悄悄
 限制。
 
+## MCP 服务器
+
+nanopi 是一个 [MCP](https://modelcontextprotocol.io) 客户端：外部 MCP 服务器提供
+的工具会变成普通工具，名字形如 `mcp__<server>__<tool>`。服务器列在
+`~/.nanopi/mcp.json`（设置了 `NANOPI_HOME` 则在其下）里，格式与 Claude Code 等
+多数客户端通用的 `mcpServers` 一致，已有的配置块可以原样粘贴。该文件只有全局
+一份，nanopi 从不写它。
+
+```json
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/projects"],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "playwright": { "type": "http", "url": "http://127.0.0.1:8931/mcp" },
+    "gateway": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${GATEWAY_TOKEN}" }
+    }
+  }
+}
+```
+
+**stdio**（`command`、`args`、`env`）：nanopi 把服务器作为子进程启动。该子进程拥有
+你的全部权限——与 WASM 插件不同，它没有沙箱——所以只列你愿意手动运行的服务器。
+`env` 的值原样使用，不展开 `${VAR}`。
+
+**Streamable HTTP**（`url`，可选 `headers`）：连接一个已在运行的服务器（共享浏览器、
+团队网关等）。有 `url` 时 `"type": "http"` 可省略。服务器可以用普通 JSON 或 SSE 流
+应答，两种都支持。
+
+- `headers` 的值和 `url` 里的 `${VAR}` 会从环境变量替换，这样 token 留在你的
+  shell 里，而不是写进 `mcp.json`。变量未设置时，该服务器会被跳过并给出诊断
+  （字面的 `${VAR}` 绝不会被发出去）；变量为空则展开为空串。`$${` 表示字面的
+  `${`。其他位置一律不展开。
+- **明文只允许在回环地址上带凭据。** 只要服务器带有任意 header、URL 用户信息或
+  形如凭据的查询参数，指向非回环主机（`127.0.0.0/8`、`::1`、`localhost` 之外）的
+  `http://` 就会被拒绝，请改用 `https://`。回环地址上的 `http://` 没问题；不带任何
+  凭据的远程 `http://` 也允许。
+- `/tools`（编排模式关闭时）会显示每个工具的来源。HTTP 服务器显示的是 URL，用户
+  信息显示为 `***@`，`?` 之后的全部内容显示为 `?***`；header 的名字和值都不会打印。
+- **退出时会结束会话。** 服务器的 `Mcp-Session-Id` 会话会通过一次 HTTP `DELETE`
+  关闭：TUI 退出时、`-p` 运行结束时、以及 `-p` 运行中收到 Ctrl-C 或 SIGTERM 时。
+  向 TUI 发 SIGTERM 和 `kill -9` 做不到，会话留给服务器自己过期。服务器在运行中丢弃
+  会话（`404`）时，会重新初始化一次并重试失败的调用。
+- 不跟随重定向；回环目标会绕过 `http_proxy`。
+
+暂不支持：较老的 HTTP+SSE 传输（`"type": "sse"` 会被提示并跳过）、OAuth（只支持
+静态 `headers`）、承载服务器主动消息的常驻 `GET` 流（因此看不到服务器的
+`tools/list_changed`；工具列表只在启动时读取一次）、WebSocket，以及 MCP 的
+`prompts`/`resources`。
+
+所有服务器在启动时并发连接，总预算 15 秒。启动失败的服务器或无效的条目会被报告并
+跳过，绝不会阻止 nanopi 启动，也不会影响其他服务器。`--tools` 会限制工具集，因此
+会排除 MCP 工具。
+
+**配合编排模式**：主 agent 自己没有 MCP 工具，但能看到它们的名字和描述，可以在
+`agent` 工具的 `tools` 列表里点名，把它们授予派出去的 agent。这些 agent 是独立进程，
+从不自己连接服务器：每次调用都经由主进程——它持有唯一的连接（HTTP 则是唯一的
+会话），检查授权并返回结果。子 agent 永远不知道服务器是怎么连上的，因此服务器的
+`env`、URL 和 `headers` 都只留在父进程里。这条通道仅限 Unix；在 Windows 上服务器在
+主进程里可用，但无法把它们的工具授予 agent。用 `/orchestrator off`（或在
+`nanopi -p` 里）时，这些工具就直接在主 agent 的工具集中。
+
 ## Skills
 
 Nanopi 实现了 [Agent Skills 规范](https://agentskills.io/specification)。往 `~/.nanopi/skills/<name>/` 里丢一个 `SKILL.md`：

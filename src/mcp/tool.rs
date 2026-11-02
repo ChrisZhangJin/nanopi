@@ -223,7 +223,8 @@ impl McpTool {
     /// holds), the description and the schema, and nothing about where it
     /// came from. The endpoint and the server's `env` are deliberately
     /// not reachable from here — a child is model-driven and must not be
-    /// able to learn how a server was launched.
+    /// able to learn how a server was launched or reached (a URL, a
+    /// header).
     pub fn definition(&self) -> McpToolDef {
         McpToolDef {
             name: self.spec.name.clone(),

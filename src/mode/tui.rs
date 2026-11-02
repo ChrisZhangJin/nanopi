@@ -3819,10 +3819,10 @@ async fn handle_action(
                     ]),
                 )?;
                 // Second line: where the tool came from. `path` for a
-                // plugin, the command line or URL for an MCP server —
-                // the same question, and for MCP a security-relevant
-                // one, since a stdio server is an unsandboxed
-                // subprocess.
+                // plugin, the command line (stdio) or masked URL (HTTP)
+                // for an MCP server — the same question, and for MCP a
+                // security-relevant one, since a stdio server is an
+                // unsandboxed subprocess.
                 let origin = match src {
                     crate::tool::ToolSource::Plugin { path, .. } => Some(path.clone()),
                     crate::tool::ToolSource::Mcp { endpoint, .. } => Some(endpoint.clone()),
