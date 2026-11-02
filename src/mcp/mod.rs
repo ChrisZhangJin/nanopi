@@ -15,6 +15,8 @@ pub mod client;
 /// Child→parent channel for proxied MCP calls. Unix only; see `docs/mcp-ipc.md`.
 #[cfg(unix)]
 pub mod ipc;
+/// Streamable HTTP transport. See `docs/mcp-http.md`.
+pub mod http;
 /// Owns all server connections: concurrent connect, registration, shutdown.
 pub mod manager;
 /// A child agent's MCP tools: `Tool`s that forward each call to the parent.
@@ -27,3 +29,5 @@ pub mod protocol;
 pub mod stdio;
 /// `Tool` adapter and `CallToolResult` -> `ToolOutput` mapping.
 pub mod tool;
+/// One enum over the stdio and HTTP transports.
+pub mod transport;
