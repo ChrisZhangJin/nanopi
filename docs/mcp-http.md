@@ -129,17 +129,16 @@ transport rather than a generic "remote".
   "credentials rejected", not a generic transport failure.
 - OAuth is out of scope. Static headers only.
 
-## Open questions for the owner
+## Decisions (owner, resolved)
 
-1. **`${VAR}` expansion in `headers`.** M4 deliberately deferred expansion for
-   `env`. For HTTP the pressure is real: otherwise a bearer token sits in
-   `mcp.json` in plaintext. Recommendation: support `${VAR}` in `headers` and
-   `url` only, an unset variable being an error diagnostic for that server (never
-   the literal `${VAR}` sent on the wire). The alternative is plaintext tokens.
-2. **Cleartext credentials to non-loopback hosts:** refuse (recommended) or warn?
-3. **Legacy HTTP+SSE fallback** for servers that predate Streamable HTTP. Claude
-   Code does this automatically. Recommendation: not now; revisit if a server
-   the owner actually uses needs it.
+1. **`${VAR}` expansion: yes, in `headers` and `url` only.** Otherwise a bearer
+   token sits in `mcp.json` in plaintext. An unset variable is an error
+   diagnostic for that server and the server is skipped — the literal `${VAR}`
+   is **never** sent on the wire. `env` (stdio) stays unexpanded, as M4 decided.
+2. **Credentials over cleartext `http://` to a non-loopback host: refused** with
+   a diagnostic. Loopback `http://` is allowed (the motivating case).
+3. **Legacy HTTP+SSE fallback: deferred to the next phase** (task H6 in
+   `TODO.md`), not dropped.
 
 ## Verification
 
@@ -157,5 +156,5 @@ transport rather than a generic "remote".
 
 ## Not in this plan
 
-Legacy HTTP+SSE transport; the standing `GET` stream and resumability
+Legacy HTTP+SSE transport (next phase, H6); the standing `GET` stream and resumability
 (`Last-Event-ID`); `notifications/tools/list_changed`; OAuth; WebSocket.

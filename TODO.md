@@ -246,7 +246,8 @@ fails fast rather than waiting out the call timeout.
 `headers` support; `endpoint_of` masks URL userinfo and credential-looking query
 parameters and shows header names at most; `401`/`403` get distinct errors;
 cleartext `http://` with credentials to a non-loopback host is refused with a
-diagnostic. `${VAR}` expansion per the open question in the design doc.
+diagnostic. `${VAR}` expansion in `headers` and `url` only; an unset variable
+skips that server with a diagnostic and is never sent literally (decided).
 
 **ACCEPTANCE** No header value appears in `/tools`, notices, errors or anything
 sent toward a child (test it); the refusal and the masking each have a test.
@@ -260,10 +261,20 @@ children never see how a server is reached. Docs (`README`, `config.toml.example
 list the 23 tools, call `browser_navigate` and `browser_snapshot`, and confirm
 the session is `DELETE`d on exit. Full suite, Windows and wasm checks clean.
 
+### H6 — Legacy HTTP+SSE fallback (next phase)
+
+Decided to defer, not drop. Per the spec's backwards-compatibility note: POST an
+`initialize` to the configured URL; if it fails with a `4xx` (`405`/`404`), `GET`
+the URL expecting an SSE stream whose first event is `endpoint`, then use the old
+transport (`GET` stream for responses, `POST` to the announced endpoint). Pick it
+up when a server the owner actually uses needs it. Reuses H2's SSE parsing and
+H4's credential handling.
+
+**ACCEPTANCE** A fake legacy-only server is reachable with `type` omitted; a
+Streamable HTTP server is never routed through the legacy path.
+
 ## Later, explicitly out of scope for now
 
-- **Legacy HTTP+SSE transport** — deprecated; do not implement unless a server
-  the owner actually uses requires it.
 - **Standing `GET` stream** and resumability for Streamable HTTP.
 - **`prompts/*`** — maps naturally onto skills / slash commands
   (`/mcp:<server>:<prompt>`).
