@@ -48,6 +48,9 @@ use tokio::task::JoinHandle;
 use crate::agent_registry::ChildGuard;
 use crate::mcp::config::{ServerConfig, ServerSpec};
 use crate::mcp::protocol::method::{CANCELLED, INITIALIZE};
+// Re-exported so `stdio::TransportError` keeps working for existing
+// importers; the type itself is shared with the HTTP transport.
+pub use crate::mcp::transport::TransportError;
 use crate::mcp::protocol::{
     error_code, Incoming, Notification, Request, RequestId, Response, ResponsePayload, RpcError,
 };
@@ -100,43 +103,6 @@ const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const WRITE_FAILURE_GRACE: Duration = Duration::from_secs(2);
 
 const EXIT_POLL: Duration = Duration::from_millis(10);
-
-// ------------------------------------------------------------- errors
-
-/// Why a transport operation failed.
-///
-/// [`TransportError::Rpc`] is deliberately a peer of the I/O failures
-/// rather than folded into them: it is the server working correctly and
-/// refusing the call, which M5 turns into an in-band `is_error` result
-/// the model can read, whereas the others mean the connection itself is
-/// unusable and M3 should move the server to `Failed`.
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    #[error("failed to spawn `{command}`: {source}")]
-    Spawn {
-        command: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("{0}")]
-    Rpc(#[from] RpcError),
-    #[error("`{method}` timed out after {:.1}s", timeout.as_secs_f32())]
-    Timeout { method: String, timeout: Duration },
-    /// The connection is gone: the process exited, closed the pipe, or
-    /// was shut down. The string is the one line worth showing a user.
-    #[error("{0}")]
-    Closed(String),
-    #[error("writing to the server: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("encoding a JSON-RPC message: {0}")]
-    Encode(#[from] serde_json::Error),
-    /// This transport cannot serve the server it was handed.
-    #[error("{0}")]
-    Unsupported(String),
-    /// Unreachable in practice — see [`send_line`].
-    #[error("a serialised message contained a newline, which would desynchronise the framing")]
-    Framing,
-}
 
 // ------------------------------------------------------- shared state
 

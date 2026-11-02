@@ -379,7 +379,8 @@ impl McpManager {
         }
         // Ready servers only. A client that failed its handshake was
         // already shut down and reaped by `connect`, so its pid may
-        // belong to someone else now.
+        // belong to someone else now. An HTTP server has no pid, which
+        // `filter_map` skips: there is no process of ours to kill.
         #[cfg(unix)]
         for pid in self
             .servers
@@ -406,7 +407,7 @@ impl McpManager {
     }
 
     /// Pids of every live server process, for tests that must prove
-    /// none survive.
+    /// none survive. HTTP servers have none and contribute nothing.
     pub fn pids(&self) -> Vec<u32> {
         self.servers
             .iter()
@@ -784,6 +785,30 @@ mod tests {
             let st = m.status();
             assert!(!st[0].connected && st[1].connected, "{st:?}");
             assert_eq!(m.notices().len(), 1);
+            m.shutdown().await;
+        }
+
+        /// An HTTP server has no pid and, until its transport exists, no
+        /// connection: it is a failed row beside the working stdio one,
+        /// and nothing about it (header values included) reaches the
+        /// status or the notices.
+        #[tokio::test]
+        async fn an_http_server_is_a_failed_row_and_leaks_nothing() {
+            let remote = ServerConfig::http(
+                "remote",
+                "https://user:hunter2@example.com/mcp?api_key=abc123",
+                BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
+            );
+            let m = McpManager::connect(vec![remote, cfg("ok", "", &["t"])], ManagerOptions::default()).await;
+            let st = m.status();
+            assert!(!st[0].connected && st[1].connected, "{st:?}");
+            assert!(st[0].reason.as_deref().unwrap().contains("not implemented"), "{st:?}");
+            assert_eq!(m.pids().len(), 1, "only the stdio server has a pid");
+            let shown = format!("{st:?} {:?}", m.notices());
+            for secret in ["s3cret", "hunter2", "abc123"] {
+                assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+            }
+            m.kill_now();
             m.shutdown().await;
         }
 

@@ -1,5 +1,5 @@
 //! MCP client: the initialize handshake, `tools/list`, `tools/call`, and
-//! connection state, over a `StdioTransport`.
+//! connection state, over a [`Transport`].
 //!
 //! The transport knows how to move JSON-RPC and nothing about MCP, so it
 //! will happily send `tools/list` to a server that was never initialised
@@ -22,7 +22,7 @@
 //! [`McpClient::state`].
 //!
 //! **No reconnect, on purpose.** Once the transport is closed it is
-//! closed for good (`StdioTransport::close_reason`), so a `Failed`
+//! closed for good (`Transport::close_reason`), so a `Failed`
 //! client is terminal. Recovering means building a new client from the
 //! same `ServerConfig`; nothing here holds anything that would prevent
 //! that, and the old client's `Drop` reaps its process group.
@@ -39,7 +39,7 @@ use crate::mcp::protocol::{
     method, CallToolParams, CallToolResult, InitializeParams, InitializeResult, ListToolsParams,
     ListToolsResult, RpcError, Tool, PROTOCOL_VERSION,
 };
-use crate::mcp::stdio::{StdioTransport, TransportError};
+use crate::mcp::transport::{Transport, TransportError};
 
 /// Protocol revisions we accept in an `initialize` reply: the one we
 /// ask for, plus the two before it.
@@ -215,10 +215,11 @@ pub enum ClientError {
 #[derive(Debug)]
 pub struct McpClient {
     name: String,
-    /// `None` only when the process could not be spawned at all. Kept
+    /// `None` only when no connection could be made at all (the process
+    /// would not spawn, or the transport is unavailable). Kept
     /// after a handshake failure too (already shut down) so `pid()` and
     /// `diagnostics()` still answer for a `Failed` server.
-    transport: Option<StdioTransport>,
+    transport: Option<Transport>,
     state: Mutex<ConnectionState>,
     /// Immutable after `connect`: the server's identity and capabilities
     /// do not change mid-session. `None` iff the handshake never
@@ -240,7 +241,7 @@ impl McpClient {
     }
 
     pub async fn connect_with(config: &ServerConfig, options: ClientOptions) -> Self {
-        let transport = match StdioTransport::spawn(config).await {
+        let transport = match Transport::connect(config).await {
             Ok(t) => t,
             Err(e) => {
                 return Self {
@@ -319,14 +320,14 @@ impl McpClient {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.transport.as_ref().and_then(StdioTransport::pid)
+        self.transport.as_ref().and_then(Transport::pid)
     }
 
     /// Everything the server printed outside the protocol, for `/mcp`.
     pub fn diagnostics(&self) -> String {
         self.transport
             .as_ref()
-            .map(StdioTransport::diagnostics)
+            .map(Transport::diagnostics)
             .unwrap_or_default()
     }
 
@@ -443,7 +444,7 @@ impl McpClient {
     /// completes". The transport has no notion of a handshake, so
     /// without this a caller could send a request a server has not yet
     /// agreed to serve.
-    fn ready_transport(&self) -> Result<&StdioTransport, ClientError> {
+    fn ready_transport(&self) -> Result<&Transport, ClientError> {
         let state = self.state();
         match (&state, &self.transport) {
             (ConnectionState::Ready, Some(transport)) => Ok(transport),
@@ -504,7 +505,7 @@ impl McpClient {
 /// `initialize`, judge the answer, then `notifications/initialized`.
 /// `Err` is the failure headline; the caller attaches diagnostics.
 async fn handshake(
-    transport: &StdioTransport,
+    transport: &Transport,
     timeout: Duration,
 ) -> Result<InitializeResult, String> {
     let params = serde_json::to_value(InitializeParams::new("nanopi", env!("CARGO_PKG_VERSION")))
@@ -538,7 +539,7 @@ async fn handshake(
 /// This is the whole reason a failed `npx` server is debuggable: the
 /// transport's own error says "exited with code 1", and the 404 that
 /// caused it exists only in what the process printed.
-fn with_diagnostics(headline: String, transport: &StdioTransport) -> String {
+fn with_diagnostics(headline: String, transport: &Transport) -> String {
     let diagnostics = transport.diagnostics();
     let diagnostics = diagnostics.trim_end();
     if diagnostics.is_empty() {
@@ -777,6 +778,25 @@ mod tests {
         client.shutdown().await;
     }
 
+    /// Until the HTTP transport exists, an `http` server must still be an
+    /// ordinary `Failed` row: no panic, no hang, a reason that says why.
+    #[tokio::test]
+    async fn an_http_server_ends_failed_as_not_implemented() {
+        let cfg = ServerConfig::http("remote", "http://127.0.0.1:1/mcp", BTreeMap::new());
+        let client = tokio::time::timeout(Duration::from_secs(5), McpClient::connect_with(&cfg, quick()))
+            .await
+            .expect("connect must not hang");
+
+        let reason = failed_reason(&client);
+        assert!(reason.contains("not implemented"), "{reason}");
+        assert!(client.pid().is_none());
+        assert!(matches!(
+            client.list_tools().await,
+            Err(ClientError::NotReady { .. })
+        ));
+        client.shutdown().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_server_that_answers_initialize_with_an_error_ends_failed() {
@@ -876,7 +896,7 @@ mod tests {
             "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done",
             log.display()
         );
-        let transport = StdioTransport::spawn(&config(&script)).await.unwrap();
+        let transport = Transport::connect(&config(&script)).await.unwrap();
         // Built directly: `connect` never hands out a `Connecting` client.
         let client = McpClient {
             name: "fake".to_string(),
