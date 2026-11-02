@@ -31,7 +31,7 @@
 //!
 //! MVP: single-line input; multi-line + Emacs keys come in v0.7 S2.
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -56,6 +56,7 @@ use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, SteerMessage};
 use crate::mode::agents_strip::{self, AgentsView, StripOpts};
+use crate::mode::exit_signal::ExitSignals;
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
@@ -408,6 +409,11 @@ fn grants_section(grants: &[crate::plugin_grants::PluginGrants]) -> Vec<Line<'st
     lines
 }
 
+/// Upper bound on everything after the terminal is restored: the MCP
+/// servers' own 5 s `SHUTDOWN_BUDGET` plus room for a session-end hook.
+/// Past it the exit happens anyway (see `run_tui_mode`).
+const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(7);
+
 const DOCK_HEIGHT: u16 = 10; // palette(4) + status(1) + input(3) + footer(2)
 
 /// Max input content lines shown at once when no overlay menu is open and
@@ -723,6 +729,12 @@ pub async fn run_tui_mode(
     };
     print_startup_banner(model, &header.id, &loaded_skills);
 
+    // Installed only now: before this point there is nothing to shut
+    // down in an orderly way that `_mcp_kill_guard`'s default-disposition
+    // death does not already cover, and a SIGTERM that has to wait out a
+    // slow startup would look like a hang. After this, SIGTERM/SIGHUP
+    // become an exit code out of `run_app` (see `exit_signal`).
+    let mut exit_signals = ExitSignals::install();
     let mut terminal = setup_terminal()?;
     // From here on there IS a drain loop, so `host-notify` may queue
     // instead of writing to stderr. Before this point (and in `-p`
@@ -819,27 +831,59 @@ pub async fn run_tui_mode(
     if let Some(reg) = crate::agent_registry::global() {
         reg.set_background_default(true);
     }
-    let result = run_app(&mut terminal, &mut app, agent_slot.clone()).await;
+    let mut result =
+        run_app(&mut terminal, &mut app, agent_slot.clone(), &mut exit_signals).await;
+    // SIGHUP means the terminal is gone, so the next draw usually fails
+    // before the signal arm gets a turn and `run_app` returns that error.
+    // The signal is the real reason; report it rather than a draw error.
+    if result.is_err() {
+        if let Some(code) = exit_signals.try_recv() {
+            result = Ok(code);
+        }
+    }
     // TUI quit: stop every live agent child before anything else.
     if let Some(reg) = crate::agent_registry::global() {
         reg.kill_all();
     }
     let _ = teardown_terminal(&mut terminal);
-    // Channel first: a child must not start a call into a server that is
-    // being stopped, and this also cancels the calls already in flight.
-    #[cfg(unix)]
-    crate::mcp::ipc::shutdown_global();
-    // After the terminal is restored, not before: stopping a server that
-    // ignores stdin EOF can take a second or two, and doing it under the
-    // alt screen makes quitting look hung.
-    app.mcp.shutdown().await;
 
-    // Session-end hook.
-    {
+    // The rest is what can block: an MCP server that ignores stdin EOF,
+    // a session-end hook, a dead HTTP server. Bounded as a whole, and cut
+    // short by a second signal; either way the exit still happens, with
+    // the same code the orderly path would have returned.
+    let graceful = async {
+        // Channel first: a child must not start a call into a server that
+        // is being stopped, and this also cancels the calls already in
+        // flight.
+        #[cfg(unix)]
+        crate::mcp::ipc::shutdown_global();
+        // After the terminal is restored, not before: stopping a server
+        // that ignores stdin EOF can take a second or two, and doing it
+        // under the alt screen makes quitting look hung.
+        app.mcp.shutdown().await;
+
+        // Session-end hook.
         let g = agent_slot.lock().await;
         if let Some(a) = g.as_ref() {
             a.fire_session_shutdown("quit").await;
         }
+    };
+    let cut_short = tokio::select! {
+        _ = graceful => None,
+        _ = tokio::time::sleep(SHUTDOWN_BUDGET) => {
+            Some(*result.as_ref().unwrap_or(&1))
+        }
+        code = exit_signals.recv() => Some(code),
+    };
+    if let Some(code) = cut_short {
+        // Last resort for what `shutdown` did not finish: SIGKILL the
+        // servers' process groups and end HTTP sessions (bounded by
+        // `DELETE_TIMEOUT`). Then leave without unwinding the runtime,
+        // which would wait on whatever blocked us.
+        app.mcp.kill_now();
+        #[cfg(unix)]
+        crate::mcp::ipc::shutdown_global();
+        std::process::exit(code);
     }
 
     // Closing line: the resume hint, and only that.
@@ -860,7 +904,13 @@ pub async fn run_tui_mode(
     // one you STARTED in — and this line sent you back to a
     // conversation you had abandoned.
     let sid = app.session_id.clone();
-    println!("\n\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m");
+    // `let _ =`, not `println!`: after SIGHUP stdout is a dead terminal,
+    // and `println!` panics on the write error, turning a clean exit
+    // into code 101.
+    let _ = writeln!(
+        io::stdout(),
+        "\n\x1b[2mTo resume:  nanopi --continue    or    nanopi --session {sid}\x1b[0m"
+    );
 
     result
 }
@@ -2338,6 +2388,7 @@ async fn run_app(
     term: &mut Term,
     app: &mut App,
     agent_slot: Arc<Mutex<Option<Agent>>>,
+    exit_signals: &mut ExitSignals,
 ) -> Result<i32> {
     let mut key_events = EventStream::new();
     let mut ag_rx: Option<mpsc::Receiver<AgentEvent>> = None;
@@ -2381,6 +2432,10 @@ async fn run_app(
         }
 
         tokio::select! {
+            // SIGTERM / SIGHUP: leave exactly as `/quit` does. Returning
+            // here lands in the shutdown sequence in `run_tui_mode`; the
+            // code becomes the process exit code (143 / 129).
+            code = exit_signals.recv() => return Ok(code),
             _ = tick.tick() => {
                 // Pick up a completed summarize task. The tick is
                 // 120ms, which matches PI's UX for "quick actions"

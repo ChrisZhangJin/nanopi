@@ -294,12 +294,25 @@ HTTP tool through the parent (one session, no header value anywhere a child coul
 see it, one `DELETE`) plus the `DELETE` on SIGTERM and SIGINT. `README` (both
 languages) and `docs/mcp.md` document the config; `config.toml.example` does not
 mention MCP and is unchanged. Live check against `playwright-mcp` passed (see
-`docs/mcp-http.md`, "Verification"). Known gap: SIGTERM to the TUI installs no
-handler, so it ends no HTTP session.
+`docs/mcp-http.md`, "Verification"). SIGTERM/SIGHUP to the TUI is handled
+(see "TUI SIGTERM/SIGHUP" below); only `kill -9` leaves a session behind.
 
 **ACCEPTANCE** Against the real `playwright-mcp` at `127.0.0.1:8931`: connect,
 list the 23 tools, call `browser_navigate` and `browser_snapshot`, and confirm
 the session is `DELETE`d on exit. Full suite, Windows and wasm checks clean.
+
+### ✅ TUI SIGTERM/SIGHUP
+
+The TUI had no signal handler, so `kill`, `docker stop`, a systemd stop or a
+closed terminal skipped the orderly exit (no HTTP `DELETE`, stdio servers left to
+`PDEATHSIG`). `mode/exit_signal.rs` now turns SIGTERM and SIGHUP into an exit code
+out of the event loop, the same way `/quit` leaves it: terminal restored, agents
+stopped, `McpManager::shutdown`, session-end hook, then exit 143 / 129. The part
+after the terminal is restored is bounded (7 s) and a second signal ends it at
+once, via `McpManager::kill_now`. Tests: `tests/tui_signal_e2e.rs` (real binary on
+a pty: both signals, the bound, the second signal) and a unit test of the
+signal-to-code mapping. Windows: inert. SIGINT is not handled (in raw mode Ctrl-C
+is a key).
 
 ### H6 — Legacy HTTP+SSE fallback (next phase)
 
