@@ -336,6 +336,11 @@ stream; both work.
   any header, URL userinfo, or a credential-looking query parameter; use
   `https://`. `http://` to loopback is fine, and so is `http://` to a remote host
   with no credentials at all.
+- `/mcp` shows every server in `mcp.json` and where it stands: *connected* (with
+  tool names), *failed* (with the reason), or *skipped* (an invalid entry, an
+  unset `${VAR}`, a refused cleartext URL, `type: sse`), with the same masking as
+  below. It reads cached state, so it is safe to run mid-turn. With the
+  orchestrator on it notes that the tools are used by the agents you dispatch.
 - `/tools` (with the orchestrator off) shows each tool's origin. For an HTTP server that is the URL with
   userinfo shown as `***@` and everything after `?` shown as `?***`; header
   names and values are never printed.

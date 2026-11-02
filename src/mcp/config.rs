@@ -151,6 +151,11 @@ impl std::fmt::Debug for ServerConfig {
 pub struct ConfigDiagnostic {
     pub message: String,
     pub path: PathBuf,
+    /// The server whose entry this rejection is about, or `None` for a
+    /// problem with the file as a whole (or a warning that did not drop
+    /// anything). `/mcp` shows the first kind as a skipped row and the
+    /// second as a note.
+    pub rejected: Option<String>,
 }
 
 /// Outcome of [`load`]. A struct rather than a `Result` because a
@@ -160,6 +165,34 @@ pub struct ConfigDiagnostic {
 pub struct LoadResult {
     pub servers: Vec<ServerConfig>,
     pub diagnostics: Vec<ConfigDiagnostic>,
+    /// Entries that were rejected, in file order, with the same text the
+    /// matching diagnostic carries. Kept as data (not just a printed
+    /// line) so `/mcp` can show a configured-but-skipped server with its
+    /// reason after the startup output has scrolled away.
+    pub skipped: Vec<SkippedServer>,
+}
+
+/// A server that is in `mcp.json` but was not loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedServer {
+    pub name: String,
+    /// Why, as one diagnostic. Never contains a header or `env` value
+    /// (`diagnostics_never_contain_header_values`).
+    pub reason: String,
+}
+
+impl LoadResult {
+    /// Diagnostics about the file as a whole (unreadable, malformed) or
+    /// that are warnings rather than rejections (a repeated name), each
+    /// formatted with its path like [`print_diagnostics`]. The per-entry
+    /// rejections are in [`skipped`](Self::skipped) instead.
+    pub fn file_notes(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.rejected.is_none())
+            .map(|d| format!("{} ({})", d.message, d.path.display()))
+            .collect()
+    }
 }
 
 // ── on-disk shape ───────────────────────────────────────────────────
@@ -252,6 +285,7 @@ pub fn load_with(path: &Path, lookup: Lookup) -> LoadResult {
             out.diagnostics.push(ConfigDiagnostic {
                 message: format!("could not read ({e}); no MCP servers configured"),
                 path: path.to_path_buf(),
+                rejected: None,
             });
             return out;
         }
@@ -269,6 +303,7 @@ pub fn load_with(path: &Path, lookup: Lookup) -> LoadResult {
                     e.line()
                 ),
                 path: path.to_path_buf(),
+                rejected: None,
             });
             return out;
         }
@@ -282,18 +317,24 @@ pub fn load_with(path: &Path, lookup: Lookup) -> LoadResult {
             out.diagnostics.push(ConfigDiagnostic {
                 message: format!("server \"{name}\" is defined more than once; using the last one"),
                 path: path.to_path_buf(),
+                rejected: None,
             });
             out.servers.retain(|s| s.name != name);
+            out.skipped.retain(|s| s.name != name);
         } else {
             seen.push(name.clone());
         }
 
         match validate(&name, raw, lookup) {
             Ok(cfg) => out.servers.push(cfg),
-            Err(message) => out.diagnostics.push(ConfigDiagnostic {
-                message,
-                path: path.to_path_buf(),
-            }),
+            Err(message) => {
+                out.skipped.push(SkippedServer { name: name.clone(), reason: message.clone() });
+                out.diagnostics.push(ConfigDiagnostic {
+                    message,
+                    path: path.to_path_buf(),
+                    rejected: Some(name),
+                });
+            }
         }
     }
 
@@ -653,6 +694,53 @@ mod tests {
         ));
         let names: Vec<&str> = res.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["zebra", "alpha"]);
+    }
+
+    #[test]
+    fn rejected_entries_are_data_with_their_reason_and_file_problems_are_not() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {
+                "good": {"command": "x"},
+                "ws": {"type": "ws", "url": "wss://h.example/mcp"},
+                "empty": {}
+            }}"#,
+        )
+        .unwrap();
+        let res = load(&path);
+        assert_eq!(res.servers.len(), 1);
+        let names: Vec<_> = res.skipped.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["ws", "empty"]);
+        assert!(res.skipped[0].reason.contains("WebSocket"), "{:?}", res.skipped);
+        // Every rejection is also the printed diagnostic, word for word.
+        for s in &res.skipped {
+            assert!(res.diagnostics.iter().any(|d| d.message == s.reason));
+        }
+        assert!(res.file_notes().is_empty(), "{:?}", res.file_notes());
+
+        // A malformed file is a file-level note and has no rows.
+        std::fs::write(&path, "{ not json").unwrap();
+        let bad = load(&path);
+        assert!(bad.servers.is_empty() && bad.skipped.is_empty());
+        let notes = bad.file_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("invalid JSON at line 1"), "{notes:?}");
+        assert!(notes[0].contains("mcp.json"), "the path is included: {notes:?}");
+    }
+
+    #[test]
+    fn a_repeated_name_leaves_one_skipped_row_and_a_file_note() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            r#"{"mcpServers": {"a": {}, "a": {"type": "ws"}}}"#,
+        )
+        .unwrap();
+        let res = load(&path);
+        assert_eq!(res.skipped.len(), 1, "{:?}", res.skipped);
+        assert_eq!(res.file_notes().len(), 1, "{:?}", res.file_notes());
+        assert!(res.file_notes()[0].contains("more than once"));
     }
 
     /// A typo must never cost the user their config, and the message

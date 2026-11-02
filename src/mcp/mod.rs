@@ -21,6 +21,8 @@ pub mod http;
 pub mod credentials;
 /// Owns all server connections: concurrent connect, registration, shutdown.
 pub mod manager;
+/// The text of `/mcp`: a pure function from status rows to lines.
+pub mod report;
 /// A child agent's MCP tools: `Tool`s that forward each call to the parent.
 pub mod proxy;
 /// Server definitions read from `<nanopi_home>/mcp.json`.

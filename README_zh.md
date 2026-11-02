@@ -310,6 +310,10 @@ nanopi 是一个 [MCP](https://modelcontextprotocol.io) 客户端：外部 MCP �
   形如凭据的查询参数，指向非回环主机（`127.0.0.0/8`、`::1`、`localhost` 之外）的
   `http://` 就会被拒绝，请改用 `https://`。回环地址上的 `http://` 没问题；不带任何
   凭据的远程 `http://` 也允许。
+- `/mcp` 会列出 `mcp.json` 里的每个服务器及其状态：*connected*（附工具名）、
+  *failed*（附原因）、*skipped*（无效条目、未设置的 `${VAR}`、被拒绝的明文 URL、
+  `type: sse`），脱敏规则与下文相同。它只读缓存状态，因此在 turn 进行中运行也是
+  安全的。编排模式开启时，它会注明这些工具由你派出的 agent 使用，而不是主 agent。
 - `/tools`（编排模式关闭时）会显示每个工具的来源。HTTP 服务器显示的是 URL，用户
   信息显示为 `***@`，`?` 之后的全部内容显示为 `?***`；header 的名字和值都不会打印。
 - **退出时会结束会话。** 服务器的 `Mcp-Session-Id` 会话会通过一次 HTTP `DELETE`

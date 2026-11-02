@@ -29,7 +29,7 @@ use futures_util::future::join_all;
 use tokio::time::Instant;
 
 use crate::mcp::client::{ConnectionState, McpClient};
-use crate::mcp::config::{self, ServerConfig, ServerSpec};
+use crate::mcp::config::{self, ServerConfig, ServerSpec, SkippedServer};
 use crate::mcp::credentials::{redact_arg, redact_url};
 use crate::mcp::http::DELETE_TIMEOUT;
 use crate::mcp::tool::{first_line, registered_tool_name, McpTool};
@@ -56,6 +56,12 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 /// often one very long line (a minified stack frame, a URL), and the
 /// status row and the notice both share a terminal line.
 const DETAIL_CHARS: usize = 160;
+
+/// Longest reason `/mcp` shows, in characters. Its own line (it wraps)
+/// rather than a status row, so the full first line is wanted, but the
+/// first line of a minified stack trace is still unbounded and the cap
+/// keeps one server from filling the screen.
+const REASON_FULL_CHARS: usize = 600;
 
 #[derive(Debug, Clone)]
 pub struct ManagerOptions {
@@ -112,19 +118,76 @@ fn skip_reason(kind: SessionKind, tools_allow: &[String]) -> Option<&'static str
     None
 }
 
+/// Which transport a configured server uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Stdio,
+    Http,
+}
+
+impl TransportKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            TransportKind::Stdio => "stdio",
+            TransportKind::Http => "http",
+        }
+    }
+}
+
+/// Where a configured server stands, as `/mcp` words it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+    Connected,
+    /// The handshake is in flight. `connect` does not return until it
+    /// resolves, so this is only ever seen if a client reports it; it is
+    /// carried so a future reconnect needs no change here.
+    Connecting,
+    /// Tried and did not work (spawn failure, handshake error, timeout,
+    /// died since).
+    Failed,
+    /// Never tried: `mcp.json` rejected the entry (see
+    /// [`SkippedServer`]).
+    Skipped,
+}
+
+impl ServerState {
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerState::Connected => "connected",
+            ServerState::Connecting => "connecting",
+            ServerState::Failed => "failed",
+            ServerState::Skipped => "skipped",
+        }
+    }
+}
+
 /// One server as `/mcp` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatus {
     pub name: String,
     /// What is being run, with secrets masked. See [`endpoint_of`].
+    /// Empty for a skipped server: the entry was rejected before it
+    /// became a config, and the reason names what was wrong with it.
     pub endpoint: String,
+    /// `None` for a skipped server, whose transport is not known.
+    pub transport: Option<TransportKind>,
+    pub state: ServerState,
+    /// Same as `state == Connected`.
     pub connected: bool,
     pub tool_count: usize,
+    /// The registered names (`mcp__<server>__<tool>`) of the tools this
+    /// server contributed, in the order it listed them.
+    pub tool_names: Vec<String>,
     /// First line of why it is not (fully) working, control characters
-    /// removed and length capped. Never the full reason: that can be
-    /// ~12 KB of stderr, and `ConnectionState::Failed` keeps all of it
-    /// for the one place that wants it.
+    /// removed and length capped at 160 — the row/notice form. Never the
+    /// full reason: that can be ~12 KB of stderr, and
+    /// `ConnectionState::Failed` keeps all of it for the one place that
+    /// wants it.
     pub reason: Option<String>,
+    /// The same first line with a much larger cap (600 characters), for
+    /// `/mcp`, which gives it a line of its own. Still one line, still
+    /// control characters flattened.
+    pub reason_full: Option<String>,
 }
 
 struct Server {
@@ -133,10 +196,13 @@ struct Server {
     /// `None` when the server never produced a client: it timed out
     /// before `connect` returned, and the in-flight attempt was dropped.
     client: Option<Arc<McpClient>>,
-    tool_count: usize,
-    /// Why the server is not fully usable *as of startup*. Live
-    /// failures after that come from the client's own state.
-    startup_reason: Option<String>,
+    kind: TransportKind,
+    /// Registered names of the tools kept, in listing order.
+    tool_names: Vec<String>,
+    /// Why the server is not fully usable *as of startup*, as a first
+    /// line capped for `/mcp`. Live failures after that come from the
+    /// client's own state.
+    startup_reason_full: Option<String>,
 }
 
 /// Every server's connection, and the tools they offered.
@@ -153,6 +219,17 @@ pub struct McpManager {
     /// process group whose leader has been reaped: the pid is free for
     /// reuse by then.
     stopped: AtomicBool,
+    /// Entries of `mcp.json` that were rejected, in file order. They
+    /// have no connection and no tools, but they are configured, and
+    /// "why is my server not there" is the question `/mcp` answers.
+    skipped: Vec<SkippedServer>,
+    /// File-level problems: unreadable or malformed `mcp.json`, a name
+    /// defined twice. Each already carries its path.
+    config_notes: Vec<String>,
+    /// Why this session never looked at `mcp.json`, when it did not
+    /// (`--tools`, child agent). Without it `/mcp` would say "not
+    /// configured" about a file it never read.
+    disabled: Option<&'static str>,
 }
 
 impl McpManager {
@@ -164,7 +241,27 @@ impl McpManager {
             tools: Vec::new(),
             notices: Vec::new(),
             stopped: AtomicBool::new(false),
+            skipped: Vec::new(),
+            config_notes: Vec::new(),
+            disabled: None,
         }
+    }
+
+    /// Record what `mcp.json` held that did not become a connection.
+    /// Display only: nothing here affects connecting or registration.
+    pub fn with_config_problems(
+        mut self,
+        skipped: Vec<SkippedServer>,
+        config_notes: Vec<String>,
+    ) -> Self {
+        self.skipped = skipped;
+        self.config_notes = config_notes;
+        self
+    }
+
+    /// A manager for a session that must not connect, remembering why.
+    fn disabled(reason: &'static str) -> Self {
+        Self { disabled: Some(reason), ..Self::empty() }
     }
 
     /// The one startup call: decide whether this session connects, load
@@ -173,14 +270,15 @@ impl McpManager {
     /// Returns an `Arc` because the TUI's `App` and every later
     /// registry rebuild share it.
     pub async fn start_for_session(kind: SessionKind, tools_allow: &[String]) -> Arc<Self> {
-        if skip_reason(kind, tools_allow).is_some() {
-            return Arc::new(Self::empty());
+        if let Some(reason) = skip_reason(kind, tools_allow) {
+            return Arc::new(Self::disabled(reason));
         }
 
         let loaded = config::load_global();
         config::print_diagnostics(&loaded.diagnostics);
+        let notes = loaded.file_notes();
         if loaded.servers.is_empty() {
-            return Arc::new(Self::empty());
+            return Arc::new(Self::empty().with_config_problems(loaded.skipped, notes));
         }
 
         if kind == SessionKind::Tui {
@@ -189,7 +287,9 @@ impl McpManager {
                 loaded.servers.len()
             );
         }
-        let manager = Self::connect(loaded.servers, ManagerOptions::default()).await;
+        let manager = Self::connect(loaded.servers, ManagerOptions::default())
+            .await
+            .with_config_problems(loaded.skipped, notes);
         for line in manager.notices() {
             crate::note!("{line}");
         }
@@ -216,10 +316,10 @@ impl McpManager {
 
         for (cfg, result) in configs.iter().zip(results) {
             let endpoint = endpoint_of(cfg);
-            let BringUp { client, tools, reason } = result;
+            let BringUp { client, tools, reason, reason_full } = result;
 
             let mut skipped: Vec<String> = Vec::new();
-            let mut kept = 0usize;
+            let mut tool_names: Vec<String> = Vec::new();
             if let Some(client) = &client {
                 for def in tools {
                     // An empty name is a server bug, and would register
@@ -233,11 +333,11 @@ impl McpManager {
                         skipped.push(format!("{:?} (same name as {owner})", def.name));
                         continue;
                     }
-                    taken.insert(name, format!("{:?} of \"{}\"", def.name, cfg.name));
+                    taken.insert(name.clone(), format!("{:?} of \"{}\"", def.name, cfg.name));
                     manager
                         .tools
                         .push(Arc::new(McpTool::new(client.clone(), endpoint.clone(), def)));
-                    kept += 1;
+                    tool_names.push(name);
                 }
             }
 
@@ -266,8 +366,12 @@ impl McpManager {
                 name: cfg.name.clone(),
                 endpoint,
                 client,
-                tool_count: kept,
-                startup_reason: reason,
+                kind: match cfg.spec {
+                    ServerSpec::Stdio { .. } => TransportKind::Stdio,
+                    ServerSpec::Http { .. } => TransportKind::Http,
+                },
+                tool_names,
+                startup_reason_full: reason_full,
             });
         }
         manager
@@ -293,33 +397,66 @@ impl McpManager {
             .collect()
     }
 
-    /// Per-server status for `/mcp`, in config order. Read live from
-    /// each client, so a server that died since startup shows as failed.
+    /// Per-server status for `/mcp`: the connected and failed servers in
+    /// config order, then the entries `mcp.json` rejected. Read from
+    /// state the manager already holds (each client's state is a field
+    /// read, never a request), so a server that died since startup shows
+    /// as failed and a wedged one cannot make this wait.
     pub fn status(&self) -> Vec<ServerStatus> {
-        self.servers
-            .iter()
-            .map(|s| {
-                let (connected, reason) = match &s.client {
-                    Some(client) => match client.state() {
-                        ConnectionState::Ready => (true, s.startup_reason.clone()),
-                        ConnectionState::Connecting => {
-                            (false, Some("still connecting".to_string()))
-                        }
-                        ConnectionState::Failed { reason } => {
-                            (false, Some(first_line(&reason, DETAIL_CHARS)))
-                        }
-                    },
-                    None => (false, s.startup_reason.clone()),
-                };
-                ServerStatus {
-                    name: s.name.clone(),
-                    endpoint: s.endpoint.clone(),
-                    connected,
-                    tool_count: s.tool_count,
-                    reason,
-                }
-            })
-            .collect()
+        let live = self.servers.iter().map(|s| {
+            let (state, reason_full) = match &s.client {
+                Some(client) => match client.state() {
+                    ConnectionState::Ready => {
+                        (ServerState::Connected, s.startup_reason_full.clone())
+                    }
+                    ConnectionState::Connecting => {
+                        (ServerState::Connecting, Some("still connecting".to_string()))
+                    }
+                    ConnectionState::Failed { reason } => (
+                        ServerState::Failed,
+                        Some(first_line(&reason, REASON_FULL_CHARS)),
+                    ),
+                },
+                None => (ServerState::Failed, s.startup_reason_full.clone()),
+            };
+            ServerStatus {
+                name: s.name.clone(),
+                endpoint: s.endpoint.clone(),
+                transport: Some(s.kind),
+                state,
+                connected: state == ServerState::Connected,
+                tool_count: s.tool_names.len(),
+                tool_names: s.tool_names.clone(),
+                reason: reason_full.as_deref().map(|r| first_line(r, DETAIL_CHARS)),
+                reason_full,
+            }
+        });
+        let skipped = self.skipped.iter().map(|s| {
+            let full = first_line(&s.reason, REASON_FULL_CHARS);
+            ServerStatus {
+                name: s.name.clone(),
+                endpoint: String::new(),
+                transport: None,
+                state: ServerState::Skipped,
+                connected: false,
+                tool_count: 0,
+                tool_names: Vec::new(),
+                reason: Some(first_line(&full, DETAIL_CHARS)),
+                reason_full: Some(full),
+            }
+        });
+        live.chain(skipped).collect()
+    }
+
+    /// File-level `mcp.json` problems (unreadable, malformed, a repeated
+    /// name), each with its path, for `/mcp` to show.
+    pub fn config_notes(&self) -> &[String] {
+        &self.config_notes
+    }
+
+    /// Why this session never read `mcp.json`, if it did not.
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        self.disabled
     }
 
     /// Startup problems, one line each.
@@ -449,6 +586,8 @@ struct BringUp {
     tools: Vec<crate::mcp::protocol::Tool>,
     /// First line only, already cleaned. `None` = fully up.
     reason: Option<String>,
+    /// The same line with the larger `/mcp` cap.
+    reason_full: Option<String>,
 }
 
 /// Connect one server and list its tools, all under `deadline`.
@@ -465,13 +604,12 @@ async fn bring_up(cfg: &ServerConfig, deadline: Instant, budget: Duration) -> Br
                     Vec::new(),
                     Some(format!(
                         "connected, but listing tools failed: {}",
-                        first_line(&e.to_string(), DETAIL_CHARS)
+                        first_line(&e.to_string(), REASON_FULL_CHARS)
                     )),
                 ),
             },
             ConnectionState::Failed { reason } => {
-                let reason = first_line(&reason, DETAIL_CHARS);
-                (client, Vec::new(), Some(reason))
+                (client, Vec::new(), Some(first_line(&reason, REASON_FULL_CHARS)))
             }
             ConnectionState::Connecting => (
                 client,
@@ -482,20 +620,29 @@ async fn bring_up(cfg: &ServerConfig, deadline: Instant, budget: Duration) -> Br
     };
 
     match tokio::time::timeout_at(deadline, attempt).await {
-        Ok((client, tools, reason)) => BringUp { client: Some(client), tools, reason },
+        Ok((client, tools, full)) => BringUp {
+            client: Some(client),
+            tools,
+            reason: full.as_deref().map(|r| first_line(r, DETAIL_CHARS)),
+            reason_full: full,
+        },
         // The attempt is dropped here, which is what reaps the child.
         // The message carries the cause people actually hit: a cold
         // `npx` cache.
-        Err(_) => BringUp {
-            client: None,
-            tools: Vec::new(),
-            reason: Some(format!(
+        Err(_) => {
+            let reason = format!(
                 "did not finish starting within {}s and was skipped for this session \
                  (a first `npx`/`uvx` run downloads the package; run the command once \
                  by hand to warm its cache)",
                 budget.as_secs()
-            )),
-        },
+            );
+            BringUp {
+                client: None,
+                tools: Vec::new(),
+                reason: Some(reason.clone()),
+                reason_full: Some(reason),
+            }
+        }
     }
 }
 
@@ -651,6 +798,32 @@ mod tests {
         for e in [&http, &stdio] {
             assert!(!e.contains("hunter2") && !e.contains("abc123"), "{e}");
         }
+    }
+
+    #[test]
+    fn skipped_entries_are_rows_after_the_live_ones_and_carry_their_reason() {
+        let skipped = vec![
+            SkippedServer { name: "gw".into(), reason: "server \"gw\": unset ${NOPE}\nsecond line".into() },
+            SkippedServer { name: "ws".into(), reason: "server \"ws\": WebSocket is not supported".into() },
+        ];
+        let m = McpManager::empty().with_config_problems(skipped, vec!["note (/p)".into()]);
+        assert!(m.is_empty(), "skipped entries hold no connection");
+        let st = m.status();
+        assert_eq!(st.len(), 2);
+        assert_eq!(st[0].name, "gw");
+        assert_eq!(st[0].state, ServerState::Skipped);
+        assert!(!st[0].connected && st[0].transport.is_none() && st[0].endpoint.is_empty());
+        assert_eq!(st[0].reason_full.as_deref(), Some("server \"gw\": unset ${NOPE}"));
+        assert_eq!(m.config_notes(), ["note (/p)"]);
+        assert!(m.disabled_reason().is_none());
+    }
+
+    #[test]
+    fn a_session_that_may_not_connect_remembers_why() {
+        let m = McpManager::disabled(skip_reason(SessionKind::Tui, &["read".into()]).unwrap());
+        assert!(m.disabled_reason().unwrap().contains("--tools"));
+        assert!(m.status().is_empty());
+        assert!(McpManager::empty().disabled_reason().is_none());
     }
 
     #[test]
@@ -819,6 +992,55 @@ mod tests {
             assert!(!m.notices()[0].contains("stack frame"), "{}", m.notices()[0]);
             assert!(!m.notices()[0].contains('\x1b'));
             m.shutdown().await;
+        }
+
+        /// `/mcp` shows the whole first line (up to its own, larger cap)
+        /// where the status row and the startup notice show 160
+        /// characters: the reason is the thing the user came to read.
+        #[tokio::test]
+        async fn status_keeps_the_full_first_line_beside_the_capped_one() {
+            let long = format!("/definitely/not/installed/{}", "x".repeat(300));
+            let ghost = ServerConfig::stdio("ghost", long.clone(), Vec::new(), BTreeMap::new());
+            let m = McpManager::connect(vec![ghost], ManagerOptions::default()).await;
+            let st = &m.status()[0];
+            assert_eq!(st.state, ServerState::Failed);
+            let short = st.reason.as_deref().unwrap();
+            let full = st.reason_full.as_deref().unwrap();
+            assert!(short.chars().count() <= DETAIL_CHARS + 1, "{short}");
+            assert!(full.contains(&long), "the whole first line, not the cap: {full}");
+            assert!(!full.contains('\n'));
+            assert!(full.chars().count() <= REASON_FULL_CHARS + 1);
+            m.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn status_lists_registered_tool_names_transport_and_state() {
+            let m = McpManager::connect(
+                vec![cfg("alpha", "", &["one", "two"]), cfg("beta", "", &[])],
+                ManagerOptions::default(),
+            )
+            .await;
+            let st = m.status();
+            assert_eq!(st[0].state, ServerState::Connected);
+            assert_eq!(st[0].transport, Some(TransportKind::Stdio));
+            assert_eq!(st[0].tool_names, ["mcp__alpha__one", "mcp__alpha__two"]);
+            assert_eq!(st[1].tool_count, 0);
+            assert!(st[1].tool_names.is_empty());
+            m.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn a_server_that_timed_out_is_failed_with_the_whole_hint() {
+            let hung = ServerConfig::stdio(
+                "hung",
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                BTreeMap::new(),
+            );
+            let m = McpManager::connect(vec![hung], quick(200)).await;
+            let st = &m.status()[0];
+            assert_eq!(st.state, ServerState::Failed);
+            assert!(st.reason_full.as_deref().unwrap().contains("warm its cache"), "{st:?}");
         }
 
         #[tokio::test]
