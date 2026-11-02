@@ -527,6 +527,9 @@ async fn handshake(
         ));
     }
 
+    // Before `initialized`: that notification is already a request the
+    // server may check the version header on.
+    transport.set_protocol_version(&result.protocol_version);
     transport
         .notify(method::INITIALIZED, None)
         .await
@@ -778,17 +781,17 @@ mod tests {
         client.shutdown().await;
     }
 
-    /// Until the HTTP transport exists, an `http` server must still be an
-    /// ordinary `Failed` row: no panic, no hang, a reason that says why.
+    /// A dead `http` server is an ordinary `Failed` row: no panic, no
+    /// hang, a reason that says what could not be reached.
     #[tokio::test]
-    async fn an_http_server_ends_failed_as_not_implemented() {
+    async fn an_unreachable_http_server_ends_failed() {
         let cfg = ServerConfig::http("remote", "http://127.0.0.1:1/mcp", BTreeMap::new());
         let client = tokio::time::timeout(Duration::from_secs(5), McpClient::connect_with(&cfg, quick()))
             .await
             .expect("connect must not hang");
 
         let reason = failed_reason(&client);
-        assert!(reason.contains("not implemented"), "{reason}");
+        assert!(reason.contains("cannot connect to 127.0.0.1:1"), "{reason}");
         assert!(client.pid().is_none());
         assert!(matches!(
             client.list_tools().await,

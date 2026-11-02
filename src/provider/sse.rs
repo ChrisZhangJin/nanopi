@@ -59,6 +59,11 @@ where
     /// Pending bytes not yet emitted as a complete event.
     /// Always ends on a `\n` boundary (or is empty) once we yield an event.
     buf: Vec<u8>,
+    /// Prefix of `buf` already searched for `\n` and found to have none.
+    /// Without it every arriving chunk rescans the whole partial line, so
+    /// one n-byte line delivered in small chunks costs O(n^2) — seconds of
+    /// CPU for a multi-megabyte `data:` line.
+    scanned: usize,
     /// Set to true when we hit `[DONE]`; we'll yield no more events.
     done: bool,
     _phantom: std::marker::PhantomData<E>,
@@ -82,6 +87,7 @@ where
         Self {
             inner,
             buf: Vec::new(),
+            scanned: 0,
             done: false,
             _phantom: std::marker::PhantomData,
         }
@@ -106,7 +112,12 @@ where
 
         loop {
             // Try to extract a complete line (ending in \n) from buf.
-            if let Some(idx) = this.buf.iter().position(|&b| b == b'\n') {
+            let newline = this.buf[this.scanned..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| this.scanned + i);
+            if let Some(idx) = newline {
+                this.scanned = 0;
                 let line_bytes: Vec<u8> = this.buf.drain(..=idx).collect();
                 // Strip trailing \n (and any \r before it).
                 let line_bytes =
@@ -136,6 +147,7 @@ where
             }
 
             // No complete line in buf. Pull more bytes.
+            this.scanned = this.buf.len();
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.buf.extend_from_slice(&chunk);
@@ -148,6 +160,7 @@ where
                     // Stream ended without [DONE]. If we have a partial line,
                     // try to flush it as a final event.
                     if !this.buf.is_empty() {
+                        this.scanned = 0;
                         let line_bytes: Vec<u8> = this.buf.drain(..).collect();
                         let line = match std::str::from_utf8(&line_bytes) {
                             Ok(s) => s.trim(),
@@ -223,6 +236,17 @@ mod tests {
         let events = unwrap_ok(collect(SseStream::new(s)).await);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
+    }
+
+    #[tokio::test]
+    async fn newline_arriving_alone_in_a_later_chunk_is_found() {
+        // The scan resumes where it stopped, so the newline that is the
+        // whole of a chunk (and one right after a drained line) must
+        // still be seen.
+        let s = chunks(vec!["data: a", "\n", "\n", "data: b", "\n", "da", "ta: c\n"]);
+        let events = unwrap_ok(collect(SseStream::new(s)).await);
+        let data: Vec<_> = events.iter().map(|e| e.data.as_str()).collect();
+        assert_eq!(data, ["a", "b", "c"]);
     }
 
     #[tokio::test]

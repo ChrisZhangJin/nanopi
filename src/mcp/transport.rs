@@ -50,10 +50,38 @@ pub enum TransportError {
     #[error("a serialised message contained a newline, which would desynchronise the framing")]
     Framing,
     /// No connection was attempted: this transport cannot serve the
-    /// server it was handed (HTTP before it exists, or a spec of the
-    /// other kind).
+    /// server it was handed (a spec of the other kind, or an HTTP URL
+    /// that is not one).
     #[error("{0}")]
     Unsupported(String),
+
+    // The variants below are HTTP's. They stay out of `Closed` on purpose:
+    // `McpClient` treats `Closed` as the end of the server for good, which
+    // is right for a dead pipe and wrong for a request that merely did not
+    // get through.
+    /// This request got no answer — refused, unresolvable, or the stream
+    /// was cut — but nothing says the next one will not. There is no
+    /// pipe to be "gone", so the transport stays usable.
+    #[error("{0}")]
+    Disconnected(String),
+    /// `404` on a request that carried a session id: the server dropped
+    /// the session, and did not run the request. The one failure the
+    /// spec tells a client to recover from with a fresh `initialize`.
+    #[error("the server no longer knows this session (HTTP 404)")]
+    SessionExpired,
+    #[error("server requires authentication (HTTP 401)")]
+    Unauthorized,
+    #[error("credentials rejected by the server (HTTP 403)")]
+    Forbidden,
+    /// Any other non-success status: `400`, `429`, `5xx`, an unfollowed
+    /// redirect. `detail` is already sanitised and short.
+    #[error("HTTP {status}: {detail}")]
+    Http { status: u16, detail: String },
+    /// The server answered, but not in a way the transport spec allows:
+    /// the wrong content type, a body that is not JSON-RPC, an oversized
+    /// event.
+    #[error("{0}")]
+    Protocol(String),
 }
 
 /// A live connection to one MCP server, over whichever transport its
@@ -105,6 +133,16 @@ impl Transport {
         match self {
             Self::Stdio(t) => t.notify(method, params).await,
             Self::Http(t) => t.notify(method, params).await,
+        }
+    }
+
+    /// Tell the transport which protocol revision `initialize` settled
+    /// on. HTTP must repeat it in a header on every later request; stdio
+    /// has nowhere to put it.
+    pub fn set_protocol_version(&self, version: &str) {
+        match self {
+            Self::Stdio(_) => {}
+            Self::Http(t) => t.set_protocol_version(version),
         }
     }
 

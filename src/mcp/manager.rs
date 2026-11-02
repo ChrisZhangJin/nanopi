@@ -802,21 +802,21 @@ mod tests {
             m.shutdown().await;
         }
 
-        /// An HTTP server has no pid and, until its transport exists, no
-        /// connection: it is a failed row beside the working stdio one,
-        /// and nothing about it (header values included) reaches the
-        /// status or the notices.
+        /// An HTTP server has no pid: it is a failed row beside the
+        /// working stdio one, and nothing about it (header values
+        /// included) reaches the status or the notices. The address is a
+        /// closed local port so the test stays off the network.
         #[tokio::test]
         async fn an_http_server_is_a_failed_row_and_leaks_nothing() {
             let remote = ServerConfig::http(
                 "remote",
-                "https://user:hunter2@example.com/mcp?api_key=abc123",
+                "http://user:hunter2@127.0.0.1:1/mcp?api_key=abc123",
                 BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
             );
             let m = McpManager::connect(vec![remote, cfg("ok", "", &["t"])], ManagerOptions::default()).await;
             let st = m.status();
             assert!(!st[0].connected && st[1].connected, "{st:?}");
-            assert!(st[0].reason.as_deref().unwrap().contains("not implemented"), "{st:?}");
+            assert!(st[0].reason.as_deref().unwrap().contains("cannot connect"), "{st:?}");
             assert_eq!(m.pids().len(), 1, "only the stdio server has a pid");
             let shown = format!("{st:?} {:?}", m.notices());
             for secret in ["s3cret", "hunter2", "abc123"] {
