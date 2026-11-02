@@ -1,6 +1,6 @@
 # MCP over Streamable HTTP — implementation plan
 
-Status: **planned, not started.** Task list is in `TODO.md` under "Streamable HTTP".
+Status: **in progress** — H1 (transport seam) and H2 (HTTP core) merged. Task list is in `TODO.md` under "Streamable HTTP".
 
 ## Why
 

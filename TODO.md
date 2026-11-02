@@ -216,7 +216,7 @@ a behaviour-preserving refactor and must land alone.
 behaviour is byte-identical. An `http` entry now parses into `ServerSpec::Http`
 (and is skipped with a "not implemented" diagnostic until H2).
 
-### H2 — HTTP transport core
+### ✅ H2 — HTTP transport core
 
 `src/mcp/http.rs`: POST over `net::client_builder()`; parse **both**
 `application/json` and `text/event-stream` responses (the real server answers
@@ -229,6 +229,21 @@ reqwest timeout; redirects disabled; loopback bypasses any proxy.
 response, `202`, `400`/`404`/`401`/`5xx` mapped to typed errors, a redirect
 refused, a stream closing before the matching id, a server request on the stream.
 No new dependency. Windows check clean.
+
+### H2b — SSE parser spec compliance (found during H2)
+
+`provider::sse::SseStream` yields one event per `data: ` line. Per the SSE spec a
+field may be written `data:` with or without the single space, and an event may
+span several `data:` lines that must be **joined with `\n`**. The parser does
+neither, so a spec-legal server that pretty-prints its JSON across several `data:`
+lines, or omits the space, would be misread (or fail to parse). The real
+Playwright server does neither, which is why H2's live check passed. The parser is
+shared with the LLM providers, so change it deliberately: tests first, and confirm
+the OpenAI/Anthropic streaming tests are unchanged.
+
+**ACCEPTANCE** Tests for `data:x`, `data: x`, a multi-line event joined with `\n`,
+an `event:`/`id:`/comment line interleaved, and `\r\n` endings; all existing
+provider streaming tests pass untouched.
 
 ### H3 — Session lifecycle
 
