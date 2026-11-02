@@ -871,11 +871,8 @@ pub fn print_skill_diagnostics(diags: &[SkillDiagnostic]) {
 mod tests {
     use super::*;
 
-    fn tmpdir(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("nanopi-build-{tag}-{}", crate::util::uuid::v7()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir(tag: &str) -> crate::ScratchPath {
+        crate::ScratchPath::dir(&format!("nanopi-build-{tag}-"))
     }
 
     fn tools() -> Vec<String> {

@@ -482,10 +482,8 @@ mod tests {
 
     /// A directory per test: these cases turn on whether a file exists,
     /// so they must not share one.
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("nanopi-mcp-{}", crate::util::uuid::v7()));
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("mcp.json")
+    fn tmp() -> crate::ScratchPath {
+        crate::ScratchPath::file("nanopi-mcp-", "mcp.json")
     }
 
     /// The stdio fields of a server these tests expect to be stdio.
@@ -496,7 +494,7 @@ mod tests {
         }
     }
 
-    fn write(body: &str) -> PathBuf {
+    fn write(body: &str) -> crate::ScratchPath {
         let p = tmp();
         std::fs::write(&p, body).unwrap();
         p

@@ -468,10 +468,8 @@ mod tests {
 
     #[test]
     fn append_amendment_roundtrip_and_mode() {
-        let dir = std::env::temp_dir().join(format!("nanopi-brief-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::ScratchPath::dir("nanopi-brief-");
         let p = dir.join("brief.md");
-        let _ = std::fs::remove_file(&p);
         append_amendment(&p, 1, "x").unwrap();
         #[cfg(unix)]
         {
@@ -686,10 +684,8 @@ mod tests {
 
     #[test]
     fn append_amendment_writes_timestamped_heading() {
-        let dir = std::env::temp_dir().join(format!("nanopi-brief-time-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::ScratchPath::dir("nanopi-brief-time-");
         let p = dir.join("brief.md");
-        let _ = std::fs::remove_file(&p);
         std::fs::write(&p, render_brief(&spec("t"))).unwrap();
         append_amendment(&p, 3, "hello").unwrap();
         let c = std::fs::read_to_string(&p).unwrap();

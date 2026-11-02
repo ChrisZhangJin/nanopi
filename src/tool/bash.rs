@@ -360,6 +360,20 @@ mod tests {
         p
     }
 
+    /// A capped run spills the full output to `nanopi-bash-<id>.log` in
+    /// the tmpdir BY DESIGN (the model is pointed at it), so a test that
+    /// triggers the cap must delete the spill it caused.
+    fn remove_overflow(out: &ToolOutput) {
+        if let Some(p) = out
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("overflow_path"))
+            .and_then(|v| v.as_str())
+        {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     #[tokio::test]
     async fn runs_simple_command() {
         let dir = tmp();
@@ -410,6 +424,7 @@ mod tests {
             "got len {}",
             out.content.len()
         );
+        remove_overflow(&out);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -465,6 +480,7 @@ mod tests {
             .unwrap();
         assert!(out.content.len() <= 30_000 + 200);
         assert!(!out.content.is_empty());
+        remove_overflow(&out);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

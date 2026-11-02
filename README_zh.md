@@ -206,7 +206,7 @@ auto-compact 也只能退回到更粗糙的字符数阈值。
 
 ```json
 {
-  "generated_by": "0.14.0",
+  "generated_by": "0.15.0",
   "custom": [
     { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
   ],
@@ -219,9 +219,11 @@ auto-compact 也只能退回到更粗糙的字符数阈值。
 `my-model-20260101`。
 
 nanopi 版本变化时会重新生成 `builtin`——先把旧文件复制成 `models.json.bak`，
-并原样保留你的 `custom`。这个拆分正是让文件不会过期的关键：升级 nanopi 就能
-拿到新的内置模型，同时保住你自己加的条目。直接改 `builtin` 里的内容也有效，
-但下次升级会被覆盖，想长期保留就放进 `custom`。
+并原样保留你的 `custom`（以及你自己加的其他顶层键）；`_comment` 是 nanopi 自己的
+说明文字，会被重写，旧文本留在 `.bak` 里。这个拆分正是让文件不会过期的关键：升级
+nanopi 就能拿到新的内置模型，同时保住你自己加的条目。直接改 `builtin` 里的内容
+只在 `generated_by` 与当前版本一致时有效：升级之后旧的 `builtin` 会被忽略（即使在
+无法改写文件的 `nanopi -p` 里也一样），随后被替换，想长期保留就放进 `custom`。
 
 文件格式错误时**绝不覆盖**——nanopi 会报出错误所在行，并在本次运行回退到内置表。
 `nanopi -p` 只读取该文件，永远不会创建或刷新它，脚本化运行没有任何副作用。
@@ -325,8 +327,10 @@ nanopi 是一个 [MCP](https://modelcontextprotocol.io) 客户端：外部 MCP �
 
 暂不支持：较老的 HTTP+SSE 传输（`"type": "sse"` 会被提示并跳过）、OAuth（只支持
 静态 `headers`）、承载服务器主动消息的常驻 `GET` 流（因此看不到服务器的
-`tools/list_changed`；工具列表只在启动时读取一次）、WebSocket，以及 MCP 的
-`prompts`/`resources`。
+`tools/list_changed`；工具列表只在启动时读取一次）和流的断点续传
+（`Last-Event-ID`）、可交互的 `/mcp`（重连某个服务器、启用或禁用某个服务器：
+`/mcp` 目前只读，`mcp.json` 只在启动时读取一次，`/reload` 也不会重新读取它）、
+WebSocket，以及 MCP 的 `prompts`/`resources`。
 
 所有服务器在启动时并发连接，总预算 15 秒。启动失败的服务器或无效的条目会被报告并
 跳过，绝不会阻止 nanopi 启动，也不会影响其他服务器。`--tools` 会限制工具集，因此

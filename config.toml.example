@@ -394,7 +394,7 @@ base_url = "https://api.openai.com/v1"
 # On first interactive run nanopi writes `~/.nanopi/models.json`:
 #
 #   {
-#     "generated_by": "0.14.0",
+#     "generated_by": "0.15.0",
 #     "custom":  [],
 #     "builtin": [ { "id": "...", "vendor": "...", "context_window": 0 } ]
 #   }
@@ -411,9 +411,12 @@ base_url = "https://api.openai.com/v1"
 #
 # `builtin` is regenerated whenever nanopi's version changes — the old
 # file is copied to `models.json.bak` first and your `custom` entries
-# are carried over untouched. Edits inside `builtin` work until that
-# point, then they are replaced; put anything you want to keep in
-# `custom`.
+# (and any extra top-level keys you added) are carried over untouched;
+# `_comment` is nanopi's own text and is rewritten. Edits inside
+# `builtin` work only while `generated_by` matches the running version:
+# after an upgrade the old `builtin` is ignored (even in `nanopi -p`,
+# which cannot rewrite the file) and then replaced; put anything you
+# want to keep in `custom`.
 #
 # A malformed file is never overwritten: nanopi says so and falls back
 # to the built-in table for that run. `nanopi -p` reads the file but

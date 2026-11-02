@@ -2500,11 +2500,8 @@ mod tests {
     use crate::agent::context::{ContentBlock, ContextMessage, ToolSpec};
     use serde_json::json;
 
-    fn tmp() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("nanopi-agent-{}", uuid::v7()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp() -> crate::ScratchPath {
+        crate::ScratchPath::dir("nanopi-agent-")
     }
 
     fn fake_provider() -> OpenAiProvider {
@@ -4138,7 +4135,7 @@ mod tests {
     /// Build a minimal Agent for compaction tests. Uses FakeProvider so
     /// the summarizer call inside compact() returns synthesized text
     /// instead of hitting the network.
-    fn agent_for_compact_test(response: &str) -> (Agent, PathBuf) {
+    fn agent_for_compact_test(response: &str) -> (Agent, crate::ScratchPath) {
         let dir = tmp();
         let session_path = dir.join("session.jsonl");
         std::fs::write(&session_path, "").unwrap();
@@ -5659,7 +5656,7 @@ mod tests {
         }
     }
 
-    fn limit_agent(tokens: u32) -> (Agent, std::sync::Arc<std::sync::atomic::AtomicUsize>, PathBuf) {
+    fn limit_agent(tokens: u32) -> (Agent, std::sync::Arc<std::sync::atomic::AtomicUsize>, crate::ScratchPath) {
         let dir = tmp();
         let session_path = dir.join("limits.jsonl");
         std::fs::write(

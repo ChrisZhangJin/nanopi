@@ -1477,8 +1477,9 @@ mod tests {
         assert_eq!(actual, BASELINE_STANDARD_WITH_CONTROL_SPECS);
     }
 
-    /// ORC-02/ORC-04: `write`, `edit`, `bash`, `ls` must all be absent;
-    /// exactly the 7 documented tools remain.
+    /// ORC-02/ORC-04: `write`, `edit`, `bash`, `ls` (and the read-only
+    /// `read`, `grep`, `find`) must all be absent; exactly the 4 agent
+    /// control tools remain.
     #[test]
     fn orchestrator_registry_excludes_write_edit_bash() {
         let r = ToolRegistry::orchestrator();

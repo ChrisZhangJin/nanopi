@@ -1478,4 +1478,5 @@ fn a_reload_does_not_refund_a_plugins_spent_session_budget() {
     let after = nanopi::plugin_send::send("reload-budget", "hi")
         .expect_err("a reload must not refund the cap");
     assert_eq!(after, spent, "the same refusal, before and after the reload");
+    let _ = std::fs::remove_dir_all(&dir);
 }

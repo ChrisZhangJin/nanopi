@@ -855,8 +855,8 @@ mod tests {
             ManagerOptions { startup_deadline: Duration::from_millis(ms) }
         }
 
-        fn tmp_file(tag: &str) -> std::path::PathBuf {
-            std::env::temp_dir().join(format!("nanopi-mgr-{tag}-{}", crate::util::uuid::v7()))
+        fn tmp_file(tag: &str) -> crate::ScratchPath {
+            crate::ScratchPath::file(&format!("nanopi-mgr-{tag}-"), "pid")
         }
 
         /// Alive means a process that is not a zombie: a killed
