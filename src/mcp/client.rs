@@ -28,6 +28,7 @@
 //! that, and the old client's `Drop` reaps its process group.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -225,7 +226,30 @@ pub struct McpClient {
     /// do not change mid-session. `None` iff the handshake never
     /// completed.
     handshake: Option<InitializeResult>,
+    /// Single-flight bookkeeping for [`McpClient::request`]'s recovery
+    /// from an expired HTTP session. Never touched over stdio.
+    recovery: SessionRecovery,
     options: ClientOptions,
+}
+
+/// How many times the session has been re-established, and how the last
+/// attempt went.
+///
+/// A request notes `epoch` *before* it is sent. If it is refused because
+/// the session is gone, whoever then holds `last` knows from the epoch
+/// whether the session was already replaced since this request went out
+/// (then only a retry is due) or not (then this request does the
+/// re-`initialize`). That is what turns N concurrent `404`s into one
+/// handshake: the first takes the lock and does it, the other N-1 queue on
+/// the lock and find the epoch moved.
+#[derive(Debug, Default)]
+struct SessionRecovery {
+    epoch: AtomicU64,
+    /// The outcome of the attempt that produced the current `epoch`
+    /// (`None` before the first). A failure is shared, not retried by each
+    /// waiter: N requests queued behind a handshake that just timed out
+    /// would otherwise take N timeouts to fail.
+    last: tokio::sync::Mutex<Option<Result<(), String>>>,
 }
 
 impl McpClient {
@@ -249,6 +273,7 @@ impl McpClient {
                     transport: None,
                     state: Mutex::new(ConnectionState::Failed { reason: e.to_string() }),
                     handshake: None,
+                    recovery: SessionRecovery::default(),
                     options,
                 };
             }
@@ -260,6 +285,7 @@ impl McpClient {
                 transport: Some(transport),
                 state: Mutex::new(ConnectionState::Ready),
                 handshake: Some(result),
+                recovery: SessionRecovery::default(),
                 options,
             },
             Err(headline) => {
@@ -274,6 +300,7 @@ impl McpClient {
                     transport: Some(transport),
                     state: Mutex::new(ConnectionState::Failed { reason }),
                     handshake: None,
+                    recovery: SessionRecovery::default(),
                     options,
                 }
             }
@@ -455,6 +482,33 @@ impl McpClient {
         }
     }
 
+    /// Shut down from a context that cannot `await`; see
+    /// [`McpManager::kill_now`](crate::mcp::manager::McpManager::kill_now).
+    /// The receiver yields when the best-effort HTTP `DELETE` is over.
+    pub fn abandon(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.transport.as_ref().and_then(Transport::abandon)
+    }
+
+    /// Send one request, recovering once from an expired HTTP session.
+    ///
+    /// **A `404` on a request that carried a session id means the server
+    /// dropped the session and did not run the request** (the transport
+    /// only reports [`TransportError::SessionExpired`] for exactly that).
+    /// The spec's remedy is a fresh `initialize`, after which the original
+    /// request is sent again — once. This is safe for that one status and
+    /// for no other: a timeout, a `5xx` or a cut stream may follow a
+    /// `tools/call` that *did* run, and repeating it would run it twice. A
+    /// second `SessionExpired` is returned, not looped on: a server that
+    /// refuses the session it just issued is broken, not forgetful.
+    ///
+    /// **The tool table is deliberately not rebuilt.** The `McpTool`s the
+    /// model was shown were fixed at startup and a re-`initialize` does
+    /// not change them; if the restarted server now offers different
+    /// tools, a call to a vanished one comes back as its own JSON-RPC
+    /// error and a new one stays invisible until the next nanopi session.
+    /// Likewise [`initialize_result`](Self::initialize_result) keeps the
+    /// first handshake's capabilities. Reconciling would mean tools
+    /// appearing and disappearing under a running turn.
     async fn request<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -462,16 +516,71 @@ impl McpClient {
         timeout: Duration,
     ) -> Result<T, ClientError> {
         let transport = self.ready_transport()?;
-        let raw = transport
+        // Before sending: see `SessionRecovery`.
+        let epoch = self.recovery.epoch.load(Ordering::Acquire);
+        // Only HTTP has a session to lose; do not copy arguments that may
+        // be megabytes for a transport that can never use the copy.
+        let spare = matches!(transport, Transport::Http(_)).then(|| params.clone());
+        let sent = transport
             .request_with_timeout(method, Some(params), timeout)
-            .await
-            .map_err(|e| self.classify(e))?;
+            .await;
+        let raw = match (sent, spare) {
+            (Err(TransportError::SessionExpired), Some(params)) => {
+                self.recover_session(transport, epoch).await?;
+                transport
+                    .request_with_timeout(method, Some(params), timeout)
+                    .await
+                    .map_err(|e| self.classify(e))?
+            }
+            (other, _) => other.map_err(|e| self.classify(e))?,
+        };
         // Strict here, unlike the lenient content blocks inside: a
         // result that is not even the right envelope cannot be mapped
         // to anything, and pretending otherwise would hand the model an
         // empty success.
         serde_json::from_value(raw)
             .map_err(|e| ClientError::Protocol(format!("malformed `{method}` result: {e}")))
+    }
+
+    /// Make sure the session is newer than `seen_epoch`, re-running the
+    /// handshake only if nobody else has. `Ok` means "send again".
+    ///
+    /// The stale session id is left in place until `initialize` replaces
+    /// it (which sends no id of its own), rather than cleared first:
+    /// requests that start during the handshake then fail with a `404` we
+    /// know how to recover from, instead of an id-less request the server
+    /// refuses with a `400` we do not.
+    async fn recover_session(
+        &self,
+        transport: &Transport,
+        seen_epoch: u64,
+    ) -> Result<(), ClientError> {
+        let mut last = self.recovery.last.lock().await;
+        if self.recovery.epoch.load(Ordering::Acquire) == seen_epoch {
+            let outcome = handshake(transport, self.options.initialize_timeout).await;
+            *last = Some(outcome.as_ref().map(|_| ()).map_err(String::clone));
+            self.recovery.epoch.fetch_add(1, Ordering::Release);
+            if let Err(headline) = outcome {
+                return Err(self.reinitialize_failed(transport, headline));
+            }
+        }
+        match last.as_ref() {
+            Some(Err(headline)) => Err(self.reinitialize_failed(transport, headline.clone())),
+            _ => Ok(()),
+        }
+    }
+
+    fn reinitialize_failed(&self, transport: &Transport, headline: String) -> ClientError {
+        // Shut down underneath us: that is the real answer, not "failed to
+        // re-initialize".
+        if let Some(reason) = transport.close_reason() {
+            return self.classify(TransportError::Closed(reason));
+        }
+        // `Disconnected`, not `Closed`: the transport is intact, and the
+        // next call may find the server back and recover.
+        ClientError::Transport(TransportError::Disconnected(format!(
+            "the server dropped the session and re-initializing failed: {headline}"
+        )))
     }
 
     fn classify(&self, error: TransportError) -> ClientError {
@@ -906,6 +1015,7 @@ mod tests {
             transport: Some(transport),
             state: Mutex::new(ConnectionState::Connecting),
             handshake: None,
+            recovery: SessionRecovery::default(),
             options: quick(),
         };
 

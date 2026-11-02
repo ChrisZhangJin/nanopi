@@ -30,6 +30,7 @@ use tokio::time::Instant;
 
 use crate::mcp::client::{ConnectionState, McpClient};
 use crate::mcp::config::{self, redact_url, ServerConfig, ServerSpec};
+use crate::mcp::http::DELETE_TIMEOUT;
 use crate::mcp::tool::{first_line, registered_tool_name, McpTool};
 use crate::tool::{Tool, ToolRegistry};
 
@@ -358,9 +359,12 @@ impl McpManager {
         }
     }
 
-    /// SIGKILL every server's process group, synchronously. The last
-    /// resort for exits that cannot `await` [`shutdown`](Self::shutdown):
-    /// a dropped future, an early `?` return, a signal handler.
+    /// SIGKILL every server's process group, synchronously, and end every
+    /// HTTP server's session. The last resort for exits that cannot
+    /// `await` [`shutdown`](Self::shutdown): a dropped future, an early
+    /// `?` return, a signal handler. The HTTP half blocks for at most
+    /// [`DELETE_TIMEOUT`] (plus a margin) in total, however many servers
+    /// there are or however wedged: exit must not hang on a courtesy.
     ///
     /// **This exists because drop-based cleanup does not run here.** The
     /// transports carry a `ChildGuard` for exactly this, but a clone of
@@ -381,20 +385,31 @@ impl McpManager {
         // already shut down and reaped by `connect`, so its pid may
         // belong to someone else now. An HTTP server has no pid, which
         // `filter_map` skips: there is no process of ours to kill.
+        let ready = || {
+            self.servers
+                .iter()
+                .filter_map(|s| s.client.as_ref())
+                .filter(|c| c.state() == ConnectionState::Ready)
+        };
         #[cfg(unix)]
-        for pid in self
-            .servers
-            .iter()
-            .filter_map(|s| s.client.as_ref())
-            .filter(|c| c.state() == ConnectionState::Ready)
-            .filter_map(|c| c.pid())
-        {
+        for pid in ready().filter_map(|c| c.pid()) {
             if pid > 1 {
                 // SAFETY: a plain syscall; no memory is touched.
                 unsafe {
                     libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                 }
             }
+        }
+        // An HTTP server has no process to kill, but a session to end.
+        // This is the only place those exits can reach `DELETE`: it
+        // cannot `await`, so each one goes out on its own thread, all at
+        // once, and we wait for them together under one deadline — a
+        // dead server must delay an exit that is already unclean by
+        // `DELETE_TIMEOUT`, not by that times the number of servers.
+        let pending: Vec<_> = ready().filter_map(|c| c.abandon()).collect();
+        let deadline = std::time::Instant::now() + DELETE_TIMEOUT + Duration::from_millis(250);
+        for done in pending {
+            let _ = done.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         }
     }
 

@@ -22,6 +22,8 @@ use tokio::sync::Notify;
 use super::*;
 use crate::mcp::client::{ConnectionState, McpClient};
 
+mod lifecycle;
+
 // ------------------------------------------------------------ fake server
 
 #[derive(Clone, Debug)]
@@ -80,6 +82,10 @@ struct Reply {
     headers: Vec<(String, String)>,
     parts: Vec<Part>,
     framing: Framing,
+    /// Say nothing at all, not even the status line, until this opens.
+    /// (`Part::Wait` holds back the *body*; a client's `send()` has
+    /// already returned by then.)
+    hold: Option<Gate>,
 }
 
 impl Reply {
@@ -89,6 +95,7 @@ impl Reply {
             headers: vec![("content-type".into(), content_type.into())],
             parts: vec![Part::Bytes(body)],
             framing: Framing::Length,
+            hold: None,
         }
     }
 
@@ -97,7 +104,7 @@ impl Reply {
     }
 
     fn status(status: u16) -> Self {
-        Self { status, headers: vec![], parts: vec![], framing: Framing::Length }
+        Self { status, headers: vec![], parts: vec![], framing: Framing::Length, hold: None }
     }
 
     fn text(status: u16, body: &str) -> Self {
@@ -116,11 +123,18 @@ impl Reply {
             headers: vec![("content-type".into(), "text/event-stream".into())],
             parts,
             framing: Framing::UntilClose,
+            hold: None,
         }
     }
 
     fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Hold the whole reply, head included, until `gate` opens.
+    fn held_by(mut self, gate: &Gate) -> Self {
+        self.hold = Some(Arc::clone(gate));
         self
     }
 
@@ -154,6 +168,14 @@ impl Drop for Fake {
 }
 
 impl Fake {
+    /// Stop accepting and close the listening socket, so the next
+    /// connection is refused. Awaits the task's end: `abort` alone only
+    /// asks, and the socket stays open until the task is actually gone.
+    async fn stop(&mut self) {
+        self.accept.abort();
+        let _ = (&mut self.accept).await;
+    }
+
     async fn start(handler: impl Fn(&Req) -> Reply + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().unwrap();
@@ -269,6 +291,9 @@ async fn serve(
     requests.lock().unwrap().push(req);
     arrived.notify_waiters();
 
+    if let Some(gate) = &reply.hold {
+        gate.notified().await;
+    }
     let mut head = format!("HTTP/1.1 {} X\r\nconnection: close\r\n", reply.status);
     for (k, v) in &reply.headers {
         head.push_str(&format!("{k}: {v}\r\n"));

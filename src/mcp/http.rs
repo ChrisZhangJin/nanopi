@@ -62,6 +62,13 @@ use crate::provider::sse::{SseError, SseStream};
 /// in milliseconds, and "refused" returns at once regardless.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the session-ending `DELETE` may take, connect included.
+/// Shutdown must not wait on a server that is gone (a dead host would
+/// otherwise cost the connect timeout, and a wedged one forever), and
+/// the `DELETE` is a courtesy: the server expires an abandoned session
+/// on its own, so losing the race against this deadline costs nothing.
+pub const DELETE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Largest single SSE event, or JSON body, accepted. Matches
 /// `stdio::MAX_LINE`, for the same reason: an `image` content block is
 /// base64 and routinely megabytes, so the cap must sit well above any
@@ -140,6 +147,11 @@ pub struct HttpTransport {
     /// Fired by `shutdown` to fail requests that are mid-flight, as
     /// stdio's `Shared::close` fails its pending map.
     cancel: CancellationToken,
+    /// Makes `shutdown` run once while letting a second caller wait for
+    /// the first to finish. Without the wait, a `shutdown` that returns
+    /// "at once" because another is mid-`DELETE` lets the process exit
+    /// and take that `DELETE` with it.
+    shutdown_once: tokio::sync::OnceCell<()>,
 }
 
 impl HttpTransport {
@@ -194,22 +206,7 @@ impl HttpTransport {
             None => host.to_string(),
         };
 
-        let mut client = crate::net::client_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(options.connect_timeout);
-        if let Some(proxy) = proxy {
-            client = client.proxy(proxy);
-        }
-        // A proxy cannot reach the user's own 127.0.0.1: it would dial
-        // its own loopback, or refuse. Honouring `http_proxy` here turns
-        // a working local server into an unexplained failure, and the
-        // motivating case (a container published on a loopback port) is
-        // exactly this one. Decided per server, not globally, so a remote
-        // server in the same config still goes through the proxy.
-        if is_loopback(&url) {
-            client = client.no_proxy();
-        }
-        let client = client.build().map_err(|e| {
+        let client = make_client(&url, options.connect_timeout, proxy).map_err(|e| {
             TransportError::Unsupported(format!(
                 "server \"{}\": cannot build an HTTP client: {}",
                 config.name,
@@ -229,6 +226,7 @@ impl HttpTransport {
             last_error_body: Mutex::new(String::new()),
             closed: Mutex::new(None),
             cancel: CancellationToken::new(),
+            shutdown_once: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -317,22 +315,85 @@ impl HttpTransport {
         .await
     }
 
-    /// End the transport. Idempotent: the first call wins and later ones
-    /// return at once.
+    /// End the transport, and the session with it. Idempotent: the first
+    /// call does the work, concurrent and later calls return once it is
+    /// done, and only one `DELETE` is ever sent.
     ///
-    /// H3 sends `DELETE` here — after the flag is set and in-flight
-    /// requests are cancelled, while `session` still holds the id, and
-    /// bypassing `check_open`, which now refuses — with its own short
-    /// timeout, because shutdown must not wait on a server that is gone.
+    /// The order is the contract: the closed flag is set and in-flight
+    /// requests are cancelled *first*, so they fail at once and nothing
+    /// new starts; only then is the session ended, while `session` still
+    /// holds the id and bypassing `check_open`, which now refuses.
+    /// Cancelling after the `DELETE` would leave every in-flight call
+    /// waiting out a server that may be the reason we are shutting down.
+    ///
+    /// The `DELETE` (spec: a client that no longer needs a session SHOULD
+    /// send one) is best effort under [`DELETE_TIMEOUT`]. A `405` (the
+    /// server does not let clients end sessions, which the spec allows),
+    /// a `404` (already gone), a refused connection and a hang are all
+    /// the same to us: nothing to do about them while quitting. No
+    /// session id, no `DELETE`.
     pub async fn shutdown(&self) {
+        self.shutdown_once
+            .get_or_init(|| async {
+                if let Some(headers) = self.begin_shutdown() {
+                    delete_session(&self.client, &self.url, headers).await;
+                }
+            })
+            .await;
+    }
+
+    /// [`shutdown`](Self::shutdown) for an exit that cannot `await`: a
+    /// dropped future, an early return, a signal. Marks the transport
+    /// closed and sends the `DELETE` from its own thread and runtime
+    /// (this one may be blocked or going away, and the pooled client is
+    /// bound to it). The receiver yields once the attempt is over;
+    /// waiting on it for at most [`DELETE_TIMEOUT`] is the caller's
+    /// choice. `None` when there is nothing to send: no session, or the
+    /// transport was already shut down.
+    pub fn abandon(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        let headers = self.begin_shutdown()?;
+        let (done, finished) = std::sync::mpsc::channel();
+        let url = self.url.clone();
+        let connect_timeout = self.options.connect_timeout;
+        let spawned = std::thread::Builder::new()
+            .name("mcp-http-delete".into())
+            .spawn(move || {
+                let attempt = || -> Option<()> {
+                    let client = make_client(&url, connect_timeout, None).ok()?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    runtime.block_on(delete_session(&client, &url, headers));
+                    Some(())
+                };
+                let _ = attempt();
+                let _ = done.send(());
+            });
+        spawned.ok().map(|_| finished)
+    }
+
+    /// The synchronous half of shutdown: set the flag, cancel what is in
+    /// flight, and build the `DELETE`'s headers. `None` if shutdown had
+    /// already begun (so the `DELETE` was, or will be, sent by whoever
+    /// began it) or there is no session to end.
+    fn begin_shutdown(&self) -> Option<HeaderMap> {
         {
             let mut closed = self.closed.lock().unwrap();
             if closed.is_some() {
-                return;
+                return None;
             }
             *closed = Some(format!("server \"{}\" was shut down", self.name));
         }
         self.cancel.cancel();
+        // Not `INITIALIZE`, so this carries the session and version.
+        let (mut headers, had_session) = self.headers_for("");
+        if !had_session {
+            return None;
+        }
+        // There is no body to describe.
+        headers.remove(CONTENT_TYPE);
+        Some(headers)
     }
 
     // --------------------------------------------------------- internals
@@ -651,6 +712,40 @@ fn base_headers(
     map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     map.insert(ACCEPT, HeaderValue::from_static("application/json, text/event-stream"));
     Ok(map)
+}
+
+/// The HTTP client for one server. A function, not inlined in `build`,
+/// because the exit path that cannot `await` ([`HttpTransport::abandon`])
+/// needs a second one that belongs to its own runtime.
+fn make_client(
+    url: &Url,
+    connect_timeout: Duration,
+    proxy: Option<Proxy>,
+) -> Result<Client, reqwest::Error> {
+    let mut client = crate::net::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout);
+    if let Some(proxy) = proxy {
+        client = client.proxy(proxy);
+    }
+    // A proxy cannot reach the user's own 127.0.0.1: it would dial
+    // its own loopback, or refuse. Honouring `http_proxy` here turns
+    // a working local server into an unexplained failure, and the
+    // motivating case (a container published on a loopback port) is
+    // exactly this one. Decided per server, not globally, so a remote
+    // server in the same config still goes through the proxy.
+    if is_loopback(url) {
+        client = client.no_proxy();
+    }
+    client.build()
+}
+
+/// `DELETE` the session, ignoring every outcome. Never longer than
+/// [`DELETE_TIMEOUT`]; the response body is not read, since only whether
+/// the server heard us would matter and we could not act on it.
+async fn delete_session(client: &Client, url: &Url, headers: HeaderMap) {
+    let send = client.delete(url.clone()).headers(headers).send();
+    let _ = tokio::time::timeout(DELETE_TIMEOUT, send).await;
 }
 
 /// Whether `url` points at this machine.
