@@ -611,6 +611,20 @@ mod tests {
     }
 
     #[test]
+    fn an_http_endpoint_is_the_masked_url_and_never_a_header() {
+        let cfg = ServerConfig::http(
+            "gw",
+            "https://admin:hunter2@mcp.example.com/mcp?api_key=abc123",
+            BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
+        );
+        let e = endpoint_of(&cfg);
+        for secret in ["hunter2", "abc123", "s3cret", "Authorization"] {
+            assert!(!e.contains(secret), "{secret} leaked: {e}");
+        }
+        assert_eq!(e, "https://***@mcp.example.com/mcp?***");
+    }
+
+    #[test]
     fn an_empty_manager_registers_nothing_and_shuts_down_instantly() {
         let m = McpManager::empty();
         let mut r = ToolRegistry::standard();
