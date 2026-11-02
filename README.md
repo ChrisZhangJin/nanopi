@@ -345,8 +345,9 @@ stream; both work.
   userinfo shown as `***@` and everything after `?` shown as `?***`; header
   names and values are never printed.
 - **Sessions are ended on exit.** The server's `Mcp-Session-Id` session is closed
-  with an HTTP `DELETE` when the TUI quits, when a `-p` run ends, and on Ctrl-C
-  or SIGTERM in a `-p` run. SIGTERM to the TUI and `kill -9` cannot, and leave the
+  with an HTTP `DELETE` when the TUI quits (including on SIGTERM or SIGHUP, which
+  take the same orderly path as `/quit` and exit 143 / 129), when a `-p` run ends,
+  and on Ctrl-C or SIGTERM in a `-p` run. `kill -9` cannot, and leaves the
   session for the server to expire. A server that drops the session mid-run (`404`) is re-initialized once and the
   failed call retried.
 - Redirects are not followed, and loopback targets bypass `http_proxy`.

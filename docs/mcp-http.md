@@ -250,8 +250,11 @@ OAuth is out of scope. Static headers only.
 - **Exit paths** (`tests/mcp_agent_e2e.rs`, a fake HTTP server): the `DELETE` is
   asserted for the end of a `-p` run, for SIGTERM (via `McpManager::kill_now`) and
   for Ctrl-C/SIGINT. The TUI's quit path is the same `McpManager::shutdown` and was
-  checked live, not by a test. SIGTERM to the *TUI* has no handler (it is not
-  installed for the TUI at all, stdio servers included) and so sends no `DELETE`.
+  checked live, not by a test. SIGTERM and SIGHUP to the *TUI* are turned into the
+  same quit as `/quit` (`mode/exit_signal.rs`, exit 143 / 129), so they `DELETE`
+  through `McpManager::shutdown` too; `tests/tui_signal_e2e.rs` runs the real
+  binary on a pty and asserts the `DELETE`, no stdio server left, the terminal
+  restored and the exit codes. Only SIGKILL still leaves the session to expire.
 
 ## Not in this plan
 

@@ -317,8 +317,9 @@ nanopi 是一个 [MCP](https://modelcontextprotocol.io) 客户端：外部 MCP �
 - `/tools`（编排模式关闭时）会显示每个工具的来源。HTTP 服务器显示的是 URL，用户
   信息显示为 `***@`，`?` 之后的全部内容显示为 `?***`；header 的名字和值都不会打印。
 - **退出时会结束会话。** 服务器的 `Mcp-Session-Id` 会话会通过一次 HTTP `DELETE`
-  关闭：TUI 退出时、`-p` 运行结束时、以及 `-p` 运行中收到 Ctrl-C 或 SIGTERM 时。
-  向 TUI 发 SIGTERM 和 `kill -9` 做不到，会话留给服务器自己过期。服务器在运行中丢弃
+  关闭：TUI 退出时（收到 SIGTERM 或 SIGHUP 时也一样，走与 `/quit` 相同的有序退出
+  路径，退出码分别为 143 / 129）、`-p` 运行结束时、以及 `-p` 运行中收到 Ctrl-C 或
+  SIGTERM 时。`kill -9` 做不到，会话留给服务器自己过期。服务器在运行中丢弃
   会话（`404`）时，会重新初始化一次并重试失败的调用。
 - 不跟随重定向；回环目标会绕过 `http_proxy`。
 
