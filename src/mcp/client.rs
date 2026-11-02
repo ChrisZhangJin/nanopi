@@ -527,6 +527,9 @@ async fn handshake(
         ));
     }
 
+    // Before `initialized`: that notification is already a request the
+    // server may check the version header on.
+    transport.set_protocol_version(&result.protocol_version);
     transport
         .notify(method::INITIALIZED, None)
         .await
