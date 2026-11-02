@@ -230,7 +230,7 @@ response, `202`, `400`/`404`/`401`/`5xx` mapped to typed errors, a redirect
 refused, a stream closing before the matching id, a server request on the stream.
 No new dependency. Windows check clean.
 
-### H2b — SSE parser spec compliance (found during H2)
+### ✅ H2b — SSE parser spec compliance (found during H2)
 
 `provider::sse::SseStream` yields one event per `data: ` line. Per the SSE spec a
 field may be written `data:` with or without the single space, and an event may
