@@ -309,6 +309,8 @@ pub fn load_with(path: &Path, lookup: Lookup) -> LoadResult {
         }
     };
 
+    record_references(&parsed);
+
     let mut seen: Vec<String> = Vec::new();
     for (name, raw) in parsed.mcp_servers.0 {
         // Last-wins matches what every JSON parser does with a repeated
@@ -339,6 +341,34 @@ pub fn load_with(path: &Path, lookup: Lookup) -> LoadResult {
     }
 
     out
+}
+
+/// Tell `credentials` which environment variables this file references
+/// (`${NAME}` in a `url` or a `headers` value), so child agents are not
+/// handed them. Done on the raw entries, before validation, so a server
+/// that is about to be skipped still counts, and every entry of a
+/// repeated name does too.
+fn record_references(parsed: &ConfigFile) {
+    credentials::record_referenced_env(parsed.mcp_servers.0.iter().flat_map(|(_, raw)| {
+        raw.url
+            .iter()
+            .chain(raw.headers.values())
+            .flat_map(|t| credentials::referenced_names(t))
+    }));
+}
+
+/// [`record_references`] for a session that will not load the file (a
+/// `--tools` allowlist excludes MCP). Its children still must not
+/// inherit what the file names. Silent: an unreadable or unparseable file
+/// is [`load`]'s to diagnose, and there is nothing to record from it.
+pub fn note_global_references() {
+    let Some(path) = crate::paths::global_mcp_path() else { return };
+    if let Some(parsed) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<ConfigFile>(&t).ok())
+    {
+        record_references(&parsed);
+    }
 }
 
 /// Turn one raw entry into a [`ServerConfig`], or into the diagnostic

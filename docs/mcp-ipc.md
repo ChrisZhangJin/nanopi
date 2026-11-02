@@ -96,8 +96,19 @@ a guarantee that is only Linux-true.
 4. **Do not widen the child's registry beyond what was allowed.** The child's
    tools are built from the dispatch-time allowlist, never from "everything the
    parent offers".
-5. **Credentials.** A child must never receive a server's `env`. It talks to the
-   parent; it does not learn how the server was launched.
+5. **Credentials.** A child must never receive a server's `env`, URL or
+   `headers`. It talks to the parent; it does not learn how the server was
+   reached. Two things enforce this: the channel carries only tool names,
+   schemas and results, and `tool::agent::configure_child_env` removes from every
+   child's environment (dispatch and `send_message` continuation alike) each
+   variable `mcp.json` references as `${VAR}`, so a secret the parent expanded
+   into a header is not in the child's environment. Honest limits, since this is
+   not a sandbox: a child with `read` or `bash` can read `~/.nanopi/mcp.json`
+   (stdio `env` values and literal headers are plaintext there), and on Linux a
+   child with `bash` can read its parent's `/proc/<pid>/environ`. Both run as
+   the owner. `PATH`, `HOME`, the provider key (`OPENAI_API_KEY`) and `NANOPI_*`
+   are never removed. Details and the test: `docs/mcp-http.md` ("Nothing toward
+   a child").
 
 ## Split
 

@@ -47,6 +47,15 @@ its tools register as `mcp__<server>__<tool>`. `/tools` shows each tool's origin
 exit. A child agent never connects: it calls through the parent
 (`docs/mcp-ipc.md`).
 
+What a child does not receive: a server's `env`, URL or `headers` (the channel
+never carries them), and any environment variable `mcp.json` references as
+`${VAR}`, which nanopi removes from the child's environment at spawn. What it
+can still reach: `mcp.json` itself, if the child has `read` or `bash`. Literal
+header values and stdio `env` values are plaintext there, the same trust class as
+an API key in `config.toml`, so write a secret as `${VAR}`. This is not a
+sandbox; see `docs/mcp-http.md` ("Nothing toward a child") for the exact set and
+the remaining limits.
+
 ### `/mcp`
 
 Read-only; it answers from what the manager already holds, so it never makes a

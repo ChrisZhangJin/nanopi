@@ -12,7 +12,7 @@
 //!
 //! Nothing here is `cfg(unix)`: HTTP MCP is available on Windows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Url;
@@ -109,6 +109,55 @@ pub fn expand(template: &str, lookup: Lookup) -> Result<String, ExpandError> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+// ------------------------------------------------- referenced variables
+
+/// The names `${NAME}` mentions in `template`, in order, under the same
+/// grammar as [`expand`] (so `$${NAME}` is the escape and names nothing)
+/// but without ever failing: a malformed reference simply names nothing.
+/// Pure, and never looks anything up, so it cannot see a value.
+pub fn referenced_names(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(i) = rest.find('$') {
+        let after = &rest[i + 1..];
+        if let Some(r) = after.strip_prefix("${") {
+            rest = r;
+        } else if let Some(r) = after.strip_prefix('{') {
+            let Some(end) = r.find('}') else { break };
+            if is_name(&r[..end]) {
+                out.push(r[..end].to_string());
+            }
+            rest = &r[end + 1..];
+        } else {
+            rest = after;
+        }
+    }
+    out
+}
+
+/// Every environment variable an `mcp.json` has *referenced* so far in
+/// this process, by name only. See [`record_referenced_env`].
+static REFERENCED_ENV: std::sync::Mutex<BTreeSet<String>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Remember that `mcp.json` references `names`. Called by the config
+/// loader for every configured server, including ones that end up
+/// skipped: the name alone identifies the secret, and a server that is
+/// skipped today may be fixed by an edit tomorrow.
+///
+/// Process-wide and only ever growing, in the style of
+/// `mcp::ipc::global()`: the code that spawns child agents has no handle
+/// on the session's manager. Names only, never a value.
+pub fn record_referenced_env<I: IntoIterator<Item = String>>(names: I) {
+    REFERENCED_ENV.lock().unwrap_or_else(|e| e.into_inner()).extend(names);
+}
+
+/// The names recorded by [`record_referenced_env`], sorted. What a child
+/// agent must not inherit: see `tool::agent::child_env_removals`.
+pub fn referenced_env_names() -> Vec<String> {
+    REFERENCED_ENV.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
 }
 
 // ------------------------------------------------------------ loopback
