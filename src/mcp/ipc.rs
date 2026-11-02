@@ -2043,4 +2043,174 @@ mod tests {
         drop(server);
         h.finish().await;
     }
+
+    // ── H4: credentials never travel toward a child ─────────────────
+
+    const H4_TOKEN_VAR: &str = "NANOPI_TEST_H4_IPC_TOKEN_6b1e";
+    const H4_EXPANDED: &str = "expanded-bearer-9d4f2a71";
+    const H4_LITERAL: &str = "literal-header-secret-5c80e3";
+    const H4_URL_SECRET: &str = "url-query-secret-a17b64";
+
+    /// A Streamable HTTP MCP server on loopback that insists on the
+    /// credential (so the test knows it was really sent), answers one
+    /// tool normally and one with a `403` that quotes the credential back
+    /// as a careless server would. Every request's head is returned.
+    async fn credentialed_http_server() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let heads: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen = heads.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, body) = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                        let want = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + want {
+                            break (head, buf[end + 4..end + 4 + want].to_vec());
+                        }
+                    };
+                    seen.lock().unwrap().push(head.clone());
+                    let reply = |status: &str, ctype: &str, body: &str| {
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let authorised = head.contains(&format!("Bearer {H4_EXPANDED}"))
+                        && head.contains(H4_LITERAL);
+                    let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let id = msg["id"].clone();
+                    let ok = |result: Value| {
+                        reply("200 OK", "application/json", &json!({"jsonrpc":"2.0","id":id,"result":result}).to_string())
+                    };
+                    let out = if !head.starts_with("POST") {
+                        reply("200 OK", "text/plain", "")
+                    } else if !authorised {
+                        reply("401 Unauthorized", "text/plain", "no credentials")
+                    } else {
+                        match msg["method"].as_str() {
+                            Some("initialize") => ok(json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"gw","version":"1"}})),
+                            Some(m) if m.starts_with("notifications/") => reply("202 Accepted", "text/plain", ""),
+                            Some("tools/list") => ok(json!({"tools":[
+                                {"name":"echo","description":"echoes","inputSchema":{"type":"object"}},
+                                {"name":"denied","description":"refused","inputSchema":{"type":"object"}}]})),
+                            Some("tools/call") if msg["params"]["name"] == "denied" => reply(
+                                "403 Forbidden",
+                                "text/plain",
+                                &format!("forbidden for Bearer {H4_EXPANDED} / {H4_LITERAL} / {H4_URL_SECRET}"),
+                            ),
+                            Some("tools/call") => ok(json!({"content":[{"type":"text","text":"ran echo"}]})),
+                            _ => reply("400 Bad Request", "text/plain", "?"),
+                        }
+                    };
+                    let _ = sock.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        (addr, heads)
+    }
+
+    /// Owner rule: a child never learns a server's credentials. Drive an
+    /// HTTP server carrying three distinctive secrets — an expanded
+    /// `${VAR}`, a literal header and a URL query parameter — through
+    /// the real channel with a client that asks for everything, and grep
+    /// every message the parent wrote, the child's environment and its
+    /// argv. The server insists on the credential, so a pass cannot be
+    /// "it was never sent".
+    #[tokio::test]
+    async fn no_http_credential_is_ever_sent_toward_a_child() {
+        let secrets = [H4_EXPANDED, H4_LITERAL, H4_URL_SECRET, H4_TOKEN_VAR];
+
+        let (addr, heads) = credentialed_http_server().await;
+        std::env::set_var(H4_TOKEN_VAR, H4_EXPANDED);
+        let config = ServerConfig::http(
+            "gw",
+            format!("http://{addr}/mcp?api_key={H4_URL_SECRET}"),
+            BTreeMap::from([
+                ("Authorization".to_string(), format!("Bearer ${{{H4_TOKEN_VAR}}}")),
+                ("X-Literal".to_string(), H4_LITERAL.to_string()),
+            ]),
+        );
+        let manager = Arc::new(McpManager::connect(vec![config], ManagerOptions::default()).await);
+        std::env::remove_var(H4_TOKEN_VAR);
+        assert_eq!(manager.tool_count(), 2, "{:?}", manager.status());
+        {
+            let heads = heads.lock().unwrap();
+            assert!(!heads.is_empty());
+            assert!(
+                heads.iter().any(|h| h.contains(&format!("Bearer {H4_EXPANDED}")) && h.contains(H4_LITERAL)),
+                "the server never received the credential: {heads:?}"
+            );
+        }
+
+        let dir = scratch("h4");
+        let server = IpcServer::start_in(&dir, &manager).expect("start");
+        server.grant("a1", ["mcp__gw__echo", "mcp__gw__denied"]);
+        server.grant("a2", ["mcp__gw__echo", "mcp__gw__denied"]);
+
+        // Everything a child can ask, including the call the server
+        // answers with a quote of the credential.
+        let mut raw = Raw::connect(server.socket_path()).await;
+        raw.hello("a1").await;
+        let listed = raw.rpc(1, TOOLS_LIST, json!({})).await;
+        assert!(listed["result"]["tools"].as_array().is_some_and(|t| t.len() == 2), "{listed}");
+        let ok = raw.rpc(2, TOOLS_CALL, json!({"name":"mcp__gw__echo","arguments":{}})).await;
+        assert!(ok.get("result").is_some(), "{ok}");
+        let refused = raw.rpc(3, TOOLS_CALL, json!({"name":"mcp__gw__denied","arguments":{}})).await;
+        assert!(refused.to_string().contains("403"), "the refusal should reach the child: {refused}");
+        raw.rpc(4, TOOLS_CALL, json!({"name":"mcp__gw__missing","arguments":{}})).await;
+        raw.rpc(5, "tools/nope", json!({})).await;
+        assert!(raw.seen.lines().count() >= 6, "{}", raw.seen);
+
+        // The real client too: its errors are what a child's model reads.
+        let client = IpcClient::connect(server.socket_path(), "a2").await.expect("connect");
+        let tools = client.list_tools().await.expect("list");
+        let e = client.call_tool("mcp__gw__denied", args()).await.unwrap_err().to_string();
+        assert!(e.contains("403"), "{e}");
+
+        let spec = crate::tool::agent::ChildLaunchSpec::default();
+        let child_env = crate::tool::agent::build_child_env(&spec, "a1");
+        let child_args = crate::tool::agent::build_child_args(
+            &spec,
+            &dir,
+            &["mcp__gw__echo".to_string(), "mcp__gw__denied".to_string()],
+            None,
+        );
+
+        let everything = [
+            ("every IPC message", raw.seen.clone()),
+            ("the IPC client's view", format!("{tools:?} {e}")),
+            ("the child environment", format!("{child_env:?}")),
+            ("the child argv", format!("{child_args:?}")),
+            ("the status rows", format!("{:?}", manager.status())),
+            ("the notices", format!("{:?}", manager.notices())),
+            ("the grants", format!("{:?} {:?}", server.catalogue(), server.granted_tools("a1"))),
+        ];
+        for (what, text) in &everything {
+            for secret in secrets {
+                assert!(!text.contains(secret), "{secret} leaked into {what}: {text}");
+            }
+        }
+
+        drop(raw);
+        drop(client);
+        server.shutdown();
+        manager.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

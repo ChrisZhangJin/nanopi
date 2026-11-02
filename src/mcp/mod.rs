@@ -17,6 +17,8 @@ pub mod client;
 pub mod ipc;
 /// Streamable HTTP transport. See `docs/mcp-http.md`.
 pub mod http;
+/// `${VAR}` expansion, the cleartext refusal and the shared masking rules.
+pub mod credentials;
 /// Owns all server connections: concurrent connect, registration, shutdown.
 pub mod manager;
 /// A child agent's MCP tools: `Tool`s that forward each call to the parent.

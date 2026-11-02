@@ -33,7 +33,6 @@
 //! configured.
 
 use std::error::Error as StdError;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,13 +40,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, RETRY_AFTER};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE,
+};
 use reqwest::{Client, Proxy, StatusCode, Url};
 use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::config::{ServerConfig, ServerSpec};
+use crate::mcp::credentials::{self, Lookup};
 use crate::mcp::protocol::method::INITIALIZE;
 use crate::mcp::protocol::{
     error_code, Incoming, Notification, Request, RequestId, Response, ResponsePayload, RpcError,
@@ -129,10 +131,19 @@ pub struct HttpTransport {
     client: Client,
     url: Url,
     /// `host:port`, the only part of the URL that is ever shown. The path
-    /// and query may carry a token and the userinfo is a credential.
+    /// and query may carry a token and the userinfo is a credential. Taken
+    /// from the *template* when the authority holds a `${VAR}`, so even a
+    /// host that comes from the environment is shown as written.
     endpoint: String,
     /// Configured headers plus the fixed ones. Secrets: never printed.
     base_headers: HeaderMap,
+    /// Header values and URL credentials, to scrub from anything the
+    /// server says that we keep or show: error pages sometimes quote the
+    /// credential that was just refused.
+    secrets: Vec<String>,
+    /// Whether the config had any `headers`: it picks the advice in a
+    /// `401`/`403` message.
+    has_headers: bool,
     session: Mutex<Session>,
     next_id: AtomicI64,
     options: HttpOptions,
@@ -163,48 +174,33 @@ impl HttpTransport {
         config: &ServerConfig,
         options: HttpOptions,
     ) -> Result<Self, TransportError> {
-        Self::build(config, options, None)
+        Self::build(config, options, None, &credentials::env_lookup)
     }
 
     /// `proxy` stands in for the process-wide environment proxy, which
-    /// reqwest reads once per process and so cannot be varied per test.
-    /// Production always passes `None`.
+    /// reqwest reads once per process and so cannot be varied per test,
+    /// and `lookup` for the process environment, which tests must not
+    /// mutate. Production passes `None` and the real environment.
     fn build(
         config: &ServerConfig,
         options: HttpOptions,
         proxy: Option<Proxy>,
+        lookup: Lookup,
     ) -> Result<Self, TransportError> {
-        let ServerSpec::Http { url, headers } = &config.spec else {
+        let ServerSpec::Http { url: url_template, headers } = &config.spec else {
             return Err(TransportError::Unsupported(format!(
                 "server \"{}\" is not an HTTP server",
                 config.name
             )));
         };
-        // The parse error is not echoed with the input: it would be the
-        // one place a malformed URL carrying a token could leak.
-        let url = Url::parse(url).map_err(|e| {
-            TransportError::Unsupported(format!(
-                "server \"{}\" has an invalid url ({e})",
-                config.name
-            ))
-        })?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(TransportError::Unsupported(format!(
-                "server \"{}\": url scheme `{}` is not http or https",
-                config.name,
-                url.scheme()
-            )));
-        }
-        let Some(host) = url.host_str() else {
-            return Err(TransportError::Unsupported(format!(
-                "server \"{}\": url has no host",
-                config.name
-            )));
-        };
-        let endpoint = match url.port_or_known_default() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
+        // Everything that can be wrong with the url or a header — an
+        // unset `${VAR}`, a refused cleartext credential, an invalid
+        // value — is decided here, by the same function the config
+        // loader used, and none of its messages echoes a value.
+        let resolved = credentials::resolve_http(&config.name, url_template, headers, lookup)
+            .map_err(TransportError::Unsupported)?;
+        let credentials::ResolvedHttp { url, headers: resolved_headers, secrets } = resolved;
+        let endpoint = shown_endpoint(url_template, &url);
 
         let client = make_client(&url, options.connect_timeout, proxy).map_err(|e| {
             TransportError::Unsupported(format!(
@@ -219,7 +215,9 @@ impl HttpTransport {
             client,
             url,
             endpoint,
-            base_headers: base_headers(&config.name, headers)?,
+            base_headers: base_headers(resolved_headers),
+            secrets,
+            has_headers: !headers.is_empty(),
             session: Mutex::new(Session::default()),
             next_id: AtomicI64::new(1),
             options,
@@ -605,6 +603,7 @@ impl HttpTransport {
         id: Option<&RequestId>,
     ) -> TransportError {
         let status = response.status();
+        let scheme = (status.as_u16() == 401).then(|| auth_scheme(response.headers())).flatten();
         if status.is_redirection() {
             return TransportError::Http {
                 status: status.as_u16(),
@@ -622,9 +621,22 @@ impl HttpTransport {
         let text = String::from_utf8_lossy(&body);
         self.remember(&text);
 
+        // Neither carries the body: it is the server's words, may quote
+        // what we sent, and the message is complete without it.
         match status.as_u16() {
-            401 => return TransportError::Unauthorized,
-            403 => return TransportError::Forbidden,
+            401 => {
+                return TransportError::Unauthorized {
+                    server: self.name.clone(),
+                    scheme,
+                    has_headers: self.has_headers,
+                }
+            }
+            403 => {
+                return TransportError::Forbidden {
+                    server: self.name.clone(),
+                    has_headers: self.has_headers,
+                }
+            }
             404 if had_session => return TransportError::SessionExpired,
             _ => {}
         }
@@ -646,9 +658,9 @@ impl HttpTransport {
 
         let quoted = match &rpc {
             Some(Response { payload: ResponsePayload::Error(e), .. }) => {
-                format!("{} (code {})", sanitize(&e.message, DETAIL_CAP), e.code)
+                format!("{} (code {})", sanitize(&self.scrub(&e.message), DETAIL_CAP), e.code)
             }
-            _ => sanitize(&text, DETAIL_CAP),
+            _ => sanitize(&self.scrub(&text), DETAIL_CAP),
         };
         let mut detail = status.canonical_reason().unwrap_or("error").to_string();
         if !quoted.is_empty() {
@@ -661,7 +673,14 @@ impl HttpTransport {
     }
 
     fn remember(&self, text: &str) {
-        *self.last_error_body.lock().unwrap() = sanitize(text, DIAGNOSTIC_CAP);
+        *self.last_error_body.lock().unwrap() = sanitize(&self.scrub(text), DIAGNOSTIC_CAP);
+    }
+
+    /// Server text with our own credentials masked: an error page that
+    /// quotes the `Authorization` it just rejected must not carry it into
+    /// diagnostics or a message a model reads.
+    fn scrub(&self, text: &str) -> String {
+        credentials::scrub(text, &self.secrets)
     }
 }
 
@@ -685,33 +704,59 @@ fn encode<T: Serialize>(message: &T) -> Result<Bytes, TransportError> {
     Ok(Bytes::from(serde_json::to_vec(message)?))
 }
 
-/// The configured headers, then the fixed ones on top: a user header
-/// must not be able to replace `Content-Type` and make the server read
-/// our JSON as something else.
-fn base_headers(
-    server: &str,
-    configured: &std::collections::BTreeMap<String, String>,
-) -> Result<HeaderMap, TransportError> {
+/// The configured headers (already expanded and validated by
+/// [`credentials::resolve_http`]), then the fixed ones on top: a user
+/// header must not be able to replace `Content-Type` and make the server
+/// read our JSON as something else.
+fn base_headers(configured: Vec<(HeaderName, HeaderValue)>) -> HeaderMap {
     let mut map = HeaderMap::new();
     for (name, value) in configured {
-        // The value is never put in the message, only the name: an
-        // invalid one is most likely a pasted secret with a stray newline.
-        let n = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            TransportError::Unsupported(format!(
-                "server \"{server}\": {name:?} is not a valid header name"
-            ))
-        })?;
-        let mut v = HeaderValue::from_str(value).map_err(|_| {
-            TransportError::Unsupported(format!(
-                "server \"{server}\": the value of header {name:?} is not valid"
-            ))
-        })?;
-        v.set_sensitive(true);
-        map.insert(n, v);
+        map.insert(name, value);
     }
     map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     map.insert(ACCEPT, HeaderValue::from_static("application/json, text/event-stream"));
-    Ok(map)
+    map
+}
+
+/// What an error message calls the server's address: `host:port` of the
+/// URL, unless the template's authority holds a `${VAR}`, in which case
+/// the authority as written (userinfo masked) — the expanded host is a
+/// value from the environment and is not printed.
+fn shown_endpoint(template: &str, url: &Url) -> String {
+    let masked = credentials::redact_url(template);
+    let authority = masked
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?']).next().unwrap_or(rest))
+        .unwrap_or("");
+    if authority.contains("${") {
+        return authority.trim_start_matches("***@").to_string();
+    }
+    let host = url.host_str().unwrap_or_default();
+    match url.port_or_known_default() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+/// The auth scheme *names* a `401` offers, from `WWW-Authenticate`
+/// (`Bearer realm="x", error="invalid_token"` → `Bearer`): at most three,
+/// each limited to token characters and 20 of them. The parameters are
+/// the server's to describe and ours not to repeat.
+fn auth_scheme(headers: &HeaderMap) -> Option<String> {
+    let mut schemes: Vec<String> = Vec::new();
+    for value in headers.get_all(WWW_AUTHENTICATE) {
+        let Ok(value) = value.to_str() else { continue };
+        let name: String = value
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | '+'))
+            .take(20)
+            .collect();
+        if !name.is_empty() && !schemes.contains(&name) && schemes.len() < 3 {
+            schemes.push(name);
+        }
+    }
+    (!schemes.is_empty()).then(|| schemes.join("/"))
 }
 
 /// The HTTP client for one server. A function, not inlined in `build`,
@@ -748,23 +793,16 @@ async fn delete_session(client: &Client, url: &Url, headers: HeaderMap) {
     let _ = tokio::time::timeout(DELETE_TIMEOUT, send).await;
 }
 
-/// Whether `url` points at this machine.
+/// Whether a request to `url` stays on this machine, so a proxy must be
+/// bypassed. Wider than [`credentials::is_loopback`], which gates sending
+/// credentials in the clear: `*.localhost` is local by RFC 6761, and a
+/// proxy cannot reach it either way, but a resolver that ignores the RFC
+/// would send the name out, and that is not a risk to take with a token.
 fn is_loopback(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
-    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
-        return true;
-    }
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_loopback(),
-        // `::ffff:127.0.0.1` reaches the same socket as `127.0.0.1`.
-        Ok(IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-        Err(_) => false,
-    }
+    credentials::is_loopback(url)
+        || url
+            .host_str()
+            .is_some_and(|h| h.trim_end_matches('.').to_ascii_lowercase().ends_with(".localhost"))
 }
 
 /// `a: b: c` for an error and its sources. reqwest's own message is the
