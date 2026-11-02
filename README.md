@@ -220,7 +220,7 @@ doesn't know to `custom`:
 
 ```json
 {
-  "generated_by": "0.14.0",
+  "generated_by": "0.15.0",
   "custom": [
     { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
   ],
@@ -233,10 +233,14 @@ a case-insensitive longest-prefix match, so `my-model` also covers
 `my-model-20260101`.
 
 `builtin` is regenerated whenever nanopi's version changes — the previous file is
-copied to `models.json.bak` first, and your `custom` entries carry over untouched.
+copied to `models.json.bak` first, and your `custom` entries (and any extra top-level
+keys you added) carry over untouched; `_comment` is nanopi's own text and is rewritten,
+the old one stays in the `.bak`.
 That split is what stops the file going stale: upgrade nanopi and you get its newer
-models, while keeping your own. Edits made directly inside `builtin` work until the
-next upgrade replaces them, so put anything you want to keep in `custom`.
+models, while keeping your own. Edits made directly inside `builtin` work only while
+`generated_by` matches the running version: once nanopi is upgraded the old `builtin`
+is ignored (even in `nanopi -p`, which cannot rewrite the file) and then replaced, so
+put anything you want to keep in `custom`.
 
 A malformed file is never overwritten — nanopi reports the line and falls back to the
 built-in table for that run. `nanopi -p` reads the file but never creates or refreshes
@@ -355,7 +359,10 @@ stream; both work.
 Not supported yet: the older HTTP+SSE transport (`"type": "sse"` is reported and
 skipped), OAuth (static `headers` only), the standing `GET` stream that carries
 server-initiated messages (so a server's `tools/list_changed` is not seen; the
-tool list is read once at startup), WebSocket, and MCP `prompts`/`resources`.
+tool list is read once at startup) and stream resumability (`Last-Event-ID`),
+an interactive `/mcp` (reconnecting a server, enabling or disabling one: `/mcp`
+is read-only, `mcp.json` is read once at startup, and `/reload` does not re-read
+it), WebSocket, and MCP `prompts`/`resources`.
 
 All servers connect concurrently at startup under one 15 s budget. A server that
 fails to start, or an entry that is invalid, is reported and skipped; it never

@@ -47,7 +47,9 @@ pub struct CatalogueFile {
     /// Binary version that last wrote `builtin`. Drives regeneration.
     #[serde(default)]
     pub generated_by: String,
-    /// Human-facing note; round-tripped so a hand edit survives.
+    /// Human-facing note about the file. nanopi's own text: it is
+    /// rewritten on a refresh (its wording tracks the release), so a
+    /// hand edit to it does not survive one — the `.bak` keeps it.
     #[serde(default, rename = "_comment", skip_serializing_if = "String::is_empty")]
     pub comment: String,
     /// User-owned. Never rewritten by nanopi. Wins over `builtin`.
@@ -56,11 +58,17 @@ pub struct CatalogueFile {
     /// Mirror of the compiled table, regenerated on version change.
     #[serde(default)]
     pub builtin: Vec<OwnedModel>,
+    /// Any other top-level key the user added. Carried through a refresh
+    /// so a note or field nanopi does not know is not silently dropped;
+    /// never consulted otherwise.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 const COMMENT: &str = "`builtin` is regenerated when nanopi's version changes (the previous file is \
 saved alongside as models.json.bak). Put your own entries in `custom` — those are never touched, \
-and they win over `builtin` when the id matches.";
+and they win over `builtin` when the id matches. Edits inside `builtin` only apply while \
+generated_by matches the running nanopi; after an upgrade `builtin` is ignored and replaced.";
 
 /// A problem that did not stop startup. Mirrors `resources::SkillDiagnostic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,12 +97,20 @@ pub struct LoadResult {
 /// Pure, so it is testable without touching the process-global
 /// `OnceLock` that [`crate::models::install`] owns.
 pub fn merge(compiled: &[ModelInfo], file: &CatalogueFile) -> Vec<ModelInfo> {
+    merge_parts(compiled, &file.builtin, &file.custom)
+}
+
+fn merge_parts(
+    compiled: &[ModelInfo],
+    builtin: &[OwnedModel],
+    custom: &[OwnedModel],
+) -> Vec<ModelInfo> {
     // Walk lowest-precedence first and let later inserts overwrite.
     let mut by_id: std::collections::HashMap<String, ModelInfo> = std::collections::HashMap::new();
     for m in compiled {
         by_id.insert(m.id.to_ascii_lowercase(), *m);
     }
-    for src in [&file.builtin, &file.custom] {
+    for src in [builtin, custom] {
         for m in src {
             if m.id.trim().is_empty() || m.context_window == 0 {
                 continue;
@@ -128,12 +144,18 @@ fn to_owned(models: &[ModelInfo]) -> Vec<OwnedModel> {
         .collect()
 }
 
-fn fresh_file(compiled: &[ModelInfo], version: &str, custom: Vec<OwnedModel>) -> CatalogueFile {
+fn fresh_file(
+    compiled: &[ModelInfo],
+    version: &str,
+    custom: Vec<OwnedModel>,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> CatalogueFile {
     CatalogueFile {
         generated_by: version.to_string(),
         comment: COMMENT.to_string(),
         custom,
         builtin: to_owned(compiled),
+        extra,
     }
 }
 
@@ -160,9 +182,13 @@ fn write_atomic(path: &Path, file: &CatalogueFile) -> std::io::Result<()> {
 /// merged catalogue.
 ///
 /// - absent → write it, return the compiled table merged with nothing
-/// - `generated_by` matches `version` → load as-is, no write
+/// - `generated_by` matches `version` → load as-is, no write; the file's
+///   `builtin` overrides the compiled table, so a hand edit works
 /// - `generated_by` differs → back up to `models.json.bak`, rewrite
-///   `builtin`, preserve `custom` verbatim
+///   `builtin`, preserve `custom` and unknown top-level keys verbatim.
+///   The file's old `builtin` is ignored for this run even when the
+///   refresh could not happen (print mode, failed backup/write): only
+///   compiled + `custom` apply
 /// - unparseable → **never overwrite**, diagnose, fall back
 ///
 /// `allow_write` is false for print mode: a scripted run must not
@@ -186,7 +212,7 @@ pub fn load(path: &Path, compiled: &'static [ModelInfo], version: &str, allow_wr
 
     let Some(text) = raw else {
         if allow_write {
-            if let Err(e) = write_atomic(path, &fresh_file(compiled, version, Vec::new())) {
+            if let Err(e) = write_atomic(path, &fresh_file(compiled, version, Vec::new(), Default::default())) {
                 diags.push(CatalogueDiagnostic {
                     message: format!("could not write ({e}); using the built-in catalogue"),
                     path: path.to_path_buf(),
@@ -217,7 +243,7 @@ pub fn load(path: &Path, compiled: &'static [ModelInfo], version: &str, allow_wr
         let bak = path.with_extension("json.bak");
         match std::fs::copy(path, &bak) {
             Ok(_) => {
-                let refreshed = fresh_file(compiled, version, parsed.custom.clone());
+                let refreshed = fresh_file(compiled, version, parsed.custom.clone(), parsed.extra.clone());
                 match write_atomic(path, &refreshed) {
                     Ok(()) => diags.push(CatalogueDiagnostic {
                         message: format!(
@@ -242,7 +268,15 @@ pub fn load(path: &Path, compiled: &'static [ModelInfo], version: &str, allow_wr
         }
     }
 
-    LoadResult { merged: Some(merge(compiled, &parsed)), diagnostics: diags }
+    // A file written by a different version carries a `builtin` block
+    // that is older (or newer) than the table compiled into THIS binary.
+    // Whether or not the refresh above managed to run (print mode, a
+    // failed backup, a failed write), that block must not beat the
+    // compiled windows — a stale wrong value would win. Only a matching
+    // version lets a hand-edited `builtin` through.
+    let builtin: &[OwnedModel] =
+        if parsed.generated_by == version { &parsed.builtin } else { &[] };
+    LoadResult { merged: Some(merge_parts(compiled, builtin, &parsed.custom)), diagnostics: diags }
 }
 
 /// Print load diagnostics, mirroring `build::print_skill_diagnostics`.
@@ -282,10 +316,9 @@ mod tests {
         OwnedModel { id: id.into(), vendor: vendor.into(), context_window: w }
     }
 
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("nanopi-cat-{}", crate::util::uuid::v7()));
-        std::fs::create_dir_all(&d).unwrap();
-        d.join("models.json")
+    /// `models.json` inside a scratch dir that is removed on drop.
+    fn tmp() -> crate::ScratchPath {
+        crate::ScratchPath::file("nanopi-cat-", "models.json")
     }
 
     #[test]
@@ -398,6 +431,158 @@ mod tests {
         let merged = res.merged.unwrap();
         assert!(merged.iter().any(|m| m.id == "gpt-6"));
         assert!(merged.iter().any(|m| m.id == "my-model"));
+    }
+
+    /// A file stamped by an OLDER nanopi, whose `builtin` carries a stale
+    /// (wrong) window for `gpt-5` and one entry the current build dropped,
+    /// plus the user's own `custom`.
+    fn write_stale_file(p: &Path) {
+        let f = CatalogueFile {
+            generated_by: "0.1.0".into(),
+            comment: String::new(),
+            custom: vec![owned("my-model", "openai", 7), owned("gpt-5.4", "openai", 4242)],
+            builtin: vec![owned("gpt-5", "openai", 1_000_000), owned("dropped", "openai", 5)],
+            extra: Default::default(),
+        };
+        std::fs::write(p, serde_json::to_string_pretty(&f).unwrap()).unwrap();
+    }
+
+    fn window(merged: &[ModelInfo], id: &str) -> Option<u32> {
+        merged.iter().find(|m| m.id == id).map(|m| m.context_window)
+    }
+
+    /// Print mode (`allow_write = false`) cannot refresh the file, so the
+    /// stale `builtin` is still on disk — and must NOT beat the compiled
+    /// table. `custom` still wins over compiled.
+    #[test]
+    fn version_mismatch_without_write_ignores_stale_builtin() {
+        let p = tmp();
+        write_stale_file(&p);
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        let res = load(&p, compiled(), "2.0.0", false);
+
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "print mode must not write");
+        assert!(!p.with_extension("json.bak").exists());
+        let merged = res.merged.unwrap();
+        assert_eq!(window(&merged, "gpt-5"), Some(400_000), "compiled must beat stale builtin");
+        assert_eq!(window(&merged, "dropped"), None, "stale builtin-only entry must not leak in");
+        assert_eq!(window(&merged, "my-model"), Some(7), "custom is still honoured");
+        assert_eq!(window(&merged, "gpt-5.4"), Some(4242), "custom still beats compiled");
+    }
+
+    /// The refresh is attempted but the backup fails (the `.bak` path is a
+    /// directory): the file is left unchanged and the stale `builtin` is
+    /// still ignored for this run.
+    #[test]
+    fn version_mismatch_with_failed_backup_ignores_stale_builtin() {
+        let p = tmp();
+        write_stale_file(&p);
+        std::fs::create_dir(p.with_extension("json.bak")).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        let res = load(&p, compiled(), "2.0.0", true);
+
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "left unchanged on a failed backup");
+        assert_eq!(res.diagnostics.len(), 1, "{:?}", res.diagnostics);
+        assert!(res.diagnostics[0].message.contains("back up"), "{:?}", res.diagnostics);
+        let merged = res.merged.unwrap();
+        assert_eq!(window(&merged, "gpt-5"), Some(400_000));
+        assert_eq!(window(&merged, "dropped"), None);
+        assert_eq!(window(&merged, "my-model"), Some(7));
+        assert_eq!(window(&merged, "gpt-5.4"), Some(4242));
+    }
+
+    /// Same, when the backup succeeds but the rewrite fails (the `.tmp`
+    /// path is a directory, so the atomic write cannot create it).
+    #[test]
+    fn version_mismatch_with_failed_write_ignores_stale_builtin() {
+        let p = tmp();
+        write_stale_file(&p);
+        std::fs::create_dir(p.with_extension("json.tmp")).unwrap();
+
+        let res = load(&p, compiled(), "2.0.0", true);
+
+        assert!(
+            res.diagnostics.iter().any(|d| d.message.contains("could not refresh")),
+            "{:?}",
+            res.diagnostics
+        );
+        let merged = res.merged.unwrap();
+        assert_eq!(window(&merged, "gpt-5"), Some(400_000));
+        assert_eq!(window(&merged, "my-model"), Some(7));
+    }
+
+    /// When the versions match the file is current, so a hand edit inside
+    /// `builtin` is honoured over the compiled table (and `custom` still
+    /// beats both).
+    #[test]
+    fn version_match_honours_hand_edited_builtin() {
+        let p = tmp();
+        let f = CatalogueFile {
+            generated_by: "2.0.0".into(),
+            custom: vec![owned("gpt-5.4", "openai", 4242)],
+            builtin: vec![owned("gpt-5", "openai", 777)],
+            ..Default::default()
+        };
+        std::fs::write(&p, serde_json::to_string_pretty(&f).unwrap()).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        let res = load(&p, compiled(), "2.0.0", true);
+
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "no rewrite on a match");
+        let merged = res.merged.unwrap();
+        assert_eq!(window(&merged, "gpt-5"), Some(777), "hand-edited builtin wins over compiled");
+        assert_eq!(window(&merged, "gpt-5.4"), Some(4242), "custom wins over builtin");
+    }
+
+    /// A refresh carries unknown top-level keys through, and replaces
+    /// `_comment` with the current text (the old one stays in the `.bak`).
+    #[test]
+    fn refresh_preserves_unknown_top_level_keys() {
+        let p = tmp();
+        std::fs::write(
+            &p,
+            r#"{ "generated_by": "0.1.0", "_comment": "mine", "my_note": {"a": [1, 2]},
+                 "custom": [], "builtin": [] }"#,
+        )
+        .unwrap();
+
+        load(&p, compiled(), "2.0.0", true);
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(after["my_note"], serde_json::json!({"a": [1, 2]}), "unknown key preserved");
+        assert_eq!(after["generated_by"], "2.0.0");
+        assert_eq!(after["_comment"], COMMENT, "_comment is nanopi's own text");
+        let bak = std::fs::read_to_string(p.with_extension("json.bak")).unwrap();
+        assert!(bak.contains("\"mine\""), "the user's _comment survives in the .bak");
+    }
+
+    /// Every `"generated_by": "<v>"` shown in the docs/examples must be
+    /// the version being shipped, or the example teaches a stale value.
+    /// The files are in-repo, so a missing one is a compile error
+    /// (`include_str!`) and a file with no example fails loudly.
+    #[test]
+    fn documented_generated_by_matches_the_current_version() {
+        let version = include_str!("../VERSION").trim();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"), "VERSION and Cargo.toml disagree");
+        let files: [(&str, &str); 3] = [
+            ("README.md", include_str!("../README.md")),
+            ("README_zh.md", include_str!("../README_zh.md")),
+            ("config.toml.example", include_str!("../config.toml.example")),
+        ];
+        let needle = "\"generated_by\": \"";
+        for (name, text) in files {
+            let mut found = 0;
+            for (i, _) in text.match_indices(needle) {
+                let rest = &text[i + needle.len()..];
+                let v = &rest[..rest.find('"').expect("unterminated generated_by string")];
+                assert_eq!(v, version, "{name}: example generated_by is stale");
+                found += 1;
+            }
+            assert!(found > 0, "{name}: expected a `\"generated_by\": \"...\"` example");
+        }
     }
 
     /// A typo must never cost the user their additions.
