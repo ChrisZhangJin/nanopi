@@ -207,6 +207,11 @@ const MCP_NOT_CARRIED_OVER: &str = "this agent was dispatched with MCP tools by 
 process; MCP grants do not carry over between processes, so it continues without them. Dispatch a \
 new agent with those tools if it needs them.";
 
+/// Said when a continued agent's original `tools` list survives nowhere:
+/// the only thing left to launch it with is the default set.
+const TOOLS_NOT_RECOVERED: &str = "no record of the tools this agent was dispatched with could be \
+found, so it continues with the default tool set rather than any restriction it started with.";
+
 /// Whether a brief's front matter lists an MCP tool. Only ever used to
 /// decide whether to *mention* something — never to grant anything.
 fn brief_listed_mcp_tools(brief_text: &str) -> bool {
@@ -316,6 +321,7 @@ impl Tool for SendMessageTool {
 
         let l = AgentTool::new().launcher();
         let prepared = agent::prepare_continue(&l, &id, &entry.dir, &ctx.cwd);
+        let tools_unrecovered = prepared.tools_unrecovered();
         agent::spawn_continue_background(&reg, prepared);
 
         let mut result = json!({ "id": id, "delivered": "continuing" });
@@ -327,6 +333,8 @@ impl Tool for SendMessageTool {
         // model to wonder why the tools vanished.
         if reg.recorded_agent_tools(&id).is_none() && brief_listed_mcp_tools(&existing) {
             result["note"] = json!(MCP_NOT_CARRIED_OVER);
+        } else if tools_unrecovered {
+            result["note"] = json!(TOOLS_NOT_RECOVERED);
         }
         Ok(ok_json(result))
     }

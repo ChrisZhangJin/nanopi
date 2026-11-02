@@ -116,18 +116,21 @@ pub struct AgentRegistry {
     /// `background` runs in the background, so the foreground
     /// conversation stays free while the agent works.
     background_default: AtomicBool,
-    /// The whole `tools` list of every agent dispatched with MCP tools,
-    /// by id, as the dispatching model asked for it and the parent
-    /// validated it.
+    /// The whole `tools` list of every agent this process dispatched, by
+    /// id, as the dispatching model asked for it and the parent validated
+    /// it. Empty means the default set.
     ///
-    /// **Why not read it back from `brief.md`.** A continued agent
-    /// (`send_message` on a finished one) is launched again and needs the
-    /// same MCP grant, and `brief.md` records the list — but it sits in
-    /// the agent's own directory, which the agent can write. Taking its
-    /// authority from there would let a model widen its next run's grant
-    /// by editing a file. The parent's own memory cannot be edited by a
-    /// child. Agents that never had MCP tools are not recorded, so their
-    /// continuation is launched exactly as before.
+    /// A continued agent (`send_message` on a finished one) is launched
+    /// again and needs the same `--tools` — or it comes up with the default
+    /// set, wider than it was — and the same MCP grant.
+    ///
+    /// **Why the grant is not read back from disk.** The list is also in
+    /// the agent's own directory (`brief.md`, `tools.json`), which the
+    /// agent can write. Taking MCP authority from there would let a model
+    /// widen its next run's grant by editing a file. The parent's own
+    /// memory cannot be edited by a child. What an *adopted* agent (one
+    /// from an earlier process, so not in this map) gets from disk is
+    /// its `--tools` restriction only; see `agent::prepare_continue`.
     agent_tools: Mutex<HashMap<String, Vec<String>>>,
 }
 
@@ -241,8 +244,8 @@ impl AgentRegistry {
         ids.into_iter().filter(|id| self.stop(id).is_ok()).collect()
     }
 
-    /// Remember the full `tools` list `id` was dispatched with. Only for
-    /// agents that were given MCP tools; see the field's docs.
+    /// Remember the full `tools` list `id` was dispatched with (empty =
+    /// default set); see the field's docs.
     pub fn record_agent_tools(&self, id: &str, tools: Vec<String>) {
         self.agent_tools
             .lock()
@@ -251,9 +254,9 @@ impl AgentRegistry {
     }
 
     /// What [`record_agent_tools`](Self::record_agent_tools) stored for
-    /// `id`; `None` for an agent dispatched without MCP tools, or by an
-    /// earlier process (nothing carries over between processes: the
-    /// grants lived in that process's channel).
+    /// `id`; `None` for an agent dispatched by an earlier process (the
+    /// grants lived in that process's channel, so nothing is carried over
+    /// in memory).
     pub fn recorded_agent_tools(&self, id: &str) -> Option<Vec<String>> {
         self.agent_tools
             .lock()

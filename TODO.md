@@ -197,7 +197,11 @@ tools from `--tools` (`mcp::proxy`); the orchestrator's prompt carries a
 capped catalogue (`mcp::catalogue`, applied by the TUI's one recompose
 helper). Known gap: a `send_message` continuation of an agent adopted from an
 *earlier process* continues without its MCP tools (the grants lived in that
-process's channel) and says so in its result.
+process's channel) and says so in its result. Fixed: a `send_message`
+continuation used to be re-spawned without `--tools` (widening a restricted
+agent to the default set); the list is now recorded for every dispatch, in
+memory and in `<agent dir>/tools.json`, and an adopted agent keeps its
+restriction (old records fall back to `brief.md`).
 
 ## M11 — `/mcp` interactive
 
