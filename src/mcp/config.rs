@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use crate::mcp::credentials::{self, redact_url, Lookup};
+
 /// One validated server, ready for a transport to connect.
 ///
 /// `name` is carried in the struct rather than left as a map key so the
@@ -63,9 +65,14 @@ pub enum ServerSpec {
         env: BTreeMap<String, String>,
     },
     Http {
+        /// As written, so it may hold `${VAR}` references; expanded only
+        /// when connecting (see [`credentials::resolve_http`]).
         url: String,
-        /// Sent on every request. **Secrets** (`Authorization` lives
-        /// here): never printed, never part of an endpoint string.
+        /// Sent on every request. Values are **templates** — `Bearer
+        /// ${GATEWAY_TOKEN}` — and what they expand to is a secret
+        /// (`Authorization` lives here): the expansion is never stored,
+        /// printed or part of an endpoint string, and neither is a
+        /// literal value, which is why `Debug` shows names only.
         headers: BTreeMap<String, String>,
     },
 }
@@ -136,24 +143,6 @@ impl std::fmt::Debug for ServerConfig {
             .field("spec", &self.spec)
             .finish()
     }
-}
-
-/// A URL that is safe to print: userinfo (`user:pass@`) masked and any
-/// query or fragment replaced, because tokens ride in both
-/// (`?api_key=…`) and telling a credential from a harmless parameter by
-/// name is a guess a log line should not depend on.
-pub(crate) fn redact_url(url: &str) -> String {
-    let (base, tail) = match url.find(['?', '#']) {
-        Some(i) => (&url[..i], "?***"),
-        None => (url, ""),
-    };
-    let masked = base.find("://").and_then(|i| {
-        let (head, rest) = base.split_at(i + 3);
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        let at = rest[..authority_end].rfind('@')?;
-        Some(format!("{head}***@{}", &rest[at + 1..]))
-    });
-    format!("{}{tail}", masked.unwrap_or_else(|| base.to_string()))
 }
 
 /// A problem that did not stop startup. Mirrors
@@ -248,6 +237,12 @@ struct RawServer {
 ///   line number, continue with no servers
 /// - a bad entry → diagnose that entry, keep the rest
 pub fn load(path: &Path) -> LoadResult {
+    load_with(path, &credentials::env_lookup)
+}
+
+/// [`load`] with the environment as a parameter: `${VAR}` in a remote
+/// server's `url` and `headers` is checked against `lookup`.
+pub fn load_with(path: &Path, lookup: Lookup) -> LoadResult {
     let mut out = LoadResult::default();
 
     let text = match std::fs::read_to_string(path) {
@@ -293,7 +288,7 @@ pub fn load(path: &Path) -> LoadResult {
             seen.push(name.clone());
         }
 
-        match validate(&name, raw) {
+        match validate(&name, raw, lookup) {
             Ok(cfg) => out.servers.push(cfg),
             Err(message) => out.diagnostics.push(ConfigDiagnostic {
                 message,
@@ -321,7 +316,7 @@ pub fn load(path: &Path) -> LoadResult {
 /// command they wrote on purpose. `type` could break the tie, but then
 /// the other field is silently dead config, which is how a stale line
 /// survives an edit unnoticed. One line to delete is a better price.
-fn validate(name: &str, raw: RawServer) -> Result<ServerConfig, String> {
+fn validate(name: &str, raw: RawServer, lookup: Lookup) -> Result<ServerConfig, String> {
     let command = raw.command.as_deref().map(str::trim).unwrap_or("");
     let url = raw.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
     let kind = raw.transport_type.as_deref().map(|t| t.trim().to_ascii_lowercase());
@@ -358,13 +353,14 @@ fn validate(name: &str, raw: RawServer) -> Result<ServerConfig, String> {
         if kind == Some("stdio") {
             return Err(format!("server \"{name}\" has \"type\": \"stdio\" but a \"url\""));
         }
-        // Checked here so a typo is a config diagnostic naming the
-        // server rather than a transport failure at connect time.
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(format!(
-                "server \"{name}\" has a \"url\" that does not start with http:// or https://"
-            ));
-        }
+        // Resolved here, and the result thrown away, so that a typo, an
+        // unset `${VAR}`, an unusable header or cleartext credentials
+        // are a config diagnostic naming the server — that one server
+        // is skipped and the others load — rather than a failure at
+        // connect time. The *template* is what is kept: the transport
+        // resolves again when it connects, and nothing expanded lives
+        // in the config where a `Debug` or an echo could print it.
+        credentials::resolve_http(name, url, &raw.headers, lookup)?;
         return Ok(ServerConfig::http(name, url, raw.headers));
     }
 
@@ -719,5 +715,211 @@ mod tests {
         assert_eq!(redact_url("http://127.0.0.1:8931/mcp"), "http://127.0.0.1:8931/mcp");
         assert_eq!(redact_url("https://u:p@h.example/mcp"), "https://***@h.example/mcp");
         assert_eq!(redact_url("https://h.example/mcp?token=abc#frag"), "https://h.example/mcp?***");
+    }
+
+    // ── H4: credentials ─────────────────────────────────────────────
+
+    /// A lookup over a fixed map: `load_with` takes the environment as a
+    /// parameter, so no test here touches the process's.
+    fn vars(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+
+    fn http_of(c: &ServerConfig) -> (&str, &BTreeMap<String, String>) {
+        match &c.spec {
+            ServerSpec::Http { url, headers } => (url, headers),
+            other => panic!("expected an http server, got {other:?}"),
+        }
+    }
+
+    /// The config keeps what was written. The expansion exists only
+    /// where a request is built, so nothing that prints a config — a
+    /// `Debug`, `/mcp`, a diagnostic — can show it.
+    #[test]
+    fn a_set_variable_loads_and_the_config_keeps_the_template() {
+        let res = load_with(
+            &write(
+                r#"{ "mcpServers": { "gw": { "url": "https://${HOST}/mcp",
+                     "headers": { "Authorization": "Bearer ${GW_TOKEN}" } } } }"#,
+            ),
+            &vars(&[("HOST", "mcp.example.com"), ("GW_TOKEN", "s3cr3t-value")]),
+        );
+        assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+        let (url, headers) = http_of(&res.servers[0]);
+        assert_eq!(url, "https://${HOST}/mcp");
+        assert_eq!(headers["Authorization"], "Bearer ${GW_TOKEN}");
+        for text in [format!("{:?}", res.servers[0]), format!("{:#?}", res.servers)] {
+            assert!(!text.contains("s3cr3t-value") && !text.contains("mcp.example.com"), "{text}");
+        }
+    }
+
+    /// The owner decision: that one server is skipped, naming the
+    /// variable; the rest load. The literal never becomes a header.
+    #[test]
+    fn an_unset_variable_skips_only_that_server() {
+        let res = load_with(
+            &write(
+                r#"{ "mcpServers": {
+                     "before": { "command": "run-me" },
+                     "gw":     { "url": "https://h.example/mcp",
+                                 "headers": { "Authorization": "Bearer ${GW_TOKEN}" } },
+                     "after":  { "url": "https://ok.example/mcp",
+                                 "headers": { "X-Key": "${HAVE}" } }
+                   } }"#,
+            ),
+            &vars(&[("HAVE", "v"), ("UNRELATED", "unrelated-secret")]),
+        );
+        let names: Vec<&str> = res.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["before", "after"], "{:?}", res.diagnostics);
+        assert_eq!(res.diagnostics.len(), 1, "{:?}", res.diagnostics);
+        let m = &res.diagnostics[0].message;
+        assert!(m.contains("\"gw\"") && m.contains("GW_TOKEN") && m.contains("Authorization"), "{m}");
+        assert!(m.contains("skipped"), "{m}");
+        assert!(!m.contains("unrelated-secret") && !m.contains("Bearer"), "{m}");
+    }
+
+    #[test]
+    fn an_unset_variable_in_the_url_skips_that_server_too() {
+        let res = load_with(
+            &write(r#"{ "mcpServers": { "gw": { "url": "https://${GW_HOST}/mcp" } } }"#),
+            &vars(&[]),
+        );
+        let m = only_diagnostic(&res);
+        assert!(m.contains("\"gw\"") && m.contains("GW_HOST"), "{m}");
+    }
+
+    #[test]
+    fn an_empty_variable_loads_and_an_unset_one_does_not() {
+        let body = r#"{ "mcpServers": { "gw": { "url": "https://h.example/mcp",
+                          "headers": { "X-Opt": "${V}" } } } }"#;
+        assert_eq!(load_with(&write(body), &vars(&[("V", "")])).servers.len(), 1);
+        assert!(load_with(&write(body), &vars(&[])).servers.is_empty());
+    }
+
+    #[test]
+    fn escapes_and_dollar_names_load_as_text() {
+        let res = load_with(
+            &write(
+                r#"{ "mcpServers": { "gw": { "url": "https://h.example/mcp",
+                     "headers": { "X-A": "$${NOT_A_VAR}", "X-B": "$HOME", "X-C": "pa$$word" } } } }"#,
+            ),
+            &vars(&[]),
+        );
+        assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    }
+
+    #[test]
+    fn malformed_references_skip_the_server_without_quoting_them() {
+        for header in ["Bearer ${GW_TOKEN", "${}", "${A${B}}", "${A:-d}"] {
+            let res = load_with(
+                &write(&format!(
+                    r#"{{ "mcpServers": {{ "gw": {{ "url": "https://h.example/mcp",
+                         "headers": {{ "Authorization": "{header}" }} }} }} }}"#
+                )),
+                &vars(&[("A", "x"), ("B", "y")]),
+            );
+            let m = only_diagnostic(&res);
+            assert!(m.contains("\"gw\"") && m.contains("Authorization"), "{m}");
+            assert!(!m.contains("Bearer") && !m.contains("GW_TOKEN"), "{m}");
+        }
+    }
+
+    /// `${…}` is for `headers` and `url`. Everything else is verbatim —
+    /// M4 decided that for `env`, and `command` and `args` are no
+    /// different.
+    #[test]
+    fn expansion_applies_to_headers_and_url_only() {
+        let res = load_with(
+            &write(
+                r#"{ "mcpServers": { "s": { "command": "${CMD}", "args": ["--t", "${TOK}"],
+                     "env": { "T": "${TOK}" } } } }"#,
+            ),
+            &vars(&[("CMD", "expanded"), ("TOK", "expanded")]),
+        );
+        assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+        let (command, args, env) = stdio(&res.servers[0]);
+        assert_eq!(command, "${CMD}");
+        assert_eq!(args, ["--t", "${TOK}"]);
+        assert_eq!(env["T"], "${TOK}");
+        // And an unset variable there is not an error: nothing is expanded.
+        let res = load_with(
+            &write(r#"{ "mcpServers": { "s": { "command": "c", "env": { "T": "${NOPE}" } } } }"#),
+            &vars(&[]),
+        );
+        assert!(res.diagnostics.is_empty() && res.servers.len() == 1);
+    }
+
+    #[test]
+    fn a_url_that_only_exists_after_expansion_is_accepted() {
+        // The scheme check is on the expanded text, so a template that
+        // starts with a variable is not rejected for "not starting with http".
+        let res = load_with(
+            &write(r#"{ "mcpServers": { "s": { "url": "${BASE}/mcp" } } }"#),
+            &vars(&[("BASE", "https://h.example")]),
+        );
+        assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+        let res = load_with(
+            &write(r#"{ "mcpServers": { "s": { "url": "${BASE}/mcp" } } }"#),
+            &vars(&[("BASE", "h.example")]),
+        );
+        assert!(only_diagnostic(&res).contains("http://"));
+    }
+
+    #[test]
+    fn a_header_that_is_invalid_after_expansion_skips_the_server() {
+        let res = load_with(
+            &write(
+                r#"{ "mcpServers": { "gw": { "url": "https://h.example/mcp",
+                     "headers": { "Authorization": "Bearer ${TOK}" } } } }"#,
+            ),
+            &vars(&[("TOK", "line1\nline2-s3cr3t")]),
+        );
+        let m = only_diagnostic(&res);
+        assert!(m.contains("Authorization") && m.contains("\"gw\""), "{m}");
+        assert!(!m.contains("line1") && !m.contains("s3cr3t"), "{m}");
+    }
+
+    /// The refusal, at load: skipped with a diagnostic, others kept.
+    #[test]
+    fn cleartext_credentials_to_a_remote_host_skip_that_server() {
+        let res = load_with(
+            &write(
+                r#"{ "mcpServers": {
+                     "bad":   { "url": "http://mcp.example.com/mcp",
+                                "headers": { "Authorization": "Bearer s3cr3t" } },
+                     "trick": { "url": "http://127.0.0.1@evil.com/mcp" },
+                     "local": { "url": "http://127.0.0.1:8931/mcp",
+                                "headers": { "Authorization": "Bearer s3cr3t" } },
+                     "tls":   { "url": "https://mcp.example.com/mcp",
+                                "headers": { "Authorization": "Bearer s3cr3t" } },
+                     "plain": { "url": "http://mcp.example.com/mcp" }
+                   } }"#,
+            ),
+            &vars(&[]),
+        );
+        let names: Vec<&str> = res.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["local", "tls", "plain"], "{:?}", res.diagnostics);
+        assert_eq!(res.diagnostics.len(), 2, "{:?}", res.diagnostics);
+        for (d, server) in res.diagnostics.iter().zip(["bad", "trick"]) {
+            assert!(d.message.contains(&format!("\"{server}\"")), "{}", d.message);
+            assert!(d.message.contains("https://") && d.message.contains("cleartext"), "{}", d.message);
+            assert!(!d.message.contains("s3cr3t"), "{}", d.message);
+        }
+    }
+
+    /// The raw template is what an echo shows; a secret in a literal
+    /// header never is.
+    #[test]
+    fn debug_of_a_templated_config_shows_the_template_not_a_value() {
+        let http = ServerConfig::http(
+            "gw",
+            "https://${HOST}/mcp?token=${TOK}",
+            BTreeMap::from([("Authorization".to_string(), "Bearer ${TOK}".to_string())]),
+        );
+        let shown = format!("{http:?}");
+        assert!(shown.contains("${HOST}"), "{shown}");
+        assert!(!shown.contains("Bearer"), "{shown}");
+        assert!(!shown.contains("${TOK}"), "the query is masked: {shown}");
+        assert!(shown.contains("Authorization"), "{shown}");
     }
 }

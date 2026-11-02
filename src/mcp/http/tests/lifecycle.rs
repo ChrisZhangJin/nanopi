@@ -257,7 +257,12 @@ async fn only_session_expired_is_ever_retried() {
     // 401 is about credentials, which a new session does not change.
     assert!(matches!(
         once(Reply::text(401, "no"), long).await,
-        ClientError::Transport(TransportError::Unauthorized)
+        ClientError::Transport(TransportError::Unauthorized { .. })
+    ));
+    // Nor is 403: the same credentials on a new session fare the same.
+    assert!(matches!(
+        once(Reply::text(403, "no"), long).await,
+        ClientError::Transport(TransportError::Forbidden { .. })
     ));
 }
 

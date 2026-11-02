@@ -1,6 +1,6 @@
 # MCP over Streamable HTTP — implementation plan
 
-Status: **in progress** — H1 (transport seam) and H2 (HTTP core) merged. Task list is in `TODO.md` under "Streamable HTTP".
+Status: **in progress** — H1 (transport seam), H2 (HTTP core), H3 (session lifecycle) and H4 (credentials) done; H5 (wiring, live check) is next. Task list is in `TODO.md` under "Streamable HTTP".
 
 ## Why
 
@@ -59,9 +59,11 @@ so every existing stdio test is the proof it changed nothing.
 { "mcpServers": {
     "playwright": { "type": "http", "url": "http://127.0.0.1:8931/mcp" },
     "gateway":    { "type": "http", "url": "https://mcp.example.com/mcp",
-                    "headers": { "Authorization": "Bearer …" } }
+                    "headers": { "Authorization": "Bearer ${GATEWAY_TOKEN}" } }
 } }
 ```
+
+A token belongs in the environment, not in `mcp.json`: see "Credentials".
 
 `ServerConfig` becomes `{ name, spec }` with `ServerSpec::Stdio { command, args,
 env }` / `ServerSpec::Http { url, headers }`. A new enum, not extra optional
@@ -127,19 +129,93 @@ transport rather than a generic "remote".
 
 ### Credentials
 
-- `headers` values are secrets. They never appear in `/tools`, `/mcp`, notices or
-  errors. `endpoint_of` must mask URL userinfo and credential-looking query
-  parameters, and show header *names* at most.
-- The existing owner rule applies: **a child agent must never learn a server's
-  credentials.** Children reach HTTP servers only through the M9 channel, so
-  `ipc.rs` already prevents this; add a test that no header value is ever
-  serialised toward a child.
-- Sending credentials over cleartext `http://` to a **non-loopback** host is
-  refused with a diagnostic (loopback `http://` is fine — that is the motivating
-  case). Open question below.
-- `401`/`403` map to a distinct error: "server requires authentication" /
-  "credentials rejected", not a generic transport failure.
-- OAuth is out of scope. Static headers only.
+Implemented in `src/mcp/credentials.rs`, used by `config`, `http`, `manager`.
+
+**A secret lives in the environment and in the outgoing request, nowhere
+else.** `ServerConfig` keeps the *template* (`Bearer ${GATEWAY_TOKEN}`), not
+its expansion. Expansion happens in `credentials::resolve_http`, which both
+`config::load` (so a bad server is skipped at startup, with a diagnostic, and
+the others still load) and `HttpTransport::connect` (the only thing that sends
+anything, so it does not trust that a config came from a file) call. What it
+returns exists only to build the request's `HeaderMap`, whose values are marked
+sensitive.
+
+**`${VAR}` expansion — `headers` values and `url` only.** Not header names, not
+`env`, not `command`/`args`.
+
+| Input | Result |
+|---|---|
+| `${NAME}`, `NAME` = `[A-Za-z_][A-Za-z0-9_]*` | the variable's value |
+| `${NAME}`, variable **unset** | **error**: that one server is skipped; the diagnostic names the server, the header (or `url`) and `NAME`, never a value |
+| `${NAME}`, variable set but **empty** | allowed; expands to nothing (`Bearer ${EMPTY}` → `Bearer `) |
+| `$NAME`, `$`, `$$`, `pa$$word` | not expanded; literal text |
+| `$${` | the one escape: a literal `${` (`$${HOME}` → `${HOME}`) |
+| `${` with no `}`; `${}`; `${A-B}`; `${A:-d}`; nested `${A${B}}` | **error**, server skipped, template text not quoted |
+| a variable whose value contains `${OTHER}` | copied as text; never expanded twice |
+
+Unset is an error and empty is not because an empty value is a statement ("no
+token here") while an unset one is nearly always a typo or a forgotten
+`export`. `$$${X}` reads left to right (a `$`, then the escape, giving `$${X}`),
+so a literal `$` immediately before a real reference cannot be written; that is
+accepted. A variable that is not valid Unicode counts as unset. The literal
+`${VAR}` is never sent: it is either expanded or the server does not connect.
+
+After expansion the header name must be a valid HTTP name and the value a valid
+header value (no control characters — typically a trailing newline from `$(cat
+file)`); the diagnostic names the header, never the value.
+
+**Cleartext refusal.** A server whose URL is `http://` to a host that is not
+loopback is skipped (at load, and again at connect) if it carries credentials:
+*any* configured header, URL userinfo, or a credential-looking query parameter.
+The diagnostic names the host (not the URL) and suggests `https://`.
+
+- Loopback is `127.0.0.0/8`, `::1` (and IPv4-mapped `::ffff:127.x`), and the
+  exact name `localhost`. Decided on `reqwest::Url`'s parsed host after
+  expansion, so `localhost.evil.com`, `127.0.0.1.nip.io`, `[::ffff:10.0.0.1]` and
+  `http://127.0.0.1@evil.com/` (host `evil.com`, userinfo `127.0.0.1`) are
+  remote. `*.localhost` is **not** loopback here (a resolver that ignores RFC
+  6761 would send it to DNS); the proxy bypass in `http.rs` still treats it as
+  local, which only affects routing.
+- `http://` to a remote host with *no* credentials is allowed; `https://` is
+  always allowed; loopback `http://` with headers is allowed.
+- "Credential-looking" is `credentials::is_credential_name`: contains `token`,
+  `secret`, `password`, `passwd`, `pwd`, `key`, `auth`, `credential`,
+  `signature`, `bearer`, `cookie` or `jwt`, or has `sig` as a whole word
+  (case-insensitive).
+
+**Masking — one helper.** `credentials::redact_url` and `redact_arg` are the
+only masking code; `ServerConfig`'s `Debug`, `manager::endpoint_of` (which feeds
+`/mcp`, `/tools` and `ToolSource::Mcp.endpoint`) and the transport's address
+in errors use them. Userinfo becomes `***@`; **everything** after `?`/`#`
+becomes `?***` — stricter than masking only credential-looking parameters,
+because a parameter named `s` or `sid` is as secret as `token`. Header names are
+not shown at all. The path is shown as written, so put a secret there as a
+`${VAR}`: the template is what is printed. A stdio `KEY=value` argument whose key
+looks like a credential has its value masked; a URL argument gets `redact_url`.
+A host that comes from `${VAR}` is shown as `${VAR}` in transport errors.
+
+**`401`/`403`** are `TransportError::Unauthorized` and `Forbidden`, neither
+carrying a header value or the response body:
+`server requires authentication (HTTP 401[, Bearer]): check the `headers` for
+server "X"` (with no `headers` configured: add one, such as `Authorization`) and
+`credentials were rejected or access is forbidden (HTTP 403): check the
+`headers` for server "X"`. A `WWW-Authenticate` contributes only scheme names
+(at most three, 20 characters each), never its parameters. Only `404` with a
+session re-initializes; `401`/`403` never do (asserted). Whatever the server
+says that is kept for `/mcp` (the error-body diagnostics, a quoted detail) has
+this server's header values and URL credentials scrubbed out first, because
+error pages sometimes quote the credential they just rejected.
+
+**Nothing toward a child.** Children reach HTTP servers only through the M9
+channel, which carries tool names, schemas and results, never how a server is
+reached. `ipc::tests::no_http_credential_is_ever_sent_toward_a_child` drives a
+server holding three distinctive secrets (an expanded `${VAR}`, a literal
+header, a URL query value) through the real channel and greps every message,
+the child environment and its argv. One thing nanopi does not do: a variable
+named in a `${VAR}` stays in the parent's environment, which a child process
+inherits like any other.
+
+OAuth is out of scope. Static headers only.
 
 ## Decisions (owner, resolved)
 
@@ -148,7 +224,8 @@ transport rather than a generic "remote".
    diagnostic for that server and the server is skipped — the literal `${VAR}`
    is **never** sent on the wire. `env` (stdio) stays unexpanded, as M4 decided.
 2. **Credentials over cleartext `http://` to a non-loopback host: refused** with
-   a diagnostic. Loopback `http://` is allowed (the motivating case).
+   a diagnostic. Loopback `http://` is allowed (the motivating case). The exact
+   rules are in "Credentials".
 3. **Legacy HTTP+SSE fallback: deferred to the next phase** (task H6 in
    `TODO.md`), not dropped.
 

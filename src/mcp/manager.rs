@@ -29,7 +29,8 @@ use futures_util::future::join_all;
 use tokio::time::Instant;
 
 use crate::mcp::client::{ConnectionState, McpClient};
-use crate::mcp::config::{self, redact_url, ServerConfig, ServerSpec};
+use crate::mcp::config::{self, ServerConfig, ServerSpec};
+use crate::mcp::credentials::{redact_arg, redact_url};
 use crate::mcp::http::DELETE_TIMEOUT;
 use crate::mcp::tool::{first_line, registered_tool_name, McpTool};
 use crate::tool::{Tool, ToolRegistry};
@@ -509,9 +510,12 @@ async fn bring_up(cfg: &ServerConfig, deadline: Instant, budget: Duration) -> Br
 /// default either — connection strings and `-e TOKEN=...` flags are
 /// common — so [`redact_arg`] masks the two shapes that carry secrets.
 ///
-/// An HTTP server shows its URL through [`redact_url`] and nothing else:
-/// `headers` carry the bearer token, and even their names are left out
-/// until there is a reason to show them.
+/// An HTTP server shows its URL — as written in `mcp.json`, so a `${VAR}`
+/// is shown as `${VAR}` and never as what it expands to — through
+/// [`redact_url`], and nothing else: `headers` carry the bearer token,
+/// and even their names are left out. Masking is shared with
+/// `ServerConfig`'s `Debug` and the transport's errors
+/// (`mcp::credentials`), so there is one rule for what is safe to print.
 pub fn endpoint_of(cfg: &ServerConfig) -> String {
     let line = match &cfg.spec {
         ServerSpec::Stdio { command, args, .. } => {
@@ -522,27 +526,6 @@ pub fn endpoint_of(cfg: &ServerConfig) -> String {
         ServerSpec::Http { url, .. } => redact_url(url),
     };
     first_line(&line, 200)
-}
-
-/// Mask a URL's userinfo (`scheme://user:pass@host` → `scheme://***@host`)
-/// and the value of a `KEY=value` argument whose key names a credential.
-fn redact_arg(arg: &str) -> String {
-    if let Some(i) = arg.find("://") {
-        let (head, rest) = arg.split_at(i + 3);
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some(at) = rest[..authority_end].rfind('@') {
-            return format!("{head}***@{}", &rest[at + 1..]);
-        }
-    }
-    if let Some((key, _)) = arg.split_once('=') {
-        let lower = key.to_ascii_lowercase();
-        const SECRETISH: [&str; 7] =
-            ["token", "secret", "password", "passwd", "key", "auth", "credential"];
-        if SECRETISH.iter().any(|w| lower.contains(w)) {
-            return format!("{key}=***");
-        }
-    }
-    arg.to_string()
 }
 
 /// A fake server for tests in this crate that need real connections
@@ -637,6 +620,36 @@ mod tests {
             assert!(!e.contains(secret), "{secret} leaked: {e}");
         }
         assert_eq!(e, "https://***@mcp.example.com/mcp?***");
+    }
+
+    /// The raw template is what `/tools` and `/mcp` show: a `${VAR}` is
+    /// never replaced by what it expands to, and a header never appears.
+    #[test]
+    fn an_http_endpoint_shows_the_template_and_masks_what_it_cannot_judge() {
+        let cfg = ServerConfig::http(
+            "gw",
+            "https://${GW_HOST}/${GW_PATH}/mcp?access_token=${GW_TOKEN}&x=1",
+            BTreeMap::from([("Authorization".to_string(), "Bearer ${GW_TOKEN}".to_string())]),
+        );
+        let e = endpoint_of(&cfg);
+        assert_eq!(e, "https://${GW_HOST}/${GW_PATH}/mcp?***");
+        for leaked in ["GW_TOKEN", "Authorization", "Bearer", "access_token"] {
+            assert!(!e.contains(leaked), "{leaked} leaked: {e}");
+        }
+    }
+
+    /// One rule for URLs wherever they appear: the same helper masks an
+    /// HTTP server's `url` and a URL passed as a stdio argument.
+    #[test]
+    fn a_url_argument_and_an_http_url_are_masked_the_same_way() {
+        let url = "https://u:hunter2@h.example/mcp?token=abc123";
+        let http = endpoint_of(&ServerConfig::http("a", url, BTreeMap::new()));
+        let stdio = endpoint_of(&ServerConfig::stdio("b", "run", vec![url.into()], BTreeMap::new()));
+        assert_eq!(http, "https://***@h.example/mcp?***");
+        assert_eq!(stdio, format!("run {http}"));
+        for e in [&http, &stdio] {
+            assert!(!e.contains("hunter2") && !e.contains("abc123"), "{e}");
+        }
     }
 
     #[test]

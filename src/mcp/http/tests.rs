@@ -692,8 +692,12 @@ async fn http_400_echoing_our_id_is_the_server_declining_the_call() {
 async fn http_401_and_403_have_their_own_honest_messages() {
     let (_f, t) = failing_without_session(Reply::text(401, "nope")).await;
     let e = t.request("tools/list", None).await.unwrap_err();
-    assert!(matches!(e, TransportError::Unauthorized), "{e:?}");
-    assert_eq!(e.to_string(), "server requires authentication (HTTP 401)");
+    assert!(matches!(e, TransportError::Unauthorized { .. }), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        "server requires authentication (HTTP 401): server \"fake\" has no `headers`; add one, \
+         such as `Authorization`"
+    );
 
     let (_f, t) = failing_without_session(Reply::json(
         403,
@@ -701,8 +705,8 @@ async fn http_401_and_403_have_their_own_honest_messages() {
     ))
     .await;
     let e = t.request("tools/list", None).await.unwrap_err();
-    assert!(matches!(e, TransportError::Forbidden), "{e:?}");
-    assert_eq!(e.to_string(), "credentials rejected by the server (HTTP 403)");
+    assert!(matches!(e, TransportError::Forbidden { .. }), "{e:?}");
+    assert!(e.to_string().contains("(HTTP 403)"), "{e}");
 }
 
 #[tokio::test]
@@ -1014,6 +1018,7 @@ async fn loopback_server_bypasses_a_configured_proxy() {
         &target.config(&[]),
         HttpOptions::default(),
         Some(Proxy::all(format!("http://{}", proxy.addr)).unwrap()),
+        &|_| None,
     )
     .unwrap();
     assert_eq!(t.request("tools/list", None).await.unwrap(), json!({"direct": true}));
@@ -1066,7 +1071,7 @@ async fn unusable_configs_are_refused_without_echoing_secrets() {
     let e = HttpTransport::connect(&http("not a url?token=hunter2", &[])).await.unwrap_err();
     assert!(matches!(e, TransportError::Unsupported(ref m) if !m.contains("hunter2")), "{e:?}");
 
-    let e = HttpTransport::connect(&http("http://h/", &[("Authorization", "Bearer a\nb")]))
+    let e = HttpTransport::connect(&http("http://localhost/", &[("Authorization", "Bearer a\nb")]))
         .await
         .unwrap_err();
     match e {
@@ -1090,6 +1095,293 @@ async fn a_configured_header_cannot_replace_the_content_type() {
     let t = HttpTransport::connect(&fake.config(&[("Content-Type", "text/plain")])).await.unwrap();
     t.request("tools/list", None).await.unwrap();
     assert_eq!(fake.requests()[0].header("content-type"), Some("application/json"));
+}
+
+// ----------------------------------------------------------- credentials
+
+const SECRET: &str = "s3cr3t-value-7f3a";
+
+/// Build a transport against `${VAR}` values from `vars`, not from the
+/// process environment, which a test must not touch.
+fn build_with(
+    config: &ServerConfig,
+    vars: &'static [(&'static str, &'static str)],
+) -> Result<HttpTransport, TransportError> {
+    HttpTransport::build(config, HttpOptions::default(), None, &|name: &str| {
+        vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    })
+}
+
+#[tokio::test]
+async fn headers_are_expanded_on_the_wire_and_the_template_never_is() {
+    let fake = Fake::start(|req| Reply::json(200, &result_of(&req.json()["id"], json!({})))).await;
+    let config = fake.config(&[
+        ("Authorization", "Bearer ${GW_TOKEN}"),
+        ("X-Plain", "literal"),
+        ("X-Escaped", "$${NOT_EXPANDED}"),
+        ("X-Dollar", "$HOME"),
+    ]);
+    let t = build_with(&config, &[("GW_TOKEN", SECRET)]).unwrap();
+    t.request("tools/list", None).await.unwrap();
+
+    let req = &fake.requests()[0];
+    assert_eq!(req.header("authorization"), Some(format!("Bearer {SECRET}").as_str()));
+    assert_eq!(req.header("x-plain"), Some("literal"));
+    assert_eq!(req.header("x-escaped"), Some("${NOT_EXPANDED}"));
+    assert_eq!(req.header("x-dollar"), Some("$HOME"));
+    // The one literal `${` on the wire is the escaped one the user wrote.
+    for (name, value) in &req.headers {
+        assert!(!value.contains("${GW_TOKEN}"), "{name}: {value}");
+    }
+}
+
+#[tokio::test]
+async fn an_unset_variable_stops_the_connect_and_nothing_is_sent() {
+    let fake = Fake::start(|req| Reply::json(200, &result_of(&req.json()["id"], json!({})))).await;
+    let config = fake.config(&[("Authorization", "Bearer ${GW_TOKEN}")]);
+    let e = build_with(&config, &[("UNRELATED", SECRET)]).unwrap_err();
+    match &e {
+        TransportError::Unsupported(m) => {
+            assert!(m.contains("GW_TOKEN") && m.contains("\"fake\""), "{m}");
+            assert!(!m.contains("Bearer") && !m.contains(SECRET), "{m}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fake.requests().is_empty(), "the literal template must never be sent");
+
+    // Through the public entry point, which reads the real environment.
+    let config = fake.config(&[("Authorization", "Bearer ${NANOPI_TEST_H4_SURELY_UNSET_9f2c}")]);
+    let e = HttpTransport::connect(&config).await.unwrap_err();
+    assert!(matches!(&e, TransportError::Unsupported(m) if m.contains("NANOPI_TEST_H4_SURELY_UNSET_9f2c")), "{e:?}");
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_templated_host_is_shown_as_written_never_as_expanded() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let config = ServerConfig::http("dead", format!("http://${{HOST}}:{port}/mcp"), BTreeMap::new());
+    let t = build_with(&config, &[("HOST", "127.0.0.1")]).unwrap();
+    let e = t.request("initialize", None).await.unwrap_err();
+    match &e {
+        TransportError::Disconnected(m) => {
+            assert!(m.starts_with(&format!("cannot connect to ${{HOST}}:{port}")), "{m}");
+            assert!(!m.contains("127.0.0.1"), "{m}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!format!("{t:?}").contains("127.0.0.1"));
+}
+
+#[tokio::test]
+async fn cleartext_credentials_are_refused_at_connect_before_any_io() {
+    let headers = BTreeMap::from([("Authorization".to_string(), format!("Bearer {SECRET}"))]);
+    for url in [
+        "http://mcp.example.com/mcp",
+        "http://localhost.evil.com/mcp",
+        "http://127.0.0.1.nip.io/mcp",
+        "http://127.0.0.1@evil.com/mcp",
+        "http://[::ffff:10.0.0.1]/mcp",
+    ] {
+        let e = HttpTransport::connect(&ServerConfig::http("gw", url, headers.clone()))
+            .await
+            .unwrap_err();
+        match &e {
+            TransportError::Unsupported(m) => {
+                assert!(m.contains("cleartext") && m.contains("https://"), "{url}: {m}");
+                assert!(!m.contains(SECRET), "{m}");
+            }
+            other => panic!("{url}: {other:?}"),
+        }
+    }
+    // Loopback is the motivating case, and https is always the user's call.
+    for url in ["http://127.0.0.1:1/mcp", "http://localhost:1/mcp", "http://[::1]:1/mcp", "https://mcp.example.com/mcp"] {
+        assert!(HttpTransport::connect(&ServerConfig::http("gw", url, headers.clone())).await.is_ok(), "{url}");
+    }
+}
+
+/// The reply a server that echoes the credential it just refused sends.
+fn echoing(status: u16) -> Reply {
+    Reply::text(status, &format!("invalid credentials: Bearer {SECRET} (token {SECRET})"))
+        .header("www-authenticate", "Bearer realm=\"internal-realm\", error=\"invalid_token\"")
+}
+
+async fn refused(status: u16, headers: &[(&str, &str)]) -> (Fake, HttpTransport, TransportError) {
+    let fake = Fake::start(move |_| echoing(status)).await;
+    let t = HttpTransport::connect(&fake.config(headers)).await.unwrap();
+    let e = t.request("tools/list", None).await.unwrap_err();
+    (fake, t, e)
+}
+
+#[tokio::test]
+async fn a_401_asks_for_the_headers_names_the_scheme_and_repeats_no_secret() {
+    let auth = format!("Bearer {SECRET}");
+    let (fake, t, e) = refused(401, &[("Authorization", auth.as_str())]).await;
+    assert!(matches!(e, TransportError::Unauthorized { .. }), "{e:?}");
+    let m = e.to_string();
+    assert_eq!(
+        m,
+        "server requires authentication (HTTP 401, Bearer): check the `headers` for server \"fake\""
+    );
+    // The scheme only: not the realm, not the error description, not the body.
+    for leaked in [SECRET, "internal-realm", "invalid_token", "invalid credentials"] {
+        assert!(!m.contains(leaked), "{leaked} in {m}");
+    }
+    // What the server said is kept for `/mcp`, with our credential scrubbed out.
+    let d = t.diagnostics();
+    assert!(d.contains("invalid credentials"), "{d}");
+    assert!(!d.contains(SECRET), "{d}");
+    assert!(!format!("{t:?}").contains(SECRET));
+    // It sent the header; the scrub is not an accident of it being absent.
+    assert_eq!(fake.requests()[0].header("authorization"), Some(auth.as_str()));
+}
+
+#[tokio::test]
+async fn a_401_without_headers_says_to_add_one() {
+    let (_f, _t, e) = refused(401, &[]).await;
+    let m = e.to_string();
+    assert!(m.contains("HTTP 401") && m.contains("has no `headers`") && m.contains("Authorization"), "{m}");
+    assert!(!m.contains(SECRET), "{m}");
+}
+
+#[tokio::test]
+async fn a_403_says_the_credentials_were_rejected_and_repeats_no_secret() {
+    let auth = format!("Bearer {SECRET}");
+    let (_f, t, e) = refused(403, &[("Authorization", auth.as_str())]).await;
+    assert!(matches!(e, TransportError::Forbidden { .. }), "{e:?}");
+    let m = e.to_string();
+    assert_eq!(
+        m,
+        "credentials were rejected or access is forbidden (HTTP 403): check the `headers` for \
+         server \"fake\""
+    );
+    assert!(!m.contains(SECRET) && !m.contains("invalid credentials"), "{m}");
+    assert!(!t.diagnostics().contains(SECRET), "{}", t.diagnostics());
+    // 401 and 403 are different answers, and read differently.
+    assert_ne!(m, refused(401, &[("Authorization", auth.as_str())]).await.2.to_string());
+}
+
+#[tokio::test]
+async fn the_www_authenticate_scheme_is_capped_and_deduplicated() {
+    let long = "A".repeat(100);
+    let fake = Fake::start(move |_| {
+        Reply::text(401, "")
+            .header("www-authenticate", &format!("{long} realm=\"x\""))
+            .header("www-authenticate", "Basic realm=\"x\", Bearer")
+            .header("www-authenticate", "Basic")
+            .header("www-authenticate", "Digest nonce=\"zzz\"")
+            .header("www-authenticate", "Negotiate")
+    })
+    .await;
+    let t = fake.transport().await;
+    let m = t.request("tools/list", None).await.unwrap_err().to_string();
+    assert!(m.contains(&format!("HTTP 401, {}/Basic/Digest)", "A".repeat(20))), "{m}");
+    assert!(!m.contains(&"A".repeat(21)) && !m.contains("nonce") && !m.contains("Negotiate"), "{m}");
+}
+
+#[tokio::test]
+async fn a_server_that_quotes_the_credential_in_a_json_error_is_scrubbed_too() {
+    let fake = Fake::start(|_| {
+        Reply::json(
+            500,
+            &json!({"jsonrpc": "2.0", "id": null,
+                "error": {"code": -32000, "message": format!("could not verify {SECRET} for you")}}),
+        )
+    })
+    .await;
+    let auth = format!("Bearer {SECRET}");
+    let t = HttpTransport::connect(&fake.config(&[("Authorization", auth.as_str())])).await.unwrap();
+    let e = t.request("tools/list", None).await.unwrap_err();
+    match &e {
+        TransportError::Http { status: 500, detail } => {
+            assert!(detail.contains("could not verify"), "{detail}");
+            assert!(!detail.contains(SECRET), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!t.diagnostics().contains(SECRET));
+}
+
+#[tokio::test]
+async fn a_credential_in_the_url_is_scrubbed_from_what_the_server_says_back() {
+    let fake = Fake::start(|req| {
+        Reply::text(500, &format!("bad request for {}", req.path))
+    })
+    .await;
+    let config = ServerConfig::http("fake", format!("{}?api_key={SECRET}", fake.url()), BTreeMap::new());
+    let t = HttpTransport::connect(&config).await.unwrap();
+    let e = t.request("tools/list", None).await.unwrap_err();
+    assert!(!e.to_string().contains(SECRET), "{e}");
+    assert!(!t.diagnostics().contains(SECRET), "{}", t.diagnostics());
+}
+
+#[tokio::test]
+async fn a_401_or_403_on_a_live_session_is_not_a_session_expiry() {
+    for (status, what) in [(401u16, "Unauthorized"), (403, "Forbidden")] {
+        let (fake, t) = failing_after_session(Reply::text(status, "no")).await;
+        let e = t.request("tools/list", None).await.unwrap_err();
+        assert!(
+            matches!(e, TransportError::Unauthorized { .. } | TransportError::Forbidden { .. }),
+            "{status}: {e:?}"
+        );
+        assert!(!matches!(e, TransportError::SessionExpired), "{what}");
+        // It carried the session id, and still is not `SessionExpired`.
+        assert_eq!(fake.requests().last().unwrap().header("mcp-session-id"), Some("sess-abc123"));
+    }
+}
+
+#[tokio::test]
+async fn a_401_server_is_a_status_row_with_the_advice_and_no_secret() {
+    use crate::mcp::manager::{ManagerOptions, McpManager};
+
+    let fake = Fake::start(|_| echoing(401)).await;
+    let auth = format!("Bearer {SECRET}");
+    let config = ServerConfig::http(
+        "gw",
+        format!("{}?api_key={SECRET}", fake.url()),
+        BTreeMap::from([("Authorization".to_string(), auth.clone())]),
+    );
+    let manager = McpManager::connect(vec![config], ManagerOptions::default()).await;
+
+    let status = manager.status();
+    assert_eq!(status.len(), 1);
+    let row = &status[0];
+    assert!(!row.connected && row.tool_count == 0, "{row:?}");
+    assert_eq!(row.endpoint, format!("{}?***", fake.url()));
+    let reason = row.reason.as_deref().unwrap();
+    assert!(reason.contains("requires authentication"), "{reason}");
+    assert!(reason.contains("check the `headers` for server \"gw\""), "{reason}");
+
+    // Everything the manager would show, in one place.
+    let everything = format!("{row:?} {:?} {:?}", manager.notices(), manager.status());
+    for leaked in [SECRET, "Authorization", "internal-realm", "invalid credentials"] {
+        assert!(!everything.contains(leaked), "{leaked} leaked: {everything}");
+    }
+    assert!(fake.requests().iter().all(|r| r.rpc_method().as_deref() != Some("tools/list")));
+}
+
+#[tokio::test]
+async fn an_unset_variable_at_connect_is_a_status_row_naming_the_variable() {
+    use crate::mcp::manager::{ManagerOptions, McpManager};
+
+    let fake = Fake::start(|req| Reply::json(200, &result_of(&req.json()["id"], json!({})))).await;
+    let config = ServerConfig::http(
+        "gw",
+        format!("{}?api_key=${{NANOPI_TEST_H4_SURELY_UNSET_9f2c}}", fake.url()),
+        BTreeMap::from([("Authorization".to_string(), format!("Bearer {SECRET}"))]),
+    );
+    let manager = McpManager::connect(vec![config], ManagerOptions::default()).await;
+    let row = &manager.status()[0];
+    assert!(!row.connected);
+    let reason = row.reason.as_deref().unwrap();
+    assert!(reason.contains("NANOPI_TEST_H4_SURELY_UNSET_9f2c"), "{reason}");
+    assert!(!reason.contains(SECRET), "{reason}");
+    // The row shows the template's masked form: the variable's name is
+    // inside the masked query, so not even that.
+    assert_eq!(row.endpoint, format!("{}?***", fake.url()));
+    assert!(fake.requests().is_empty(), "nothing was sent");
 }
 
 // ----------------------------------------------------- hostile-ish input

@@ -69,10 +69,22 @@ pub enum TransportError {
     /// spec tells a client to recover from with a fresh `initialize`.
     #[error("the server no longer knows this session (HTTP 404)")]
     SessionExpired,
-    #[error("server requires authentication (HTTP 401)")]
-    Unauthorized,
-    #[error("credentials rejected by the server (HTTP 403)")]
-    Forbidden,
+    /// `401`. About credentials, not about the session, so it never
+    /// triggers the re-`initialize` that `SessionExpired` does.
+    #[error("{}", unauthorized_message(server, scheme.as_deref(), *has_headers))]
+    Unauthorized {
+        server: String,
+        /// The auth scheme *name* from `WWW-Authenticate` (`Bearer`),
+        /// sanitised and capped. Never its parameters, which can carry
+        /// a realm, a nonce or an error description.
+        scheme: Option<String>,
+        /// Whether the server has any `headers` configured, which
+        /// decides whether "check them" or "add one" is the advice.
+        has_headers: bool,
+    },
+    /// `403`. Neither variant carries a header value or the response body.
+    #[error("{}", forbidden_message(server, *has_headers))]
+    Forbidden { server: String, has_headers: bool },
     /// Any other non-success status: `400`, `429`, `5xx`, an unfollowed
     /// redirect. `detail` is already sanitised and short.
     #[error("HTTP {status}: {detail}")]
@@ -82,6 +94,34 @@ pub enum TransportError {
     /// event.
     #[error("{0}")]
     Protocol(String),
+}
+
+fn unauthorized_message(server: &str, scheme: Option<&str>, has_headers: bool) -> String {
+    let scheme = scheme.map(|s| format!(", {s}")).unwrap_or_default();
+    if has_headers {
+        format!(
+            "server requires authentication (HTTP 401{scheme}): check the `headers` for server \"{server}\""
+        )
+    } else {
+        format!(
+            "server requires authentication (HTTP 401{scheme}): server \"{server}\" has no \
+             `headers`; add one, such as `Authorization`"
+        )
+    }
+}
+
+fn forbidden_message(server: &str, has_headers: bool) -> String {
+    if has_headers {
+        format!(
+            "credentials were rejected or access is forbidden (HTTP 403): check the `headers` \
+             for server \"{server}\""
+        )
+    } else {
+        format!(
+            "access is forbidden (HTTP 403): server \"{server}\" has no `headers`; it may \
+             need credentials, such as an `Authorization` header"
+        )
+    }
 }
 
 /// A live connection to one MCP server, over whichever transport its

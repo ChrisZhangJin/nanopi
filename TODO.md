@@ -256,13 +256,15 @@ as normal.
 transparently; shutdown sends `DELETE` (asserted on the fake server); a dead host
 fails fast rather than waiting out the call timeout.
 
-### H4 — Credentials
+### ✅ H4 — Credentials
 
-`headers` support; `endpoint_of` masks URL userinfo and credential-looking query
-parameters and shows header names at most; `401`/`403` get distinct errors;
-cleartext `http://` with credentials to a non-loopback host is refused with a
-diagnostic. `${VAR}` expansion in `headers` and `url` only; an unset variable
-skips that server with a diagnostic and is never sent literally (decided).
+`headers` support; `endpoint_of` masks URL userinfo and the query and shows no
+header names; `401`/`403` get distinct, actionable errors (and never trigger the
+H3 re-initialize); cleartext `http://` with credentials to a non-loopback host is
+refused with a diagnostic. `${VAR}` expansion in `headers` values and `url` only;
+an unset variable skips that server with a diagnostic and is never sent literally
+(decided). Rules, escaping and the empty-versus-unset decision are in
+`docs/mcp-http.md` "Credentials"; the code is `src/mcp/credentials.rs`.
 
 **ACCEPTANCE** No header value appears in `/tools`, notices, errors or anything
 sent toward a child (test it); the refusal and the masking each have a test.
