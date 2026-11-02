@@ -77,7 +77,9 @@ ensure-tools:
 		echo "         Install it manually for a packed binary; the build still works."; \
 	fi
 
-build: ensure-target ensure-musl-cc
+# ensure-musl-cc first: a missing compiler must fail before
+# ensure-target's `rustup target add` downloads anything.
+build: ensure-musl-cc ensure-target
 	cargo build --release --target $(TARGET)
 
 # ensure-tools belongs here, not only on `check`: packing is what needs
@@ -145,14 +147,19 @@ wasm: build-wasm ensure-tools
 	@ls -lh $(WASM_BIN_OUT)
 	@echo "point it at a plugin with an [[extensions]] entry in config.toml"
 
-build-wasm: ensure-target ensure-musl-cc
+build-wasm: ensure-musl-cc ensure-target
 	cargo build --release --target $(TARGET) --features wasm
 
-# A musl C compiler is required to link the musl target, stock build and
+# A musl C compiler is required for the musl target, stock build and
 # wasm build alike. Rust's musl rust-std is self-contained for Rust code,
-# but the C dependencies (ring, and wasmtime's cc-rs step) are compiled by
-# cc-rs, and `.cargo/config.toml` sets `linker = "musl-gcc"`. Without it
-# the build dies deep in cargo at something like
+# but the C dependencies (ring, and wasmtime's build step with --features
+# wasm) are compiled by cc-rs, which looks for `x86_64-linux-musl-gcc`
+# and then `musl-gcc` for this target. The repo's `.cargo/config.toml`
+# does NOT configure a linker (it only sets `[test] jobs = 1`); CI
+# installs `musl-tools` and sets none either, and the optional
+# `linker = "musl-gcc"` in the README is a user-level ~/.cargo/config.toml
+# snippet. Without a compiler the build dies deep in cargo at something
+# like
 #   error occurred in cc-rs: failed to find tool "x86_64-linux-musl-gcc"
 # which names a tool, not a cause. Fail early with the fix instead.
 #
