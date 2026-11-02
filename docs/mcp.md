@@ -1,10 +1,51 @@
 # MCP (Model Context Protocol)
 
-Status: **researched, architecture decided, not implemented.** This file
-exists so the work can be picked up without re-deriving the research.
+Status: **implemented** — stdio and Streamable HTTP servers, tools in solo mode
+and, through the parent↔child channel, for dispatched agents (M1–M6, M8–M10,
+H1–H5). Still open: the `/mcp` command (M7, M11) and the legacy HTTP+SSE
+fallback (H6). The rest of this file is the research and the reasoning behind
+the architecture; `docs/mcp-http.md` and `docs/mcp-ipc.md` are the transport and
+channel designs, `TODO.md` the task list.
 
 Target: let nanopi act as an MCP *client*, so the model can call tools served
 by external MCP servers, with a `/mcp` command to inspect and manage them.
+
+## Configuration
+
+`<nanopi_home>/mcp.json` (`~/.nanopi/mcp.json`, or under `NANOPI_HOME`), global
+only, never written by nanopi. One `mcpServers` object keyed by server name, the
+ecosystem-standard shape. Each entry is one of two transports:
+
+```json
+{ "mcpServers": {
+    "fs":         { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv"],
+                    "env": { "LOG_LEVEL": "warn" } },
+    "playwright": { "type": "http", "url": "http://127.0.0.1:8931/mcp" },
+    "gateway":    { "url": "https://mcp.example.com/mcp",
+                    "headers": { "Authorization": "Bearer ${GATEWAY_TOKEN}" } }
+} }
+```
+
+| Field | Applies to | Meaning |
+|---|---|---|
+| `command`, `args` | stdio | The server is launched as a subprocess (own process group, reaped on exit). |
+| `env` | stdio | Extra environment for that process. Used verbatim; `${VAR}` is **not** expanded. |
+| `url` | http | The Streamable HTTP endpoint. `${VAR}` is expanded. |
+| `headers` | http | Sent on every request. Values may use `${VAR}`; names may not. |
+| `type` | both | `stdio` or `http`; optional (`url` means `http`, `command` means `stdio`). `sse` and `ws` are reported as unsupported. |
+
+An entry with both `command` and `url`, a `type` that contradicts its fields, or
+an unknown `type` is skipped with a diagnostic, as is an HTTP server whose
+`${VAR}` is unset or whose `http://` URL to a non-loopback host carries
+credentials. One bad entry never stops the others from loading. The rules for
+`${VAR}`, the cleartext refusal and what gets masked when a server's origin is
+printed are in `docs/mcp-http.md` ("Credentials").
+
+Every server connects once at startup, concurrently, under a 15 s total budget;
+its tools register as `mcp__<server>__<tool>`. `/tools` shows each tool's origin
+(the command line, or the masked URL), and an HTTP server's session is ended on
+exit. A child agent never connects: it calls through the parent
+(`docs/mcp-ipc.md`).
 
 ## Decision: the main process owns every connection and proxies for children
 
@@ -130,6 +171,9 @@ has capabilities granted one at a time (`allow_network`, `allow_fs`, …).
 2. **Streamable HTTP.** Reuse `SseStream`. Lazy connect, timeouts, reconnect.
    `MCP-Protocol-Version: 2025-06-18` header, `Mcp-Session-Id` session. The
    older HTTP+SSE transport is deprecated — do not implement it.
+   *Done (H1–H5), with two departures from this sketch: servers connect eagerly at
+   startup like stdio ones, and a dropped session is re-initialized once rather
+   than reconnected in a loop. The legacy transport is deferred (H6), not dropped.*
 3. **Optional.** `prompts/*` maps naturally onto nanopi's skills / slash
    commands (e.g. `/mcp:<server>:<prompt>`). OAuth last, or start with a static
    `Authorization` header only.

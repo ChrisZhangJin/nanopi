@@ -1,14 +1,14 @@
 # MCP over Streamable HTTP — implementation plan
 
-Status: **in progress** — H1 (transport seam), H2 (HTTP core), H3 (session lifecycle) and H4 (credentials) done; H5 (wiring, live check) is next. Task list is in `TODO.md` under "Streamable HTTP".
+Status: **done** — H1 (transport seam), H2 (HTTP core), H3 (session lifecycle), H4 (credentials) and H5 (wiring, live check) are in. Only the legacy HTTP+SSE fallback (H6) is still to do; see "Not in this plan". Task list is in `TODO.md` under "Streamable HTTP"; user-facing docs are in `README.md` and `docs/mcp.md` ("Configuration").
 
 ## Why
 
 stdio covers servers nanopi launches itself. A server that is already running —
 a shared browser, a team gateway, anything behind a URL — can only be reached
 over HTTP. The concrete motivating case is the `playwright-mcp` container already
-running on this machine (`http://127.0.0.1:8931/mcp`), which nanopi cannot use
-today: `config.rs` reports any `url` entry as "not supported yet".
+running on this machine (`http://127.0.0.1:8931/mcp`), which nanopi could not use
+before this work: `config.rs` reported any `url` entry as "not supported yet".
 
 Only **Streamable HTTP** (spec 2025-06-18). The older HTTP+SSE transport is
 deprecated and is out of scope; see "Not in this plan".
@@ -241,7 +241,17 @@ OAuth is out of scope. Static headers only.
 - **Live:** connect to the real `playwright-mcp` at `127.0.0.1:8931`, list its 23
   tools, call `browser_navigate` and `browser_snapshot`, and confirm the session
   is `DELETE`d afterwards. Real servers behave in ways fakes do not (the SSE-only
-  POST response above was not in the spec reading).
+  POST response above was not in the spec reading). Done in H5 with the real
+  binary: a `-p` run driven by a scripted model (no API key needed) listed all 23
+  tools, called `browser_navigate`, `browser_snapshot` and `browser_close`, and
+  exited with one `DELETE`, after which a `POST` on that session id was `404`; the
+  same through a dispatched agent (one session, held by the parent); and the TUI
+  (orchestrator off) showed the 23 tools with the masked URL and `DELETE`d on quit.
+- **Exit paths** (`tests/mcp_agent_e2e.rs`, a fake HTTP server): the `DELETE` is
+  asserted for the end of a `-p` run, for SIGTERM (via `McpManager::kill_now`) and
+  for Ctrl-C/SIGINT. The TUI's quit path is the same `McpManager::shutdown` and was
+  checked live, not by a test. SIGTERM to the *TUI* has no handler (it is not
+  installed for the TUI at all, stdio servers included) and so sends no `DELETE`.
 
 ## Not in this plan
 

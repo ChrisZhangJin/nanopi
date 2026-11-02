@@ -88,9 +88,10 @@ pub enum SessionKind {
 /// **A child agent never connects.** Children are separate processes,
 /// up to `agent.max_concurrency` of them, and each one connecting its
 /// own servers is `max_concurrency × servers` processes each paying an
-/// `npx` cold start — option B, which `docs/mcp.md` rejects by name.
-/// Until the parent↔child channel exists (M9) a child simply has no MCP
-/// tools, and says so nowhere: a scripted child is not a place for
+/// `npx` cold start (or, for an HTTP server, its own session) — option B,
+/// which `docs/mcp.md` rejects by name. A child reaches the parent's
+/// servers through the M9 channel instead (`mcp::proxy`), and says
+/// nothing about any of this: a scripted child is not a place for
 /// startup chatter.
 ///
 /// **A `--tools` allowlist excludes MCP.** An allowlist is a
