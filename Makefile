@@ -60,10 +60,7 @@ ensure-target:
 		rustup target add $(TARGET); \
 	fi
 
-# Only upx. `musl-tools` used to be required here, but Rust's musl
-# rust-std links self-contained — a clean build of this project (ring's
-# C included) succeeds with musl-gcc absent, so demanding it just forced
-# a pointless apt install.
+# Only upx here; the musl C compiler is checked by `ensure-musl-cc`.
 #
 # Never fatal: `pack` still produces a working, merely-unpacked binary
 # without upx. It says so loudly instead.
@@ -80,7 +77,7 @@ ensure-tools:
 		echo "         Install it manually for a packed binary; the build still works."; \
 	fi
 
-build: ensure-target
+build: ensure-target ensure-musl-cc
 	cargo build --release --target $(TARGET)
 
 # ensure-tools belongs here, not only on `check`: packing is what needs
@@ -151,26 +148,32 @@ wasm: build-wasm ensure-tools
 build-wasm: ensure-target ensure-musl-cc
 	cargo build --release --target $(TARGET) --features wasm
 
-# musl-tools IS required for this build, unlike the stock one. The
-# comment above `ensure-tools` explains why it was dropped there: Rust's
-# musl rust-std links self-contained. wasmtime breaks that assumption —
-# it carries a cc-rs build step, and without a musl C compiler the build
-# dies at
+# A musl C compiler is required to link the musl target, stock build and
+# wasm build alike. Rust's musl rust-std is self-contained for Rust code,
+# but the C dependencies (ring, and wasmtime's cc-rs step) are compiled by
+# cc-rs, and `.cargo/config.toml` sets `linker = "musl-gcc"`. Without it
+# the build dies deep in cargo at something like
 #   error occurred in cc-rs: failed to find tool "x86_64-linux-musl-gcc"
-# which names a tool, not a cause, and sends you looking in the wrong
-# place. Fail early with the fix instead.
+# which names a tool, not a cause. Fail early with the fix instead.
+#
+# Check only, never installs: CI installs `musl-tools` in its own step
+# (release.yml, "install musl toolchain"), and a local build should not
+# silently run apt. Override MUSL_CCS to test the failure path, e.g.
+#   make build MUSL_CCS=/nonexistent
+MUSL_CCS := x86_64-linux-musl-gcc musl-gcc
+
 ensure-musl-cc:
-	@if command -v x86_64-linux-musl-gcc >/dev/null 2>&1 || command -v musl-gcc >/dev/null 2>&1; then \
-		echo "musl C compiler present"; \
-	elif command -v apt-get >/dev/null 2>&1 && . /etc/os-release 2>/dev/null && \
-	     case "$$ID$$ID_LIKE" in *debian*|*ubuntu*) true;; *) false;; esac; then \
-		echo "installing musl-tools (apt) — wasmtime's cc-rs step needs it"; \
-		$(SUDO) apt-get update && $(SUDO) apt-get install -y --no-install-recommends musl-tools; \
-	else \
-		echo "ERROR: musl-tools not found and cannot auto-install here."; \
-		echo "       wasmtime's cc-rs build step needs x86_64-linux-musl-gcc."; \
-		exit 1; \
-	fi
+	@for cc in $(MUSL_CCS); do \
+		if command -v $$cc >/dev/null 2>&1; then \
+			echo "musl C compiler present ($$cc)"; \
+			exit 0; \
+		fi; \
+	done; \
+	echo "ERROR: no musl C compiler found (looked for: $(MUSL_CCS))."; \
+	echo "       Building $(TARGET) needs one for the C dependencies."; \
+	echo "       Debian/Ubuntu: sudo apt install -y musl-tools build-essential"; \
+	echo "       (CI does: sudo apt-get update && sudo apt-get install -y musl-tools)"; \
+	exit 1
 
 # Same binary, unoptimized, on the native target — musl is pointless
 # for a debug build you are not shipping. ~10x slower to load a plugin
