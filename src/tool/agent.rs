@@ -1334,6 +1334,10 @@ pub(crate) struct PreparedRun {
     /// in `run_body`, which both dispatch paths and `send_message`
     /// continuation reach, so there is one place that has to be right.
     mcp: McpAccess,
+    /// A continuation whose original `tools` list could not be found
+    /// anywhere, so it runs with the default set; see [`prepare_continue`].
+    /// Always `false` for a fresh dispatch.
+    tools_unrecovered: bool,
 }
 
 /// The MCP tools an agent was dispatched with, and the channel that will
@@ -1344,7 +1348,9 @@ pub(crate) struct PreparedRun {
 /// server instead of installing the process-wide one (which would race
 /// every other test that asserts there is none).
 struct McpAccess {
-    /// Registered names (`mcp__server__tool`), lowercase.
+    /// Registered names (`mcp__server__tool`), lowercase. Only the grant
+    /// reads them, and there is no grant without Unix sockets.
+    #[cfg_attr(not(unix), allow(dead_code))]
     tools: Vec<String>,
     #[cfg(unix)]
     server: Option<Arc<crate::mcp::ipc::IpcServer>>,
@@ -1422,6 +1428,13 @@ impl Drop for McpGrant {
 }
 
 impl PreparedRun {
+    /// Whether this is a continuation that had to fall back to the default
+    /// tool set because no record of its `tools` list survived. The caller
+    /// tells the model, as it does for MCP tools that do not carry over.
+    pub(crate) fn tools_unrecovered(&self) -> bool {
+        self.tools_unrecovered
+    }
+
     /// `.nanopi/agents/<run>/<id>/`, for `{id, state, archive_path}`.
     fn archive_path(&self) -> String {
         self.dir.to_string_lossy().into_owned()
@@ -1517,10 +1530,15 @@ fn prepare_run(
     }
 
     let mcp = McpAccess::for_tools(&tools);
-    if !mcp.tools.is_empty() {
-        // For `send_message` on this agent once it has finished: see
-        // `prepare_continue`.
-        reg.record_agent_tools(&id, tools.clone());
+    // For `send_message` on this agent once it has finished: see
+    // `prepare_continue`. Recorded for every agent, restricted or not — a
+    // continuation that finds nothing runs with the default set, which for
+    // a restricted agent is a wider one — and on disk too, for a
+    // continuation from a later process.
+    reg.record_agent_tools(&id, tools.clone());
+    if let Err(e) = persist_tools(&dir, &tools) {
+        // Not fatal to this run; a later process falls back to the brief.
+        crate::note!("nanopi: debug: cannot write {TOOLS_RECORD} in {}: {e}", dir.display());
     }
 
     let mut command = l.program.command();
@@ -1545,6 +1563,7 @@ fn prepare_run(
         worktree,
         warning,
         mcp,
+        tools_unrecovered: false,
     })
 }
 
@@ -1562,6 +1581,7 @@ pub(crate) async fn run_body(reg: &AgentRegistry, prepared: PreparedRun) -> Tool
         worktree,
         warning,
         mcp,
+        tools_unrecovered: _,
     } = prepared;
     let mut sg = StateGuard {
         reg,
@@ -1742,21 +1762,90 @@ const BACKGROUND_NOTE: &str = "The agent is running in the background. Its repor
 added to the conversation automatically when it finishes. Do not wait, poll list_agents, \
 or sleep for it: tell the user it has started and end your turn.";
 
+/// File in an agent's directory holding the `tools` list it was dispatched
+/// with, written at dispatch: `{"tools": ["read", "grep"]}`. Empty means
+/// the default set. Exists because `brief.md` is a lossy record of it
+/// (`fm_value` cuts a long list at 120 characters) and the continuation of
+/// an agent from an earlier process has nothing else to go on.
+const TOOLS_RECORD: &str = "tools.json";
+
+fn persist_tools(dir: &Path, tools: &[String]) -> std::io::Result<()> {
+    write_private(&dir.join(TOOLS_RECORD), &json!({ "tools": tools }).to_string())
+}
+
+/// The `tools` list an agent was dispatched with, as an earlier process
+/// left it on disk. `Some(vec![])` is a real answer: it was dispatched
+/// without a restriction. `None` means no usable record.
+///
+/// Newest format first: [`TOOLS_RECORD`]. Records from before it existed
+/// have only `brief.md`, whose `tools:` front-matter line is read instead;
+/// it is `(all)` for no restriction, and a list cut short by `fm_value`
+/// ends in `…`, in which case the half-written last name is dropped (a
+/// narrower list, never a wider one).
+///
+/// This only ever supplies `--tools`. It never supplies an MCP grant: an
+/// agent can write these files, and nothing it writes may widen what the
+/// parent's channel serves it (see [`prepare_continue`]).
+fn recover_tools(dir: &Path) -> Option<Vec<String>> {
+    let from_record = std::fs::read_to_string(dir.join(TOOLS_RECORD))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| {
+            v.get("tools")?
+                .as_array()?
+                .iter()
+                .map(|t| t.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+        });
+    if from_record.is_some() {
+        return from_record;
+    }
+    let brief = std::fs::read_to_string(dir.join("brief.md")).ok()?;
+    let line = crate::agent::brief::front_matter_get(&brief, "tools")?;
+    let line = line.trim();
+    if line == "(all)" {
+        return Some(Vec::new());
+    }
+    let cut = line.ends_with('…');
+    let mut names: Vec<String> = line
+        .trim_end_matches('…')
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if cut {
+        names.pop();
+    }
+    (!names.is_empty()).then_some(names)
+}
+
 /// Build the child command to continue a finished agent (CTL-06): same
 /// id and dir, same `--session-file` transcript (which auto-resumes —
 /// `session::open_or_create_at`), brief.md re-read as the task (it now
 /// carries the amendment appended by the caller). Pure apart from
 /// reading `l`'s resolved spec/program.
 pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -> PreparedRun {
-    // A continued agent is spawned afresh, so it needs its MCP grant
-    // afresh too — `run_body` revoked the last one when the agent ended —
-    // and its `--tools`, or the new child would have no proxies for them.
-    // Both come from what *this process* recorded at dispatch, never from
-    // `brief.md`, which the agent can edit. An agent without MCP tools was
-    // not recorded and continues exactly as it always did; one adopted
-    // from an earlier process was never recorded here and continues
-    // without MCP (the caller says so).
-    let tools = l.registry.recorded_agent_tools(id).unwrap_or_default();
+    // A continued agent is spawned afresh, so it needs its `--tools` again
+    // — without them it is launched with the default set, which widens a
+    // restricted agent — and, for MCP tools, its grant again too (`run_body`
+    // revoked the last one when the agent ended).
+    //
+    // The list comes from what *this process* recorded at dispatch. An
+    // agent adopted from an earlier process has no such record, and its
+    // list is read off disk (`recover_tools`) — for `--tools` only. The
+    // MCP grant is never derived from disk, because the agent can write
+    // there: an adopted agent keeps its `mcp__…` names in `--tools` (so it
+    // stays as narrow as it was; its proxies are refused at the handshake)
+    // but is granted nothing, and the caller says so. When no record of
+    // any kind survives, the default set is the only thing left, and the
+    // caller says that too.
+    let (tools, granted, unrecovered) = match l.registry.recorded_agent_tools(id) {
+        Some(t) => (t.clone(), t, false),
+        None => match recover_tools(dir) {
+            Some(t) => (t, Vec::new(), false),
+            None => (Vec::new(), Vec::new(), true),
+        },
+    };
     let mut command = l.program.command();
     command
         .args(build_child_args(&l.spec, dir, &tools, None))
@@ -1771,7 +1860,8 @@ pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -
         timeout: l.spec.timeout,
         worktree: None,
         warning: None,
-        mcp: McpAccess::for_tools(&tools),
+        mcp: McpAccess::for_tools(&granted),
+        tools_unrecovered: unrecovered,
     }
 }
 
@@ -3495,6 +3585,220 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A continued agent must keep the `--tools` restriction it was
+    /// dispatched with. `send_message` re-spawns the child, and a respawn
+    /// that forgets the list silently widens the agent to the default set.
+    #[cfg(unix)]
+    mod continuation_tools {
+        use super::*;
+
+        /// Records its argv and exits at once.
+        fn logging_script() -> String {
+            format!("d=\"$(dirname \"$4\")\"; echo \"$*\" >> \"$d/argv.log\"; echo '{OK_ENV}'")
+        }
+
+        fn dir(l: &Launcher, cwd: &Path, id: &str) -> PathBuf {
+            cwd.join(".nanopi/agents").join(l.registry.run_id()).join(id)
+        }
+
+        fn with_tools(tools: Option<Vec<&str>>) -> AgentConfig {
+            AgentConfig {
+                tools: tools.map(|t| t.into_iter().map(String::from).collect()),
+                ..agent_fixture()
+            }
+        }
+
+        fn argv_of(prepared: &PreparedRun) -> Vec<String> {
+            prepared
+                .command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        /// The value after `--tools`, if the flag is there at all.
+        fn tools_flag(argv: &[String]) -> Option<String> {
+            argv.iter().position(|a| a == "--tools").map(|i| argv[i + 1].clone())
+        }
+
+        /// What `send_message` does to a finished agent, minus the
+        /// process-wide launcher it cannot be given.
+        fn continue_it(l: &Launcher, cwd: &Path, id: &str) -> PreparedRun {
+            l.registry.reactivate(id).ok();
+            prepare_continue(l, id, &dir(l, cwd, id), cwd)
+        }
+
+        /// Another process of the same run: same agent dirs on disk,
+        /// nothing in memory.
+        fn later_process(l: &Launcher) -> Launcher {
+            Launcher {
+                registry: AgentRegistry::with_run_id(
+                    &crate::config::AgentConfig::default(),
+                    l.registry.run_id().to_string(),
+                ),
+                spec: l.spec.clone(),
+                program: l.program.clone(),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_continuation_keeps_the_restriction_the_agent_was_dispatched_with() {
+            let cwd = tmp("cont-restricted");
+            let l = launcher(&logging_script(), 8, 4);
+            let agent = with_tools(Some(vec!["read", "grep"]));
+            let out = run_single(&l, &agent, "t", &cwd, None, None).await;
+            assert!(!out.is_error, "{}", out.content);
+
+            let again = continue_it(&l, &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&again)).as_deref(), Some("read,grep"));
+            let out = run_body(&l.registry, again).await;
+            assert!(!out.is_error, "{}", out.content);
+
+            let argv = std::fs::read_to_string(dir(&l, &cwd, "a1").join("argv.log")).unwrap();
+            let runs: Vec<&str> = argv.lines().collect();
+            assert_eq!(runs.len(), 2, "{argv}");
+            for r in &runs {
+                assert!(r.contains("--tools read,grep"), "every run keeps the restriction: {r}");
+            }
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// The same, for a process that was not the one that dispatched:
+        /// nothing in memory, so the restriction has to come off disk.
+        #[tokio::test]
+        async fn an_agent_adopted_from_an_earlier_process_keeps_its_restriction() {
+            let cwd = tmp("cont-adopted");
+            let first = launcher(&logging_script(), 8, 4);
+            let agent = with_tools(Some(vec!["read", "grep"]));
+            run_single(&first, &agent, "t", &cwd, None, None).await;
+
+            let second = later_process(&first);
+            assert_eq!(second.registry.recorded_agent_tools("a1"), None);
+            let again = continue_it(&second, &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&again)).as_deref(), Some("read,grep"));
+            assert!(!again.tools_unrecovered());
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// No restriction in, no restriction out — in this process and the
+        /// next, and without anything being reported as lost.
+        #[tokio::test]
+        async fn an_unrestricted_agent_continues_unrestricted() {
+            let cwd = tmp("cont-open");
+            let first = launcher(&logging_script(), 8, 4);
+            run_single(&first, &with_tools(None), "t", &cwd, None, None).await;
+
+            let same = continue_it(&first, &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&same)), None);
+            let later = continue_it(&later_process(&first), &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&later)), None);
+            assert!(!later.tools_unrecovered(), "an `(all)` record is a record");
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// A record written before `tools.json` existed: only `brief.md`,
+        /// whose `tools:` line is the one thing to go on.
+        #[tokio::test]
+        async fn an_old_record_without_tools_json_falls_back_to_the_brief() {
+            let cwd = tmp("cont-old");
+            let first = launcher(&logging_script(), 8, 4);
+            run_single(&first, &with_tools(Some(vec!["read", "grep"])), "t", &cwd, None, None).await;
+            let d = dir(&first, &cwd, "a1");
+            std::fs::remove_file(d.join(TOOLS_RECORD)).unwrap();
+
+            let again = continue_it(&later_process(&first), &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&again)).as_deref(), Some("read,grep"));
+            assert!(!again.tools_unrecovered());
+
+            // `(all)` was how an unrestricted agent was recorded.
+            let brief = std::fs::read_to_string(d.join("brief.md")).unwrap();
+            std::fs::write(d.join("brief.md"), brief.replace("tools: read, grep", "tools: (all)")).unwrap();
+            let open = continue_it(&later_process(&first), &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&open)), None);
+            assert!(!open.tools_unrecovered());
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// `fm_value` cuts the brief's line at 120 characters; the name it
+        /// cut in half must not become a tool.
+        #[test]
+        fn a_truncated_brief_line_loses_its_half_written_last_name() {
+            let cwd = tmp("cont-cut");
+            let d = cwd.join("a1");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("brief.md"), "---\nid: a1\ntools: read, grep, fi…\n---\n\nt\n").unwrap();
+            assert_eq!(recover_tools(&d), Some(vec!["read".to_string(), "grep".to_string()]));
+            std::fs::write(d.join("brief.md"), "---\nid: a1\ntools: rea…\n---\n\nt\n").unwrap();
+            assert_eq!(recover_tools(&d), None, "nothing whole is left to go on");
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// Nothing at all survives: the default set is all that is left,
+        /// and the caller is told so rather than the agent quietly
+        /// widening.
+        #[tokio::test]
+        async fn with_no_record_anywhere_the_default_is_used_and_flagged() {
+            let cwd = tmp("cont-none");
+            let first = launcher(&logging_script(), 8, 4);
+            run_single(&first, &with_tools(Some(vec!["read"])), "t", &cwd, None, None).await;
+            let d = dir(&first, &cwd, "a1");
+            std::fs::remove_file(d.join(TOOLS_RECORD)).unwrap();
+            std::fs::write(d.join("brief.md"), "---\nid: a1\nstate: done\n---\n\nt\n").unwrap();
+
+            let again = continue_it(&later_process(&first), &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&again)), None);
+            assert!(again.tools_unrecovered());
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// An adopted agent with MCP tools keeps its `--tools` as it was —
+        /// so it is no wider than before — and is granted nothing: the
+        /// grant is the parent's memory, which a later process does not
+        /// have. (The M10 behaviour, unchanged.)
+        #[tokio::test]
+        async fn an_adopted_agent_keeps_its_mcp_names_but_is_not_granted_them() {
+            let cwd = tmp("cont-mcp");
+            let first = launcher(&logging_script(), 8, 4);
+            let agent = with_tools(Some(vec!["read", "mcp__fake__echo"]));
+            run_single(&first, &agent, "t", &cwd, None, None).await;
+
+            let again = continue_it(&later_process(&first), &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&again)).as_deref(), Some("read,mcp__fake__echo"));
+            assert!(again.mcp.tools.is_empty(), "{:?}", again.mcp.tools);
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// Within the dispatching process the parent's memory wins, so an
+        /// agent that rewrites its own record gains nothing.
+        #[tokio::test]
+        async fn what_an_agent_writes_into_its_records_does_not_widen_its_own_process_continuation() {
+            let cwd = tmp("cont-forged");
+            let l = launcher(&logging_script(), 8, 4);
+            run_single(&l, &with_tools(Some(vec!["read"])), "t", &cwd, None, None).await;
+            let d = dir(&l, &cwd, "a1");
+            std::fs::write(d.join(TOOLS_RECORD), r#"{"tools":["bash"]}"#).unwrap();
+            let brief = std::fs::read_to_string(d.join("brief.md")).unwrap();
+            std::fs::write(d.join("brief.md"), brief.replace("tools: read", "tools: (all)")).unwrap();
+
+            let again = continue_it(&l, &cwd, "a1");
+            assert_eq!(tools_flag(&argv_of(&again)).as_deref(), Some("read"));
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+
+        /// A record in a format this code does not understand is no record.
+        #[test]
+        fn a_malformed_tools_json_falls_through_to_the_brief() {
+            let cwd = tmp("cont-bad");
+            let d = cwd.join("a1");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(TOOLS_RECORD), r#"{"tools": [1, 2]}"#).unwrap();
+            std::fs::write(d.join("brief.md"), "---\nid: a1\ntools: grep\n---\n\nt\n").unwrap();
+            assert_eq!(recover_tools(&d), Some(vec!["grep".to_string()]));
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+    }
+
     /// The parent's side of MCP for agents: a real channel in front of a
     /// real (fake) server, and children that are `sh` scripts.
     #[cfg(unix)]
@@ -3639,10 +3943,10 @@ mod tests {
             w.finish().await;
         }
 
-        /// A continued agent that never had MCP tools is launched exactly
-        /// as before: no `--tools`, no grant.
+        /// A continued agent that never had MCP tools gets no grant, and
+        /// the `--tools` restriction it had (see `continuation_tools`).
         #[tokio::test]
-        async fn continuing_an_agent_without_mcp_tools_is_unchanged() {
+        async fn continuing_an_agent_without_mcp_tools_grants_nothing() {
             let w = World::new("grant-none").await;
             let plain = agent_fixture();
             let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None).unwrap();
@@ -3657,7 +3961,8 @@ mod tests {
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
-            assert!(!args.iter().any(|a| a == "--tools"), "{args:?}");
+            let i = args.iter().position(|a| a == "--tools").expect("restriction kept");
+            assert_eq!(args[i + 1], "read,grep", "{args:?}");
             w.finish().await;
         }
 
