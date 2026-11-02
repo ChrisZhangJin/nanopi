@@ -732,6 +732,11 @@ mod tests {
 
     /// Build a fresh temp dir; auto-cleaned on drop.
     struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     impl TempDir {
         fn new() -> Self {
             let mut p = std::env::temp_dir();

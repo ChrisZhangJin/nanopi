@@ -7170,11 +7170,8 @@ mod tests {
         }
     }
 
-    fn tmp_dir() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("nanopi-tui-swap-{}", crate::util::uuid::v7()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp_dir() -> crate::ScratchPath {
+        crate::ScratchPath::dir("nanopi-tui-swap-")
     }
 
     fn agent_with_id(dir: &std::path::Path, session_id: &str, hooks: HooksConfig) -> Agent {

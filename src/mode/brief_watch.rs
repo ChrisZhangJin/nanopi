@@ -79,14 +79,8 @@ mod tests {
 
     const TICK: Duration = Duration::from_millis(20);
 
-    fn tmp_brief(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nanopi-brief-watch-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("brief.md");
+    fn tmp_brief(tag: &str) -> crate::ScratchPath {
+        let p = crate::ScratchPath::file(&format!("nanopi-brief-watch-{tag}-"), "brief.md");
         let spec = brief::BriefSpec {
             task: "task".into(),
             ..Default::default()
@@ -177,7 +171,7 @@ mod tests {
     async fn watcher_stops_when_receiver_dropped() {
         let p = tmp_brief("stop");
         let (tx, rx) = mpsc::channel(8);
-        let h = spawn_brief_watcher(p, 0, tx, TICK);
+        let h = spawn_brief_watcher(p.to_path_buf(), 0, tx, TICK);
         drop(rx);
         tokio::time::timeout(Duration::from_secs(2), h)
             .await

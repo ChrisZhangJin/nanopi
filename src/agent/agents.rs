@@ -231,11 +231,8 @@ pub fn discover_agents(cwd: &Path, scope: AgentScope) -> DiscoveryResult {
 mod tests {
     use super::*;
 
-    fn tmp() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("nanopi-agents-{}", crate::util::uuid::v7()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp() -> crate::ScratchPath {
+        crate::ScratchPath::dir("nanopi-agents-")
     }
 
     fn write_agent(dir: &Path, file: &str, body: &str) -> PathBuf {

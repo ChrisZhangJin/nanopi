@@ -81,6 +81,54 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A scratch path inside a fresh temp directory that is deleted when the
+/// guard drops, **including when the test panics**.
+///
+/// Tests used to build `temp_dir().join("nanopi-x-<uuid>")` by hand and
+/// never remove it: the suite left ~85 entries in `/tmp` per run, which
+/// over a few dozen runs was thousands. Derefs to the path it names —
+/// the directory ([`ScratchPath::dir`]) or a file name inside it
+/// ([`ScratchPath::file`]) — so `&scratch` coerces to `&Path`. Hold the
+/// guard for as long as the path is in use; use `.to_path_buf()` where
+/// an owned `PathBuf` is needed.
+#[cfg(test)]
+pub struct ScratchPath {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl ScratchPath {
+    /// A fresh, existing directory named `<prefix>…` under the temp dir.
+    pub fn dir(prefix: &str) -> Self {
+        let dir = tempfile::Builder::new().prefix(prefix).tempdir().expect("scratch dir");
+        let path = dir.path().to_path_buf();
+        Self { _dir: dir, path }
+    }
+
+    /// `name` inside a fresh directory; the file itself is not created.
+    pub fn file(prefix: &str, name: &str) -> Self {
+        let mut s = Self::dir(prefix);
+        s.path = s.path.join(name);
+        s
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ScratchPath {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &std::path::PathBuf {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for ScratchPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 /// A scratch `$NANOPI_HOME` that is put back when the test ends —
 /// **including when the test ends by panicking**.
 ///
