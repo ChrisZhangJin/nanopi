@@ -1332,16 +1332,16 @@ mod tests {
     impl Harness {
         async fn new(tag: &str) -> Self {
             let dir = scratch(tag);
-            let config = ServerConfig {
-                name: "fake".into(),
-                command: "sh".into(),
-                args: vec!["-c".into(), SERVER_SH.into(), "sh".into(), LAUNCH_MARKER.into()],
-                env: BTreeMap::from([
+            let config = ServerConfig::stdio(
+                "fake",
+                "sh",
+                vec!["-c".into(), SERVER_SH.into(), "sh".into(), LAUNCH_MARKER.into()],
+                BTreeMap::from([
                     ("LOG".to_string(), dir.join("calls.log").display().to_string()),
                     ("RELEASE".to_string(), dir.join("release").display().to_string()),
                     ("API_TOKEN".to_string(), ENV_SECRET.to_string()),
                 ]),
-            };
+            );
             let manager = Arc::new(McpManager::connect(vec![config], ManagerOptions::default()).await);
             assert_eq!(manager.tool_count(), 3, "{:?}", manager.status());
             let server = IpcServer::start_in(&dir, &manager).expect("start");

@@ -29,7 +29,7 @@ use futures_util::future::join_all;
 use tokio::time::Instant;
 
 use crate::mcp::client::{ConnectionState, McpClient};
-use crate::mcp::config::{self, ServerConfig};
+use crate::mcp::config::{self, redact_url, ServerConfig, ServerSpec};
 use crate::mcp::tool::{first_line, registered_tool_name, McpTool};
 use crate::tool::{Tool, ToolRegistry};
 
@@ -379,7 +379,8 @@ impl McpManager {
         }
         // Ready servers only. A client that failed its handshake was
         // already shut down and reaped by `connect`, so its pid may
-        // belong to someone else now.
+        // belong to someone else now. An HTTP server has no pid, which
+        // `filter_map` skips: there is no process of ours to kill.
         #[cfg(unix)]
         for pid in self
             .servers
@@ -406,7 +407,7 @@ impl McpManager {
     }
 
     /// Pids of every live server process, for tests that must prove
-    /// none survive.
+    /// none survive. HTTP servers have none and contribute nothing.
     pub fn pids(&self) -> Vec<u32> {
         self.servers
             .iter()
@@ -492,10 +493,19 @@ async fn bring_up(cfg: &ServerConfig, deadline: Instant, budget: Duration) -> Br
 /// some-package` versus a local binary), but they are not safe by
 /// default either — connection strings and `-e TOKEN=...` flags are
 /// common — so [`redact_arg`] masks the two shapes that carry secrets.
+///
+/// An HTTP server shows its URL through [`redact_url`] and nothing else:
+/// `headers` carry the bearer token, and even their names are left out
+/// until there is a reason to show them.
 pub fn endpoint_of(cfg: &ServerConfig) -> String {
-    let mut parts = vec![cfg.command.clone()];
-    parts.extend(cfg.args.iter().map(|a| redact_arg(a)));
-    let line = parts.join(" ");
+    let line = match &cfg.spec {
+        ServerSpec::Stdio { command, args, .. } => {
+            let mut parts = vec![command.clone()];
+            parts.extend(args.iter().map(|a| redact_arg(a)));
+            parts.join(" ")
+        }
+        ServerSpec::Http { url, .. } => redact_url(url),
+    };
     first_line(&line, 200)
 }
 
@@ -553,12 +563,7 @@ pub(crate) mod testing {
             done
             "#
         );
-        ServerConfig {
-            name: name.to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script],
-            env: BTreeMap::new(),
-        }
+        ServerConfig::stdio(name, "sh", vec!["-c".to_string(), script], BTreeMap::new())
     }
 }
 
@@ -583,10 +588,10 @@ mod tests {
 
     #[test]
     fn the_endpoint_never_contains_env_and_masks_credentials_in_arguments() {
-        let cfg = ServerConfig {
-            name: "db".into(),
-            command: "npx".into(),
-            args: vec![
+        let cfg = ServerConfig::stdio(
+            "db",
+            "npx",
+            vec![
                 "-y".into(),
                 "@scope/server-postgres".into(),
                 "postgresql://admin:hunter2@db.internal:5432/app".into(),
@@ -594,8 +599,8 @@ mod tests {
                 "GITHUB_TOKEN=ghp_abc123".into(),
                 "--root=/srv".into(),
             ],
-            env: BTreeMap::from([("API_KEY".to_string(), "sk-live-xyz".to_string())]),
-        };
+            BTreeMap::from([("API_KEY".to_string(), "sk-live-xyz".to_string())]),
+        );
         let e = endpoint_of(&cfg);
         assert!(!e.contains("hunter2"), "{e}");
         assert!(!e.contains("ghp_abc123"), "{e}");
@@ -603,6 +608,20 @@ mod tests {
         assert!(e.contains("db.internal:5432/app"), "host survives so the line stays useful: {e}");
         assert!(e.contains("--root=/srv"), "{e}");
         assert!(e.starts_with("npx -y @scope/server-postgres"), "{e}");
+    }
+
+    #[test]
+    fn an_http_endpoint_is_the_masked_url_and_never_a_header() {
+        let cfg = ServerConfig::http(
+            "gw",
+            "https://admin:hunter2@mcp.example.com/mcp?api_key=abc123",
+            BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
+        );
+        let e = endpoint_of(&cfg);
+        for secret in ["hunter2", "abc123", "s3cret", "Authorization"] {
+            assert!(!e.contains(secret), "{secret} leaked: {e}");
+        }
+        assert_eq!(e, "https://***@mcp.example.com/mcp?***");
     }
 
     #[test]
@@ -718,15 +737,12 @@ mod tests {
         #[tokio::test]
         async fn a_hung_server_costs_the_deadline_once_and_is_reaped() {
             let pidfile = tmp_file("hung");
-            let hung = ServerConfig {
-                name: "hung".into(),
-                command: "sh".into(),
-                args: vec![
-                    "-c".into(),
-                    format!("echo $$ > {}; exec sleep 60", pidfile.display()),
-                ],
-                env: BTreeMap::new(),
-            };
+            let hung = ServerConfig::stdio(
+                "hung",
+                "sh",
+                vec!["-c".into(), format!("echo $$ > {}; exec sleep 60", pidfile.display())],
+                BTreeMap::new(),
+            );
             let start = StdInstant::now();
             let m = McpManager::connect(
                 vec![hung, cfg("good", "", &["t"])],
@@ -763,12 +779,7 @@ mod tests {
                 i=0; while [ $i -lt 300 ]; do echo "    at stack frame $i (some/very/long/path/to/a/module.js:1:1)" >&2; i=$((i+1)); done
                 exit 1
             "#;
-            let dead = ServerConfig {
-                name: "dead".into(),
-                command: "sh".into(),
-                args: vec!["-c".into(), script.into()],
-                env: BTreeMap::new(),
-            };
+            let dead = ServerConfig::stdio("dead", "sh", vec!["-c".into(), script.into()], BTreeMap::new());
             let m = McpManager::connect(vec![dead], ManagerOptions::default()).await;
             let st = &m.status()[0];
             assert!(!st.connected);
@@ -783,16 +794,35 @@ mod tests {
 
         #[tokio::test]
         async fn a_server_that_cannot_be_spawned_is_a_row_not_an_error() {
-            let ghost = ServerConfig {
-                name: "ghost".into(),
-                command: "/definitely/not/installed".into(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-            };
+            let ghost = ServerConfig::stdio("ghost", "/definitely/not/installed", Vec::new(), BTreeMap::new());
             let m = McpManager::connect(vec![ghost, cfg("ok", "", &["t"])], ManagerOptions::default()).await;
             let st = m.status();
             assert!(!st[0].connected && st[1].connected, "{st:?}");
             assert_eq!(m.notices().len(), 1);
+            m.shutdown().await;
+        }
+
+        /// An HTTP server has no pid and, until its transport exists, no
+        /// connection: it is a failed row beside the working stdio one,
+        /// and nothing about it (header values included) reaches the
+        /// status or the notices.
+        #[tokio::test]
+        async fn an_http_server_is_a_failed_row_and_leaks_nothing() {
+            let remote = ServerConfig::http(
+                "remote",
+                "https://user:hunter2@example.com/mcp?api_key=abc123",
+                BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
+            );
+            let m = McpManager::connect(vec![remote, cfg("ok", "", &["t"])], ManagerOptions::default()).await;
+            let st = m.status();
+            assert!(!st[0].connected && st[1].connected, "{st:?}");
+            assert!(st[0].reason.as_deref().unwrap().contains("not implemented"), "{st:?}");
+            assert_eq!(m.pids().len(), 1, "only the stdio server has a pid");
+            let shown = format!("{st:?} {:?}", m.notices());
+            for secret in ["s3cret", "hunter2", "abc123"] {
+                assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+            }
+            m.kill_now();
             m.shutdown().await;
         }
 

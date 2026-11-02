@@ -32,7 +32,7 @@
 //! hard crash still reaps it, and [`ChildGuard`] so an early return or
 //! a cancelled future does too.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,8 +46,11 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::agent_registry::ChildGuard;
-use crate::mcp::config::ServerConfig;
+use crate::mcp::config::{ServerConfig, ServerSpec};
 use crate::mcp::protocol::method::{CANCELLED, INITIALIZE};
+// Re-exported so `stdio::TransportError` keeps working for existing
+// importers; the type itself is shared with the HTTP transport.
+pub use crate::mcp::transport::TransportError;
 use crate::mcp::protocol::{
     error_code, Incoming, Notification, Request, RequestId, Response, ResponsePayload, RpcError,
 };
@@ -100,40 +103,6 @@ const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const WRITE_FAILURE_GRACE: Duration = Duration::from_secs(2);
 
 const EXIT_POLL: Duration = Duration::from_millis(10);
-
-// ------------------------------------------------------------- errors
-
-/// Why a transport operation failed.
-///
-/// [`TransportError::Rpc`] is deliberately a peer of the I/O failures
-/// rather than folded into them: it is the server working correctly and
-/// refusing the call, which M5 turns into an in-band `is_error` result
-/// the model can read, whereas the others mean the connection itself is
-/// unusable and M3 should move the server to `Failed`.
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    #[error("failed to spawn `{command}`: {source}")]
-    Spawn {
-        command: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("{0}")]
-    Rpc(#[from] RpcError),
-    #[error("`{method}` timed out after {:.1}s", timeout.as_secs_f32())]
-    Timeout { method: String, timeout: Duration },
-    /// The connection is gone: the process exited, closed the pipe, or
-    /// was shut down. The string is the one line worth showing a user.
-    #[error("{0}")]
-    Closed(String),
-    #[error("writing to the server: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("encoding a JSON-RPC message: {0}")]
-    Encode(#[from] serde_json::Error),
-    /// Unreachable in practice — see [`send_line`].
-    #[error("a serialised message contained a newline, which would desynchronise the framing")]
-    Framing,
-}
 
 // ------------------------------------------------------- shared state
 
@@ -360,9 +329,18 @@ impl StdioTransport {
         config: &ServerConfig,
         options: TransportOptions,
     ) -> Result<Self, TransportError> {
-        let mut command = build_command(config);
+        let ServerSpec::Stdio { command: program, args, env } = &config.spec else {
+            // Unreachable through `Transport::connect`, which dispatches on
+            // the spec; here so a direct caller gets an error, not a spawn
+            // of nothing.
+            return Err(TransportError::Unsupported(format!(
+                "server \"{}\" is not a stdio server",
+                config.name
+            )));
+        };
+        let mut command = build_command(program, args, env);
         let mut child = command.spawn().map_err(|source| TransportError::Spawn {
-            command: config.command.clone(),
+            command: program.clone(),
             source,
         })?;
         let pid = child.id();
@@ -641,11 +619,11 @@ impl Drop for StdioTransport {
 /// this run's agent registry and write into its archive. Both are
 /// present in the environment whenever nanopi is itself a child agent,
 /// which M6 makes a normal case.
-fn build_command(config: &ServerConfig) -> Command {
-    let mut command = Command::new(&config.command);
+fn build_command(program: &str, args: &[String], env: &BTreeMap<String, String>) -> Command {
+    let mut command = Command::new(program);
     command
-        .args(&config.args)
-        .envs(&config.env)
+        .args(args)
+        .envs(env)
         .env_remove("NANOPI_PARENT_PID")
         .env_remove("NANOPI_RUN_ID")
         .stdin(Stdio::piped())
@@ -1080,12 +1058,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn config(script: &str) -> ServerConfig {
-        ServerConfig {
-            name: "fake".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
-            env: BTreeMap::new(),
-        }
+        ServerConfig::stdio(
+            "fake",
+            "sh",
+            vec!["-c".to_string(), script.to_string()],
+            BTreeMap::new(),
+        )
     }
 
     /// Echo every request back as a success whose `result` carries the
@@ -1471,12 +1449,7 @@ mod tests {
     }
 
     fn config_for(command: &str) -> ServerConfig {
-        ServerConfig {
-            name: "missing".to_string(),
-            command: command.to_string(),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-        }
+        ServerConfig::stdio("missing", command, Vec::new(), BTreeMap::new())
     }
 
     /// The framing invariant, asserted rather than assumed: a newline

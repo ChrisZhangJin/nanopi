@@ -203,7 +203,7 @@ Motivating case: the `playwright-mcp` container already running at
 `http://127.0.0.1:8931/mcp`, which nanopi cannot use today. Order matters: H1 is
 a behaviour-preserving refactor and must land alone.
 
-### H1 — Transport seam (pure refactor)
+### ✅ H1 — Transport seam (pure refactor)
 
 `enum Transport { Stdio, Http }` with the surface `McpClient` already uses
 (`request_with_timeout`, `notify`, `shutdown`, `close_reason`, `diagnostics`,

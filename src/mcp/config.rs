@@ -31,22 +31,129 @@ use std::path::{Path, PathBuf};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-/// One validated stdio server, ready for the transport in M2 to spawn.
+/// One validated server, ready for a transport to connect.
 ///
 /// `name` is carried in the struct rather than left as a map key so the
 /// loaded set is an ordered `Vec`: diagnostics, `/mcp` and connection
 /// order then follow the order the user wrote in the file instead of a
 /// hash or alphabetical order they never chose.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand: a derived one prints every `env` and
+/// `headers` value, and a `{:?}` of a config in a log line or a panic
+/// message is exactly how a bearer token ends up in a bug report.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    /// Extra environment for the child process. Values are used
-    /// **verbatim**: `${VAR}` is not interpolated — see `validate` for
-    /// why that decision is deferred to the code that builds the child
-    /// process rather than made here.
-    pub env: BTreeMap<String, String>,
+    pub spec: ServerSpec,
+}
+
+/// How to reach a server. An enum rather than optional fields on
+/// [`ServerConfig`]: `command` empty-means-HTTP would let a config that
+/// is neither (or both) compile, and every consumer would have to
+/// re-derive which one it holds.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ServerSpec {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// Extra environment for the child process. Values are used
+        /// **verbatim**: `${VAR}` is not interpolated — see `validate`
+        /// for why that decision is deferred to the code that builds the
+        /// child process rather than made here.
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        url: String,
+        /// Sent on every request. **Secrets** (`Authorization` lives
+        /// here): never printed, never part of an endpoint string.
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl ServerConfig {
+    pub fn stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            spec: ServerSpec::Stdio { command: command.into(), args, env },
+        }
+    }
+
+    pub fn http(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        headers: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            spec: ServerSpec::Http { url: url.into(), headers },
+        }
+    }
+}
+
+/// Keys shown, values hidden: which variables or headers are set is
+/// what anyone debugging a config needs, and the values are the secret.
+struct Redacted<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ServerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `args` stay verbatim, as they were under the derive:
+            // unlike `env` they are not a conventional place for
+            // secrets, and the heuristic masking `endpoint_of` applies
+            // would make a debug dump misleading about what is run.
+            ServerSpec::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("env", &Redacted(env))
+                .finish(),
+            ServerSpec::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", &redact_url(url))
+                .field("headers", &Redacted(headers))
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("name", &self.name)
+            .field("spec", &self.spec)
+            .finish()
+    }
+}
+
+/// A URL that is safe to print: userinfo (`user:pass@`) masked and any
+/// query or fragment replaced, because tokens ride in both
+/// (`?api_key=…`) and telling a credential from a harmless parameter by
+/// name is a guess a log line should not depend on.
+pub(crate) fn redact_url(url: &str) -> String {
+    let (base, tail) = match url.find(['?', '#']) {
+        Some(i) => (&url[..i], "?***"),
+        None => (url, ""),
+    };
+    let masked = base.find("://").and_then(|i| {
+        let (head, rest) = base.split_at(i + 3);
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let at = rest[..authority_end].rfind('@')?;
+        Some(format!("{head}***@{}", &rest[at + 1..]))
+    });
+    format!("{}{tail}", masked.unwrap_or_else(|| base.to_string()))
 }
 
 /// A problem that did not stop startup. Mirrors
@@ -71,7 +178,7 @@ pub struct LoadResult {
 /// The on-disk shape of `mcp.json`. Unknown top-level keys are ignored
 /// (serde's default) so a file shared with another client that carries
 /// its own extras still loads.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct ConfigFile {
     #[serde(default, rename = "mcpServers")]
     mcp_servers: RawServers,
@@ -84,7 +191,7 @@ struct ConfigFile {
 /// map impl resolves them last-wins — and a user who pasted the same
 /// server twice would get no hint that half their edit was ignored. The
 /// visitor keeps every pair so [`load`] can diagnose it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct RawServers(Vec<(String, RawServer)>);
 
 impl<'de> Deserialize<'de> for RawServers {
@@ -111,10 +218,11 @@ impl<'de> Deserialize<'de> for RawServers {
 /// entry produces a diagnostic naming the server rather than a parse
 /// error that takes the whole file down with it.
 ///
-/// `url` and `transport_type` are captured only to tell a remote-server
-/// entry apart from a plain typo; see [`validate`]. Other unknown keys
-/// (`headers`, future transports) are ignored.
-#[derive(Debug, Default, Deserialize)]
+/// `url`, `type` and `headers` select and configure a remote server; see
+/// [`validate`]. Other unknown keys are ignored.
+// No `Debug`: it would print `env` and `headers` values, and nothing
+// needs to format an unvalidated entry.
+#[derive(Default, Deserialize)]
 struct RawServer {
     #[serde(default)]
     command: Option<String>,
@@ -126,6 +234,8 @@ struct RawServer {
     url: Option<String>,
     #[serde(default, rename = "type")]
     transport_type: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 // ── loading ─────────────────────────────────────────────────────────
@@ -198,34 +308,77 @@ pub fn load(path: &Path) -> LoadResult {
 /// Turn one raw entry into a [`ServerConfig`], or into the diagnostic
 /// text explaining why it was dropped.
 ///
-/// **A `url` with no `command` is an error, not a silent skip.** It is
-/// the one malformed case where we can tell exactly what the user meant
-/// — a remote server, which nanopi cannot speak to until the Streamable
-/// HTTP transport lands — and where guessing is actively dangerous: the
-/// only other reading is "run it as stdio", which would execute a URL
-/// string as a command line. Claude Code treats a `url` without a
-/// `type` as a hard configuration error for the same reason. Staying
-/// quiet would leave the user watching a server they configured never
-/// appear, with nothing anywhere saying why.
+/// **A `url` is never read as a command line.** Treating a malformed
+/// remote entry as stdio would execute a URL string, so every
+/// combination that is not clearly one transport is a diagnostic, never
+/// a guess. `type` is optional when `url` is present and means `http`:
+/// that is the common case and a pasted block often omits it.
+///
+/// **`command` together with `url` is rejected, even with a `type`.**
+/// Both alternatives lose something: preferring the `command` runs a
+/// local process the user may have meant as a remote endpoint, and
+/// preferring the `url` sends their `headers` to a host while ignoring a
+/// command they wrote on purpose. `type` could break the tie, but then
+/// the other field is silently dead config, which is how a stale line
+/// survives an edit unnoticed. One line to delete is a better price.
 fn validate(name: &str, raw: RawServer) -> Result<ServerConfig, String> {
-    let command = raw.command.unwrap_or_default();
-    let command = command.trim();
+    let command = raw.command.as_deref().map(str::trim).unwrap_or("");
+    let url = raw.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let kind = raw.transport_type.as_deref().map(|t| t.trim().to_ascii_lowercase());
+    let kind = kind.as_deref();
 
-    if command.is_empty() {
-        if raw.url.is_some() {
-            let kind = raw.transport_type.as_deref().unwrap_or("remote");
+    if !command.is_empty() && url.is_some() {
+        return Err(format!(
+            "server \"{name}\" has both \"command\" and \"url\"; it is either a stdio server \
+             or a remote one, so remove one of them"
+        ));
+    }
+
+    // Named by transport rather than "remote": the user needs to know
+    // which of the things they might have meant is the unsupported one.
+    match kind {
+        Some("sse") => {
             return Err(format!(
-                "server \"{name}\" is a {kind} server (\"url\"), which is not supported yet; \
-                 only stdio servers with a \"command\" are"
+                "server \"{name}\": SSE (legacy HTTP+SSE) is not supported yet; use \
+                 \"type\": \"http\" if the server offers Streamable HTTP"
             ));
         }
+        Some("ws" | "websocket") => {
+            return Err(format!("server \"{name}\": WebSocket is not supported"));
+        }
+        None | Some("stdio" | "http") => {}
+        Some(other) => {
+            return Err(format!(
+                "server \"{name}\" has unknown \"type\" {other:?}; expected \"stdio\" or \"http\""
+            ));
+        }
+    }
+
+    if let Some(url) = url {
+        if kind == Some("stdio") {
+            return Err(format!("server \"{name}\" has \"type\": \"stdio\" but a \"url\""));
+        }
+        // Checked here so a typo is a config diagnostic naming the
+        // server rather than a transport failure at connect time.
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(format!(
+                "server \"{name}\" has a \"url\" that does not start with http:// or https://"
+            ));
+        }
+        return Ok(ServerConfig::http(name, url, raw.headers));
+    }
+
+    if kind == Some("http") {
+        return Err(format!("server \"{name}\" has \"type\": \"http\" but no \"url\"; skipped"));
+    }
+    if command.is_empty() {
         return Err(format!("server \"{name}\" has no \"command\"; skipped"));
     }
 
-    Ok(ServerConfig {
-        name: name.to_string(),
-        command: command.to_string(),
-        args: raw.args,
+    Ok(ServerConfig::stdio(
+        name,
+        command,
+        raw.args,
         // Not expanded. `${VAR}` is left verbatim for now: expansion
         // needs a decided syntax (`${VAR}` vs `$VAR`), an escape for a
         // literal `$` — Postgres and GitHub tokens contain one — and a
@@ -234,8 +387,8 @@ fn validate(name: &str, raw: RawServer) -> Result<ServerConfig, String> {
         // a credential. It also belongs next to the code that actually
         // builds the child's environment and decides whether the parent
         // env is inherited at all, which is M2's spawn path, not here.
-        env: raw.env,
-    })
+        raw.env,
+    ))
 }
 
 /// Print load diagnostics, mirroring `model_catalogue::print_diagnostics`.
@@ -266,6 +419,14 @@ mod tests {
         let d = std::env::temp_dir().join(format!("nanopi-mcp-{}", crate::util::uuid::v7()));
         std::fs::create_dir_all(&d).unwrap();
         d.join("mcp.json")
+    }
+
+    /// The stdio fields of a server these tests expect to be stdio.
+    fn stdio(c: &ServerConfig) -> (&str, &[String], &BTreeMap<String, String>) {
+        match &c.spec {
+            ServerSpec::Stdio { command, args, env } => (command, args, env),
+            other => panic!("expected a stdio server, got {other:?}"),
+        }
     }
 
     fn write(body: &str) -> PathBuf {
@@ -313,12 +474,12 @@ mod tests {
         assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
         assert_eq!(
             res.servers,
-            vec![ServerConfig {
-                name: "github".into(),
-                command: "npx".into(),
-                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
-                env: BTreeMap::from([("GITHUB_TOKEN".to_string(), "t0ken".to_string())]),
-            }]
+            vec![ServerConfig::stdio(
+                "github",
+                "npx",
+                vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                BTreeMap::from([("GITHUB_TOKEN".to_string(), "t0ken".to_string())]),
+            )]
         );
     }
 
@@ -327,13 +488,13 @@ mod tests {
         let res = load(&write(r#"{ "mcpServers": { "x": { "command": "run-me" } } }"#));
         assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
         assert_eq!(res.servers.len(), 1);
-        assert!(res.servers[0].args.is_empty());
-        assert!(res.servers[0].env.is_empty());
+        assert!(stdio(&res.servers[0]).1.is_empty());
+        assert!(stdio(&res.servers[0]).2.is_empty());
     }
 
-    /// Later transports put `type`, `url` and `headers` here. Loading
-    /// must not fail on keys this version has no use for, or a shared
-    /// file breaks on the older client.
+    /// Loading must not fail on keys this version has no use for, or a
+    /// shared file breaks on the older client. (`headers` means nothing
+    /// on a stdio entry.)
     #[test]
     fn unknown_keys_are_ignored() {
         let res = load(&write(
@@ -368,21 +529,103 @@ mod tests {
         assert_eq!(res.diagnostics.len(), 1);
     }
 
-    /// A remote entry is diagnosed, never guessed at — reading a `url`
-    /// as a command line would execute it.
+    fn load_one(entry: &str) -> LoadResult {
+        load(&write(&format!(r#"{{ "mcpServers": {{ "x": {entry} }} }}"#)))
+    }
+
+    /// The single diagnostic of a load that must have produced no server.
+    fn only_diagnostic(res: &LoadResult) -> &str {
+        assert!(res.servers.is_empty(), "{:?}", res.servers);
+        assert_eq!(res.diagnostics.len(), 1, "{:?}", res.diagnostics);
+        &res.diagnostics[0].message
+    }
+
     #[test]
-    fn url_without_command_reports_an_unsupported_transport() {
-        let res = load(&write(
-            r#"{ "mcpServers": {
-                 "remote": { "type": "http", "url": "https://example.com/mcp" }
-               } }"#,
-        ));
-        assert!(res.servers.is_empty());
-        assert_eq!(res.diagnostics.len(), 1);
-        let m = &res.diagnostics[0].message;
-        assert!(m.contains("remote"), "{m}");
-        assert!(m.contains("not supported yet"), "{m}");
-        assert!(m.contains("http"), "names the transport it found: {m}");
+    fn an_http_entry_parses_to_an_http_spec_with_headers() {
+        let res = load_one(
+            r#"{ "type": "http", "url": "https://example.com/mcp",
+                  "headers": { "Authorization": "Bearer t0ken" } }"#,
+        );
+        assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+        assert_eq!(
+            res.servers,
+            vec![ServerConfig::http(
+                "x",
+                "https://example.com/mcp",
+                BTreeMap::from([("Authorization".to_string(), "Bearer t0ken".to_string())]),
+            )]
+        );
+    }
+
+    /// A pasted block rarely carries `type`; a `url` alone is the
+    /// common spelling of an HTTP server.
+    #[test]
+    fn type_is_optional_when_url_is_present() {
+        let res = load_one(r#"{ "url": "http://127.0.0.1:8931/mcp" }"#);
+        assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+        assert_eq!(
+            res.servers,
+            vec![ServerConfig::http("x", "http://127.0.0.1:8931/mcp", BTreeMap::new())]
+        );
+    }
+
+    /// The diagnostics name what was asked for, so the user can tell
+    /// "not yet" (SSE) from "not at all" (WebSocket).
+    #[test]
+    fn sse_and_ws_are_diagnosed_by_name() {
+        let sse = load_one(r#"{ "type": "sse", "url": "https://example.com/sse" }"#);
+        let m = only_diagnostic(&sse);
+        assert!(m.contains("SSE (legacy HTTP+SSE) is not supported yet"), "{m}");
+        assert!(m.contains("\"x\""), "names the server: {m}");
+
+        let ws = load_one(r#"{ "type": "ws", "url": "wss://example.com/mcp" }"#);
+        let m = only_diagnostic(&ws);
+        assert!(m.contains("WebSocket is not supported"), "{m}");
+        assert!(m.contains("\"x\""), "names the server: {m}");
+    }
+
+    /// Ambiguous, so neither is guessed: running the command or sending
+    /// headers to the url would each be a surprise. `type` does not
+    /// break the tie either — see `validate`.
+    #[test]
+    fn command_together_with_url_is_rejected_even_with_a_type() {
+        for entry in [
+            r#"{ "command": "run-me", "url": "https://example.com/mcp" }"#,
+            r#"{ "type": "http", "command": "run-me", "url": "https://example.com/mcp" }"#,
+            r#"{ "type": "stdio", "command": "run-me", "url": "https://example.com/mcp" }"#,
+        ] {
+            let res = load_one(entry);
+            let m = only_diagnostic(&res);
+            assert!(m.contains("both") && m.contains("command") && m.contains("url"), "{m}");
+        }
+    }
+
+    #[test]
+    fn malformed_remote_entries_are_diagnosed_not_guessed() {
+        let m = only_diagnostic(&load_one(r#"{ "type": "http" }"#)).to_string();
+        assert!(m.contains("no \"url\""), "{m}");
+        let m = only_diagnostic(&load_one(r#"{ "type": "carrier-pigeon", "url": "http://h" }"#)).to_string();
+        assert!(m.contains("carrier-pigeon"), "{m}");
+        let m = only_diagnostic(&load_one(r#"{ "url": "example.com/mcp" }"#)).to_string();
+        assert!(m.contains("http://"), "{m}");
+        let m = only_diagnostic(&load_one(r#"{ "type": "stdio", "url": "http://h" }"#)).to_string();
+        assert!(m.contains("stdio"), "{m}");
+    }
+
+    /// Header values are secrets and diagnostics are printed at startup
+    /// and pasted into bug reports.
+    #[test]
+    fn diagnostics_never_contain_header_values() {
+        let res = load_one(
+            r#"{ "type": "sse", "url": "https://example.com/sse",
+                  "headers": { "Authorization": "Bearer s3cret" } }"#,
+        );
+        assert!(!only_diagnostic(&res).contains("s3cret"));
+        let res = load_one(
+            r#"{ "command": "c", "url": "https://example.com/mcp",
+                  "headers": { "Authorization": "Bearer s3cret" } }"#,
+        );
+        assert!(!only_diagnostic(&res).contains("s3cret"));
     }
 
     /// JSON allows a repeated key and every parser resolves it
@@ -397,7 +640,7 @@ mod tests {
                } }"#,
         ));
         assert_eq!(res.servers.len(), 1);
-        assert_eq!(res.servers[0].command, "second", "last definition wins");
+        assert_eq!(stdio(&res.servers[0]).0, "second", "last definition wins");
         assert_eq!(res.diagnostics.len(), 1);
         assert!(res.diagnostics[0].message.contains("more than once"), "{:?}", res.diagnostics);
     }
@@ -439,6 +682,42 @@ mod tests {
         let res = load(&write(
             r#"{ "mcpServers": { "x": { "command": "run-me", "env": { "T": "${HOME}" } } } }"#,
         ));
-        assert_eq!(res.servers[0].env["T"], "${HOME}");
+        assert_eq!(stdio(&res.servers[0]).2["T"], "${HOME}");
+    }
+
+    /// A `{:?}` of a config lands in logs and panic messages, so a
+    /// derived `Debug` would print every token. Keys stay: which
+    /// variables or headers are set is what a debugger needs.
+    #[test]
+    fn debug_hides_env_and_header_values_but_keeps_the_keys() {
+        let stdio = ServerConfig::stdio(
+            "db",
+            "npx",
+            vec!["-y".into()],
+            BTreeMap::from([("API_KEY".to_string(), "sk-live-xyz".to_string())]),
+        );
+        let http = ServerConfig::http(
+            "gw",
+            "https://user:hunter2@example.com/mcp?api_key=abc123",
+            BTreeMap::from([("Authorization".to_string(), "Bearer s3cret".to_string())]),
+        );
+        for (cfg, secrets, key) in [
+            (&stdio, ["sk-live-xyz", "", ""], "API_KEY"),
+            (&http, ["s3cret", "hunter2", "abc123"], "Authorization"),
+        ] {
+            for text in [format!("{cfg:?}"), format!("{cfg:#?}"), format!("{:?}", cfg.spec)] {
+                for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                    assert!(!text.contains(secret), "{secret} leaked: {text}");
+                }
+                assert!(text.contains(key), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_url_masks_userinfo_and_query_and_leaves_the_rest() {
+        assert_eq!(redact_url("http://127.0.0.1:8931/mcp"), "http://127.0.0.1:8931/mcp");
+        assert_eq!(redact_url("https://u:p@h.example/mcp"), "https://***@h.example/mcp");
+        assert_eq!(redact_url("https://h.example/mcp?token=abc#frag"), "https://h.example/mcp?***");
     }
 }

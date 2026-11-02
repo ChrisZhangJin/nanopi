@@ -1159,12 +1159,7 @@ mod tests {
         "#;
 
         async fn client(script: &str) -> Arc<McpClient> {
-            let c = McpClient::connect(&ServerConfig {
-                name: "fake".to_string(),
-                command: "sh".to_string(),
-                args: vec!["-c".to_string(), script.to_string()],
-                env: BTreeMap::new(),
-            })
+            let c = McpClient::connect(&ServerConfig::stdio("fake", "sh", vec!["-c".to_string(), script.to_string()], BTreeMap::new()))
             .await;
             Arc::new(c)
         }
@@ -1257,12 +1252,7 @@ mod tests {
         #[tokio::test]
         async fn a_client_that_never_started_fails_the_call_instead_of_panicking() {
             let c = Arc::new(
-                McpClient::connect(&ServerConfig {
-                    name: "ghost".to_string(),
-                    command: "/definitely/not/a/real/binary".to_string(),
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                })
+                McpClient::connect(&ServerConfig::stdio("ghost", "/definitely/not/a/real/binary", Vec::new(), BTreeMap::new()))
                 .await,
             );
             let tool = McpTool::new(c, "ghost", def("anything"));
