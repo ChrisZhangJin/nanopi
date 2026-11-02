@@ -376,6 +376,38 @@ async fn sse_single_frame_is_the_reply() {
 }
 
 #[tokio::test]
+async fn sse_reply_pretty_printed_across_several_data_lines() {
+    // Spec-legal: one event, one JSON value written over many `data:`
+    // lines, which the client joins with `\n` before parsing. Sent one
+    // byte per part so line and `\r\n` boundaries all get split too.
+    let fake = Fake::start(|req| {
+        let pretty = serde_json::to_string_pretty(&result_of(&req.json()["id"], json!({"ok": [1, 2]})))
+            .unwrap();
+        assert!(pretty.lines().count() > 3);
+        let mut wire = String::from("event: message\r\nid: 1\r\n");
+        for line in pretty.lines() {
+            wire.push_str(&format!("data: {line}\r\n"));
+        }
+        wire.push_str("\r\n");
+        Reply::sse_parts(wire.bytes().map(|b| Part::Bytes(vec![b])).collect())
+    })
+    .await;
+    let t = fake.transport().await;
+    assert_eq!(t.request("tools/list", None).await.unwrap(), json!({"ok": [1, 2]}));
+}
+
+#[tokio::test]
+async fn sse_reply_with_data_field_lacking_the_space() {
+    let fake = Fake::start(|req| {
+        let message = result_of(&req.json()["id"], json!({"nospace": true}));
+        Reply::sse_parts(vec![Part::Bytes(format!("data:{message}\n\n").into_bytes())])
+    })
+    .await;
+    let t = fake.transport().await;
+    assert_eq!(t.request("tools/list", None).await.unwrap(), json!({"nospace": true}));
+}
+
+#[tokio::test]
 async fn large_sse_frame_split_across_reads_and_mid_line() {
     // 600 KB on one `data:` line, in 997-byte pieces: not a multiple of
     // anything, so pieces end mid-line, mid-JSON and mid-`data: `.
