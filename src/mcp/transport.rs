@@ -154,6 +154,18 @@ impl Transport {
         }
     }
 
+    /// Shut down from a context that cannot `await` (see
+    /// `McpManager::kill_now`). Only HTTP has anything to do here — a
+    /// stdio server is reaped by signalling its process group — and it
+    /// returns a receiver that yields when its best-effort `DELETE` is
+    /// over; `None` when there is nothing to wait for.
+    pub fn abandon(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        match self {
+            Self::Stdio(_) => None,
+            Self::Http(t) => t.abandon(),
+        }
+    }
+
     /// `Some(reason)` once the connection is unusable.
     pub fn close_reason(&self) -> Option<String> {
         match self {

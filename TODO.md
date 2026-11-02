@@ -245,7 +245,7 @@ the OpenAI/Anthropic streaming tests are unchanged.
 an `event:`/`id:`/comment line interleaved, and `\r\n` endings; all existing
 provider streaming tests pass untouched.
 
-### H3 — Session lifecycle
+### ✅ H3 — Session lifecycle
 
 `404` with a session id → re-`initialize` once and retry (only `404`; never
 timeouts or `5xx`, where a `tools/call` may have run); `DELETE` on shutdown with a

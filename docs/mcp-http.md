@@ -105,7 +105,19 @@ transport rather than a generic "remote".
   retries the failed request. Retrying is safe here specifically because `404`
   means the server did not execute it; it must not be generalised to timeouts or
   `5xx`, where a `tools/call` may have run.
-- `DELETE` on shutdown, best effort with a short timeout. There is no process to
+  Implemented in `McpClient::request` (it owns the handshake), single-flight:
+  concurrent `404`s trigger one `initialize`, the rest wait and retry on the new
+  session; a second `404` is returned, never looped on. The tool table is *not*
+  rebuilt after a re-initialize, so a restarted server's changed tool list is
+  not picked up until the next nanopi session. The stale session id stays in
+  place until `initialize` replaces it, so a failed recovery is retried by the
+  next call rather than leaving id-less requests the server answers with `400`.
+- `DELETE` on shutdown, best effort with a short timeout
+  (`http::DELETE_TIMEOUT`, 2 s). Sent after the transport is marked closed and
+  in-flight requests are cancelled; any failure (`405` included) is ignored.
+  Exits that cannot `await` (SIGTERM, early return) reach it through
+  `McpManager::kill_now`, which sends it from its own thread and waits at most
+  the same 2 s in total. There is no process to
   kill, so unlike stdio a SIGKILLed nanopi leaves its session on the server until
   the server expires it. That is a server-side leak, not a local one, and it is
   documented rather than engineered around.
