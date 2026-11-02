@@ -117,6 +117,12 @@ enum SlashCmd {
     /// asking the model to list its own tools is not: it will happily
     /// present plugin tools as built-ins, or invent skills.
     ListTools,
+    /// `/mcp`: every server in `mcp.json` with its state (connected,
+    /// failed, skipped), endpoint and tools, into scrollback. Read-only
+    /// and answered from the manager's cached state — it never issues a
+    /// request, so it is safe while a turn streams and with a wedged
+    /// server.
+    Mcp,
     /// Re-read config.toml + settings.toml + skills without exiting
     /// the session. Mirrors PI's `/reload` — new skills installed
     /// mid-session become visible to the model on the next turn.
@@ -234,6 +240,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/tools",
             "List all callable tools + their source",
             SlashCmd::ListTools,
+        ),
+        MenuItem::new(
+            "/mcp",
+            "Show MCP servers: state, endpoint, tools",
+            SlashCmd::Mcp,
         ),
         MenuItem::new(
             "/reload",
@@ -1407,6 +1418,8 @@ enum KeyAction {
     ShowSkills,
     /// `/tools`: dump the live tool registry into scrollback.
     ShowTools,
+    /// `/mcp`: print the MCP server report into scrollback.
+    ShowMcp,
     /// `/session`: dump usage / cost / model summary into scrollback.
     ShowSessionInfo,
     /// Bare `/name` — print the session's current name to scrollback.
@@ -2078,6 +2091,68 @@ fn parse_orchestrator_args(arg: &str) -> Result<Option<bool>, String> {
     }
 }
 
+/// `/mcp` as styled transcript lines. The wording lives in
+/// `mcp::report` (pure and tested); this only picks colours, matching
+/// `/tools`: green heading, cyan names, dim detail.
+fn mcp_report_lines(
+    mcp: &crate::mcp::manager::McpManager,
+    orchestrator: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use crate::mcp::manager::ServerState;
+    use crate::mcp::report::{self, Line as R};
+    let rows = mcp.status();
+    let path = crate::paths::global_mcp_path();
+    let input = report::Input {
+        rows: &rows,
+        config_notes: mcp.config_notes(),
+        disabled: mcp.disabled_reason(),
+        config_path: path.as_deref(),
+        orchestrator,
+        width,
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let state_colour = |s: ServerState| match s {
+        ServerState::Connected => Color::Green,
+        ServerState::Connecting => Color::Yellow,
+        ServerState::Failed => Color::Red,
+        ServerState::Skipped => Color::Yellow,
+    };
+    report::report(&input)
+        .into_iter()
+        .map(|line| match line {
+            R::Heading(t) => Line::from(vec![Span::styled(
+                t,
+                Style::default()
+                    .fg(Color::Indexed(108))
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            R::Note(t) => Line::from(vec![Span::styled(t, dim)]),
+            R::Warn(t) => Line::from(vec![Span::styled(t, Style::default().fg(Color::Yellow))]),
+            R::Row { name, state, summary } => Line::from(vec![
+                Span::styled(format!("  {name} "), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("[{}]", state.label()),
+                    Style::default().fg(state_colour(state)),
+                ),
+                Span::styled(format!(" {summary}"), Style::default().fg(Color::Gray)),
+            ]),
+            R::Detail(t) => Line::from(vec![Span::styled(
+                format!("      {t}"),
+                dim.add_modifier(Modifier::DIM),
+            )]),
+            R::Reason { state, text } => Line::from(vec![Span::styled(
+                format!("      {text}"),
+                Style::default().fg(match state {
+                    ServerState::Connected => Color::Yellow,
+                    s => state_colour(s),
+                }),
+            )]),
+            R::Blank => Line::from(""),
+        })
+        .collect()
+}
+
 fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
     match cmd {
         SlashCmd::Compact => KeyAction::Compact,
@@ -2089,6 +2164,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
         SlashCmd::ListSkills => KeyAction::ShowSkills,
         SlashCmd::ListTools => KeyAction::ShowTools,
+        SlashCmd::Mcp => KeyAction::ShowMcp,
         SlashCmd::SessionInfo => KeyAction::ShowSessionInfo,
         // PI's /name: bare shows current, `/name X` sets it. See
         // packages/coding-agent/src/modes/interactive/interactive-
@@ -3740,6 +3816,14 @@ async fn handle_action(
                     )?;
                 }
                 insert_line(term, Line::from(""))?;
+            }
+        }
+        KeyAction::ShowMcp => {
+            // From the manager only: no agent lock (a turn may hold it)
+            // and no request to any server.
+            let width = term.size().map(|r| r.width).unwrap_or(80) as usize;
+            for line in mcp_report_lines(&app.mcp, app.orchestrator, width) {
+                insert_line(term, line)?;
             }
         }
         KeyAction::ShowTools => {
@@ -8059,6 +8143,69 @@ mod tests {
         assert!(slash_items().iter().any(|i| i.label == "/agents"));
     }
 
+    #[test]
+    fn mcp_is_in_the_palette_and_dispatches_to_show_mcp() {
+        let item = slash_items()
+            .into_iter()
+            .find(|i| i.label == "/mcp")
+            .expect("/mcp must be offered by the palette");
+        assert_eq!(item.payload, SlashCmd::Mcp);
+        assert!(!item.description.is_empty());
+        assert!(matches!(dispatch_slash(SlashCmd::Mcp, String::new()), KeyAction::ShowMcp));
+        // A stray argument is ignored rather than becoming a usage error:
+        // the command is read-only and takes none.
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Mcp, "extra".to_string()),
+            KeyAction::ShowMcp
+        ));
+    }
+
+    #[test]
+    fn mcp_is_a_known_command_and_enter_runs_it_even_mid_stream() {
+        let mut app = mkapp();
+        assert!(known_command_names(&app).iter().any(|n| n == "mcp"));
+        for status in [Status::Idle, Status::Streaming] {
+            let mut app = mkapp();
+            app.status = status.clone();
+            seed_input(&mut app, "/mcp");
+            let got = interpret_key(&mut app, KeyEvent::from(KeyCode::Enter));
+            assert!(matches!(got, KeyAction::ShowMcp), "{status:?}: {got:?}");
+        }
+        // And Tab-completion offers it from a prefix.
+        seed_input(&mut app, "/mc");
+        let m = app.palette.as_ref().unwrap();
+        let labels: Vec<_> = m.visible().iter().map(|i| i.label.clone()).collect();
+        assert!(labels.iter().any(|l| l == "/mcp"), "{labels:?}");
+    }
+
+    fn mcp_plain(mcp: &crate::mcp::manager::McpManager, orchestrator: bool) -> String {
+        mcp_report_lines(mcp, orchestrator, 0)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn mcp_report_lines_renders_every_state_from_the_apps_manager() {
+        use crate::mcp::config::SkippedServer;
+        use crate::mcp::manager::McpManager;
+        let none = McpManager::empty();
+        let out = mcp_plain(&none, false);
+        assert!(out.contains("No MCP servers configured"), "{out}");
+        assert!(out.contains("mcp.json"), "{out}");
+
+        let skipped = McpManager::empty().with_config_problems(
+            vec![SkippedServer { name: "gw".into(), reason: "server \"gw\": WebSocket is not supported".into() }],
+            vec!["could not read (denied); no MCP servers configured (/x/mcp.json)".into()],
+        );
+        let out = mcp_plain(&skipped, true);
+        assert!(out.contains("gw [skipped]"), "{out}");
+        assert!(out.contains("WebSocket is not supported"), "{out}");
+        assert!(out.contains("Orchestrator mode"), "{out}");
+        assert!(out.contains("could not read (denied)"), "{out}");
+    }
+
     /// Typing a command name in full must preselect that command.
     #[test]
     fn typing_a_command_name_preselects_it() {
@@ -8070,6 +8217,8 @@ mod tests {
             "/name",
             "/export",
             "/agents",
+            "/mcp",
+            "/tools",
         ] {
             let mut app = mkapp();
             seed_input(&mut app, cmd);

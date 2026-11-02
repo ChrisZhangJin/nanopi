@@ -119,6 +119,7 @@ pub const RESERVED_COMMAND_NAMES: &[&str] = &[
     "hotkeys",
     "skills",
     "tools",
+    "mcp",
     "reload",
     "settings",
     "keybindings",

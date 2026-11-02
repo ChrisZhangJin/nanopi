@@ -2,8 +2,8 @@
 
 Status: **implemented** — stdio and Streamable HTTP servers, tools in solo mode
 and, through the parent↔child channel, for dispatched agents (M1–M6, M8–M10,
-H1–H5). Still open: the `/mcp` command (M7, M11) and the legacy HTTP+SSE
-fallback (H6). The rest of this file is the research and the reasoning behind
+H1–H5), plus the read-only `/mcp` command (M7). Still open: the interactive
+`/mcp` (M11) and the legacy HTTP+SSE fallback (H6). The rest of this file is the research and the reasoning behind
 the architecture; `docs/mcp-http.md` and `docs/mcp-ipc.md` are the transport and
 channel designs, `TODO.md` the task list.
 
@@ -46,6 +46,56 @@ its tools register as `mcp__<server>__<tool>`. `/tools` shows each tool's origin
 (the command line, or the masked URL), and an HTTP server's session is ended on
 exit. A child agent never connects: it calls through the parent
 (`docs/mcp-ipc.md`).
+
+### `/mcp`
+
+Read-only; it answers from what the manager already holds, so it never makes a
+request, never takes the agent lock, and is safe to run while a turn streams or a
+server is wedged. It prints into the scrollback like `/tools`. One row per entry
+in `mcp.json`: the servers that were tried, in file order, then the entries
+`config::load` rejected:
+
+```
+MCP servers (4: 1 connected, 1 failed, 2 skipped)
+  Orchestrator mode: these tools are used by the agents you dispatch, not by the main agent itself.
+  playwright [connected] http · 23 tools
+      http://127.0.0.1:8931/mcp
+      mcp__playwright__browser_close, mcp__playwright__browser_resize,
+      mcp__playwright__browser_console_messages, mcp__playwright__browser_handle_dialog,
+      mcp__playwright__browser_evaluate, mcp__playwright__browser_file_upload, mcp__playwright__browser_drop,
+      mcp__playwright__browser_fill_form, … 15 more
+  ghost      [failed] stdio
+      /nonexistent/mcp-server-ghost --port 9 --token=***
+      failed to spawn `/nonexistent/mcp-server-ghost`: No such file or directory (os error 2)
+  gateway    [skipped]
+      server "gateway": header "Authorization": environment variable M7_NOPE is not set; server skipped
+```
+
+- **States.** *connected* (transport and tool count), *failed* (the whole first
+  line of the reason, not the 160-character form the startup notice uses),
+  *skipped* (rejected at load time: unset `${VAR}`, cleartext with credentials,
+  `type: sse`/`ws`, an invalid entry — the reason is the same text the startup
+  diagnostic printed), *connecting* (only if a client reports it; startup does not
+  return until every server has resolved, so it is not normally seen).
+- **What is shown.** Transport and endpoint: for stdio the command line with args
+  masked by `redact_arg`, for HTTP the URL masked by `redact_url` (a `${VAR}` is
+  shown as written). Never `env`, header names or values, or an expanded `${VAR}`.
+  A skipped entry shows no endpoint or transport: it was rejected before it
+  became a config, and the reason names the fault.
+- **Tool names** are the registered names (`mcp__<server>__<tool>`) — the first 8
+  per server, then `… N more` — in solo and orchestrator mode alike; `/tools`
+  has the full inventory with descriptions. In orchestrator mode one line adds
+  that these tools are used by the agents you dispatch, not by the main agent.
+- **Not configured.** No `mcp.json`, or an empty `mcpServers`, prints a one-line
+  hint with the path (`paths::global_mcp_path()`); it is not an error. A
+  malformed or unreadable file shows its diagnostic (with the line number and
+  path) instead. A session that never reads the file (`--tools`) says so rather
+  than claiming nothing is configured.
+- `mcp.json` is read once at startup; `/reload` does not re-read it.
+
+Code: `mcp::report` (the wording, a pure function over `ServerStatus` rows),
+`McpManager::status` / `config_notes` / `disabled_reason`, and `SkippedServer`
+in `mcp::config`.
 
 ## Decision: the main process owns every connection and proxies for children
 

@@ -132,13 +132,21 @@ registry is still exactly the four dispatch tools — asserted by the existing
 closed-list test. A server that is down delays startup by no more than its
 timeout.
 
-## M7 — `/mcp` command, read-only
+## ✅ M7 — `/mcp` command, read-only
 
 Add `SlashCmd::Mcp`. Lists each server: status, tool count, and the failure
 reason when `Failed`. Mirrors `/tools` and `/skills` formatting.
 
 **ACCEPTANCE** Renders connected, failed and not-configured states. Credentials
 from `env` never appear in the output.
+
+As built: one row per server in `mcp.json`, including entries `config::load`
+rejected (carried into the manager as `SkippedServer`, shown as *skipped* with the
+reason). Wording is the pure `mcp::report::report`; the TUI only colours it, into
+scrollback like `/tools`, from the manager's cached state (no request, no agent
+lock, so it is safe mid-turn). Tests: `mcp::report::tests` (every state, the cap,
+the orchestrator note, and a secret-absence test over a real manager),
+`manager::tests`, `config::tests`, and the palette tests in `mode::tui`.
 
 ## ✅ M8 — Shutdown hygiene
 
