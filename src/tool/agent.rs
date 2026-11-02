@@ -1082,6 +1082,52 @@ pub fn build_child_env(spec: &ChildLaunchSpec, agent_id: &str) -> Vec<(String, S
     e
 }
 
+/// Names a child must keep even when `mcp.json` happens to reference
+/// them: what it needs to run at all (`PATH`, the home and temp
+/// directories), and the provider key, which it has to have to talk to
+/// the model. Anything starting `NANOPI_` is kept too. Referencing one of
+/// these in `mcp.json` therefore does *not* hide it from children.
+const CHILD_KEEPS: &[&str] = &[
+    "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMPDIR", "TMP", "TEMP",
+    "OPENAI_API_KEY",
+];
+
+/// The variables to take out of a child's inherited environment (pure):
+/// every name `mcp.json` references (`referenced`), minus [`CHILD_KEEPS`]
+/// and `NANOPI_*`, and minus anything `build_child_env` sets explicitly.
+///
+/// A secret the owner wrote as `${GATEWAY_TOKEN}` in a server's `headers`
+/// or `url` is the *parent's* to hold: a child that inherited it could
+/// call that server itself and step around the per-agent allowlist the
+/// parent enforces. This does not clear the environment: a child needs
+/// `PATH`, `HOME`, proxy settings and the rest of what it inherits today.
+pub fn child_env_removals(referenced: &[String], sets: &[(String, String)]) -> Vec<String> {
+    referenced
+        .iter()
+        .filter(|n| !n.starts_with("NANOPI_"))
+        .filter(|n| !CHILD_KEEPS.iter().any(|k| k.eq_ignore_ascii_case(n)))
+        .filter(|n| !sets.iter().any(|(k, _)| k == *n))
+        .cloned()
+        .collect()
+}
+
+/// Environment for a child about to be spawned: the additions of
+/// [`build_child_env`] and the removals of [`child_env_removals`], from
+/// the names the loaded `mcp.json` references. Every child spawn goes
+/// through here (`prepare_run`, `prepare_continue`), so a new spawn site
+/// cannot forget one half.
+fn configure_child_env(command: &mut Command, spec: &ChildLaunchSpec, id: &str) {
+    let sets = build_child_env(spec, id);
+    for name in child_env_removals(&crate::mcp::credentials::referenced_env_names(), &sets) {
+        command.env_remove(name);
+    }
+    command
+        .envs(sets)
+        // CTL-06 T-04-06-04: a child never joins its parent's run — if it
+        // did, it could mint ids colliding with its own parent's.
+        .env_remove("NANOPI_RUN_ID");
+}
+
 /// Max bytes of `report.md` returned to the parent model (D-06): the
 /// parent sees only a capped excerpt plus a pointer to the full
 /// `report.md` on disk, never the child's transcript.
@@ -1549,11 +1595,8 @@ fn prepare_run(
             &tools,
             agent.model.as_deref(),
         ))
-        .envs(build_child_env(&l.spec, &id))
-        // CTL-06 T-04-06-04: a child never joins its parent's run — if it
-        // did, it could mint ids colliding with its own parent's.
-        .env_remove("NANOPI_RUN_ID")
         .current_dir(&child_cwd);
+    configure_child_env(&mut command, &l.spec, &id);
 
     Ok(PreparedRun {
         id,
@@ -1849,10 +1892,8 @@ pub(crate) fn prepare_continue(l: &Launcher, id: &str, dir: &Path, cwd: &Path) -
     let mut command = l.program.command();
     command
         .args(build_child_args(&l.spec, dir, &tools, None))
-        .envs(build_child_env(&l.spec, id))
-        // CTL-06 T-04-06-04: see the same env_remove in prepare_run.
-        .env_remove("NANOPI_RUN_ID")
         .current_dir(cwd);
+    configure_child_env(&mut command, &l.spec, id);
     PreparedRun {
         id: id.to_string(),
         dir: dir.to_path_buf(),
@@ -3583,6 +3624,129 @@ mod tests {
         assert!(!wt.path.exists() || report.contains("merged") || report.contains("CONFLICT"));
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn child_env_removals_are_the_referenced_names_less_what_a_child_needs() {
+        let sets = vec![("NANOPI_AGENT_ID".to_string(), "a1".to_string())];
+        assert_eq!(
+            child_env_removals(&names(&["GATEWAY_TOKEN", "OTHER_SECRET"]), &sets),
+            names(&["GATEWAY_TOKEN", "OTHER_SECRET"])
+        );
+        // Kept even when referenced: what the child cannot run without,
+        // the provider key, and everything NANOPI_*.
+        assert!(child_env_removals(
+            &names(&["PATH", "HOME", "TMPDIR", "OPENAI_API_KEY", "NANOPI_HOME", "NANOPI_RUN_ID"]),
+            &sets
+        )
+        .is_empty());
+        // Something `build_child_env` sets itself is not removed first.
+        let sets = vec![("SHARED".to_string(), "v".to_string())];
+        assert!(child_env_removals(&names(&["SHARED"]), &sets).is_empty());
+        assert!(child_env_removals(&[], &sets).is_empty());
+    }
+
+    /// The child's environment as the parent's spawn leaves it: every
+    /// variable the loaded `mcp.json` references is gone, the rest is
+    /// inherited, for both the first spawn and a `send_message`
+    /// continuation. The child is a fake `sh` that dumps `env`.
+    #[cfg(unix)]
+    mod child_env_hygiene {
+        use super::*;
+
+        /// Appends a marker and its whole environment on every run.
+        const DUMP: &str = r#"d="$(dirname "$4")"; { echo "--run--"; env; } >> "$d/env.log"; echo '{"session_id":"s","model":"m","finish_reason":"stop","duration_ms":1,"usage":{},"messages":[{"role":"assistant","content":"DONE"}],"status":"completed"}'"#;
+
+        /// One entry per run: the variable names and values it saw.
+        fn runs(cwd: &Path, l: &Launcher) -> Vec<std::collections::BTreeMap<String, String>> {
+            let log = cwd
+                .join(".nanopi/agents")
+                .join(l.registry.run_id())
+                .join("a1/env.log");
+            std::fs::read_to_string(log)
+                .unwrap()
+                .split("--run--\n")
+                .skip(1)
+                .map(|run| {
+                    run.lines()
+                        .filter_map(|l| l.split_once('='))
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_variable_mcp_json_references_is_not_inherited_by_a_child() {
+            // Names unique to this test: the process environment is
+            // shared with every other test, and the recorded set is
+            // process-wide and only grows.
+            const IN_HEADER: &str = "GATEWAY_TOKEN_TEST_hdr_5e1c";
+            const IN_URL: &str = "GATEWAY_HOST_TEST_url_5e1c";
+            const IN_SKIPPED: &str = "GATEWAY_TOKEN_TEST_skipped_5e1c";
+            const UNREFERENCED: &str = "NOT_IN_MCP_JSON_TEST_5e1c";
+            const SECRET: &str = "SECRET-5e1c-value";
+            std::env::set_var(IN_HEADER, SECRET);
+            std::env::set_var(IN_URL, "127.0.0.1");
+            std::env::set_var(IN_SKIPPED, SECRET);
+            std::env::set_var(UNREFERENCED, "plain");
+
+            let cwd = tmp("env-hygiene");
+            let mcp_json = cwd.join("mcp.json");
+            std::fs::write(
+                &mcp_json,
+                format!(
+                    r#"{{"mcpServers": {{
+                        "gw": {{"url": "http://${{{IN_URL}}}:9/mcp",
+                                "headers": {{"Authorization": "Bearer ${{{IN_HEADER}}}"}}}},
+                        "bad": {{"command": "x", "url": "http://127.0.0.1:9/",
+                                 "headers": {{"X": "${{{IN_SKIPPED}}}"}}}}
+                    }}}}"#
+                ),
+            )
+            .unwrap();
+            let loaded = crate::mcp::config::load(&mcp_json);
+            assert_eq!(loaded.servers.len(), 1, "{:?}", loaded.diagnostics);
+            assert_eq!(loaded.skipped.len(), 1, "a skipped server still counts");
+
+            let l = launcher(DUMP, 8, 4);
+            let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+            assert!(!out.is_error, "{}", out.content);
+
+            l.registry.reactivate("a1").unwrap();
+            let again = prepare_continue(
+                &l,
+                "a1",
+                &cwd.join(".nanopi/agents").join(l.registry.run_id()).join("a1"),
+                &cwd,
+            );
+            let out = run_body(&l.registry, again).await;
+            assert!(!out.is_error, "{}", out.content);
+
+            let seen = runs(&cwd, &l);
+            assert_eq!(seen.len(), 2, "the dispatch and the send_message continuation");
+            for (which, env) in ["dispatch", "continuation"].iter().zip(&seen) {
+                for gone in [IN_HEADER, IN_URL, IN_SKIPPED] {
+                    assert!(!env.contains_key(gone), "{which}: {gone} leaked into the child");
+                }
+                assert!(
+                    !env.values().any(|v| v == SECRET),
+                    "{which}: the secret's value is in the child's environment"
+                );
+                // Not a cleared environment.
+                assert!(env.contains_key("PATH"), "{which}: PATH");
+                if std::env::var_os("HOME").is_some() {
+                    assert!(env.contains_key("HOME"), "{which}: HOME");
+                }
+                assert_eq!(env.get(UNREFERENCED).map(String::as_str), Some("plain"), "{which}");
+                assert_eq!(env.get("NANOPI_AGENT_ID").map(String::as_str), Some("a1"), "{which}");
+            }
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
     }
 
     /// A continued agent must keep the `--tools` restriction it was

@@ -328,6 +328,10 @@ Streamable HTTP server is never routed through the legacy path.
 
 ## Later, explicitly out of scope for now
 
+- **Sandbox child file reads of `~/.nanopi`** (and the parent's
+  `/proc/<pid>/environ` on Linux): a child with `read`/`bash` can read
+  `mcp.json` and `config.toml` secrets today; only the `${VAR}` environment
+  inheritance is closed (`docs/mcp-http.md`, "Nothing toward a child").
 - **Standing `GET` stream** and resumability for Streamable HTTP.
 - **`prompts/*`** — maps naturally onto skills / slash commands
   (`/mcp:<server>:<prompt>`).

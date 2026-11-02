@@ -440,3 +440,34 @@ fn a_literal_dollar_brace_never_reaches_the_wire_unless_escaped() {
     let r = resolve("https://h/mcp", &[("X-T", "$${TOKEN}")], &[]).unwrap();
     assert_eq!(r.headers[0].1.to_str().unwrap(), "${TOKEN}");
 }
+
+// ------------------------------------------------- referenced variables
+
+#[test]
+fn referenced_names_lists_every_reference_in_order() {
+    assert_eq!(referenced_names("Bearer ${TOKEN}"), vec!["TOKEN"]);
+    assert_eq!(referenced_names("${A}-${B}/${A}"), vec!["A", "B", "A"]);
+    assert_eq!(referenced_names("https://${HOST}:${PORT}/mcp"), vec!["HOST", "PORT"]);
+    assert!(referenced_names("plain").is_empty());
+}
+
+#[test]
+fn referenced_names_follows_the_expansion_grammar_and_never_fails() {
+    // `$NAME` is not a reference; `$${` is the escape.
+    assert!(referenced_names("$TOKEN").is_empty());
+    assert!(referenced_names("$${TOKEN}").is_empty());
+    // What `expand` rejects names nothing; a missing `}` ends the scan.
+    assert!(referenced_names("${}").is_empty());
+    assert!(referenced_names("${A:-b}").is_empty());
+    assert!(referenced_names("${UNTERMINATED").is_empty());
+    assert_eq!(referenced_names("${bad name} ${GOOD}"), vec!["GOOD"]);
+}
+
+#[test]
+fn the_recorded_set_holds_names_only_and_only_grows() {
+    record_referenced_env(["CRED_UNIT_TEST_ONE".to_string()]);
+    record_referenced_env(["CRED_UNIT_TEST_TWO".to_string(), "CRED_UNIT_TEST_ONE".to_string()]);
+    let all = referenced_env_names();
+    assert_eq!(all.iter().filter(|n| *n == "CRED_UNIT_TEST_ONE").count(), 1);
+    assert!(all.iter().any(|n| n == "CRED_UNIT_TEST_TWO"));
+}

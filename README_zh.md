@@ -335,8 +335,16 @@ nanopi 是一个 [MCP](https://modelcontextprotocol.io) 客户端：外部 MCP �
 **配合编排模式**：主 agent 自己没有 MCP 工具，但能看到它们的名字和描述，可以在
 `agent` 工具的 `tools` 列表里点名，把它们授予派出去的 agent。这些 agent 是独立进程，
 从不自己连接服务器：每次调用都经由主进程——它持有唯一的连接（HTTP 则是唯一的
-会话），检查授权并返回结果。子 agent 永远不知道服务器是怎么连上的，因此服务器的
-`env`、URL 和 `headers` 都只留在父进程里。这条通道仅限 Unix；在 Windows 上服务器在
+会话），检查授权并返回结果。这条通道只传工具名、schema 和结果：子 agent 收不到服务器
+的 `env`、URL 或 `headers`；并且 nanopi 会从子 agent 的环境里移除 `mcp.json` 中以
+`${VAR}` 引用的每一个变量（出现在 `url` 或 `headers` 值里的），所以在子 agent 里
+`echo $GATEWAY_TOKEN` 什么也打印不出来。其余变量照常继承，`PATH`、`HOME`、
+`OPENAI_API_KEY` 和 `NANOPI_*` 永远不会被移除，即使你在配置里引用了它们。
+**这不是沙箱。** 拥有 `read` 或 `bash` 的子 agent 可以自己读 `~/.nanopi/mcp.json`，
+其中 stdio 服务器的 `env` 值和任何字面写出的 header 值都是明文（与 `config.toml`
+里的 API key 同一信任级别）；在 Linux 上它还能读父进程的 `/proc/<pid>/environ`，
+因为两者都以你的身份运行。密钥请用 `${VAR}` 而不是字面值，并把拥有 `read` 或 `bash`
+的 agent 视为能读到你能读的一切。这条通道仅限 Unix；在 Windows 上服务器在
 主进程里可用，但无法把它们的工具授予 agent。用 `/orchestrator off`（或在
 `nanopi -p` 里）时，这些工具就直接在主 agent 的工具集中。
 

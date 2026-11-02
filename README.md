@@ -367,8 +367,18 @@ their names and descriptions and can grant them to the agents it dispatches by
 naming them in the `agent` tool's `tools` list. Those agents are separate
 processes that never connect to a server themselves: every call goes through the
 main process, which holds the one connection (one session, for HTTP), checks the
-grant, and returns the result. A child never learns how a server is reached, so a
-server's `env`, URL and `headers` stay with the parent. This channel is Unix-only;
+grant, and returns the result. The channel carries tool names, schemas and results
+only: a child is never sent a server's `env`, URL or `headers`, and nanopi removes
+from the child's environment every variable that `mcp.json` references as `${VAR}`
+(in a `url` or a `headers` value), so `echo $GATEWAY_TOKEN` in a child prints
+nothing. Every other variable is inherited as before, and `PATH`, `HOME`,
+`OPENAI_API_KEY` and `NANOPI_*` are never removed, even if you reference one.
+**This is not a sandbox.** A child that has `read` or `bash` can read
+`~/.nanopi/mcp.json` itself, where a stdio server's `env` values and any literal
+header value are plaintext (the same trust class as an API key in `config.toml`),
+and on Linux it can read its parent's `/proc/<pid>/environ`, since both run as you.
+Use `${VAR}` rather than a literal for a secret, and treat an agent with `read` or
+`bash` as able to read anything you can. This channel is Unix-only;
 on Windows the servers work in the main process but agents cannot be granted
 their tools. With `/orchestrator off` (or in `nanopi -p`) the tools are simply in
 the main agent's tool set.

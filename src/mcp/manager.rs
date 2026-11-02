@@ -271,6 +271,13 @@ impl McpManager {
     /// registry rebuild share it.
     pub async fn start_for_session(kind: SessionKind, tools_allow: &[String]) -> Arc<Self> {
         if let Some(reason) = skip_reason(kind, tools_allow) {
+            // A session that does not connect still spawns children, and
+            // they must not inherit what `mcp.json` references. A child
+            // agent needs no recording: the variables were already
+            // removed from its environment.
+            if kind != SessionKind::ChildAgent {
+                config::note_global_references();
+            }
             return Arc::new(Self::disabled(reason));
         }
 

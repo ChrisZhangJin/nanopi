@@ -211,9 +211,35 @@ channel, which carries tool names, schemas and results, never how a server is
 reached. `ipc::tests::no_http_credential_is_ever_sent_toward_a_child` drives a
 server holding three distinctive secrets (an expanded `${VAR}`, a literal
 header, a URL query value) through the real channel and greps every message,
-the child environment and its argv. One thing nanopi does not do: a variable
-named in a `${VAR}` stays in the parent's environment, which a child process
-inherits like any other.
+the child environment and its argv.
+
+**The variables a template names are removed from the child's environment.**
+`config::load` records, by name only, every `${NAME}` in a `url` or a `headers`
+value (`credentials::record_referenced_env`), for every configured server
+including ones that end up skipped, and also when the session does not connect
+(`--tools`). `tool::agent::configure_child_env` takes them out with
+`env_remove` at both child spawn sites, the dispatch (`prepare_run`) and the
+`send_message` continuation (`prepare_continue`); `child_env_removals` is the pure
+function that decides the set. The rest of the environment is inherited as
+before. Never removed: `PATH`, `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`,
+`TMPDIR`, `TMP`, `TEMP`, `OPENAI_API_KEY` (the provider key) and `NANOPI_*`, so
+a header that references one of those is still visible to children.
+`tool::agent::tests::child_env_hygiene` runs a fake child that dumps its
+environment through both spawn paths.
+
+What this does **not** do, plainly:
+
+- It is not a sandbox. A child with `read` or `bash` can read
+  `~/.nanopi/mcp.json`. A literal header value and every stdio `env` value are
+  plaintext there, the same trust class as an API key in `config.toml`. Write a
+  secret as `${VAR}` so the file holds only the template.
+- A child with `bash` on Linux can read its parent's `/proc/<pid>/environ`
+  (same user; `kernel.yama.ptrace_scope` does not stop it), where the secret
+  still is. The removal keeps it out of the child's own environment, so a stray
+  `env` or `echo` does not show it. It does not stop a child that goes looking.
+  Sandboxing child file reads is future work (`TODO.md`).
+- Stdio servers nanopi launches inherit the parent's environment, `${VAR}`
+  secrets included. They are your own configured, full-privilege subprocesses.
 
 OAuth is out of scope. Static headers only.
 
