@@ -1928,12 +1928,12 @@ impl Agent {
                 .map(|o| (o.call_id.clone(), o))
                 .collect();
             let mut synth = Vec::with_capacity(call_meta.len());
-            for (id, _name) in call_meta {
+            for (id, name) in call_meta {
                 if let Some(finished) = done.remove(&id) {
                     synth.push(finished);
                     continue;
                 }
-                let content = "[cancelled by user before tool completed]".to_string();
+                let content = crate::tool::agent::cancelled_call_note(&name);
                 let _ = session::append_entry(
                     &self.session_path,
                     &SessionEntry::ToolResult {

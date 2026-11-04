@@ -231,7 +231,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/import", "Import a session from JSONL", SlashCmd::Import),
         MenuItem::new(
             "/agents",
-            "Agent archive: clean [--older <days> | --keep <n>]",
+            "Agents: list | stop <id|name|all> | clean [--older <days> | --keep <n>]",
             SlashCmd::Agents,
         ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
@@ -830,6 +830,10 @@ pub async fn run_tui_mode(
     // the user can keep talking while they work; reports arrive later.
     if let Some(reg) = crate::agent_registry::global() {
         reg.set_background_default(true);
+        // Esc cancels the orchestrator's turn, never the agents: even a
+        // foreground dispatch (`background:false`, `parallel`, `chain`)
+        // runs detached from the turn and keeps going if it is cancelled.
+        reg.set_detach_foreground(true);
     }
     let mut result =
         run_app(&mut terminal, &mut app, agent_slot.clone(), &mut exit_signals).await;
@@ -1478,6 +1482,12 @@ enum KeyAction {
     ApplyName(String),
     /// `/agents clean ...` parsed successfully — run the prune.
     CleanAgents(crate::archive::CleanMode),
+    /// Bare `/agents` / `/agents list` — print the agents with id, name
+    /// and state.
+    ListAgents,
+    /// `/agents stop <id|name-prefix|all>` — stop agents. Works while a
+    /// turn is streaming; never touches the turn.
+    StopAgents(AgentStopTarget),
     /// `/agents ...` with bad/missing arguments — print the usage
     /// line, delete nothing (T-02-19).
     AgentsUsage(String),
@@ -2083,24 +2093,53 @@ fn sync_palette(app: &mut App) {
 }
 
 /// `/agents` usage line, shown on any bad/missing argument (T-02-19:
-/// strict parse, anything unrecognized deletes nothing).
-const AGENTS_USAGE: &str = "Usage: /agents clean [--older <days> | --keep <n>]";
+/// strict parse, anything unrecognized deletes and stops nothing).
+const AGENTS_USAGE: &str = "Usage: /agents [list] | /agents stop <id|name-prefix|all> | \
+/agents clean [--older <days> | --keep <n>]";
 
-/// Parse the argument string after `/agents` into a [`crate::archive::CleanMode`]
-/// (D-10, ARC-05). Only `clean`, `clean --older <u64>` and
-/// `clean --keep <usize>` are accepted; anything else (including bare
-/// `/agents`, `/agents list`, or a non-numeric/trailing-garbage value)
-/// is `Err(AGENTS_USAGE)`.
-fn parse_agents_args(arg: &str) -> Result<crate::archive::CleanMode, String> {
+/// What `/agents stop` was asked to stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentStopTarget {
+    /// Every live agent.
+    All,
+    /// An agent id (`a3`) or a prefix of an agent's name.
+    Query(String),
+}
+
+/// A parsed `/agents` command.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentsCmd {
+    List,
+    Stop(AgentStopTarget),
+    Clean(crate::archive::CleanMode),
+}
+
+/// Parse the argument string after `/agents` (D-10, ARC-05). Accepted:
+/// nothing or `list`; `stop <id|name-prefix|all>`; `clean`,
+/// `clean --older <u64>` and `clean --keep <usize>`. Anything else
+/// (including a non-numeric or trailing-garbage value) is
+/// `Err(AGENTS_USAGE)` and does nothing.
+fn parse_agents_args(arg: &str) -> Result<AgentsCmd, String> {
     let mut parts = arg.trim().split_whitespace();
     match parts.next() {
-        Some("clean") => match parts.next() {
-            None => {
-                if parts.next().is_some() {
-                    return Err(AGENTS_USAGE.to_string());
-                }
-                Ok(crate::archive::CleanMode::AllButCurrent)
+        None => Ok(AgentsCmd::List),
+        Some("list") => match parts.next() {
+            None => Ok(AgentsCmd::List),
+            Some(_) => Err(AGENTS_USAGE.to_string()),
+        },
+        Some("stop") => {
+            // A name prefix may contain spaces, so the whole remainder is the query.
+            let query = parts.collect::<Vec<_>>().join(" ");
+            if query.is_empty() {
+                Err(AGENTS_USAGE.to_string())
+            } else if query.eq_ignore_ascii_case("all") {
+                Ok(AgentsCmd::Stop(AgentStopTarget::All))
+            } else {
+                Ok(AgentsCmd::Stop(AgentStopTarget::Query(query)))
             }
+        }
+        Some("clean") => match parts.next() {
+            None => Ok(AgentsCmd::Clean(crate::archive::CleanMode::AllButCurrent)),
             Some("--older") => {
                 let days = parts
                     .next()
@@ -2109,7 +2148,7 @@ fn parse_agents_args(arg: &str) -> Result<crate::archive::CleanMode, String> {
                 if parts.next().is_some() {
                     return Err(AGENTS_USAGE.to_string());
                 }
-                Ok(crate::archive::CleanMode::OlderThanDays(days))
+                Ok(AgentsCmd::Clean(crate::archive::CleanMode::OlderThanDays(days)))
             }
             Some("--keep") => {
                 let n = parts
@@ -2119,12 +2158,125 @@ fn parse_agents_args(arg: &str) -> Result<crate::archive::CleanMode, String> {
                 if parts.next().is_some() {
                     return Err(AGENTS_USAGE.to_string());
                 }
-                Ok(crate::archive::CleanMode::KeepRecent(n))
+                Ok(AgentsCmd::Clean(crate::archive::CleanMode::KeepRecent(n)))
             }
             _ => Err(AGENTS_USAGE.to_string()),
         },
         _ => Err(AGENTS_USAGE.to_string()),
     }
+}
+
+/// `a` followed by digits: the shape of a registry agent id.
+fn looks_like_agent_id(q: &str) -> bool {
+    q.strip_prefix('a')
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What a name query matches: the agent's role (its agent name, or the
+/// inline role) or its label, case-insensitively, as a prefix.
+fn agent_name_matches(info: &agents_strip::AgentInfo, query: &str) -> bool {
+    let q = query.to_lowercase();
+    info.role.iter().chain(std::iter::once(&info.description)).any(|n| {
+        let n = n.trim().to_lowercase();
+        !n.is_empty() && n.starts_with(&q)
+    })
+}
+
+/// Resolve a `/agents stop <query>` query to one agent id (pure). An id
+/// is taken as is, and the registry says whether it exists or is already
+/// over. A name must pick exactly one live agent: stopping is not
+/// undoable, so an ambiguous prefix stops nothing and lists the ids.
+fn resolve_agent_query(query: &str, agents: &[agents_strip::AgentInfo]) -> Result<String, String> {
+    let q = query.trim();
+    if looks_like_agent_id(&q.to_lowercase()) {
+        return Ok(q.to_lowercase());
+    }
+    // The view holds the live agents only (the strip drops a finished one
+    // on the next tick), so a name can only ever pick a live agent.
+    let matching: Vec<&agents_strip::AgentInfo> = agents
+        .iter()
+        .filter(|a| !a.state.is_terminal() && agent_name_matches(a, q))
+        .collect();
+    match matching.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => Err(format!("no running agent matches {q:?} (/agents lists them)")),
+        many => Err(format!(
+            "{q:?} matches {} running agents ({}): give an id, or use `all`",
+            many.len(),
+            many.iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(", "),
+        )),
+    }
+}
+
+/// One line of `/agents stop` output: the text and whether it is an error.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentsOut {
+    text: String,
+    is_error: bool,
+}
+
+/// Carry out `/agents stop` against `reg` (`agents` is the strip's
+/// view, which knows the agents' names). Stops only what was asked
+/// for and says what happened, in-band: an unknown or finished id is a
+/// message, not a failure. Never touches a turn.
+fn stop_agents(
+    reg: &crate::agent_registry::AgentRegistry,
+    agents: &[agents_strip::AgentInfo],
+    target: &AgentStopTarget,
+) -> Vec<AgentsOut> {
+    let out = |text: String, is_error: bool| AgentsOut { text, is_error };
+    let ids = match target {
+        AgentStopTarget::All => {
+            let stopped = reg.stop_all();
+            return if stopped.is_empty() {
+                vec![out("no running agents to stop".into(), true)]
+            } else {
+                vec![out(format!("stopped {}", stopped.join(", ")), false)]
+            };
+        }
+        AgentStopTarget::Query(q) => match resolve_agent_query(q, agents) {
+            Ok(id) => vec![id],
+            Err(e) => return vec![out(e, true)],
+        },
+    };
+    ids.into_iter()
+        .map(|id| match reg.stop(&id) {
+            Ok(()) => out(format!("stopped {id}"), false),
+            Err(e) => out(e, true),
+        })
+        .collect()
+}
+
+/// How many agents of this run are still going (queued or running).
+fn live_agents(reg: Option<&crate::agent_registry::AgentRegistry>) -> usize {
+    reg.map_or(0, |r| r.snapshot().iter().filter(|e| !e.state.is_terminal()).count())
+}
+
+/// Plural-aware "N agent(s)".
+fn agents_phrase(n: usize) -> String {
+    format!("{n} agent{}", if n == 1 { "" } else { "s" })
+}
+
+/// Esc / Ctrl-C during a turn: cancel the orchestrator's turn token and
+/// nothing else. The registry is taken by shared reference and only read
+/// (to tell the user what is still running): dispatched agents are
+/// stopped by `/agents stop`, by the orchestrator's `stop_agent`, or by
+/// quitting, never by interrupting the turn.
+fn cancel_turn(
+    app: &mut App,
+    cancel: Option<&CancellationToken>,
+    reg: Option<&crate::agent_registry::AgentRegistry>,
+) {
+    let Some(ct) = cancel else { return };
+    ct.cancel();
+    app.turn_was_cancelled = true;
+    app.status_note = Some(match live_agents(reg) {
+        0 => "cancelling…".to_string(),
+        n => format!(
+            "turn cancelled; {} still running — /agents stop to stop them",
+            agents_phrase(n)
+        ),
+    });
 }
 
 const ORCHESTRATOR_USAGE: &str = "Usage: /orchestrator [on|off]";
@@ -2227,7 +2379,9 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             }
         }
         SlashCmd::Agents => match parse_agents_args(&arg) {
-            Ok(mode) => KeyAction::CleanAgents(mode),
+            Ok(AgentsCmd::Clean(mode)) => KeyAction::CleanAgents(mode),
+            Ok(AgentsCmd::Stop(target)) => KeyAction::StopAgents(target),
+            Ok(AgentsCmd::List) => KeyAction::ListAgents,
             Err(msg) => KeyAction::AgentsUsage(msg),
         },
         SlashCmd::Copy => KeyAction::CopyLastReply,
@@ -2652,14 +2806,27 @@ async fn run_app(
                         // "Operation aborted" for stopReason=="aborted".
                         if app.turn_was_cancelled {
                             app.turn_was_cancelled = false;
-                            insert_line(term, Line::from(vec![
+                            let mut aborted = vec![
                                 Span::styled(
                                     "Operation aborted",
                                     Style::default()
                                         .fg(Color::Indexed(131))
                                         .add_modifier(Modifier::ITALIC),
                                 ),
-                            ]))?;
+                            ];
+                            // The turn is over, the agents are not: say so
+                            // where it stays on screen.
+                            let live = live_agents(crate::agent_registry::global().as_deref());
+                            if live > 0 {
+                                aborted.push(Span::styled(
+                                    format!(
+                                        "  ({} still running — /agents stop to stop them)",
+                                        agents_phrase(live)
+                                    ),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                            insert_line(term, Line::from(aborted))?;
                         }
                         refresh_status(app, &agent_slot).await;
                         if let Some(t) = turn_task.take() {
@@ -2754,11 +2921,7 @@ async fn handle_action(
             app.should_exit = true;
         }
         KeyAction::CancelTurn => {
-            if let Some(ct) = cancel.as_ref() {
-                ct.cancel();
-                app.status_note = Some("cancelling…".into());
-                app.turn_was_cancelled = true;
-            }
+            cancel_turn(app, cancel.as_ref(), crate::agent_registry::global().as_deref());
         }
         KeyAction::ExpandLastTool => {
             // Only expand once per source. Priority: tool result first
@@ -3412,6 +3575,42 @@ async fn handle_action(
                         )]),
                     )?;
                 }
+            }
+        }
+        KeyAction::ListAgents => {
+            if let Some(reg) = crate::agent_registry::global() {
+                app.agents_view.refresh(&reg.snapshot(), std::time::Instant::now());
+            }
+            if app.agents_view.is_empty() {
+                insert_line(term, Line::from(vec![Span::styled(
+                    "no running agents",
+                    Style::default().fg(Color::DarkGray),
+                )]))?;
+            } else {
+                let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
+                insert_line(term, Line::from(vec![Span::styled(
+                    "── agents ──",
+                    Style::default().fg(Color::DarkGray),
+                )]))?;
+                for text in agents_detail_block(app, width) {
+                    insert_line(term, Line::from(vec![Span::raw(text)]))?;
+                }
+            }
+        }
+        KeyAction::StopAgents(target) => {
+            let lines = match crate::agent_registry::global() {
+                Some(reg) => {
+                    app.agents_view.refresh(&reg.snapshot(), std::time::Instant::now());
+                    stop_agents(&reg, app.agents_view.agents(), &target)
+                }
+                None => vec![AgentsOut { text: "no agent registry in this session".into(), is_error: true }],
+            };
+            for l in lines {
+                let colour = if l.is_error { Color::Yellow } else { Color::Indexed(108) };
+                insert_line(term, Line::from(vec![Span::styled(
+                    l.text,
+                    Style::default().fg(colour),
+                )]))?;
             }
         }
         KeyAction::AgentsUsage(msg) => {
@@ -8152,24 +8351,188 @@ mod tests {
     #[test]
     fn agents_clean_parses_bare_and_flags() {
         use crate::archive::CleanMode;
-        assert_eq!(parse_agents_args("clean"), Ok(CleanMode::AllButCurrent));
+        assert_eq!(parse_agents_args("clean"), Ok(AgentsCmd::Clean(CleanMode::AllButCurrent)));
         assert_eq!(
             parse_agents_args("clean --older 3"),
-            Ok(CleanMode::OlderThanDays(3))
+            Ok(AgentsCmd::Clean(CleanMode::OlderThanDays(3)))
         );
         assert_eq!(
             parse_agents_args("clean --keep 2"),
-            Ok(CleanMode::KeepRecent(2))
+            Ok(AgentsCmd::Clean(CleanMode::KeepRecent(2)))
         );
     }
 
     #[test]
     fn agents_clean_rejects_bad_args() {
-        assert!(parse_agents_args("").is_err());
-        assert!(parse_agents_args("list").is_err());
         assert!(parse_agents_args("clean --older x").is_err());
         assert!(parse_agents_args("clean --keep").is_err());
         assert!(parse_agents_args("clean bogus").is_err());
+        assert!(parse_agents_args("list extra").is_err());
+        assert!(parse_agents_args("stop").is_err());
+        assert!(parse_agents_args("bogus").is_err());
+    }
+
+    #[test]
+    fn agents_list_and_stop_parse() {
+        assert_eq!(parse_agents_args(""), Ok(AgentsCmd::List));
+        assert_eq!(parse_agents_args("list"), Ok(AgentsCmd::List));
+        assert_eq!(parse_agents_args("stop all"), Ok(AgentsCmd::Stop(AgentStopTarget::All)));
+        assert_eq!(parse_agents_args("stop ALL"), Ok(AgentsCmd::Stop(AgentStopTarget::All)));
+        assert_eq!(
+            parse_agents_args("stop a3"),
+            Ok(AgentsCmd::Stop(AgentStopTarget::Query("a3".into())))
+        );
+        // A name may have spaces in it.
+        assert_eq!(
+            parse_agents_args("  stop   code  rev "),
+            Ok(AgentsCmd::Stop(AgentStopTarget::Query("code rev".into())))
+        );
+    }
+
+    #[test]
+    fn dispatch_agents_stop_and_list() {
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "stop a1".into()),
+            KeyAction::StopAgents(AgentStopTarget::Query(q)) if q == "a1"
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "stop all".into()),
+            KeyAction::StopAgents(AgentStopTarget::All)
+        ));
+        assert!(matches!(dispatch_slash(SlashCmd::Agents, String::new()), KeyAction::ListAgents));
+        assert!(matches!(dispatch_slash(SlashCmd::Agents, "list".into()), KeyAction::ListAgents));
+    }
+
+    #[test]
+    fn agents_usage_and_palette_mention_stop() {
+        assert!(AGENTS_USAGE.contains("stop <id|name-prefix|all>"));
+        let item = slash_items().into_iter().find(|i| i.label == "/agents").unwrap();
+        assert!(item.description.contains("stop"), "{}", item.description);
+    }
+
+    /// A registry with one entry per `(label, state)`, named like the strip
+    /// names them, and the view the TUI would hold over it.
+    fn agents_fixture(
+        specs: &[(&str, crate::agent_registry::AgentState)],
+    ) -> (tempfile::TempDir, std::sync::Arc<crate::agent_registry::AgentRegistry>, AgentsView) {
+        let root = tempfile::tempdir().unwrap();
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        for (label, state) in specs {
+            let (id, dir) = reg.reserve(root.path()).unwrap();
+            std::fs::write(
+                dir.join("brief.md"),
+                format!("---\nlabel: {label}\nrole: worker\n---\ndo the thing\n"),
+            )
+            .unwrap();
+            reg.set_state(&id, *state);
+        }
+        let mut view = AgentsView::new();
+        view.refresh(&reg.snapshot(), std::time::Instant::now());
+        (root, reg, view)
+    }
+
+    fn texts(out: &[AgentsOut]) -> Vec<(&str, bool)> {
+        out.iter().map(|o| (o.text.as_str(), o.is_error)).collect()
+    }
+
+    #[test]
+    fn stop_by_id_stops_that_agent_only_and_names_it() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, view) = agents_fixture(&[("alpha", Running), ("bravo", Running)]);
+        let out = stop_agents(&reg, view.agents(), &AgentStopTarget::Query("a2".into()));
+        assert_eq!(texts(&out), vec![("stopped a2", false)]);
+    }
+
+    #[test]
+    fn stop_all_reports_every_id_stopped() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, view) = agents_fixture(&[("alpha", Running), ("bravo", Queued), ("done", Completed)]);
+        let out = stop_agents(&reg, view.agents(), &AgentStopTarget::All);
+        assert_eq!(texts(&out), vec![("stopped a1, a2", false)]);
+        // Nothing live is a message, not a failure.
+        let (_d2, reg2, view2) = agents_fixture(&[("done", Completed)]);
+        let out = stop_agents(&reg2, view2.agents(), &AgentStopTarget::All);
+        assert_eq!(texts(&out), vec![("no running agents to stop", true)]);
+    }
+
+    #[test]
+    fn stop_unknown_or_finished_id_is_a_soft_error() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, view) = agents_fixture(&[("alpha", Completed)]);
+        let out = stop_agents(&reg, view.agents(), &AgentStopTarget::Query("a9".into()));
+        assert_eq!(texts(&out), vec![("no such agent: a9", true)]);
+        let out = stop_agents(&reg, view.agents(), &AgentStopTarget::Query("a1".into()));
+        assert_eq!(texts(&out), vec![("agent a1 is already done", true)]);
+    }
+
+    #[test]
+    fn stop_by_name_prefix_needs_exactly_one_live_match() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, view) = agents_fixture(&[
+            ("reviewer one", Running),
+            ("reviewer two", Running),
+            ("builder", Running),
+            ("old builder", Completed),
+        ]);
+        let q = |s: &str| AgentStopTarget::Query(s.into());
+        // Case-insensitive prefix of the label, one live match.
+        assert_eq!(texts(&stop_agents(&reg, view.agents(), &q("BUILD"))), vec![("stopped a3", false)]);
+        // Two live matches: nothing is stopped, the ids are listed.
+        let out = stop_agents(&reg, view.agents(), &q("review"));
+        assert!(out[0].is_error && out[0].text.contains("a1, a2"), "{out:?}");
+        // A finished agent is not in the view, so its name picks nothing;
+        // its id still says what became of it.
+        let out = stop_agents(&reg, view.agents(), &q("old"));
+        assert!(out[0].is_error && out[0].text.contains("no running agent matches"), "{out:?}");
+        assert_eq!(texts(&stop_agents(&reg, view.agents(), &q("a4"))), vec![("agent a4 is already done", true)]);
+        // Matches nothing.
+        let out = stop_agents(&reg, view.agents(), &q("zzz"));
+        assert!(out[0].is_error && out[0].text.contains("no running agent matches"), "{out:?}");
+        // The role is a name too (all three live agents are `worker`s).
+        let out = stop_agents(&reg, view.agents(), &q("work"));
+        assert!(out[0].is_error && out[0].text.contains("matches 3 running agents"), "{out:?}");
+    }
+
+    /// Esc touches the turn and only the turn: the token is cancelled, the
+    /// registry is untouched, and the note says what is still running.
+    #[test]
+    fn cancel_turn_cancels_the_turn_and_leaves_agents_alone() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("alpha", Running), ("bravo", Queued), ("done", Completed)]);
+        // Give a1 a tracked task, as a dispatched agent has: `stop` would
+        // cancel its token, so an untouched token shows nothing stopped it.
+        let agent_token = CancellationToken::new();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let handle = rt.spawn(async {});
+        reg.track_background("a1", handle, agent_token.clone());
+        let mut app = mkapp();
+        let token = CancellationToken::new();
+        cancel_turn(&mut app, Some(&token), Some(&reg));
+        assert!(token.is_cancelled());
+        assert!(!agent_token.is_cancelled(), "Esc must not stop an agent");
+        assert!(app.turn_was_cancelled);
+        let note = app.status_note.clone().unwrap();
+        assert!(note.contains("2 agents still running") && note.contains("/agents stop"), "{note}");
+        let states: Vec<_> = reg.snapshot().iter().map(|e| e.state).collect();
+        assert_eq!(states, vec![Running, Queued, Completed], "no agent may be touched");
+        assert!(!reg.has_pending_reports());
+    }
+
+    #[test]
+    fn cancel_turn_with_no_agents_has_no_agent_note() {
+        let mut app = mkapp();
+        let token = CancellationToken::new();
+        cancel_turn(&mut app, Some(&token), None);
+        assert_eq!(app.status_note.as_deref(), Some("cancelling…"));
+        // And with nothing to cancel it does nothing at all.
+        let mut app = mkapp();
+        cancel_turn(&mut app, None, None);
+        assert!(app.status_note.is_none() && !app.turn_was_cancelled);
+        // One agent reads in the singular.
+        use crate::agent_registry::AgentState::Running;
+        let (_d, reg, _v) = agents_fixture(&[("alpha", Running)]);
+        cancel_turn(&mut app, Some(&CancellationToken::new()), Some(&reg));
+        assert!(app.status_note.unwrap().contains("1 agent still running"));
     }
 
     #[test]
@@ -8185,7 +8548,7 @@ mod tests {
     fn dispatch_agents_bad_arg_yields_usage() {
         let got = dispatch_slash(SlashCmd::Agents, "bogus".to_string());
         match got {
-            KeyAction::AgentsUsage(msg) => assert!(msg.contains("Usage: /agents clean")),
+            KeyAction::AgentsUsage(msg) => assert!(msg.contains("Usage: /agents")),
             other => panic!("expected AgentsUsage, got {other:?}"),
         }
     }

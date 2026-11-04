@@ -814,20 +814,17 @@ fn validate_model(
     }
 }
 
-/// Resolve + override + validate + run one dispatch item. Every
-/// failure is in-band (no spawn occurs on a validation failure).
-async fn run_item(
+/// Resolve + override + validate one dispatch item into the config its
+/// agent runs with. Every failure is in-band (no spawn occurs on a
+/// validation failure).
+fn build_item_config(
     l: &Launcher,
     item: &AgentItem,
-    task: &str,
     scope: AgentScope,
     run_cwd: &Path,
-) -> ToolOutput {
+) -> Result<AgentConfig, ToolOutput> {
     let is_builtin = item.agent.is_none();
-    let base = match resolve_agent_config(item.agent.as_deref(), scope, run_cwd) {
-        Ok(agent) => agent,
-        Err(soft) => return soft,
-    };
+    let base = resolve_agent_config(item.agent.as_deref(), scope, run_cwd)?;
     let mut cfg = apply_inline_overrides(
         base,
         is_builtin,
@@ -840,13 +837,47 @@ async fn run_item(
     if item.tools.is_some() {
         match validate_tools(cfg.tools.as_deref().unwrap_or_default()) {
             Ok(canonical) => cfg.tools = Some(canonical),
-            Err(e) => return soft_error(e),
+            Err(e) => return Err(soft_error(e)),
         }
     }
     if let Some(model) = &item.model {
         if let Err(e) = validate_model(model, l.spec.model.as_deref(), l.spec.vendor.as_deref()) {
-            return soft_error(e);
+            return Err(soft_error(e));
         }
+    }
+    Ok(cfg)
+}
+
+/// Resolve + override + validate + run one dispatch item, waiting for it.
+///
+/// Where the registry says foreground dispatches are detached (the
+/// interactive TUI), the agent runs on its own tracked task and this only
+/// awaits it: dropping this future (Esc cancelling the turn) leaves the
+/// agent running. Everywhere else the agent is owned by this future and
+/// dies with it.
+async fn run_item(
+    l: &Launcher,
+    item: &AgentItem,
+    task: &str,
+    scope: AgentScope,
+    run_cwd: &Path,
+) -> ToolOutput {
+    let cfg = match build_item_config(l, item, scope, run_cwd) {
+        Ok(cfg) => cfg,
+        Err(soft) => return soft,
+    };
+    if l.registry.detach_foreground() {
+        return match prepare_run(
+            l,
+            &cfg,
+            task,
+            run_cwd,
+            item.description.as_deref(),
+            item.isolation.as_deref(),
+        ) {
+            Ok(prepared) => spawn_detached(&l.registry, prepared).result().await,
+            Err(soft) => soft,
+        };
     }
     run_single(
         l,
@@ -861,7 +892,7 @@ async fn run_item(
 
 /// `background: true` counterpart to [`run_item`]: identical
 /// resolve/override/validate pipeline, then `prepare_run` +
-/// `spawn_background` instead of awaiting `run_single` (CTL-01).
+/// `spawn_background` instead of awaiting the run (CTL-01).
 fn run_item_background(
     l: &Launcher,
     item: &AgentItem,
@@ -869,29 +900,10 @@ fn run_item_background(
     scope: AgentScope,
     run_cwd: &Path,
 ) -> ToolOutput {
-    let is_builtin = item.agent.is_none();
-    let base = match resolve_agent_config(item.agent.as_deref(), scope, run_cwd) {
-        Ok(agent) => agent,
+    let cfg = match build_item_config(l, item, scope, run_cwd) {
+        Ok(cfg) => cfg,
         Err(soft) => return soft,
     };
-    let mut cfg = apply_inline_overrides(
-        base,
-        is_builtin,
-        item.role.as_deref(),
-        item.tools.clone(),
-        item.model.as_deref(),
-    );
-    if item.tools.is_some() {
-        match validate_tools(cfg.tools.as_deref().unwrap_or_default()) {
-            Ok(canonical) => cfg.tools = Some(canonical),
-            Err(e) => return soft_error(e),
-        }
-    }
-    if let Some(model) = &item.model {
-        if let Err(e) = validate_model(model, l.spec.model.as_deref(), l.spec.vendor.as_deref()) {
-            return soft_error(e);
-        }
-    }
     match prepare_run(
         l,
         &cfg,
@@ -979,7 +991,35 @@ async fn run_parallel(
 
 /// Run a `chain`: steps in order, each seeing the prior step's output
 /// via `{previous}`. Stops at the first failed step and reports where.
+///
+/// Where foreground dispatches are detached, the driver itself runs on a
+/// task of its own (each step is then a tracked agent as well), so that
+/// cancelling the turn leaves the chain running and later steps still
+/// start. Its combined result goes to the outbox if nobody is waiting.
 async fn run_chain(
+    l: &Launcher,
+    items: Vec<AgentItem>,
+    scope: AgentScope,
+    base_cwd: &Path,
+) -> ToolOutput {
+    if !l.registry.detach_foreground() {
+        return run_chain_steps(l, items, scope, base_cwd).await;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (l, base_cwd) = (l.clone(), base_cwd.to_path_buf());
+    let reg = Arc::clone(&l.registry);
+    let wait = DetachedWait::new(rx, &reg);
+    tokio::spawn(async move {
+        let out = run_chain_steps(&l, items, scope, &base_cwd).await;
+        let entry = format!("[chain finished] {}", out.content);
+        if let Err(f) = tx.send(Finished { out, entry }) {
+            reg.push_entry(f.entry);
+        }
+    });
+    wait.result().await
+}
+
+async fn run_chain_steps(
     l: &Launcher,
     items: Vec<AgentItem>,
     scope: AgentScope,
@@ -1745,44 +1785,7 @@ pub async fn run_single(
 pub(crate) fn spawn_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) -> ToolOutput {
     let id = prepared.id.clone();
     let archive_path = prepared.archive_path();
-    let dir = prepared.dir.clone();
-
-    let token = CancellationToken::new();
-    let reg_task = Arc::clone(reg);
-    let token_task = token.clone();
-    let id_task = id.clone();
-    let dir_task = dir.clone();
-
-    let handle = tokio::spawn(async move {
-        let reg_ref = &*reg_task;
-        let final_state = tokio::select! {
-            biased;
-            _ = token_task.cancelled() => {
-                // `run_body`'s `StateGuard` is dropped mid-flight by the
-                // cancellation of this branch's sibling, which already
-                // marks the entry Stopped and writes the partial report
-                // (ChildGuard in spawn_and_collect_with kills the group
-                // on drop too). Nothing left to do here but read it back.
-                AgentState::Stopped
-            }
-            out = run_body(reg_ref, prepared) => {
-                let _ = out;
-                reg_ref
-                    .snapshot()
-                    .into_iter()
-                    .find(|e| e.id == id_task)
-                    .map(|e| e.state)
-                    .unwrap_or(AgentState::Failed)
-            }
-        };
-        let report_path = dir_task.join("report.md");
-        let text = std::fs::read_to_string(&report_path).unwrap_or_default();
-        let capped = cap_report(text, &report_path);
-        reg_task.push_report(&id_task, final_state, &capped);
-    });
-
-    reg.track_background(&id, handle, token);
-
+    spawn_tracked(reg, prepared, None);
     ToolOutput {
         content: json!({
             "id": id,
@@ -1795,6 +1798,147 @@ pub(crate) fn spawn_background(reg: &Arc<AgentRegistry>, prepared: PreparedRun) 
         metadata: Some(json!({"agent_id": id, "agent_dir": archive_path})),
         images: Vec::new(),
     }
+}
+
+/// The tool result recorded for a call of `tool` that the user cancelled
+/// before it returned. For `agent` in a session where dispatches are
+/// detached (the TUI) it says the agents were NOT stopped: without that,
+/// the model reads "cancelled", assumes its agents died, and starts them
+/// again.
+pub(crate) fn cancelled_call_note(tool: &str) -> String {
+    cancelled_call_note_with(tool, agent_registry::global().is_some_and(|r| r.detach_foreground()))
+}
+
+fn cancelled_call_note_with(tool: &str, detached: bool) -> String {
+    if detached && tool.eq_ignore_ascii_case("agent") {
+        "[cancelled by user before the tool returned. The agents it dispatched were NOT stopped: \
+         they keep running, and each report is added to the conversation when it finishes. \
+         list_agents shows them; do not dispatch them again.]"
+            .to_string()
+    } else {
+        "[cancelled by user before tool completed]".to_string()
+    }
+}
+
+/// What a detached run hands to whoever awaits it: the tool result, and
+/// the outbox text that stands in for it if nobody is there to take it.
+struct Finished {
+    out: ToolOutput,
+    entry: String,
+}
+
+/// The waiting half of a detached foreground dispatch. Awaiting
+/// [`result`](Self::result) gives the tool result like a plain foreground
+/// call would. Dropping it first (the turn was cancelled) leaves the
+/// agent running; whatever it produced, now or later, goes to the outbox
+/// instead, so a result is delivered exactly once: to the caller or to
+/// the next turn, never both and never neither.
+struct DetachedWait {
+    rx: Option<tokio::sync::oneshot::Receiver<Finished>>,
+    reg: Arc<AgentRegistry>,
+}
+
+impl DetachedWait {
+    fn new(rx: tokio::sync::oneshot::Receiver<Finished>, reg: &Arc<AgentRegistry>) -> Self {
+        Self { rx: Some(rx), reg: Arc::clone(reg) }
+    }
+
+    async fn result(mut self) -> ToolOutput {
+        let got = match self.rx.as_mut() {
+            Some(rx) => rx.await,
+            None => unreachable!("result consumes the waiter"),
+        };
+        self.rx = None;
+        match got {
+            Ok(f) => f.out,
+            Err(_) => soft_error("the agent's task ended without a result".to_string()),
+        }
+    }
+}
+
+impl Drop for DetachedWait {
+    fn drop(&mut self) {
+        // Close first, then look: a result sent before the close is
+        // still in the channel and is forwarded here; one that arrives
+        // after finds the channel closed and forwards itself.
+        if let Some(mut rx) = self.rx.take() {
+            rx.close();
+            if let Ok(f) = rx.try_recv() {
+                self.reg.push_entry(f.entry);
+            }
+        }
+    }
+}
+
+/// A foreground dispatch that outlives the call awaiting it: the same
+/// tracked, stoppable task as a background agent, plus a way to get the
+/// result back to the caller (see [`DetachedWait`]).
+fn spawn_detached(reg: &Arc<AgentRegistry>, prepared: PreparedRun) -> DetachedWait {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    spawn_tracked(reg, prepared, Some(tx));
+    DetachedWait::new(rx, reg)
+}
+
+/// Run `prepared` on a detached, registry-tracked task. `reply`, when
+/// given, receives the result for a caller still waiting; a report for
+/// the outbox is pushed only when nobody takes it (always, if `None`).
+fn spawn_tracked(
+    reg: &Arc<AgentRegistry>,
+    prepared: PreparedRun,
+    reply: Option<tokio::sync::oneshot::Sender<Finished>>,
+) {
+    let id = prepared.id.clone();
+    let dir = prepared.dir.clone();
+
+    let token = CancellationToken::new();
+    let reg_task = Arc::clone(reg);
+    let token_task = token.clone();
+    let id_task = id.clone();
+    let dir_task = dir.clone();
+
+    let handle = tokio::spawn(async move {
+        let reg_ref = &*reg_task;
+        let (final_state, out) = tokio::select! {
+            biased;
+            _ = token_task.cancelled() => {
+                // `run_body`'s `StateGuard` is dropped mid-flight by the
+                // cancellation of this branch's sibling, which already
+                // marks the entry Stopped and writes the partial report
+                // (ChildGuard in spawn_and_collect_with kills the group
+                // on drop too). Nothing left to do here but read it back.
+                (AgentState::Stopped, None)
+            }
+            out = run_body(reg_ref, prepared) => {
+                let state = reg_ref
+                    .snapshot()
+                    .into_iter()
+                    .find(|e| e.id == id_task)
+                    .map(|e| e.state)
+                    .unwrap_or(AgentState::Failed);
+                (state, Some(out))
+            }
+        };
+        let report_path = dir_task.join("report.md");
+        let text = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let capped = cap_report(text, &report_path);
+        let entry = AgentRegistry::report_entry(&id_task, final_state, &capped);
+        match reply {
+            Some(tx) => {
+                let out = out.unwrap_or_else(|| ToolOutput {
+                    content: format!("[agent {id_task} stopped]\n\n{capped}"),
+                    is_error: true,
+                    metadata: Some(json!({"agent_id": id_task, "agent_dir": dir_task.to_string_lossy()})),
+                    images: Vec::new(),
+                });
+                if let Err(f) = tx.send(Finished { out, entry }) {
+                    reg_task.push_entry(f.entry);
+                }
+            }
+            None => reg_task.push_entry(entry),
+        }
+    });
+
+    reg.track_background(&id, handle, token);
 }
 
 /// Told to the model with every background dispatch: without it, models
@@ -3211,8 +3355,9 @@ mod tests {
     #[tokio::test]
     async fn background_dispatch_returns_immediately() {
         let cwd = tmp("bg");
-        // Slow fake child: a synchronous await would take 5s.
-        let l = launcher(&format!("sleep 5; echo '{OK_ENV}'"), 8, 4);
+        // Slow fake child: a synchronous await would take 60s, so the bound
+        // below is generous enough to hold on a loaded machine.
+        let l = launcher(&format!("sleep 60; echo '{OK_ENV}'"), 8, 4);
         let start = std::time::Instant::now();
         let out = AgentTool::with_parts(
             l.registry.clone(),
@@ -3225,7 +3370,7 @@ mod tests {
         )
         .await
         .expect("in-band dispatch");
-        assert!(start.elapsed() < Duration::from_secs(2), "must not block on the child");
+        assert!(start.elapsed() < Duration::from_secs(30), "must not block on the child");
         assert!(!out.is_error, "{}", out.content);
         let v: Value = serde_json::from_str(&out.content).unwrap();
         assert_eq!(v["id"].as_str(), Some("a1"));
@@ -3234,6 +3379,7 @@ mod tests {
             "{v}"
         );
         assert!(v["archive_path"].as_str().unwrap().contains("a1"));
+        l.registry.stop_all();
         l.registry.wait_background().await;
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -3242,7 +3388,7 @@ mod tests {
     #[tokio::test]
     async fn background_default_applies_when_flag_omitted() {
         let cwd = tmp("bg-default");
-        let l = launcher(&format!("sleep 5; echo '{OK_ENV}'"), 8, 4);
+        let l = launcher(&format!("sleep 60; echo '{OK_ENV}'"), 8, 4);
         l.registry.set_background_default(true);
         let tool = AgentTool::with_parts(l.registry.clone(), l.spec.clone(), l.program.clone());
         let start = std::time::Instant::now();
@@ -3250,7 +3396,7 @@ mod tests {
             .execute(json!({"task": "slow task"}), &ToolContext { cwd: cwd.clone() })
             .await
             .expect("in-band dispatch");
-        assert!(start.elapsed() < Duration::from_secs(2), "must not block on the child");
+        assert!(start.elapsed() < Duration::from_secs(30), "must not block on the child");
         let v: Value = serde_json::from_str(&out.content).unwrap();
         assert_eq!(v["id"].as_str(), Some("a1"));
         l.registry.stop_all();
@@ -4161,6 +4307,345 @@ mod tests {
             let _ = run.await;
             until("the grant to be revoked", || granted(&w, "a1").is_none()).await;
             w.finish().await;
+        }
+    }
+
+    /// Esc in the TUI cancels the orchestrator's turn, which drops the
+    /// future of the in-flight `agent` tool call. Dispatched agents must
+    /// survive that. These tests drive the tool exactly as the loop does
+    /// (the call runs on a task; "Esc" is aborting it) with the registry
+    /// configured as the TUI configures it.
+    #[cfg(unix)]
+    mod esc_survival {
+        use super::*;
+        use std::time::Instant;
+
+        /// Announces itself, leaves a grandchild (`gc.pid`) in its own agent
+        /// dir, then waits for a `release` file before finishing.
+        fn held_script() -> String {
+            format!(
+                "d=\"$(dirname \"$4\")\"; sleep 300 & echo $! > \"$d/gc.pid\"; touch \"$d/started\"; \
+                 while [ ! -f \"$d/release\" ]; do sleep 0.01; done; kill $!; echo '{OK_ENV}'"
+            )
+        }
+
+        struct Rig {
+            l: Launcher,
+            cwd: PathBuf,
+        }
+
+        impl Rig {
+            fn new(tag: &str) -> Self {
+                let l = launcher(&held_script(), 8, 4);
+                // What the interactive TUI does at startup.
+                l.registry.set_background_default(true);
+                l.registry.set_detach_foreground(true);
+                Self { l, cwd: tmp(tag) }
+            }
+
+            fn dir(&self, id: &str) -> PathBuf {
+                self.cwd.join(".nanopi/agents").join(self.l.registry.run_id()).join(id)
+            }
+
+            /// Run one `agent` tool call on its own task.
+            fn call(&self, args: Value) -> tokio::task::JoinHandle<Result<ToolOutput, ToolError>> {
+                let tool = AgentTool::with_parts(
+                    self.l.registry.clone(),
+                    self.l.spec.clone(),
+                    self.l.program.clone(),
+                );
+                let cwd = self.cwd.clone();
+                tokio::spawn(async move { tool.execute(args, &ToolContext { cwd }).await })
+            }
+
+            fn state(&self, id: &str) -> Option<AgentState> {
+                self.l.registry.snapshot().into_iter().find(|e| e.id == id).map(|e| e.state)
+            }
+
+            async fn started(&self, id: &str) {
+                let f = self.dir(id).join("started");
+                until(&format!("{id} to start"), || f.exists()).await;
+            }
+
+            fn release(&self, id: &str) {
+                std::fs::write(self.dir(id).join("release"), "").unwrap();
+            }
+
+            fn grandchild(&self, id: &str) -> i32 {
+                std::fs::read_to_string(self.dir(id).join("gc.pid"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            }
+
+            fn child_pid(&self, id: &str) -> i32 {
+                self.l
+                    .registry
+                    .snapshot()
+                    .into_iter()
+                    .find(|e| e.id == id)
+                    .and_then(|e| e.pid)
+                    .expect("child pid recorded") as i32
+            }
+
+            /// "Esc": the turn is cancelled, so the tool call's future is dropped.
+            async fn esc(h: tokio::task::JoinHandle<Result<ToolOutput, ToolError>>) {
+                h.abort();
+                let _ = h.await;
+            }
+
+            async fn reaped(&self, ids: &[&str]) {
+                for id in ids {
+                    let (c, g) = (self.child_pid(id), self.grandchild(id));
+                    until(&format!("{id}'s process group to be gone"), || pid_dead(c) && pid_dead(g)).await;
+                }
+            }
+
+            async fn drain(&self) {
+                self.l.registry.stop_all();
+                self.l.registry.wait_background().await;
+                let _ = std::fs::remove_dir_all(&self.cwd);
+            }
+        }
+
+        async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !cond() {
+                assert!(Instant::now() < deadline, "never saw: {what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn assert_alive(rig: &Rig, ids: &[&str]) {
+            for id in ids {
+                assert_eq!(rig.state(id), Some(AgentState::Running), "{id} must still be running");
+                assert!(!pid_dead(rig.child_pid(id)), "{id}'s child was killed");
+                assert!(!pid_dead(rig.grandchild(id)), "{id}'s grandchild was killed");
+            }
+        }
+
+        #[tokio::test]
+        async fn foreground_single_survives_esc_and_reports_later() {
+            let rig = Rig::new("esc-single");
+            let call = rig.call(json!({"task": "long", "background": false}));
+            rig.started("a1").await;
+            Rig::esc(call).await;
+
+            assert_alive(&rig, &["a1"]);
+            assert!(!rig.l.registry.has_pending_reports(), "nothing reported while it runs");
+
+            rig.release("a1");
+            until("the report to reach the outbox", || rig.l.registry.has_pending_reports()).await;
+            let text = rig.l.registry.take_reports().unwrap();
+            assert!(text.contains("[agent a1 finished: done]"), "{text}");
+            assert_eq!(rig.state("a1"), Some(AgentState::Completed));
+            rig.reaped(&["a1"]).await;
+            rig.drain().await;
+        }
+
+        #[tokio::test]
+        async fn foreground_parallel_survives_esc_and_reports_later() {
+            let rig = Rig::new("esc-par");
+            let call = rig.call(json!({"tasks": [{"task": "one"}, {"task": "two"}]}));
+            rig.started("a1").await;
+            rig.started("a2").await;
+            Rig::esc(call).await;
+
+            assert_alive(&rig, &["a1", "a2"]);
+            rig.release("a1");
+            rig.release("a2");
+            // Each item reports on its own; they can arrive batched or not.
+            let mut text = String::new();
+            until("both reports in the outbox", || {
+                if let Some(more) = rig.l.registry.take_reports() {
+                    text.push_str(&more);
+                }
+                text.contains("agent a1 finished: done") && text.contains("agent a2 finished: done")
+            })
+            .await;
+            rig.drain().await;
+        }
+
+        #[tokio::test]
+        async fn foreground_chain_survives_esc_and_later_steps_still_run() {
+            let rig = Rig::new("esc-chain");
+            let call = rig.call(json!({"chain": [{"task": "first"}, {"task": "second after {previous}"}]}));
+            rig.started("a1").await;
+            Rig::esc(call).await;
+
+            assert_alive(&rig, &["a1"]);
+            rig.release("a1");
+            // The chain driver outlived the turn: step 2 starts on its own.
+            rig.started("a2").await;
+            assert_alive(&rig, &["a2"]);
+            assert!(!rig.l.registry.has_pending_reports(), "the chain has not finished yet");
+            rig.release("a2");
+            until("the chain's report", || rig.l.registry.has_pending_reports()).await;
+            let text = rig.l.registry.take_reports().unwrap();
+            assert!(text.contains("Step 1") && text.contains("Step 2"), "{text}");
+            rig.drain().await;
+        }
+
+        /// What the model reads after Esc interrupts an `agent` call must not
+        /// tell it the agents died.
+        #[test]
+        fn the_cancelled_agent_call_says_the_agents_keep_running() {
+            let n = cancelled_call_note_with("agent", true);
+            assert!(n.contains("NOT stopped") && n.contains("keep running"), "{n}");
+            // Other tools, and sessions where dispatch is not detached, are as before.
+            assert_eq!(cancelled_call_note_with("bash", true), "[cancelled by user before tool completed]");
+            assert_eq!(cancelled_call_note_with("agent", false), "[cancelled by user before tool completed]");
+        }
+
+        #[tokio::test]
+        async fn background_true_survives_esc() {
+            let rig = Rig::new("esc-bg");
+            let call = rig.call(json!({"task": "long", "background": true}));
+            // The call returns at once; wait for the child, then "Esc".
+            rig.started("a1").await;
+            Rig::esc(call).await;
+            assert_alive(&rig, &["a1"]);
+            rig.drain().await;
+        }
+
+        /// The model gets the result when it is still there to take it, and
+        /// the outbox does not repeat it.
+        #[tokio::test]
+        async fn an_uncancelled_foreground_call_returns_its_result_and_reports_nothing() {
+            let rig = Rig::new("fg-normal");
+            let call = rig.call(json!({"task": "long", "background": false}));
+            rig.started("a1").await;
+            rig.release("a1");
+            let out = call.await.unwrap().unwrap();
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(rig.state("a1"), Some(AgentState::Completed));
+            assert!(!rig.l.registry.has_pending_reports(), "result was already returned");
+            rig.drain().await;
+        }
+
+        /// Outside the TUI a foreground dispatch dies with its caller, as ever.
+        #[tokio::test]
+        async fn without_the_tui_flag_a_foreground_call_dies_with_its_caller() {
+            let rig = Rig::new("fg-nodetach");
+            rig.l.registry.set_detach_foreground(false);
+            let call = rig.call(json!({"task": "long", "background": false}));
+            rig.started("a1").await;
+            let (child, grandchild) = (rig.child_pid("a1"), rig.grandchild("a1"));
+            Rig::esc(call).await;
+            assert_eq!(rig.state("a1"), Some(AgentState::Stopped));
+            until("the group to die", || pid_dead(child) && pid_dead(grandchild)).await;
+            rig.drain().await;
+        }
+
+        #[tokio::test]
+        async fn stop_by_id_after_esc_kills_the_whole_group_and_reports_stopped() {
+            let rig = Rig::new("stop-id");
+            let call = rig.call(json!({"task": "long", "background": false}));
+            rig.started("a1").await;
+            Rig::esc(call).await;
+            assert_alive(&rig, &["a1"]);
+
+            rig.l.registry.stop("a1").unwrap();
+            until("the report", || rig.l.registry.has_pending_reports()).await;
+            let text = rig.l.registry.take_reports().unwrap();
+            assert!(text.contains("[agent a1 finished: stopped]"), "{text}");
+            assert_eq!(rig.state("a1"), Some(AgentState::Stopped));
+            rig.reaped(&["a1"]).await;
+            // Stopping what is already over is a soft error, not a panic.
+            assert!(rig.l.registry.stop("a1").unwrap_err().contains("already stopped"));
+            assert!(rig.l.registry.stop("a99").unwrap_err().contains("no such agent"));
+            rig.drain().await;
+        }
+
+        /// The orchestrator's own `stop_agent` stops the agent it names and
+        /// returns: it does not sit waiting for every other agent to end.
+        #[tokio::test]
+        async fn stop_agent_tool_does_not_wait_for_the_others() {
+            let rig = Rig::new("stop-tool");
+            let call = rig.call(json!({"tasks": [{"task": "one"}, {"task": "two"}]}));
+            rig.started("a1").await;
+            rig.started("a2").await;
+            Rig::esc(call).await;
+
+            let tool = crate::tool::agent_ctl::StopAgentTool::with_registry(rig.l.registry.clone());
+            let out = tokio::time::timeout(
+                Duration::from_secs(15),
+                tool.execute(json!({"id": "a1"}), &ToolContext { cwd: rig.cwd.clone() }),
+            )
+            .await
+            .expect("stop_agent must return while a2 is still running")
+            .unwrap();
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(rig.state("a1"), Some(AgentState::Stopped));
+            assert_alive(&rig, &["a2"]);
+            rig.drain().await;
+        }
+
+        #[tokio::test]
+        async fn stop_all_after_esc_stops_every_parallel_agent() {
+            let rig = Rig::new("stop-all");
+            let call = rig.call(json!({"tasks": [{"task": "one"}, {"task": "two"}]}));
+            rig.started("a1").await;
+            rig.started("a2").await;
+            Rig::esc(call).await;
+
+            let mut stopped = rig.l.registry.stop_all();
+            stopped.sort();
+            assert_eq!(stopped, vec!["a1".to_string(), "a2".to_string()]);
+            rig.reaped(&["a1", "a2"]).await;
+            for id in ["a1", "a2"] {
+                until("stopped", || rig.state(id) == Some(AgentState::Stopped)).await;
+            }
+            rig.drain().await;
+        }
+
+        /// Stopping the running step of an orphaned chain ends the chain: no
+        /// later step is started behind the user's back.
+        #[tokio::test]
+        async fn stopping_a_chain_step_ends_the_chain() {
+            let rig = Rig::new("stop-chain");
+            let call = rig.call(json!({"chain": [{"task": "first"}, {"task": "second"}]}));
+            rig.started("a1").await;
+            Rig::esc(call).await;
+
+            rig.l.registry.stop("a1").unwrap();
+            until("the chain's report", || rig.l.registry.has_pending_reports()).await;
+            let text = rig.l.registry.take_reports().unwrap();
+            assert!(text.contains("Chain stopped at step 1"), "{text}");
+            assert_eq!(rig.l.registry.snapshot().len(), 1, "step 2 must never start");
+            rig.reaped(&["a1"]).await;
+            rig.drain().await;
+        }
+
+        /// While the call is still awaited, stopping returns a stopped
+        /// result to it (and so to the model) instead of hanging.
+        #[tokio::test]
+        async fn stopping_an_awaited_foreground_agent_returns_to_the_caller() {
+            let rig = Rig::new("stop-awaited");
+            let call = rig.call(json!({"task": "long", "background": false}));
+            rig.started("a1").await;
+            rig.l.registry.stop("a1").unwrap();
+            let out = call.await.unwrap().unwrap();
+            assert!(out.is_error && out.content.contains("stopped"), "{}", out.content);
+            assert!(!rig.l.registry.has_pending_reports());
+            rig.reaped(&["a1"]).await;
+            rig.drain().await;
+        }
+
+        /// The quit path sweeps the agents and then refuses new ones, so a
+        /// detached chain cannot start a child after the sweep.
+        #[tokio::test]
+        async fn quit_stops_detached_agents_and_closes_the_door() {
+            let rig = Rig::new("quit");
+            let call = rig.call(json!({"chain": [{"task": "first"}, {"task": "second"}]}));
+            rig.started("a1").await;
+            Rig::esc(call).await;
+            let (child, grandchild) = (rig.child_pid("a1"), rig.grandchild("a1"));
+            rig.l.registry.kill_all();
+            until("the group to die", || pid_dead(child) && pid_dead(grandchild)).await;
+            assert!(rig.l.registry.reserve(&rig.cwd.join(".nanopi/agents")).is_err());
+            rig.drain().await;
         }
     }
 }
