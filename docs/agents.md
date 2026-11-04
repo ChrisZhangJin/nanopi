@@ -5,9 +5,12 @@ Modes: single, parallel (up to 8 tasks), chain. A child that crashes, panics,
 is killed or times out comes back to the model as an in-band `status: failed`
 result; the parent keeps running.
 
-There is no slash command, prompt or control action for agents in the TUI.
-They are controlled only by the model through the tool. The TUI does show a
-read-only agents strip while agents are running or queued — see below.
+In the TUI the model dispatches and steers agents through the tool, and you
+watch and stop them with `/agents`: a picker over every agent of the run,
+`/agents show` for one agent's detail card, `/agents list`, `/agents stop` and
+`/agents clean` (see "Inspecting agents" and "Esc and stopping agents"). While
+agents are running or queued the TUI also shows a read-only agents strip — see
+below.
 
 ## Child command line
 
@@ -134,6 +137,79 @@ See `docs/v0.13-manual-test-plan.md` for the consolidated manual E2E plan
 (QA-01), which includes this strip's Ctrl+G rows alongside orchestrator
 mode, worktree merge, and the dispatch/amend/stop/continue control flow.
 
+## Inspecting agents (`/agents`)
+
+The strip drops an agent the moment it finishes. `/agents` does not: it covers
+every agent of the current run, finished ones included, for as long as the
+session lasts (the registry keeps them). All of it is read-only and works while
+a turn is streaming.
+
+- **`/agents`** opens a picker, the same widget as `/resume`: `Up`/`Down` move,
+  typing filters (by name, id or state), `Enter` prints that agent's detail
+  card into scrollback and closes the picker, `Esc` closes the picker and does
+  nothing else (it never cancels the turn or touches an agent). One row per
+  agent — running and queued first (by id), then finished ones, most recently
+  finished first: state glyph, id, name (the agent's label, else its role, else
+  the start of its task), and on the right the state with its elapsed time, or
+  its total duration once finished. With no agents yet it prints
+  `no agents in this session` and opens nothing. The rows are a snapshot taken
+  when the picker opens; the card is read fresh when you choose.
+- **`/agents show <id|name-prefix>`** (or just `/agents <id>`) prints the card
+  without the picker. An id is `a3`; a name is a case-insensitive prefix of an
+  agent's label, role or task and must match exactly one agent of the run,
+  finished or not. An ambiguous name shows nothing and lists the candidate ids;
+  an unknown id or name is a one-line message.
+- **`/agents list`** is the plain-text listing: the live agents exactly as
+  `Ctrl+G` prints them, then a `── finished ──` block with the run's finished
+  agents, one line each (`✓ a2  name  done 1m05s`).
+
+The card, for an agent that failed:
+
+```
+✗ a3  doc translator
+  failed · took 1s · model gpt-4o · turns 1 · tokens 0
+  tools  read, grep
+task
+  Translate the docs directory into Japanese and ...
+amendments (1 so far)
+  #1 also keep the code blocks untranslated
+activity
+  … 3 earlier entries not shown
+  → read(docs/index.md)
+  ← ok  # Index
+  ◆ Translating the first file now
+  error  provider error: provider returned status 400: quota exceeded
+report
+  /project/.nanopi/agents/<run>/a3/report.md
+  │ # Report
+  │ ## Summary
+  │ error: provider error: ...
+paths
+  dir         /project/.nanopi/agents/<run>/a3
+  transcript  /project/.nanopi/agents/<run>/a3/transcript.jsonl
+```
+
+Fields the card cannot know are left out rather than shown as placeholders:
+`model` comes from the brief, else from the transcript's session header;
+`turns` and `tokens` exist only once the agent has written its report; the
+worktree and branch only for an isolated agent; `tools` (names only) from
+`tools.json`, else the brief. The task is cut at about 300 characters. The
+activity is the last 12 transcript entries (assistant text and your own
+messages by first line, tool calls as `name(argument)`, tool results as
+`ok`/`error` plus their first line); how many earlier ones there are is stated.
+The reason line (`error`, `stopped`, `limit reached`) is the first lines of the
+report's summary, for an agent that did not complete. The report shows its
+first 15 lines. The card is at most 60 lines, and the paths are never cut, so
+you can open the full files.
+
+Nothing on the card is trusted: everything that came from a model or from a file
+an agent can write has its control characters (escape sequences included)
+stripped before it is laid out, and is cut by display width, so CJK text and
+narrow terminals are safe. Reads are bounded: the last 64 KiB of the
+transcript, the first 256 KiB of the brief and 16 KiB of the report, so a huge
+or half-written file costs the same as a small one, and an unreadable or
+non-UTF-8 one just leaves its fields out.
+
 ## Esc and stopping agents
 
 In the TUI, `Esc` (and `Ctrl-C` while a turn is streaming) interrupts **the
@@ -164,9 +240,9 @@ Agents are stopped only by:
 `/agents stop` prints which ids it stopped. An unknown or already-finished id
 (or a name that matches nothing, or several agents) is a one-line message, not
 an error: the TUI carries on. A stopped agent ends `stopped` with a partial
-report, which is delivered like any other. Bare `/agents` (or `/agents list`)
-prints the live agents with their id, name and state; `/agents clean` still
-prunes the on-disk archive.
+report, which is delivered like any other. `/agents clean` still prunes the
+on-disk archive. `/agents` (the picker) and `/agents show` are how you look at
+an agent before deciding to stop it.
 
 Non-interactive runs are unchanged: in `nanopi -p`, `Ctrl-C` stops every agent,
 and a foreground dispatch dies with the process that is waiting for it.

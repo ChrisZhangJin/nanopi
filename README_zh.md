@@ -258,8 +258,10 @@ agent 都在后台跑，所以编排者派完活就把这一轮还给你，而�
 期间的 <kbd>Ctrl-C</kbd>）只打断编排者自己；所有已派出的 agent——后台的、前台的、
 `parallel`、`chain`——都会继续跑，结束后照常汇报。要停 agent 只有三种办法：
 `/agents stop <id|名字前缀>`（或 `/agents stop all`）、你要求时由编排者自己调用
-`stop_agent`、退出 nanopi。单独输入 `/agents` 会列出正在跑的 agent。详见
-[docs/agents.md](docs/agents.md)。
+`stop_agent`、退出 nanopi。单独输入 `/agents` 会打开一个选择器，列出本次运行的所有
+agent（包括已结束的）；按 <kbd>Enter</kbd> 会把该 agent 的详情卡片（状态、耗时、模型、
+任务、最近活动、报告、路径）打印到滚动区，`/agents show <id|名字前缀>` 可直接查看某一个；
+`/agents list` 是纯文本版本。详见 [docs/agents.md](docs/agents.md)。
 
 并行写代码的 agent 可以各自用一个 git worktree（`isolation: "worktree"`），
 结束后自动合并，有冲突则升级给你处理。

@@ -55,6 +55,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::loop_::{Agent, HooksConfig};
 use crate::agent::permission::PermissionGate;
 use crate::event::{AgentEvent, SteerMessage};
+use crate::mode::agent_detail;
 use crate::mode::agents_strip::{self, AgentsView, StripOpts};
 use crate::mode::exit_signal::ExitSignals;
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
@@ -231,7 +232,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/import", "Import a session from JSONL", SlashCmd::Import),
         MenuItem::new(
             "/agents",
-            "Agents: list | stop <id|name|all> | clean [--older <days> | --keep <n>]",
+            "Agents: pick one to inspect | show <id|name> | list | stop <id|name|all> | clean [--older <days> | --keep <n>]",
             SlashCmd::Agents,
         ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
@@ -1034,6 +1035,10 @@ struct App {
     /// When Some, the `/resume` picker over past sessions in this
     /// cwd is open. Payload is the file path of the chosen session.
     resume_picker: Option<MenuState<PathBuf>>,
+    /// When Some, the bare `/agents` picker over every agent of this run
+    /// (finished ones included) is open. Payload is the agent id. Esc only
+    /// closes it; it never reaches the turn or the registry.
+    agents_picker: Option<MenuState<String>>,
     settings_menu: Option<MenuState<SettingsRow>>,
     keybindings_menu: Option<MenuState<crate::keys::ActionId>>,
     capture_key_for: Option<crate::keys::ActionId>,
@@ -1279,6 +1284,7 @@ impl App {
             thinking: None,
             turn_was_cancelled: false,
             resume_picker: None,
+            agents_picker: None,
             settings_menu: None,
             keybindings_menu: None,
             capture_key_for: None,
@@ -1482,9 +1488,14 @@ enum KeyAction {
     ApplyName(String),
     /// `/agents clean ...` parsed successfully — run the prune.
     CleanAgents(crate::archive::CleanMode),
-    /// Bare `/agents` / `/agents list` — print the agents with id, name
-    /// and state.
+    /// `/agents list` — print the agents with id, name and state, the
+    /// finished ones of this run marked as such.
     ListAgents,
+    /// Bare `/agents` — open the picker over every agent of this run.
+    OpenAgentsPicker,
+    /// `/agents show <id|name-prefix>` (or the picker's Enter, with an id)
+    /// — print one agent's detail card into scrollback.
+    ShowAgent(String),
     /// `/agents stop <id|name-prefix|all>` — stop agents. Works while a
     /// turn is streaming; never touches the turn.
     StopAgents(AgentStopTarget),
@@ -1635,6 +1646,32 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                 app.input.clear();
                 return KeyAction::Nothing;
             }
+            MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
+                return KeyAction::Nothing
+            }
+        }
+    }
+    // ── Agents picker ───────────────────────────────────────────────
+    // Handled here, ahead of the "Esc during a streaming turn" rule below,
+    // so that Esc closes the picker and nothing else: it must not reach
+    // `CancelTurn`, and no key in here touches the registry. Enter hands
+    // the chosen id to `ShowAgent`, which only reads.
+    if app.agents_picker.is_some() {
+        let m = app.agents_picker.as_mut().unwrap();
+        match m.handle_key(k) {
+            MenuAction::Chosen(id) => {
+                app.agents_picker = None;
+                app.input.clear();
+                return KeyAction::ShowAgent(id);
+            }
+            MenuAction::Cancel => {
+                app.agents_picker = None;
+                app.input.clear();
+                return KeyAction::Nothing;
+            }
+            // `ChosenRaw`: Enter on a filter that matches no agent. There is
+            // nothing to open, so the picker stays and the filter can be
+            // edited.
             MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
                 return KeyAction::Nothing
             }
@@ -2094,8 +2131,8 @@ fn sync_palette(app: &mut App) {
 
 /// `/agents` usage line, shown on any bad/missing argument (T-02-19:
 /// strict parse, anything unrecognized deletes and stops nothing).
-const AGENTS_USAGE: &str = "Usage: /agents [list] | /agents stop <id|name-prefix|all> | \
-/agents clean [--older <days> | --keep <n>]";
+const AGENTS_USAGE: &str = "Usage: /agents | /agents show <id|name-prefix> | /agents <id> | \
+/agents list | /agents stop <id|name-prefix|all> | /agents clean [--older <days> | --keep <n>]";
 
 /// What `/agents stop` was asked to stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2109,20 +2146,38 @@ enum AgentStopTarget {
 /// A parsed `/agents` command.
 #[derive(Debug, PartialEq, Eq)]
 enum AgentsCmd {
+    /// Bare `/agents`: the interactive picker.
+    Pick,
+    /// `/agents list`: the non-interactive text listing.
     List,
+    /// `/agents show <q>` or `/agents <id>`.
+    Show(String),
     Stop(AgentStopTarget),
     Clean(crate::archive::CleanMode),
 }
 
 /// Parse the argument string after `/agents` (D-10, ARC-05). Accepted:
-/// nothing or `list`; `stop <id|name-prefix|all>`; `clean`,
+/// nothing (the picker); `list`; `show <id|name-prefix>` or a bare agent id
+/// (`a3`, which no subcommand can be mistaken for); `stop <id|name-prefix|all>`; `clean`,
 /// `clean --older <u64>` and `clean --keep <usize>`. Anything else
 /// (including a non-numeric or trailing-garbage value) is
 /// `Err(AGENTS_USAGE)` and does nothing.
 fn parse_agents_args(arg: &str) -> Result<AgentsCmd, String> {
     let mut parts = arg.trim().split_whitespace();
     match parts.next() {
-        None => Ok(AgentsCmd::List),
+        None => Ok(AgentsCmd::Pick),
+        Some("show") => {
+            let query = parts.collect::<Vec<_>>().join(" ");
+            if query.is_empty() {
+                Err(AGENTS_USAGE.to_string())
+            } else {
+                Ok(AgentsCmd::Show(query))
+            }
+        }
+        Some(id) if looks_like_agent_id(&id.to_lowercase()) => match parts.next() {
+            None => Ok(AgentsCmd::Show(id.to_string())),
+            Some(_) => Err(AGENTS_USAGE.to_string()),
+        },
         Some("list") => match parts.next() {
             None => Ok(AgentsCmd::List),
             Some(_) => Err(AGENTS_USAGE.to_string()),
@@ -2168,8 +2223,7 @@ fn parse_agents_args(arg: &str) -> Result<AgentsCmd, String> {
 
 /// `a` followed by digits: the shape of a registry agent id.
 fn looks_like_agent_id(q: &str) -> bool {
-    q.strip_prefix('a')
-        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    agent_detail::is_agent_id(q)
 }
 
 /// What a name query matches: the agent's role (its agent name, or the
@@ -2245,6 +2299,98 @@ fn stop_agents(
             Err(e) => out(e, true),
         })
         .collect()
+}
+
+/// The bare `/agents` picker over every agent of this run, finished ones
+/// included (pure over `rows`; see [`open_agents_picker`] for the IO).
+/// `None` when there is nothing to pick from.
+fn build_agents_picker(rows: &[agent_detail::AgentRow]) -> Option<MenuState<String>> {
+    if rows.is_empty() {
+        return None;
+    }
+    let items = agent_detail::picker_items(rows)
+        .into_iter()
+        .map(|(label, desc, id)| MenuItem::new(label, desc, id))
+        .collect();
+    // Typing filters; Enter on no match does nothing (the list is closed).
+    Some(MenuState::new(items).with_filter_only())
+}
+
+/// Bare `/agents`: read the registry (a snapshot, plus the head of each
+/// agent's brief to name it) and build the picker, or say in one line why
+/// there is none. Never blocks on an agent and never writes.
+fn open_agents_picker(
+    reg: Option<&crate::agent_registry::AgentRegistry>,
+    now: std::time::Instant,
+) -> Result<MenuState<String>, String> {
+    let Some(reg) = reg else {
+        return Err("no agent registry in this session".to_string());
+    };
+    let rows = agent_detail::collect_rows(&reg.snapshot(), now);
+    build_agents_picker(&rows).ok_or_else(|| "no agents in this session".to_string())
+}
+
+/// `/agents show <query>` (and the picker's Enter): resolve the query over
+/// every agent of the run and render its card for `width` columns. `Err`
+/// is the one in-band line to print instead (unknown id, ambiguous name).
+/// Read-only.
+fn show_agent(
+    reg: Option<&crate::agent_registry::AgentRegistry>,
+    query: &str,
+    width: usize,
+    now: std::time::Instant,
+) -> Result<(crate::agent_registry::AgentState, Vec<agent_detail::CardLine>), String> {
+    let Some(reg) = reg else {
+        return Err("no agent registry in this session".to_string());
+    };
+    let snapshot = reg.snapshot();
+    let rows = agent_detail::collect_rows(&snapshot, now);
+    let id = agent_detail::resolve_agent(query, &rows)?;
+    let entry = snapshot
+        .iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| format!("no agent {id} in this session"))?;
+    let card = agent_detail::load_card(entry, now);
+    Ok((entry.state, agent_detail::render_card(&card, width)))
+}
+
+/// How a card line is drawn.
+fn card_line_style(kind: agent_detail::LineKind, state: crate::agent_registry::AgentState) -> Style {
+    use agent_detail::LineKind::*;
+    use crate::agent_registry::AgentState as S;
+    match kind {
+        Header => {
+            let colour = match state {
+                S::Running => Color::Cyan,
+                S::Failed => Color::Red,
+                S::Completed => Color::Green,
+                _ => Color::DarkGray,
+            };
+            Style::default().fg(colour).add_modifier(Modifier::BOLD)
+        }
+        Section => Style::default().fg(Color::Indexed(108)),
+        Body => Style::default(),
+        Dim | Path => Style::default().fg(Color::DarkGray),
+        Error => Style::default().fg(Color::Yellow),
+    }
+}
+
+/// `/agents list`'s output as `(text, dim)` lines: the live agents exactly
+/// as before, then the run's finished ones under their own heading. With
+/// nothing live the old "no running agents" line still leads.
+fn agents_list_output(live: &[String], finished: &[String]) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    if live.is_empty() {
+        out.push(("no running agents".to_string(), true));
+    } else {
+        out.push(("── agents ──".to_string(), true));
+        out.extend(live.iter().map(|l| (l.clone(), false)));
+    }
+    if !finished.is_empty() {
+        out.push(("── finished ──".to_string(), true));
+        out.extend(finished.iter().map(|l| (l.clone(), false)));
+    }
+    out
 }
 
 /// How many agents of this run are still going (queued or running).
@@ -2382,6 +2528,8 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             Ok(AgentsCmd::Clean(mode)) => KeyAction::CleanAgents(mode),
             Ok(AgentsCmd::Stop(target)) => KeyAction::StopAgents(target),
             Ok(AgentsCmd::List) => KeyAction::ListAgents,
+            Ok(AgentsCmd::Pick) => KeyAction::OpenAgentsPicker,
+            Ok(AgentsCmd::Show(q)) => KeyAction::ShowAgent(q),
             Err(msg) => KeyAction::AgentsUsage(msg),
         },
         SlashCmd::Copy => KeyAction::CopyLastReply,
@@ -3578,22 +3726,69 @@ async fn handle_action(
             }
         }
         KeyAction::ListAgents => {
+            let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
+            let now = std::time::Instant::now();
+            let mut finished: Vec<String> = Vec::new();
             if let Some(reg) = crate::agent_registry::global() {
-                app.agents_view.refresh(&reg.snapshot(), std::time::Instant::now());
+                let snapshot = reg.snapshot();
+                app.agents_view.refresh(&snapshot, now);
+                // The strip forgets a finished agent; the registry does not.
+                let done: Vec<_> =
+                    snapshot.into_iter().filter(|e| e.state.is_terminal()).collect();
+                finished = agent_detail::finished_list_lines(
+                    &agent_detail::collect_rows(&done, now),
+                    width,
+                );
             }
-            if app.agents_view.is_empty() {
-                insert_line(term, Line::from(vec![Span::styled(
-                    "no running agents",
-                    Style::default().fg(Color::DarkGray),
-                )]))?;
+            let live = if app.agents_view.is_empty() {
+                Vec::new()
             } else {
-                let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
-                insert_line(term, Line::from(vec![Span::styled(
-                    "── agents ──",
-                    Style::default().fg(Color::DarkGray),
-                )]))?;
-                for text in agents_detail_block(app, width) {
-                    insert_line(term, Line::from(vec![Span::raw(text)]))?;
+                agents_detail_block(app, width)
+            };
+            for (text, dim) in agents_list_output(&live, &finished) {
+                let style = if dim { Style::default().fg(Color::DarkGray) } else { Style::default() };
+                insert_line(term, Line::from(vec![Span::styled(text, style)]))?;
+            }
+        }
+        KeyAction::OpenAgentsPicker => {
+            match open_agents_picker(
+                crate::agent_registry::global().as_deref(),
+                std::time::Instant::now(),
+            ) {
+                Ok(picker) => app.agents_picker = Some(picker),
+                Err(msg) => {
+                    insert_line(term, Line::from(vec![Span::styled(
+                        msg,
+                        Style::default().fg(Color::DarkGray),
+                    )]))?;
+                }
+            }
+        }
+        KeyAction::ShowAgent(query) => {
+            let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
+            match show_agent(
+                crate::agent_registry::global().as_deref(),
+                &query,
+                width,
+                std::time::Instant::now(),
+            ) {
+                Ok((state, lines)) => {
+                    insert_line(term, Line::from(vec![Span::styled(
+                        "── agent ──",
+                        Style::default().fg(Color::DarkGray),
+                    )]))?;
+                    for l in lines {
+                        insert_line(term, Line::from(vec![Span::styled(
+                            l.text,
+                            card_line_style(l.kind, state),
+                        )]))?;
+                    }
+                }
+                Err(msg) => {
+                    insert_line(term, Line::from(vec![Span::styled(
+                        msg,
+                        Style::default().fg(Color::Yellow),
+                    )]))?;
                 }
             }
         }
@@ -6182,6 +6377,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // and scrolls internally to keep the cursor visible.
     let overlay_open = app.summary_prompt.is_some()
         || app.resume_picker.is_some()
+        || app.agents_picker.is_some()
         || app.fork_picker.is_some()
         || app.model_picker.is_some()
         || app.palette.is_some()
@@ -6247,6 +6443,8 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         draw_menu(buf, chunks[0], m, "keybindings");
     } else if let Some(m) = &app.resume_picker {
         draw_menu(buf, chunks[0], m, "resume session");
+    } else if let Some(m) = &app.agents_picker {
+        draw_menu(buf, chunks[0], m, "agent");
     } else if let Some(m) = &app.fork_picker {
         draw_menu(buf, chunks[0], m, "user message");
     } else if let Some(m) = &app.model_picker {
@@ -6646,7 +6844,7 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
     // Free-text menus own their filter, so echo it — otherwise the user
     // is typing blind (the input box isn't receiving these keystrokes).
     let mut lines: Vec<Line> = Vec::new();
-    let typed = m.is_free_text().then(|| m.filter()).unwrap_or("");
+    let typed = m.owns_filter().then(|| m.filter()).unwrap_or("");
     if !typed.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(format!("  {label}: "), dim),
@@ -6708,18 +6906,20 @@ fn draw_menu<T: Clone>(buf: &mut Buffer, area: Rect, m: &MenuState<T>, label: &s
         // Without this, long labels (e.g. a full user-message preview)
         // push the description off past the right edge and the column
         // stops aligning between rows.
-        let desc_w = item.description.chars().count();
+        // Display columns, not chars: a CJK label counted per char would
+        // push the right-aligned description past the row's edge.
+        let desc_w = agents_strip::display_width(&item.description);
         let label_max = total_w.saturating_sub(arrow_w + gap_w + desc_w);
-        let label_w = item.label.chars().count();
+        let label_w = agents_strip::display_width(&item.label);
         let label_str = if label_w > label_max {
-            let take = label_max.saturating_sub(1);
-            let mut s: String = item.label.chars().take(take).collect();
+            let mut s =
+                agents_strip::truncate_to_width(&item.label, label_max.saturating_sub(1));
             s.push('…');
             s
         } else {
             item.label.clone()
         };
-        let pad = label_max.saturating_sub(label_str.chars().count());
+        let pad = label_max.saturating_sub(agents_strip::display_width(&label_str));
         let label_padded = format!("{}{}", label_str, " ".repeat(pad));
 
         lines.push(Line::from(vec![
@@ -8374,7 +8574,7 @@ mod tests {
 
     #[test]
     fn agents_list_and_stop_parse() {
-        assert_eq!(parse_agents_args(""), Ok(AgentsCmd::List));
+        assert_eq!(parse_agents_args(""), Ok(AgentsCmd::Pick));
         assert_eq!(parse_agents_args("list"), Ok(AgentsCmd::List));
         assert_eq!(parse_agents_args("stop all"), Ok(AgentsCmd::Stop(AgentStopTarget::All)));
         assert_eq!(parse_agents_args("stop ALL"), Ok(AgentsCmd::Stop(AgentStopTarget::All)));
@@ -8399,7 +8599,7 @@ mod tests {
             dispatch_slash(SlashCmd::Agents, "stop all".into()),
             KeyAction::StopAgents(AgentStopTarget::All)
         ));
-        assert!(matches!(dispatch_slash(SlashCmd::Agents, String::new()), KeyAction::ListAgents));
+        assert!(matches!(dispatch_slash(SlashCmd::Agents, String::new()), KeyAction::OpenAgentsPicker));
         assert!(matches!(dispatch_slash(SlashCmd::Agents, "list".into()), KeyAction::ListAgents));
     }
 
@@ -8408,6 +8608,291 @@ mod tests {
         assert!(AGENTS_USAGE.contains("stop <id|name-prefix|all>"));
         let item = slash_items().into_iter().find(|i| i.label == "/agents").unwrap();
         assert!(item.description.contains("stop"), "{}", item.description);
+    }
+
+    // ─────── /agents picker and /agents show ───────
+
+    #[test]
+    fn agents_show_and_id_alias_parse() {
+        assert_eq!(parse_agents_args("show a3"), Ok(AgentsCmd::Show("a3".into())));
+        // A name may have spaces in it, as for `stop`.
+        assert_eq!(parse_agents_args("show  code  rev "), Ok(AgentsCmd::Show("code rev".into())));
+        // `/agents a3` is the same as `/agents show a3`; ids cannot collide
+        // with a subcommand.
+        assert_eq!(parse_agents_args("a3"), Ok(AgentsCmd::Show("a3".into())));
+        assert_eq!(parse_agents_args(" A12 "), Ok(AgentsCmd::Show("A12".into())));
+        assert!(parse_agents_args("show").is_err());
+        assert!(parse_agents_args("a3 extra").is_err());
+        // Only an id gets the shorthand: a name needs `show`, and the
+        // subcommand words keep their meaning.
+        assert!(parse_agents_args("alpha").is_err());
+        assert!(parse_agents_args("a").is_err());
+        assert!(parse_agents_args("a1b").is_err());
+        assert_eq!(parse_agents_args("list"), Ok(AgentsCmd::List));
+        assert_eq!(parse_agents_args(""), Ok(AgentsCmd::Pick));
+    }
+
+    #[test]
+    fn dispatch_agents_pick_show_and_list() {
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, String::new()),
+            KeyAction::OpenAgentsPicker
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "list".into()),
+            KeyAction::ListAgents
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "show alp".into()),
+            KeyAction::ShowAgent(q) if q == "alp"
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "a2".into()),
+            KeyAction::ShowAgent(q) if q == "a2"
+        ));
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "show".into()),
+            KeyAction::AgentsUsage(_)
+        ));
+    }
+
+    #[test]
+    fn agents_usage_and_palette_mention_show() {
+        assert!(AGENTS_USAGE.contains("show <id|name-prefix>"), "{AGENTS_USAGE}");
+        let item = slash_items().into_iter().find(|i| i.label == "/agents").unwrap();
+        assert!(item.description.contains("show"), "{}", item.description);
+    }
+
+    /// Typing `/agents` and pressing Enter reaches the picker action
+    /// through the real palette path.
+    #[test]
+    fn typing_slash_agents_enter_opens_the_picker_action() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/agents");
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(got, KeyAction::OpenAgentsPicker), "{got:?}");
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn picker_ids(app: &App) -> Vec<String> {
+        app.agents_picker
+            .as_ref()
+            .unwrap()
+            .visible()
+            .iter()
+            .map(|i| i.payload.clone())
+            .collect()
+    }
+
+    #[test]
+    fn picker_lists_live_first_then_finished_and_filters_by_typing() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[
+            ("kimi migrate", Completed),
+            ("jade audit", Running),
+            ("bad build", Failed),
+            ("waiting", Queued),
+        ]);
+        let mut app = mkapp();
+        app.agents_picker = Some(
+            open_agents_picker(Some(&reg), std::time::Instant::now()).expect("agents exist"),
+        );
+        // Live (a2 running, a4 queued) by id, then the finished ones.
+        let ids = picker_ids(&app);
+        assert_eq!(&ids[..2], ["a2", "a4"], "{ids:?}");
+        assert_eq!(ids.len(), 4);
+        assert!(ids[2..].contains(&"a1".to_string()) && ids[2..].contains(&"a3".to_string()));
+
+        // Rows carry glyph, id, name and a state clock.
+        let vis = app.agents_picker.as_ref().unwrap().visible();
+        assert_eq!(vis[0].label, "● a2  jade audit");
+        assert!(vis[0].description.starts_with("running "), "{}", vis[0].description);
+        let finished: Vec<String> = vis[2..].iter().map(|i| i.label.clone()).collect();
+        assert!(finished.iter().any(|l| l == "✓ a1  kimi migrate"), "{finished:?}");
+        assert!(finished.iter().any(|l| l == "✗ a3  bad build"), "{finished:?}");
+
+        // Typing filters. `k` and `j` are letters here, not navigation: a
+        // picker that cannot filter for "kimi" is not much of one.
+        for c in "kim".chars() {
+            assert!(matches!(
+                interpret_key(&mut app, key(KeyCode::Char(c))),
+                KeyAction::Nothing
+            ));
+        }
+        assert_eq!(picker_ids(&app), ["a1"]);
+        // A filter that matches nothing leaves the picker open and Enter inert.
+        interpret_key(&mut app, key(KeyCode::Char('z')));
+        assert!(picker_ids(&app).is_empty());
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Enter)), KeyAction::Nothing));
+        assert!(app.agents_picker.is_some(), "no match must not close the picker");
+        interpret_key(&mut app, key(KeyCode::Backspace));
+        // Enter on the match opens that agent's card.
+        match interpret_key(&mut app, key(KeyCode::Enter)) {
+            KeyAction::ShowAgent(id) => assert_eq!(id, "a1"),
+            other => panic!("expected ShowAgent, got {other:?}"),
+        }
+        assert!(app.agents_picker.is_none(), "Enter closes the picker");
+    }
+
+    #[test]
+    fn picker_arrows_move_the_selection() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("one", Running), ("two", Running)]);
+        let mut app = mkapp();
+        app.agents_picker = open_agents_picker(Some(&reg), std::time::Instant::now()).ok();
+        interpret_key(&mut app, key(KeyCode::Down));
+        match interpret_key(&mut app, key(KeyCode::Enter)) {
+            KeyAction::ShowAgent(id) => assert_eq!(id, "a2"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_or_missing_registry_means_a_message_not_an_overlay() {
+        let reg = crate::agent_registry::AgentRegistry::new(&reg_cfg());
+        assert_eq!(
+            open_agents_picker(Some(&reg), std::time::Instant::now()).err().as_deref(),
+            Some("no agents in this session")
+        );
+        assert!(open_agents_picker(None, std::time::Instant::now()).is_err());
+        assert!(build_agents_picker(&[]).is_none());
+    }
+
+    /// Esc closes the picker and NOTHING else, also mid-turn: it must not
+    /// become `CancelTurn`, must not flag the turn as cancelled, and must not
+    /// touch a single agent. This is the property the v0.15 Esc work exists
+    /// to protect, so it is tested against a real registry with live agents.
+    #[test]
+    fn esc_in_the_picker_closes_it_without_cancelling_or_touching_agents() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("alpha", Running), ("bravo", Queued)]);
+        let before: Vec<_> = reg.snapshot().iter().map(|e| (e.id.clone(), e.state, e.pid)).collect();
+
+        for streaming in [true, false] {
+            let status = if streaming { "streaming" } else { "idle" };
+            let mut app = mkapp();
+            app.status = if streaming { Status::Streaming } else { Status::Idle };
+            app.agents_picker =
+                Some(open_agents_picker(Some(&reg), std::time::Instant::now()).unwrap());
+            let got = interpret_key(&mut app, key(KeyCode::Esc));
+            assert!(matches!(got, KeyAction::Nothing), "{status:?}: {got:?}");
+            assert!(app.agents_picker.is_none(), "{status:?}: Esc closes the picker");
+            assert!(!app.turn_was_cancelled, "{status:?}");
+            assert!(app.status_note.is_none(), "{status:?}");
+            assert_eq!(app.status == Status::Streaming, streaming);
+        }
+        let after: Vec<_> = reg.snapshot().iter().map(|e| (e.id.clone(), e.state, e.pid)).collect();
+        assert_eq!(before, after, "no agent may change");
+
+        // With the picker closed, Esc while streaming is the orchestrator
+        // interrupt again, exactly as before.
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Esc)), KeyAction::CancelTurn));
+    }
+
+    /// Every key the picker can receive, while a turn is streaming, leaves
+    /// the agents alone and never yields a cancel.
+    #[test]
+    fn no_picker_key_cancels_or_stops_anything() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("alpha", Running)]);
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        app.agents_picker = open_agents_picker(Some(&reg), std::time::Instant::now()).ok();
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Char('s'),
+            KeyCode::Backspace,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Tab,
+            KeyCode::Delete,
+        ] {
+            let got = interpret_key(&mut app, key(code));
+            assert!(matches!(got, KeyAction::Nothing), "{code:?}: {got:?}");
+        }
+        assert_eq!(reg.snapshot()[0].state, Running);
+        assert!(!app.turn_was_cancelled);
+    }
+
+    #[test]
+    fn show_resolves_finished_agents_by_id_and_name_and_never_mutates() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("alpha", Completed), ("bravo", Running), ("alto", Failed)]);
+        let before: Vec<_> = reg.snapshot().iter().map(|e| (e.id.clone(), e.state)).collect();
+        let now = std::time::Instant::now();
+
+        let (state, lines) = show_agent(Some(&reg), "a1", 80, now).expect("finished id resolves");
+        assert_eq!(state, Completed);
+        assert!(lines[0].text.starts_with("✓ a1  alpha"), "{:?}", lines[0]);
+        let all: String = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("done · took "), "{all}");
+        assert!(all.contains("do the thing"), "the task: {all}");
+
+        // A name picks a finished agent too; `brav` is a running one.
+        assert_eq!(show_agent(Some(&reg), "bra", 80, now).unwrap().0, Running);
+        // `al` matches alpha and alto: nothing is shown, both ids are named.
+        let err = show_agent(Some(&reg), "al", 80, now).unwrap_err();
+        assert!(err.contains("a1") && err.contains("a3") && !err.contains("a2"), "{err}");
+        // Unknown id and unknown name are one in-band line each.
+        for q in ["a9", "nope"] {
+            let err = show_agent(Some(&reg), q, 80, now).unwrap_err();
+            assert!(!err.contains('\n') && err.starts_with("no agent"), "{err}");
+        }
+        assert!(show_agent(None, "a1", 80, now).is_err());
+
+        let after: Vec<_> = reg.snapshot().iter().map(|e| (e.id.clone(), e.state)).collect();
+        assert_eq!(before, after);
+    }
+
+    /// `show` and the picker read the registry and a few small files; they
+    /// do not depend on, or wait for, anything the turn holds.
+    #[test]
+    fn show_and_picker_work_while_a_turn_is_streaming() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("alpha", Running)]);
+        let mut app = mkapp();
+        app.status = Status::Streaming;
+        seed_input(&mut app, "/agents show a1");
+        let got = interpret_key(&mut app, key(KeyCode::Enter));
+        // While streaming, a slash command is still a command, not a steer.
+        assert!(matches!(got, KeyAction::ShowAgent(ref q) if q == "a1"), "{got:?}");
+        assert!(show_agent(Some(&reg), "a1", 60, std::time::Instant::now()).is_ok());
+
+        seed_input(&mut app, "/agents");
+        let got = interpret_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(got, KeyAction::OpenAgentsPicker), "{got:?}");
+        assert!(open_agents_picker(Some(&reg), std::time::Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn list_output_keeps_the_live_format_and_appends_finished_agents() {
+        let live = vec!["○ alpha  read x   3s".to_string(), "  read x".to_string()];
+        let finished = vec!["✓ a2  done one  done 9s".to_string()];
+        assert_eq!(
+            agents_list_output(&live, &[]),
+            vec![
+                ("── agents ──".to_string(), true),
+                (live[0].clone(), false),
+                (live[1].clone(), false),
+            ],
+            "live-only output is unchanged"
+        );
+        let both = agents_list_output(&live, &finished);
+        assert_eq!(both[3], ("── finished ──".to_string(), true));
+        assert_eq!(both[4], (finished[0].clone(), false));
+        // Nothing live: the old line still leads, then what finished.
+        let only_done = agents_list_output(&[], &finished);
+        assert_eq!(only_done[0], ("no running agents".to_string(), true));
+        assert_eq!(only_done[2], (finished[0].clone(), false));
+        assert_eq!(
+            agents_list_output(&[], &[]),
+            vec![("no running agents".to_string(), true)]
+        );
     }
 
     /// A registry with one entry per `(label, state)`, named like the strip
@@ -8669,6 +9154,7 @@ mod tests {
             pid: None,
             state,
             started: std::time::Instant::now(),
+            finished: None,
             dir: dir.path().to_path_buf(),
         };
         (dir, entry)
@@ -8934,6 +9420,7 @@ mod tests {
             pid: None,
             state: crate::agent_registry::AgentState::Running,
             started: std::time::Instant::now(),
+            finished: None,
             dir: dir.path().to_path_buf(),
         };
         app.agents_view.refresh(&[entry], std::time::Instant::now());

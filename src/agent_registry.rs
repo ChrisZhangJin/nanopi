@@ -75,6 +75,10 @@ pub struct AgentEntry {
     pub pid: Option<u32>,
     pub state: AgentState,
     pub started: Instant,
+    /// When the entry first became terminal (`None` while queued or
+    /// running). Lets `/agents` show a finished agent's total duration
+    /// rather than a clock that keeps running. Cleared by `reactivate`.
+    pub finished: Option<Instant>,
     pub dir: PathBuf,
 }
 
@@ -292,6 +296,7 @@ impl AgentRegistry {
         }
         e.state = AgentState::Queued;
         e.pid = None;
+        e.finished = None;
         Ok(())
     }
 
@@ -435,6 +440,7 @@ impl AgentRegistry {
             pid: None,
             state: AgentState::Queued,
             started: Instant::now(),
+            finished: None,
             dir: dir.clone(),
         });
         Ok((id, dir))
@@ -524,6 +530,9 @@ impl AgentRegistry {
                     pid: None,
                     state,
                     started: Instant::now(),
+                    // Adopted already terminal; its real duration belongs
+                    // to the earlier process and is not known here.
+                    finished: Some(Instant::now()),
                     dir: dir.clone(),
                 };
                 entries.push(e.clone());
@@ -560,6 +569,11 @@ impl AgentRegistry {
                 return;
             };
             e.state = state;
+            if state.is_terminal() {
+                e.finished.get_or_insert_with(Instant::now);
+            } else {
+                e.finished = None;
+            }
             e.dir.clone()
         };
         if let Err(e) = archive::set_agent_state(&dir, state.as_str()) {
@@ -581,6 +595,7 @@ impl AgentRegistry {
                     kill_group(pid);
                 }
                 e.state = AgentState::Stopped;
+                e.finished.get_or_insert_with(Instant::now);
             }
         }
     }
@@ -1105,6 +1120,38 @@ mod tests {
         let e = snap.iter().find(|e| e.id == id).unwrap();
         assert_eq!(e.state, AgentState::Queued);
         assert_eq!(e.dir, dir, "reactivated in place, same dir");
+    }
+
+    /// `/agents` shows a finished agent's total duration, which needs the
+    /// moment it finished: set once on the first terminal state, never
+    /// moved by a later one, cleared when the agent runs again.
+    #[test]
+    fn finished_is_stamped_once_and_cleared_on_reactivate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        let get = |reg: &AgentRegistry| reg.snapshot().into_iter().find(|e| e.id == id).unwrap();
+        assert!(get(&reg).finished.is_none());
+        reg.set_state(&id, AgentState::Running);
+        assert!(get(&reg).finished.is_none(), "running is not finished");
+        reg.set_state(&id, AgentState::Failed);
+        let first = get(&reg).finished.expect("stamped when it ended");
+        reg.set_state(&id, AgentState::Stopped);
+        assert_eq!(get(&reg).finished, Some(first), "a later terminal state keeps the stamp");
+        reg.reactivate(&id).unwrap();
+        assert!(get(&reg).finished.is_none(), "running again, not finished");
+    }
+
+    #[test]
+    fn kill_all_stamps_the_agents_it_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AgentRegistry::new(&cfg(8, 4));
+        let (id, _) = reg.reserve(tmp.path()).unwrap();
+        reg.set_state(&id, AgentState::Running);
+        reg.kill_all();
+        let e = reg.snapshot().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.state, AgentState::Stopped);
+        assert!(e.finished.is_some());
     }
 
     #[test]

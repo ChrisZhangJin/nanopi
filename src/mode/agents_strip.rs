@@ -43,12 +43,12 @@ pub fn glyph_for(state: AgentState) -> &'static str {
 /// Strip control characters from model-influenced text before it ever
 /// reaches layout (T-05-01): escape sequences in brief/report/transcript
 /// text must not reach the terminal.
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Width-aware truncation (CJK-safe) using display columns, not chars.
-fn truncate_to_width(s: &str, width: usize) -> String {
+pub(crate) fn truncate_to_width(s: &str, width: usize) -> String {
     use unicode_width::UnicodeWidthChar;
     if width == 0 {
         return String::new();
@@ -66,13 +66,13 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     out
 }
 
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthChar;
     s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
 }
 
 /// Format an elapsed [`std::time::Duration`] as "Ns" / "MmSSs" / "HhMMm".
-fn format_elapsed(secs: u64) -> String {
+pub(crate) fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
@@ -191,48 +191,52 @@ fn body_first_line(brief: &str) -> Option<String> {
     None
 }
 
-/// Read at most the last [`TRANSCRIPT_TAIL_BYTES`] of `path` and return the
-/// last [`ACTIVITY_LINES`] formatted `tool_call` entries. Malformed or
-/// partial trailing lines are ignored; a missing file yields no activity
-/// (T-05-02: never reads more than the capped tail, never on the draw path).
-fn tail_activity(path: &std::path::Path) -> Vec<String> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
+/// The complete lines in the last [`TRANSCRIPT_TAIL_BYTES`] of `path`
+/// (T-05-02: never reads more than the capped tail), plus whether the file
+/// was longer than that window. A missing or unreadable file yields no
+/// lines. The first line is dropped when the window starts mid-file (it is
+/// a fragment) and a final line without its newline is dropped (it may be
+/// half-written); invalid UTF-8 (a window that split a multi-byte char, a
+/// garbled file) is replaced rather than discarding everything.
+pub(crate) fn read_tail_lines(path: &std::path::Path) -> (Vec<String>, bool) {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (Vec::new(), false);
     };
-    let len = match file.metadata() {
-        Ok(m) => m.len(),
-        Err(_) => return Vec::new(),
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return (Vec::new(), false);
     };
     let start = len.saturating_sub(TRANSCRIPT_TAIL_BYTES);
     if file.seek(SeekFrom::Start(start)).is_err() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
-    let mut buf = String::new();
-    if file.read_to_string(&mut buf).is_err() {
-        // Not valid UTF-8 from this offset (likely split a multi-byte
-        // char or JSON line); fall back to no activity rather than panic.
-        return Vec::new();
+    let mut bytes = Vec::new();
+    if file.take(TRANSCRIPT_TAIL_BYTES).read_to_end(&mut bytes).is_err() && bytes.is_empty() {
+        return (Vec::new(), false);
     }
-
+    let buf = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<&str> = buf.split('\n').collect();
-    // If we didn't start at byte 0, the first "line" is a partial
-    // fragment of the previous line; drop it.
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
-    // The very last element after a trailing split is "" when the file
-    // ends with \n; if not, it's a partial (unterminated) line - drop it.
     if !buf.ends_with('\n') {
         lines.pop();
     }
+    let lines = lines
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    (lines, start > 0)
+}
 
+/// Read at most the last [`TRANSCRIPT_TAIL_BYTES`] of `path` and return the
+/// last [`ACTIVITY_LINES`] formatted `tool_call` entries. Malformed or
+/// partial trailing lines are ignored; a missing file yields no activity.
+fn tail_activity(path: &std::path::Path) -> Vec<String> {
+    let (lines, _) = read_tail_lines(path);
     let mut out: Vec<String> = Vec::new();
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    for line in &lines {
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -600,7 +604,7 @@ mod tests {
     use std::time::Duration;
 
     fn entry(id: &str, state: AgentState, started: Instant, dir: PathBuf) -> AgentEntry {
-        AgentEntry { id: id.to_string(), pid: None, state, started, dir }
+        AgentEntry { id: id.to_string(), pid: None, state, started, finished: None, dir }
     }
 
     fn tmp_dir() -> tempfile::TempDir {
