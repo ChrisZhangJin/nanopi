@@ -101,6 +101,26 @@ mod tests {
         tokio::time::sleep(TICK * 8).await;
     }
 
+    /// Wait until `n` messages have arrived (or a generous deadline), then
+    /// give the watcher a few more ticks to send anything extra. A fixed
+    /// `settle()` alone is a race on a loaded machine: the watcher needs a
+    /// size change plus a stable poll, and a delayed tick makes it miss
+    /// the window. Waiting for the expected message instead of for a
+    /// duration keeps the "exactly n" assertions meaningful.
+    async fn collect(rx: &mut mpsc::Receiver<SteerMessage>, n: usize) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut out = Vec::new();
+        while out.len() < n && tokio::time::Instant::now() < deadline {
+            out.extend(texts(rx));
+            if out.len() < n {
+                tokio::time::sleep(TICK).await;
+            }
+        }
+        settle().await;
+        out.extend(texts(rx));
+        out
+    }
+
     #[tokio::test]
     async fn initial_amendments_are_not_resent() {
         let p = tmp_brief("initial");
@@ -120,9 +140,7 @@ mod tests {
         let h = spawn_brief_watcher(p.clone(), 0, tx, TICK);
         settle().await;
         brief::append_amendment(&p, 1, "Also do X").unwrap();
-        settle().await;
-        settle().await;
-        let got = texts(&mut rx);
+        let got = collect(&mut rx, 1).await;
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].starts_with("Amendment 1 to your brief:"));
         assert!(got[0].contains("Also do X"));
@@ -141,8 +159,7 @@ mod tests {
         settle().await;
         assert!(texts(&mut rx).is_empty(), "torn section must not be sent");
         f.write_all(b" rest\n").unwrap();
-        settle().await;
-        let got = texts(&mut rx);
+        let got = collect(&mut rx, 1).await;
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].contains("partial rest"));
         drop(rx);
@@ -157,10 +174,11 @@ mod tests {
         settle().await;
         brief::append_amendment(&p, 1, "one").unwrap();
         brief::append_amendment(&p, 2, "two").unwrap();
-        settle().await;
+        let mut got = collect(&mut rx, 2).await;
         brief::append_amendment(&p, 2, "two again").unwrap();
         settle().await;
-        let got = texts(&mut rx);
+        settle().await;
+        got.extend(texts(&mut rx));
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(got[0].contains("one") && got[1].contains("two"));
         drop(rx);
