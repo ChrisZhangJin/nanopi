@@ -134,6 +134,43 @@ See `docs/v0.13-manual-test-plan.md` for the consolidated manual E2E plan
 (QA-01), which includes this strip's Ctrl+G rows alongside orchestrator
 mode, worktree merge, and the dispatch/amend/stop/continue control flow.
 
+## Esc and stopping agents
+
+In the TUI, `Esc` (and `Ctrl-C` while a turn is streaming) interrupts **the
+orchestrator's own turn and nothing else**. Dispatched agents keep running,
+whichever way they were dispatched: `background: true`, `background: false`,
+`parallel` and `chain` all run the agent on a task of its own that the tool
+call merely waits for, so cancelling the turn drops the wait and not the agent.
+A `chain` keeps going too: later steps still start. When the agents finish,
+their reports reach the conversation like any background agent's, as a new
+turn. The cancelled `agent` call itself returns nothing to the model; what the
+model reads in its place says the agents were **not** stopped and will report
+(so it does not dispatch them again).
+
+If agents are running when you press `Esc`, the `Operation aborted` line says
+so: `Operation aborted  (2 agents still running — /agents stop to stop them)`.
+
+Agents are stopped only by:
+
+- **`/agents stop <id|name-prefix>`** — stop one agent. An id is `a3`; a name is
+  a prefix of the name the strip shows, case-insensitive, and must match
+  exactly one live agent (otherwise nothing is stopped and the candidate ids
+  are listed). Works while a turn is streaming.
+- **`/agents stop all`** — stop every live agent.
+- **The orchestrator's `stop_agent`**, when you ask it to.
+- **Quitting nanopi** (`/quit`, `Ctrl-D`, SIGTERM/SIGHUP): the orderly shutdown
+  kills every agent's process group.
+
+`/agents stop` prints which ids it stopped. An unknown or already-finished id
+(or a name that matches nothing, or several agents) is a one-line message, not
+an error: the TUI carries on. A stopped agent ends `stopped` with a partial
+report, which is delivered like any other. Bare `/agents` (or `/agents list`)
+prints the live agents with their id, name and state; `/agents clean` still
+prunes the on-disk archive.
+
+Non-interactive runs are unchanged: in `nanopi -p`, `Ctrl-C` stops every agent,
+and a foreground dispatch dies with the process that is waiting for it.
+
 ## Orchestrator mode
 
 The default main flow of the TUI (ORC-01..05): the main agent is an

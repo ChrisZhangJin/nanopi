@@ -254,6 +254,13 @@ agent 都在后台跑，所以编排者派完活就把这一轮还给你，而�
 路径——打印到 scrollback。agent 结束后就从 strip 里消失，它的 report 会
 注入到对话里，那才是看结果的地方。
 
+**<kbd>Esc</kbd> 只停编排者这一轮，不会停 agent。** <kbd>Esc</kbd>（以及流式输出
+期间的 <kbd>Ctrl-C</kbd>）只打断编排者自己；所有已派出的 agent——后台的、前台的、
+`parallel`、`chain`——都会继续跑，结束后照常汇报。要停 agent 只有三种办法：
+`/agents stop <id|名字前缀>`（或 `/agents stop all`）、你要求时由编排者自己调用
+`stop_agent`、退出 nanopi。单独输入 `/agents` 会列出正在跑的 agent。详见
+[docs/agents.md](docs/agents.md)。
+
 并行写代码的 agent 可以各自用一个 git worktree（`isolation: "worktree"`），
 结束后自动合并，有冲突则升级给你处理。
 

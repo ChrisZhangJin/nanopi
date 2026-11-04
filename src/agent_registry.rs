@@ -116,6 +116,18 @@ pub struct AgentRegistry {
     /// `background` runs in the background, so the foreground
     /// conversation stays free while the agent works.
     background_default: AtomicBool,
+    /// Set by the TUI: a *foreground* dispatch (single with
+    /// `background:false`, `parallel`, `chain`) still runs its agents on
+    /// detached, registry-tracked tasks, and the tool call merely awaits
+    /// them. Cancelling the orchestrator's turn (Esc / Ctrl-C) drops that
+    /// await, not the agents: they keep running and report through the
+    /// outbox like any background agent. Off everywhere else, where a
+    /// foreground dispatch dies with its caller.
+    detach_foreground: AtomicBool,
+    /// Set by `kill_all` (orderly shutdown): nothing may be reserved
+    /// afterwards, so a detached chain cannot start another child after
+    /// the sweep that was meant to leave none.
+    closed: AtomicBool,
     /// The whole `tools` list of every agent this process dispatched, by
     /// id, as the dispatching model asked for it and the parent validated
     /// it. Empty means the default set.
@@ -168,6 +180,8 @@ impl AgentRegistry {
             notify_sink: Mutex::new(None),
             seeded: AtomicBool::new(false),
             background_default: AtomicBool::new(false),
+            detach_foreground: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             run_pid_written: AtomicBool::new(false),
             agent_tools: Mutex::new(HashMap::new()),
         })
@@ -284,7 +298,17 @@ impl AgentRegistry {
     /// Queue a finished-background report (D-06). `capped` must already
     /// be through `cap_report`. Wakes the installed sink exactly once.
     pub fn push_report(&self, id: &str, state: AgentState, capped: &str) {
-        let entry = format!("[agent {id} finished: {}] {capped}", state.as_str());
+        self.push_entry(Self::report_entry(id, state, capped));
+    }
+
+    /// The outbox text for a finished agent.
+    pub fn report_entry(id: &str, state: AgentState, capped: &str) -> String {
+        format!("[agent {id} finished: {}] {capped}", state.as_str())
+    }
+
+    /// Queue an already-formatted outbox entry (a detached `chain`'s
+    /// combined result has no single agent id). Wakes the sink once.
+    pub fn push_entry(&self, entry: String) {
         self.reports_lock().push(entry);
         if let Some(sink) = self.notify_sink.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             sink();
@@ -323,6 +347,16 @@ impl AgentRegistry {
         self.background_default.load(Ordering::Relaxed)
     }
 
+    /// Make foreground dispatches survive the cancellation of the call
+    /// that awaits them (see the field's docs).
+    pub fn set_detach_foreground(&self, on: bool) {
+        self.detach_foreground.store(on, Ordering::Relaxed);
+    }
+
+    pub fn detach_foreground(&self) -> bool {
+        self.detach_foreground.load(Ordering::Relaxed)
+    }
+
     /// Install the sink that wakes a consumer when a report arrives.
     /// Modelled on `plugin_send`'s installed-sink pattern.
     pub fn install_report_sink(&self, sink: Box<dyn Fn() + Send + Sync>) {
@@ -346,6 +380,19 @@ impl AgentRegistry {
         }
     }
 
+    /// Await the tracked tasks of exactly `ids` (a stop having been
+    /// requested for them) and nothing else: `wait_background` would also
+    /// wait for every other agent still running.
+    pub async fn wait_stopped(&self, ids: &[String]) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut bg = self.bg_lock();
+            ids.iter().filter_map(|id| bg.remove(id)).map(|b| b.handle).collect()
+        };
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+
     /// Run directory name (D-01: `YYYYMMDD-HHMMSS-<8 hex>`) shared by every
     /// child of this run.
     pub fn run_id(&self) -> &str {
@@ -365,6 +412,9 @@ impl AgentRegistry {
     /// mints an id that collides with one dispatched by an earlier
     /// process in the same run.
     pub fn reserve(&self, agents_root: &Path) -> Result<(String, PathBuf), String> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("nanopi is shutting down".to_string());
+        }
         let mut entries = self.lock();
         let live = entries.iter().filter(|e| !e.state.is_terminal()).count();
         if live >= self.max_live {
@@ -523,6 +573,7 @@ impl AgentRegistry {
 
     /// SIGKILL the process group of every Running child (used on exit).
     pub fn kill_all(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         let mut entries = self.lock();
         for e in entries.iter_mut() {
             if e.state == AgentState::Running {

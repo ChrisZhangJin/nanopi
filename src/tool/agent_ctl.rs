@@ -188,13 +188,13 @@ impl Tool for StopAgentTool {
 
         if id.eq_ignore_ascii_case("all") {
             let stopped = reg.stop_all();
-            reg.wait_background().await;
+            reg.wait_stopped(&stopped).await;
             return Ok(ok_json(json!({ "stopped": stopped })));
         }
 
         match reg.stop(&id) {
             Ok(()) => {
-                reg.wait_background().await;
+                reg.wait_stopped(std::slice::from_ref(&id)).await;
                 Ok(ok_json(json!({ "id": id, "state": "stopped" })))
             }
             Err(e) => Ok(in_band_error(e)),

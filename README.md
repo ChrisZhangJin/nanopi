@@ -275,6 +275,14 @@ history, turns/tokens, worktree/branch, report path — into scrollback. An
 agent disappears from the strip when it finishes; its report is delivered
 into the conversation, which is where you read results.
 
+**<kbd>Esc</kbd> stops the orchestrator's turn, not the agents.** <kbd>Esc</kbd>
+(and <kbd>Ctrl-C</kbd> during a streaming turn) interrupts only the orchestrator;
+every dispatched agent — background, foreground, `parallel` or `chain` — keeps
+running and reports when it finishes. Agents are stopped only by
+`/agents stop <id|name-prefix>` (or `/agents stop all`), by the orchestrator's
+own `stop_agent` when you ask it to, or by quitting nanopi. Bare `/agents`
+lists the live agents. See [docs/agents.md](docs/agents.md).
+
 Parallel agents that write code can each get their own git worktree
 (`isolation: "worktree"`), merged back automatically, with conflicts
 escalated to you.
