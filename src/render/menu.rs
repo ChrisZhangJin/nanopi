@@ -63,6 +63,10 @@ pub struct MenuState<T: Clone> {
     /// externally from the input buffer by `sync_palette`, and must
     /// not also consume keystrokes here.
     free_text: bool,
+    /// On a free-text menu: whether Enter on an empty result set hands
+    /// back the typed text (`ChosenRaw`). Off for a pure filter over a
+    /// closed list, such as the `/agents` picker.
+    raw_ok: bool,
 }
 
 impl<T: Clone> MenuState<T> {
@@ -72,6 +76,7 @@ impl<T: Clone> MenuState<T> {
             filter: String::new(),
             cursor: 0,
             free_text: false,
+            raw_ok: true,
         }
     }
 
@@ -84,8 +89,23 @@ impl<T: Clone> MenuState<T> {
         self
     }
 
+    /// Like [`with_free_text`](Self::with_free_text) (typing edits the
+    /// filter), but the list is closed: Enter on a filter that matches
+    /// nothing does nothing instead of returning the typed text.
+    pub fn with_filter_only(mut self) -> Self {
+        self.free_text = true;
+        self.raw_ok = false;
+        self
+    }
+
     /// Whether this menu owns its filter and accepts unlisted values.
     pub fn is_free_text(&self) -> bool {
+        self.free_text && self.raw_ok
+    }
+
+    /// Whether typing edits this menu's own filter (free-text or
+    /// filter-only), as opposed to the filter being driven from outside.
+    pub fn owns_filter(&self) -> bool {
         self.free_text
     }
 
@@ -202,11 +222,21 @@ impl<T: Clone> MenuState<T> {
         }
         match k.code {
             KeyCode::Esc => MenuAction::Cancel,
-            KeyCode::Up | KeyCode::Char('k') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            // vim-style j/k navigate only on a menu that does not own its
+            // filter: on a free-text menu they are letters being typed
+            // (a picker that cannot filter for "kimi" or "worker" is not a
+            // picker).
+            KeyCode::Up | KeyCode::Char('k')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && (k.code == KeyCode::Up || !self.free_text) =>
+            {
                 self.move_up();
                 MenuAction::Nothing
             }
-            KeyCode::Down | KeyCode::Char('j') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Down | KeyCode::Char('j')
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && (k.code == KeyCode::Down || !self.free_text) =>
+            {
                 self.move_down();
                 MenuAction::Nothing
             }
@@ -222,7 +252,7 @@ impl<T: Clone> MenuState<T> {
                 Some(it) => MenuAction::Chosen(it.payload),
                 // Nothing matched. On a free-text menu the filter IS the
                 // answer; elsewhere Enter is a no-op as before.
-                None if self.free_text && !self.filter.trim().is_empty() => {
+                None if self.free_text && self.raw_ok && !self.filter.trim().is_empty() => {
                     MenuAction::ChosenRaw(self.filter.trim().to_string())
                 }
                 None => MenuAction::Nothing,
@@ -402,6 +432,32 @@ mod tests {
         assert_eq!(free.visible().len(), 4);
     }
 
+    /// `j`/`k` are navigation keys on a plain menu and ordinary letters on
+    /// a free-text one, where they must reach the filter.
+    #[test]
+    fn jk_navigate_plain_menus_but_type_into_free_text_ones() {
+        let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut plain = MenuState::new(items());
+        plain.handle_key(press('j'));
+        assert_eq!(plain.cursor(), 1);
+        plain.handle_key(press('k'));
+        assert_eq!(plain.cursor(), 0);
+
+        let mut free = MenuState::new(vec![
+            MenuItem::new("kimi-k2", "", 1),
+            MenuItem::new("claude", "", 2),
+        ])
+        .with_free_text();
+        free.handle_key(press('k'));
+        free.handle_key(press('i'));
+        assert_eq!(free.filter(), "ki");
+        assert_eq!(free.visible().len(), 1);
+        // Arrow keys still move.
+        free.set_filter("");
+        free.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(free.cursor(), 1);
+    }
+
     /// Enter on a filter that matches nothing yields the raw text, so an
     /// id missing from the catalogue is still reachable. This is the
     /// escape hatch the old closed-set picker lacked.
@@ -431,5 +487,22 @@ mod tests {
         let mut plain = MenuState::new(items());
         plain.set_filter("zzz");
         assert!(matches!(plain.handle_key(enter), MenuAction::Nothing));
+    }
+
+    /// A filter-only menu filters as you type but never invents a value:
+    /// Enter on no match is a no-op, and the filter is still shown.
+    #[test]
+    fn filter_only_menu_filters_but_never_returns_raw_text() {
+        let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let mut m = MenuState::new(items()).with_filter_only();
+        assert!(m.owns_filter() && !m.is_free_text());
+        m.handle_key(press('q'));
+        assert_eq!(m.visible().len(), 1);
+        assert!(matches!(m.handle_key(enter), MenuAction::Chosen("/quit")));
+        m.handle_key(press('z'));
+        assert!(m.visible().is_empty());
+        assert!(matches!(m.handle_key(enter), MenuAction::Nothing));
+        assert_eq!(m.filter(), "qz");
     }
 }

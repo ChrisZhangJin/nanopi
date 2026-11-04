@@ -281,7 +281,10 @@ every dispatched agent — background, foreground, `parallel` or `chain` — kee
 running and reports when it finishes. Agents are stopped only by
 `/agents stop <id|name-prefix>` (or `/agents stop all`), by the orchestrator's
 own `stop_agent` when you ask it to, or by quitting nanopi. Bare `/agents`
-lists the live agents. See [docs/agents.md](docs/agents.md).
+opens a picker over every agent of the run, finished ones included; <kbd>Enter</kbd>
+prints that agent's detail card (state, time, model, task, recent activity,
+report, paths), and `/agents show <id|name-prefix>` prints one directly.
+`/agents list` is the plain-text version. See [docs/agents.md](docs/agents.md).
 
 Parallel agents that write code can each get their own git worktree
 (`isolation: "worktree"`), merged back automatically, with conflicts
