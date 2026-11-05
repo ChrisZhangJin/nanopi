@@ -343,7 +343,7 @@ pub async fn run_print_mode(
             no_context_files,
             prompt_overrides,
             initial_follow_up: None,
-            tool_exec_mode: cfg_for_build.tool_exec_mode,
+            tool_exec_mode: cfg_for_build.tool_exec_mode(),
             tool_exec_overrides: cfg_for_build.tool_exec_overrides.clone(),
             extensions: cfg_for_build.extensions,
         });
