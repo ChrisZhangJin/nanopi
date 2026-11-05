@@ -122,8 +122,16 @@ pub struct Config {
     /// (`Tool::execution_mode`) sits between the two: global mode
     /// picks the batching strategy, a `Sequential` tool in the batch
     /// forces serial regardless, and an override outranks the tool.
+    ///
+    /// `Option` so the global→project merge can tell "key absent" from
+    /// "explicitly set to the default": with a plain `ToolExecMode` a
+    /// project `tool_exec_mode = "parallel"` is indistinguishable from
+    /// no key at all, and could never override a global `"sequential"`
+    /// (issue #4). Read it through [`Config::tool_exec_mode`], which
+    /// resolves an absent key to `ToolExecMode::default()` after the
+    /// merge.
     #[serde(default)]
-    pub tool_exec_mode: ToolExecMode,
+    pub tool_exec_mode: Option<ToolExecMode>,
     /// v0.12: per-tool overrides of the tool's own declared
     /// `executionMode`.
     ///
@@ -161,9 +169,11 @@ pub struct Config {
     #[serde(default)]
     pub max_replay_entries: Option<usize>,
 
-    /// Child-process agent limits (`[agent]` section).
+    /// Child-process agent limits (`[agent]` section), as written in
+    /// the files: every key optional so the merge is field-level. Read
+    /// the resolved limits through [`Config::agent_config`].
     #[serde(default)]
-    pub agent: AgentConfig,
+    pub agent: AgentSection,
 
     /// v0.13: feature flags still under evaluation (`[experimental]`
     /// section).
@@ -222,9 +232,58 @@ impl ExperimentalConfig {
     }
 }
 
-/// `[agent]` config: caps for orchestrator-spawned `nanopi -p` children.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `[agent]` as it appears in a config file: every key optional, so the
+/// global→project merge can tell "absent" from "explicitly set to the
+/// built-in default" and can fall through FIELD BY FIELD (a project that
+/// sets only `max_turns` keeps the global `max_concurrency`). Resolve to
+/// the effective limits with [`AgentSection::resolve`].
+///
+/// The TOML shape is identical to the resolved [`AgentConfig`]; only
+/// the Rust type differs. Unknown keys are ignored as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
+pub struct AgentSection {
+    pub max_live: Option<usize>,
+    pub max_concurrency: Option<usize>,
+    pub max_turns: Option<u32>,
+    pub token_budget: Option<u64>,
+    pub timeout_secs: Option<u64>,
+    pub archive_keep_days: Option<u64>,
+}
+
+impl AgentSection {
+    /// Field-level merge: `b` (higher priority) wins wherever it set a
+    /// key, otherwise `a` is kept.
+    fn merge(a: Self, b: Self) -> Self {
+        Self {
+            max_live: b.max_live.or(a.max_live),
+            max_concurrency: b.max_concurrency.or(a.max_concurrency),
+            max_turns: b.max_turns.or(a.max_turns),
+            token_budget: b.token_budget.or(a.token_budget),
+            timeout_secs: b.timeout_secs.or(a.timeout_secs),
+            archive_keep_days: b.archive_keep_days.or(a.archive_keep_days),
+        }
+    }
+
+    /// Effective limits: absent keys take [`AgentConfig::default`].
+    /// Call this after merging, never before.
+    pub fn resolve(&self) -> AgentConfig {
+        let d = AgentConfig::default();
+        AgentConfig {
+            max_live: self.max_live.unwrap_or(d.max_live),
+            max_concurrency: self.max_concurrency.unwrap_or(d.max_concurrency),
+            max_turns: self.max_turns.unwrap_or(d.max_turns),
+            token_budget: self.token_budget.unwrap_or(d.token_budget),
+            timeout_secs: self.timeout_secs.unwrap_or(d.timeout_secs),
+            archive_keep_days: self.archive_keep_days.unwrap_or(d.archive_keep_days),
+        }
+    }
+}
+
+/// Resolved `[agent]` limits: caps for orchestrator-spawned
+/// `nanopi -p` children. Built from [`AgentSection`] after the config
+/// layers are merged (see [`Config::agent_config`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     /// Max simultaneously tracked (non-terminal) children. Default 8.
     pub max_live: usize,
@@ -488,12 +547,23 @@ impl Config {
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
-            tool_exec_mode: ToolExecMode::default(),
+            tool_exec_mode: None,
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
-            agent: AgentConfig::default(),
+            agent: AgentSection::default(),
             experimental: ExperimentalConfig::default(),
         }
+    }
+
+    /// Effective global tool execution mode: the merged value, or
+    /// `ToolExecMode::default()` (parallel) when no layer set it.
+    pub fn tool_exec_mode(&self) -> ToolExecMode {
+        self.tool_exec_mode.unwrap_or_default()
+    }
+
+    /// Effective `[agent]` limits after merging, defaults filled in.
+    pub fn agent_config(&self) -> AgentConfig {
+        self.agent.resolve()
     }
 }
 
@@ -571,7 +641,7 @@ fn validate_tool_exec_overrides(cfg: &Config) -> Result<(), ConfigError> {
 /// (`max_live = 0` refuses every spawn, `timeout_secs = 0` times every
 /// child out at once), so they are refused at load, naming the key (WR-06).
 fn validate_agent(cfg: &Config) -> Result<(), ConfigError> {
-    let s = &cfg.agent;
+    let s = &cfg.agent_config();
     let zero: Vec<&str> = [
         ("max_live", s.max_live == 0),
         ("max_concurrency", s.max_concurrency == 0),
@@ -685,14 +755,12 @@ fn merge(a: Config, b: Config) -> Config {
             ext.extend(b.extensions);
             ext
         },
-        // tool_exec_mode: b wins if explicitly set; default otherwise.
-        // Default::default() == Parallel; users opt into Sequential.
-        // tool_exec_mode: last explicit (non-Parallel) wins; else default.
-        tool_exec_mode: if b.tool_exec_mode != ToolExecMode::default() {
-            b.tool_exec_mode
-        } else {
-            a.tool_exec_mode
-        },
+        // Option per key: the project value wins whenever the key is
+        // PRESENT, including when it equals the default (`parallel`).
+        // A `!= default()` comparison cannot tell that apart from an
+        // absent key and let a global `sequential` win (issue #4). The
+        // default is applied after merging, in `Config::tool_exec_mode`.
+        tool_exec_mode: b.tool_exec_mode.or(a.tool_exec_mode),
         // Per-tool overrides merge per KEY, project winning on a
         // collision. Not concatenated like `extensions`: one tool
         // cannot hold two modes at once, so "both additive" has no
@@ -706,12 +774,11 @@ fn merge(a: Config, b: Config) -> Config {
         },
         // Scalar Option: b (project) wins if set, else a (global).
         max_replay_entries: b.max_replay_entries.or(a.max_replay_entries),
-        // Section-level: project wins if it differs from defaults.
-        agent: if b.agent != AgentConfig::default() {
-            b.agent
-        } else {
-            a.agent
-        },
+        // Field-level, same reason as `tool_exec_mode` above: each key
+        // is an `Option`, so a project key wins when present (even when
+        // equal to the default) and an absent one falls through to the
+        // global value instead of discarding the whole section.
+        agent: AgentSection::merge(a.agent, b.agent),
         // Field-level, not section-level: an `Option` per key means a
         // project value wins whenever the key is PRESENT, including
         // when it happens to equal the built-in default. A
@@ -1091,10 +1158,10 @@ command = "echo hi"
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
-            tool_exec_mode: ToolExecMode::default(),
+            tool_exec_mode: None,
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
-            agent: AgentConfig::default(),
+            agent: AgentSection::default(),
             experimental: ExperimentalConfig::default(),
         };
         let b = Config {
@@ -1109,10 +1176,10 @@ command = "echo hi"
             hooks: HooksSection::default(),
             skills: SkillsConfig::default(),
             extensions: Vec::new(),
-            tool_exec_mode: ToolExecMode::default(),
+            tool_exec_mode: None,
             tool_exec_overrides: Default::default(),
             max_replay_entries: None,
-            agent: AgentConfig::default(),
+            agent: AgentSection::default(),
             experimental: ExperimentalConfig::default(),
         };
         let m = merge(a, b);
@@ -1237,7 +1304,7 @@ command = "/bin/true"
     fn agent_config_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(
-            c.agent,
+            c.agent_config(),
             AgentConfig {
                 max_live: 8,
                 max_concurrency: 4,
@@ -1252,7 +1319,7 @@ command = "/bin/true"
     #[test]
     fn agent_config_archive_keep_days_zero_is_valid() {
         let c: Config = toml::from_str("[agent]\narchive_keep_days = 0\n").unwrap();
-        assert_eq!(c.agent.archive_keep_days, 0);
+        assert_eq!(c.agent_config().archive_keep_days, 0);
         let tmp = TempDir::new();
         tmp.write(".nanopi/config.toml", "[agent]\narchive_keep_days = 0\n");
         assert!(load_config(tmp.path()).is_ok());
@@ -1261,9 +1328,10 @@ command = "/bin/true"
     #[test]
     fn agent_config_partial_override() {
         let c: Config = toml::from_str("[agent]\nmax_live = 2\n").unwrap();
-        assert_eq!(c.agent.max_live, 2);
-        assert_eq!(c.agent.max_concurrency, 4);
-        assert_eq!(c.agent.timeout_secs, 1800);
+        let a = c.agent_config();
+        assert_eq!(a.max_live, 2);
+        assert_eq!(a.max_concurrency, 4);
+        assert_eq!(a.timeout_secs, 1800);
     }
 
     #[test]
@@ -1274,5 +1342,163 @@ command = "/bin/true"
             let err = load_config(tmp.path()).unwrap_err().to_string();
             assert!(err.contains(key), "{err}");
         }
+    }
+
+    // ----- Issue #4: project values equal to the built-in default must
+    // still override a non-default global value, through the REAL load
+    // path (global file + project file → `load_config`).
+
+    /// Write an optional global and an optional project `config.toml`,
+    /// run the real `load_config`, hand back the merged result.
+    fn load_layers(global: Option<&str>, project: Option<&str>) -> Config {
+        let h = crate::TempNanopiHome::new();
+        if let Some(g) = global {
+            std::fs::write(h.path().join("config.toml"), g).unwrap();
+        }
+        let tmp = TempDir::new();
+        if let Some(p) = project {
+            tmp.write(".nanopi/config.toml", p);
+        }
+        load_config(tmp.path()).expect("layers must load")
+    }
+
+    fn mode_of(c: &Config) -> ToolExecMode {
+        c.tool_exec_mode()
+    }
+
+    fn agent_of(c: &Config) -> AgentConfig {
+        c.agent_config()
+    }
+
+    fn mode_toml(m: &str) -> String {
+        format!("tool_exec_mode = \"{m}\"\n")
+    }
+
+    #[test]
+    fn tool_exec_mode_layering_matrix_through_load_config() {
+        use ToolExecMode::{Parallel, Sequential};
+        let seq = mode_toml("sequential");
+        let par = mode_toml("parallel");
+        // (global, project, expected)
+        let cases: [(Option<&str>, Option<&str>, ToolExecMode); 9] = [
+            // The reported defect: explicit project parallel must beat
+            // global sequential.
+            (Some(&seq), Some(&par), Parallel),
+            (Some(&par), Some(&seq), Sequential),
+            // Absent project key -> global wins.
+            (Some(&seq), Some("model = \"x\"\n"), Sequential),
+            (Some(&seq), None, Sequential),
+            (Some(&par), None, Parallel),
+            // Absent global key -> project wins.
+            (None, Some(&seq), Sequential),
+            (None, Some(&par), Parallel),
+            (Some("model = \"x\"\n"), Some(&seq), Sequential),
+            // Both absent -> default.
+            (None, None, Parallel),
+        ];
+        for (i, (g, p, want)) in cases.iter().enumerate() {
+            let c = load_layers(*g, *p);
+            assert_eq!(mode_of(&c), *want, "case {i}: global={g:?} project={p:?}");
+        }
+    }
+
+    /// `(key, built-in default, a non-default global value)` for every
+    /// `[agent]` field.
+    const AGENT_FIELDS: [(&str, u64, u64); 6] = [
+        ("max_live", 8, 3),
+        ("max_concurrency", 4, 2),
+        ("max_turns", 50, 7),
+        ("token_budget", 300_000, 1_000),
+        ("timeout_secs", 1800, 60),
+        ("archive_keep_days", 2, 9),
+    ];
+
+    fn agent_field(a: &AgentConfig, key: &str) -> u64 {
+        match key {
+            "max_live" => a.max_live as u64,
+            "max_concurrency" => a.max_concurrency as u64,
+            "max_turns" => a.max_turns as u64,
+            "token_budget" => a.token_budget,
+            "timeout_secs" => a.timeout_secs,
+            "archive_keep_days" => a.archive_keep_days,
+            other => panic!("unknown agent key {other}"),
+        }
+    }
+
+    #[test]
+    fn every_agent_field_layers_independently_through_load_config() {
+        for (key, default, non_default) in AGENT_FIELDS {
+            let g = format!("[agent]\n{key} = {non_default}\n");
+            let p_default = format!("[agent]\n{key} = {default}\n");
+            let p_other = format!("[agent]\n{key} = {}\n", non_default + 1);
+
+            // Project value EQUAL to the built-in default must override
+            // a non-default global value.
+            let c = load_layers(Some(&g), Some(&p_default));
+            assert_eq!(agent_field(&agent_of(&c), key), default, "{key}: project default must win");
+
+            // Project non-default beats global.
+            let c = load_layers(Some(&g), Some(&p_other));
+            assert_eq!(agent_field(&agent_of(&c), key), non_default + 1, "{key}: project must win");
+
+            // Absent project key -> global wins (project file exists
+            // but says nothing about [agent]).
+            let c = load_layers(Some(&g), Some("model = \"x\"\n"));
+            assert_eq!(agent_field(&agent_of(&c), key), non_default, "{key}: global must survive");
+            let c = load_layers(Some(&g), None);
+            assert_eq!(agent_field(&agent_of(&c), key), non_default, "{key}: global alone");
+
+            // Global default-valued, project absent -> default.
+            let c = load_layers(Some(&p_default), None);
+            assert_eq!(agent_field(&agent_of(&c), key), default, "{key}: explicit default");
+
+            // Project only.
+            let c = load_layers(None, Some(&g));
+            assert_eq!(agent_field(&agent_of(&c), key), non_default, "{key}: project only");
+
+            // Both absent -> built-in default.
+            let c = load_layers(None, None);
+            assert_eq!(agent_field(&agent_of(&c), key), default, "{key}: both absent");
+        }
+    }
+
+    /// A project that sets only `max_turns` must not discard the global
+    /// `max_concurrency` (the pre-fix section-level merge did exactly
+    /// that: any non-default `[agent]` replaced the whole section, so
+    /// the global value fell back to the built-in default).
+    #[test]
+    fn agent_fields_fall_through_field_by_field() {
+        let c = load_layers(
+            Some("[agent]\nmax_concurrency = 2\ntimeout_secs = 60\n"),
+            Some("[agent]\nmax_turns = 7\n"),
+        );
+        let a = agent_of(&c);
+        assert_eq!(a.max_turns, 7, "project field applies");
+        assert_eq!(a.max_concurrency, 2, "global field the project did not set survives");
+        assert_eq!(a.timeout_secs, 60, "so does every other global field");
+        assert_eq!(a.max_live, 8);
+        assert_eq!(a.token_budget, 300_000);
+
+        // And the sneaky variant: project sets one field to the default.
+        let c = load_layers(
+            Some("[agent]\nmax_concurrency = 2\nmax_turns = 7\n"),
+            Some("[agent]\nmax_turns = 50\n"),
+        );
+        let a = agent_of(&c);
+        assert_eq!(a.max_turns, 50);
+        assert_eq!(a.max_concurrency, 2);
+    }
+
+    /// Zero caps are still refused after the merge, and a project value
+    /// can repair a bad global one.
+    #[test]
+    fn agent_zero_cap_is_judged_on_the_merged_value() {
+        let h = crate::TempNanopiHome::new();
+        std::fs::write(h.path().join("config.toml"), "[agent]\nmax_live = 0\n").unwrap();
+        let tmp = TempDir::new();
+        assert!(load_config(tmp.path()).is_err(), "global zero alone is refused");
+        tmp.write(".nanopi/config.toml", "[agent]\nmax_live = 8\n");
+        let c = load_config(tmp.path()).expect("project value repairs it");
+        assert_eq!(agent_of(&c).max_live, 8);
     }
 }

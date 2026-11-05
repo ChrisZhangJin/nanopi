@@ -495,7 +495,8 @@ async fn main() -> ExitCode {
     // resolved provider settings every child inherits (D-01). `new`
     // honors NANOPI_RUN_ID, so a second nanopi process can join an
     // existing run instead of always minting a fresh one (CTL-06).
-    let agent_registry = nanopi::agent_registry::AgentRegistry::new(&cfg.agent);
+    let agent_limits = cfg.agent_config();
+    let agent_registry = nanopi::agent_registry::AgentRegistry::new(&agent_limits);
     nanopi::agent_registry::set_global(agent_registry.clone());
 
     // D-06/D-09: before any dispatch, mark stale non-terminal agents from
@@ -510,7 +511,7 @@ async fn main() -> ExitCode {
             eprintln!("nanopi: debug: mark_interrupted({}): {e}", agents_root.display());
         }
         if let Err(e) =
-            nanopi::archive::auto_prune(&agents_root, run_id, cfg.agent.archive_keep_days)
+            nanopi::archive::auto_prune(&agents_root, run_id, agent_limits.archive_keep_days)
         {
             eprintln!("nanopi: debug: auto_prune({}): {e}", agents_root.display());
         }
@@ -522,9 +523,9 @@ async fn main() -> ExitCode {
         api_kind: api_kind_raw.map(str::to_string),
         api_key: Some(api_key.clone()),
         trust: Some(project_trusted),
-        max_turns: cfg.agent.max_turns,
-        token_budget: cfg.agent.token_budget,
-        timeout: std::time::Duration::from_secs(cfg.agent.timeout_secs),
+        max_turns: agent_limits.max_turns,
+        token_budget: agent_limits.token_budget,
+        timeout: std::time::Duration::from_secs(agent_limits.timeout_secs),
         vendor: Some(startup_vendor.id().to_string()),
     });
 
