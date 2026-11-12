@@ -103,59 +103,76 @@ Current working directory: {cwd_str}"
 ///
 /// A new sibling to [`build`], not an edit of it: the default path must
 /// stay byte-identical (T-06-02, pinned by the snapshot tests in
-/// `tool/mod.rs` and `agent/build.rs`). In this mode NO file or shell
-/// tool is in the registry at all — not `write`/`edit`/`bash`, and not
-/// `read`/`grep`/`find`/`ls` either. The model delegates every
-/// concrete job instead of doing any of it directly.
+/// `tool/mod.rs` and `agent/build.rs`).
 ///
-/// Encodes the orchestrator workflow (D-08): understand the task (by
-/// dispatching an exploratory agent, since it cannot look itself) ->
-/// plan -> dispatch -> monitor (react to agent reports, amend
-/// direction with `send_message`, `stop_agent` when direction changes,
-/// continue a finished agent with `send_message`) -> verify (dispatch a
-/// verification agent where it is worth the cost) -> report one
-/// combined summary covering what was done, which files changed, any
-/// open issues, and the archive path.
+/// The orchestrator is hybrid: besides the dispatch tools it has
+/// `read`/`grep`/`find`/`ls` and `bash` (see
+/// `ToolRegistry::orchestrator`), but never `write`/`edit`. The prompt
+/// tells it to (a) scout — look at the code and environment just enough
+/// to scope a job and write a precise brief — and (b) triage: do a small
+/// job itself when dispatching would cost more than the job, delegate
+/// everything that changes files or is substantial. `bash` is confined
+/// to inspection and quick checks; file changes always go to an agent.
+///
+/// Encodes the orchestrator workflow (D-08): scout and triage -> plan
+/// -> dispatch -> monitor (react to agent reports, amend direction with
+/// `send_message`, `stop_agent` when direction changes, continue a
+/// finished agent with `send_message`) -> verify -> report one combined
+/// summary covering what was done, which files changed, any open
+/// issues, and the archive path.
 ///
 /// Also encodes: D-05 (state the plan briefly and dispatch immediately
 /// for a clear task; ask the user first for anything ambiguous, any
-/// choice between approaches, or anything risky, and dispatch only
-/// after the answer), D-06 (judge whether parallelism is worth it —
-/// sequential/interdependent work goes to ONE agent; parallel agents
-/// are only for genuinely independent work; `agent.max_concurrency` is
-/// a ceiling, not a target), D-07 (parallel code-writing agents use
-/// `isolation: "worktree"`; merges are automatic, conflicts escalate to
-/// the user), and D-09 (agents do not inherit context — every brief
-/// must be self-contained: goal, relevant files, constraints, and the
-/// expected report shape).
+/// choice between approaches, or anything risky), D-06 (judge whether
+/// parallelism is worth it), D-07 (parallel code-writing agents use
+/// `isolation: "worktree"`), and D-09 (every brief must be
+/// self-contained: goal, relevant files, constraints, and the expected
+/// report shape).
 pub fn build_orchestrator(cwd: &Path, tool_names: &[String]) -> String {
     let cwd_str = cwd.display();
     let tools_line = if tool_names.is_empty() {
         "You currently have no tools available.".to_string()
     } else {
         format!(
-            "Available tools: {}. Call them by name when you need to understand the task, dispatch or monitor agents, or report back.",
+            "Available tools: {}. Call them by name when you need to scout, do a small job, dispatch or monitor agents, or report back.",
             tool_names.join(", ")
         )
     };
 
     format!(
         "You are nanopi running in orchestrator mode: the main \
-         coordinator. You never do any concrete work yourself — not \
-         even a quick look at a file. You create dedicated agents with \
-         the `agent` tool and delegate the work to them. You have no file \
-         or shell tools (no read, grep, find, ls, write, edit or bash); \
-         anything that needs them is an agent's job.
+         coordinator. You delegate substantial work to dedicated agents \
+         created with the `agent` tool, and you handle small jobs \
+         yourself when that is faster than dispatching. You have read, \
+         grep, find, ls and bash for scouting and quick checks. You have \
+         no write or edit tool: any change to a file is an agent's job, \
+         and you never use bash to modify files either (no redirects \
+         into files, sed -i, git commit, installs or other state \
+         changes).
 
 Workflow:
-1. Understand the task. If you need facts about the code or the \
-         environment, dispatch an exploratory agent to gather them and \
-         report back.
-2. Plan. For a clear task, state the plan briefly and dispatch \
+1. Understand the task. Scout first: read the relevant files, grep \
+         for symbols, list directories, run a quick read-only command \
+         (git status, git log, a version check). Scout to scope the \
+         job and gather the facts a brief needs, not to do the job — \
+         stop once you know which files matter and what the agent must \
+         be told.
+2. Triage: do it yourself or delegate? Do it yourself when the answer \
+         is a lookup or a quick check — answering a question about the \
+         code, reading a file or a log, running one command and \
+         reporting its output — and it fits in a handful of tool calls. \
+         Delegate when the job changes files, needs many steps, takes a \
+         long time, can run in parallel with other work, or would flood \
+         your context with large reads. An agent costs a new process, a \
+         fresh context and a brief/report round trip, so it is worth it \
+         only when the job is bigger than that overhead. If you find \
+         yourself past about eight tool calls on your own, stop and \
+         dispatch an agent for the rest.
+3. Plan. For a clear task, state the plan briefly and act \
          immediately. If anything is ambiguous, if there is a real \
          choice between approaches, or if the work is risky, ask the \
          user first and dispatch only after you have an answer.
-3. Dispatch. Give each agent a short `description` (3-6 words) — it \
+4. Dispatch. Give each agent a short `description` (3-6 words) — it \
          is the agent's name in the user's agent list. Judge whether \
          parallelism is actually worth it: sequential or interdependent \
          work goes to ONE agent working through the steps (chain mode), \
@@ -163,12 +180,13 @@ Workflow:
          only for genuinely independent work, and treat \
          `agent.max_concurrency` as a ceiling, not a target. Every brief \
          must be self-contained — agents do not inherit your context, so \
-         state the goal, the relevant files, any constraints, and the \
+         state the goal, the relevant files (with the paths, symbols and \
+         facts you found while scouting), any constraints, and the \
          report you expect back. When dispatching more than one agent \
          that writes code in parallel, use isolation: \"worktree\" for \
          each so their changes don't collide; merges happen \
          automatically and conflicts are escalated to the user.
-4. Monitor. Agents run in the background and the user sees their live \
+5. Monitor. Agents run in the background and the user sees their live \
          status. Do not poll or wait: after dispatching, tell the user \
          what started and end your turn. Each agent's report is added to \
          the conversation when it finishes; react to it then. Use \
@@ -176,9 +194,10 @@ Workflow:
          `stop_agent` if the direction changes enough that continuing \
          would waste work, and `send_message` again to continue a \
          finished agent under its same id.
-5. Verify. Where it's worth the cost, dispatch a verification agent to \
-         check the work before you report it done.
-6. Report. Give the user one combined summary: what was done, which \
+6. Verify. Check an agent's work yourself when a quick look is enough \
+         (read the changed file, run the tests); dispatch a \
+         verification agent when checking is itself a substantial job.
+7. Report. Give the user one combined summary: what was done, which \
          files changed, any open issues, and the archive path for each \
          agent's work.
 
@@ -297,52 +316,63 @@ mod tests {
         crate::tool::ToolRegistry::orchestrator().names()
     }
 
-    /// The prompt and the registry must not drift apart. Every
-    /// assertion below is on wording, and wording survives a revert —
-    /// the PREVIOUS prompt ("use read/grep/find yourself for a quick
-    /// look") satisfies all of them, so reverting it would ship green
-    /// while telling the model to call tools that are not registered.
-    /// This couples the two directly: no file or shell tool may be
-    /// described as something the orchestrator can use.
+    /// The prompt and the registry must not drift apart: the prompt
+    /// may name `write`/`edit` only to say they are absent, and every
+    /// scouting tool it relies on must actually be registered.
     #[test]
     fn orchestrator_prompt_never_offers_a_tool_it_does_not_have() {
         let tools = orchestrator_tools();
         let p = build_orchestrator(&PathBuf::from("/tmp"), &tools);
 
         // Guard the fixture itself: if the registry ever gains a file
-        // or shell tool, this test must be revisited, not silently
+        // writing tool, this test must be revisited, not silently
         // weakened.
-        for absent in ["read", "grep", "find", "ls", "write", "edit", "bash"] {
+        for absent in ["write", "edit"] {
             assert!(
                 !tools.iter().any(|t| t == absent),
                 "registry unexpectedly has `{absent}` — revisit this test"
             );
         }
+        for present in ["read", "grep", "find", "ls", "bash"] {
+            assert!(
+                tools.iter().any(|t| t == present),
+                "prompt relies on `{present}` but the registry lacks it"
+            );
+        }
 
-        // The prompt may NAME an absent tool only to say it is absent.
-        // It must never instruct the model to use one. These phrasings
-        // are exactly what the pre-rewrite prompt said.
         let lc = p.to_ascii_lowercase();
-        for forbidden in [
-            "use read",
-            "read/grep/find",
-            "use read/grep/find",
-            "quick look at a file yourself",
-            "grep yourself",
-        ] {
+        for forbidden in ["use write", "use edit", "edit the file yourself", "write the file yourself"] {
             assert!(
                 !lc.contains(forbidden),
                 "prompt tells the model to use an unregistered tool \
                  ({forbidden:?}): {p}"
             );
         }
-
-        // And it must positively state the delegation rule, so the
-        // absence above is a stated contract rather than an omission.
         assert!(
-            lc.contains("no file") || lc.contains("not even"),
-            "prompt must state it has no file/shell tools at all: {p}"
+            lc.contains("no write or edit tool"),
+            "prompt must state it has no write/edit tool: {p}"
         );
+        assert!(
+            lc.contains("never use bash to modify files"),
+            "prompt must confine bash to inspection: {p}"
+        );
+    }
+
+    /// The hybrid orchestrator must be told to scout and to triage
+    /// (do-it-yourself vs delegate), with a bound on going it alone.
+    #[test]
+    fn orchestrator_prompt_covers_scouting_and_triage() {
+        let p = build_orchestrator(&PathBuf::from("/tmp"), &orchestrator_tools());
+        let lc = p.to_ascii_lowercase();
+        for phrase in [
+            "scout",
+            "triage",
+            "do it yourself",
+            "delegate when the job changes files",
+            "eight tool calls",
+        ] {
+            assert!(lc.contains(phrase), "missing {phrase:?}: {p}");
+        }
     }
 
     #[test]
@@ -373,7 +403,7 @@ mod tests {
         let lc = p.to_ascii_lowercase();
         assert!(
             lc.contains("write") && lc.contains("edit") && lc.contains("bash"),
-            "must mention write/edit/bash are unavailable: {p}"
+            "must mention write/edit (absent) and bash (inspection only): {p}"
         );
         assert!(
             lc.contains("delegat"),

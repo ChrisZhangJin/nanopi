@@ -798,7 +798,8 @@ pub fn compose_system_prompt(
 /// prompt without the orchestrator wording, and a prompt that quietly
 /// lacks the catalogue after one of those would be the same bug. Callers
 /// that rebuild an *agent's own* prompt pass `&[]`; the block is only
-/// ever added for an agent that delegates without being able to `read`.
+/// ever added for the orchestrator, or an agent that delegates without
+/// being able to `read`.
 pub fn compose_system_prompt_mode(
     cwd: &Path,
     tool_names: &[String],
@@ -831,22 +832,26 @@ pub fn compose_system_prompt_mode(
 
     // The catalogue is listed for any agent that can act on it: one
     // that loads skill files itself (`read`), or an orchestrator that
-    // routes a skill to a dispatched agent (`agent`). Gating on `read`
-    // alone silently hid every skill from the orchestrator once its
-    // tool set lost that tool. An agent with neither still gets
-    // nothing — it could not use a skill it was told about.
+    // routes a skill to a dispatched agent (`agent`). An agent with
+    // neither still gets nothing — it could not use a skill it was told
+    // about.
+    //
+    // "Delegating" = the orchestrator (which has `read` for scouting,
+    // but whose job is to route skills and MCP tools to agents and which
+    // never holds MCP tools itself), or any agent that can dispatch but
+    // not read. For it, skills get delegating wording and MCP tools are
+    // something to name in a brief. An agent with its own `read` outside
+    // orchestrator mode has the MCP tools in its registry instead and
+    // needs no catalogue.
     let has_read = tool_names.iter().any(|n| n == "read");
     let can_delegate = tool_names.iter().any(|n| n == "agent");
+    let delegating = can_delegate && (orchestrator || !has_read);
     if (has_read || can_delegate) && !skills.is_empty() {
         prompt.push_str(&crate::resources::format_skills_for_prompt_mode(
-            skills, !has_read,
+            skills, delegating,
         ));
     }
-    // Same condition as the skills' delegating wording: an agent that can
-    // dispatch but not read is the orchestrator, and MCP tools are, for
-    // it, something to name in a brief. An agent with its own `read` has
-    // the MCP tools in its registry instead and needs no catalogue.
-    if can_delegate && !has_read {
+    if delegating {
         prompt.push_str(&crate::mcp::catalogue::format_for_prompt(mcp));
     }
     prompt
@@ -946,16 +951,15 @@ mod tests {
         std::fs::remove_dir_all(&cwd).ok();
     }
 
-    /// The skills catalogue used to be gated on the `read` tool alone.
-    /// The orchestrator registry has no `read`, so once orchestrator
-    /// mode became the default every skill silently vanished from the
-    /// main agent's prompt and it could no longer route work to one.
-    /// It must see the catalogue, with delegating wording since it
-    /// cannot open the file itself.
+    /// The orchestrator must see the skills catalogue with delegating
+    /// wording: its job is to route a skill to an agent. Built from the
+    /// real orchestrator registry, which has `read` for scouting — so
+    /// the wording must follow the mode, not the presence of `read`.
     #[test]
     fn orchestrator_prompt_lists_skills_with_delegating_wording() {
         let cwd = tmpdir("orch-skills");
-        let names = vec!["agent".to_string(), "list_agents".to_string()];
+        let names = crate::tool::ToolRegistry::orchestrator().names();
+        assert!(names.iter().any(|n| n == "read"), "fixture: hybrid orchestrator has read");
         let skills = vec![one_skill()];
         let composed = compose_system_prompt_mode(
             &cwd,
@@ -974,7 +978,7 @@ mod tests {
         );
         assert!(
             !composed.contains("Use the read tool to load"),
-            "orchestrator has no read tool: {composed}"
+            "orchestrator routes skills to agents: {composed}"
         );
 
         // A solo agent still gets the original read-it-yourself wording.
@@ -1014,11 +1018,12 @@ mod tests {
     }
 
     /// The orchestrator names MCP tools in a brief without being able to
-    /// call them, so it must see them and be told how to hand one over.
+    /// call them, so it must see them and be told how to hand one over —
+    /// even though it has `read` for scouting.
     #[test]
     fn orchestrator_prompt_carries_the_mcp_catalogue() {
         let cwd = tmpdir("orch-mcp");
-        let names = vec!["agent".to_string(), "list_agents".to_string()];
+        let names = crate::tool::ToolRegistry::orchestrator().names();
         let composed = compose_system_prompt_mode(
             &cwd,
             &names,

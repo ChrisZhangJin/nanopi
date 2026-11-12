@@ -44,7 +44,7 @@ Runs on Alpine, on CentOS 6, and anywhere `npm install` isn't an option.
 - 🛠 **Streaming tool calls** — `read` / `write` / `edit` / `bash`, rendered live in a ratatui TUI
 - 🪝 **Claude Code-protocol hooks** — JSON-on-stdin, exit-2-to-block shell hooks, using PI's event names (`tool_execution_start` / `tool_execution_end` / `input` / …)
 - 🧠 **Agent Skills** — [spec-compliant](https://agentskills.io/specification) `SKILL.md` discovery + `/skill:name` expansion
-- 🎛 **Orchestrator by default** — in the TUI the main agent never does the work itself; it spawns a dedicated agent per job and shows them live under the input box
+- 🎛 **Orchestrator by default** — in the TUI the main agent scouts the code, handles quick lookups itself, and delegates real work to dedicated agents shown live under the input box
 
 ## Background — why nanopi exists
 
@@ -252,11 +252,20 @@ an existing entry is never dropped.
 
 ## Orchestrator mode
 
-In the TUI, the main agent is an **orchestrator**: it never does concrete
-work itself — not even a quick look at a file. It has no file or shell tools
-at all, only four dispatch tools (`agent`, `list_agents`, `stop_agent`,
-`send_message`). Every job becomes a dedicated agent it briefs, dispatches,
-monitors, and whose report it synthesises for you.
+In the TUI, the main agent is an **orchestrator**. Besides the four dispatch
+tools (`agent`, `list_agents`, `stop_agent`, `send_message`) it has `read`,
+`grep`, `find`, `ls` and `bash`, which it uses to:
+
+- **scout** — look at the relevant code and environment first, so each brief
+  names the right files, symbols and constraints;
+- **triage** — handle a quick lookup or check itself (answering a question
+  about the code, reading a log, running one command) when that is faster
+  than dispatching, and delegate anything that changes files, takes many
+  steps, or can run in parallel.
+
+It has no `write` or `edit` tool and is told never to modify files through
+`bash`: every change to a file is made by a dedicated agent it briefs,
+dispatches, monitors, and whose report it synthesises for you.
 
 Agents run in the background, so the orchestrator hands work off and gives
 you the turn back rather than blocking on them. Live agents appear in a strip
@@ -380,7 +389,8 @@ fails to start, or an entry that is invalid, is reported and skipped; it never
 stops nanopi from starting or hides the others. `--tools` restricts the tool set,
 which excludes MCP tools.
 
-**With the orchestrator** the main agent has no MCP tools of its own, but it sees
+**With the orchestrator** the main agent has no MCP tools of its own (only the
+built-in scouting tools), but it sees
 their names and descriptions and can grant them to the agents it dispatches by
 naming them in the `agent` tool's `tools` list. Those agents are separate
 processes that never connect to a server themselves: every call goes through the

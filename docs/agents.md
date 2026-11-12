@@ -249,11 +249,13 @@ and a foreground dispatch dies with the process that is waiting for it.
 
 ## Orchestrator mode
 
-The default main flow of the TUI (ORC-01..05): the main agent is an
-orchestrator that never does any concrete work itself. It creates dedicated
-agents via the `agent` tool, assigns the work to them, monitors them, and
-synthesises their results — it does not read files, search, edit, write, or
-run shell commands.
+The default main flow of the TUI (ORC-01..05): the main agent is a hybrid
+orchestrator. It scouts the code and environment to scope each job and write a
+precise brief, handles small lookups and checks itself when that is faster
+than dispatching, and delegates everything that changes files or is
+substantial to dedicated agents created via the `agent` tool, which it
+monitors and whose results it synthesises. Its prompt caps solo work at about
+eight tool calls before it should hand the rest to an agent.
 
 - **Toggle:** `/orchestrator` (bare = toggle, `/orchestrator on|off` sets it
   explicitly, anything else prints `Usage: /orchestrator [on|off]` without
@@ -263,11 +265,13 @@ run shell commands.
   startup value; set it to `false` to start in the classic single-agent mode.
   TUI only — print mode (`-p`) ignores it entirely, so a scripted run is never
   restricted.
-- **Exact toolset:** `agent`, `list_agents`, `stop_agent`, `send_message` —
-  four tools, hand-registered (never derived by filtering a broader set). No
-  file or shell tool (`read`, `grep`, `find`, `ls`, `write`, `edit`, `bash`)
-  is registered at all, not just discouraged (a test asserts the exact name
-  list).
+- **Exact toolset:** `agent`, `list_agents`, `stop_agent`, `send_message`,
+  plus `read`, `grep`, `find`, `ls` and `bash` — hand-registered (never
+  derived by filtering a broader set; a test asserts the exact name list).
+  `write` and `edit` are not registered, and plugin and MCP tools never enter
+  this set. `bash` is unrestricted at the tool level; the prompt confines it
+  to inspection and quick checks (no redirects into files, `sed -i`, commits
+  or installs), so this is a prompt-level boundary, not a sandbox.
 - **Off-mode guarantee:** with the mode off, the system prompt and tool
   specs sent to the provider are byte-identical to the pre-orchestrator
   (v0.12) behavior — pinned by a snapshot test.
