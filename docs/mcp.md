@@ -116,7 +116,7 @@ that decides which agent can call MCP tools.
 nanopi's process shape makes this sharp:
 
 ```
-main agent (TUI process)   orchestrator mode: 4 dispatch tools, no file/shell tools
+main agent (TUI process)   orchestrator mode: dispatch tools + read/grep/find/ls/bash, no MCP tools
   └─ child agent           separate `nanopi -p` process, full standard() registry
   └─ child agent           isolated; communicates only via brief.md / report.md
   └─ ...                   there is no realtime parent↔child channel

@@ -424,10 +424,12 @@ base_url = "https://api.openai.com/v1"
 
 # ─── Orchestrator mode (v0.13) ──────────────────────────────────────
 #
-# The TUI's default main flow. The main agent never does concrete work
-# itself — it has NO file or shell tools at all (no read, grep, find,
-# ls, write, edit or bash), only `agent`, `list_agents`, `stop_agent`
-# and `send_message`. Every job becomes a dedicated agent it dispatches,
+# The TUI's default main flow. Besides `agent`, `list_agents`,
+# `stop_agent` and `send_message`, the main agent has read, grep, find,
+# ls and bash: it scouts the code to write precise briefs and handles
+# quick lookups/checks itself when that beats dispatching. It has no
+# write or edit tool, and is told never to modify files through bash —
+# every file change is a dedicated agent's job, which it dispatches,
 # monitors, and whose report it synthesises. Live agents show up in the
 # strip under the input box; Ctrl+G prints their details.
 #

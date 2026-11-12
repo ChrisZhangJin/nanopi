@@ -5216,7 +5216,7 @@ fn reload_extensions_clause(
 
 /// Pulled out of `handle_reload` for testability (ORC-02 / WR-01):
 /// `ToolRegistry::orchestrator()` is deliberately a closed list so
-/// `write`/`edit`/`bash` can never leak in. A plugin tool registered
+/// `write`/`edit` and plugin tools can never leak in. A plugin tool registered
 /// straight into the LIVE registry by a `/reload` while orchestrator mode
 /// is active would be callable from orchestrator mode, defeating that
 /// guarantee. Apply the reload to the SAVED pre-orchestrator registry
@@ -9516,15 +9516,7 @@ mod tests {
 
         let mut after_names = agent.registry.names();
         after_names.sort();
-        assert_eq!(
-            after_names,
-            vec![
-                "agent",
-                "list_agents",
-                "send_message",
-                "stop_agent",
-            ]
-        );
+        assert_eq!(after_names, crate::tool::ToolRegistry::orchestrator().names());
         let mut tool_spec_names: Vec<String> =
             agent.context.tools.iter().map(|s| s.name.clone()).collect();
         tool_spec_names.sort();
@@ -9664,12 +9656,7 @@ mod tests {
         live_names.sort();
         assert_eq!(
             live_names,
-            vec![
-                "agent",
-                "list_agents",
-                "send_message",
-                "stop_agent",
-            ],
+            crate::tool::ToolRegistry::orchestrator().names(),
             "the live registry must stay the orchestrator closed list after a guarded reload"
         );
         let mut tool_spec_names: Vec<String> =
@@ -9747,11 +9734,11 @@ mod tests {
                 "startup / new / resume / import / fork: {:?}",
                 agent.context.system
             );
-            // The registry is still exactly the four dispatch tools: the
-            // catalogue is text for the model, never a callable.
+            // The registry is still exactly the orchestrator closed list:
+            // the catalogue is text for the model, never a callable.
             assert_eq!(
                 agent.registry.names(),
-                vec!["agent", "list_agents", "send_message", "stop_agent"]
+                crate::tool::ToolRegistry::orchestrator().names()
             );
 
             // /reload: same registry, recomposed in place.
@@ -9906,9 +9893,9 @@ mod tests {
         apply_orchestrator_mode(&mut app, &mut agent, decision.on);
         assert_eq!(
             agent.registry.names(),
-            vec!["agent", "list_agents", "send_message", "stop_agent"]
+            crate::tool::ToolRegistry::orchestrator().names()
         );
-        for t in ["read", "grep", "find", "ls", "write", "edit", "bash"] {
+        for t in ["write", "edit"] {
             assert!(
                 agent.registry.get(t).is_none(),
                 "`{t}` must be gone in the default session"
@@ -10009,8 +9996,8 @@ mod tests {
     }
 
     /// Trap 1. MCP tools are registered before orchestrator mode saves
-    /// the registry, so: on → exactly the four dispatch tools (the
-    /// closed list, untouched); off → the MCP tools are back; and again.
+    /// the registry, so: on → exactly the orchestrator closed list
+    /// (untouched, no MCP tools); off → the MCP tools are back; and again.
     #[cfg(unix)]
     #[test]
     fn mcp_tools_stay_out_of_orchestrator_mode_and_survive_leaving_it() {
@@ -10027,7 +10014,7 @@ mod tests {
             apply_orchestrator_mode(&mut app, &mut agent, true);
             assert_eq!(
                 agent.registry.names(),
-                vec!["agent", "list_agents", "send_message", "stop_agent"],
+                crate::tool::ToolRegistry::orchestrator().names(),
                 "orchestrator mode must stay exactly the closed list"
             );
             assert!(agent.context.tools.iter().all(|t| !t.name.starts_with("mcp__")));

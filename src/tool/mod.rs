@@ -670,7 +670,7 @@ impl ToolRegistry {
         r
     }
 
-    /// Restricted tool set for orchestrator mode (ORC-02).
+    /// Tool set for orchestrator mode (ORC-02).
     ///
     /// Hand-registered rather than derived from `standard()` /
     /// `standard_with_control()` by filtering: deriving-and-filtering
@@ -678,21 +678,29 @@ impl ToolRegistry {
     /// is exactly the privilege-escalation path T-06-01 exists to rule
     /// out. This constructor must never reference
     /// `agent::CONTROL_TOOLS` / `DENIED_TOOLS` for the same reason — it
-    /// is its own closed list.
+    /// is its own closed list. Plugin and MCP tools never enter it.
     ///
-    /// Registers exactly: `agent`, `list_agents`, `stop_agent`,
-    /// `send_message`.
+    /// Registers exactly: the four dispatch tools (`agent`,
+    /// `list_agents`, `stop_agent`, `send_message`) plus `read`, `grep`,
+    /// `find`, `ls` and `bash`.
     ///
-    /// No file or shell tool (`read`, `grep`, `find`, `ls`, `write`,
-    /// `edit`, `bash`) is present by design — the orchestrator never
-    /// does concrete work itself, not even a quick look at a file; it
-    /// creates an agent for that and assigns the work to it.
+    /// The orchestrator is hybrid: it scouts (reads, searches, runs a
+    /// quick command) to scope a job and write a better brief, and does
+    /// small jobs itself when dispatching an agent would cost more than
+    /// the job. `write` and `edit` stay out — changing files is always
+    /// an agent's job. `bash` can technically modify things too; the
+    /// orchestrator prompt confines it to inspection and quick checks.
     pub fn orchestrator() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(agent::AgentTool::new()));
         r.register(Arc::new(agent_ctl::ListAgentsTool::new()));
         r.register(Arc::new(agent_ctl::StopAgentTool::new()));
         r.register(Arc::new(agent_ctl::SendMessageTool::new()));
+        r.register(Arc::new(read::ReadTool));
+        r.register(Arc::new(grep::GrepTool));
+        r.register(Arc::new(find::FindTool));
+        r.register(Arc::new(ls::LsTool));
+        r.register(Arc::new(bash::BashTool::new()));
         r
     }
 
@@ -1477,25 +1485,30 @@ mod tests {
         assert_eq!(actual, BASELINE_STANDARD_WITH_CONTROL_SPECS);
     }
 
-    /// ORC-02/ORC-04: `write`, `edit`, `bash`, `ls` (and the read-only
-    /// `read`, `grep`, `find`) must all be absent; exactly the 4 agent
-    /// control tools remain.
+    /// ORC-02/ORC-04: the hybrid orchestrator has the four dispatch
+    /// tools plus read-only scouting tools and `bash`; `write` and
+    /// `edit` must stay absent.
     #[test]
-    fn orchestrator_registry_excludes_write_edit_bash() {
+    fn orchestrator_registry_is_dispatch_plus_scouting_tools() {
         let r = ToolRegistry::orchestrator();
         assert_eq!(
             r.names(),
             vec![
                 "agent",
+                "bash",
+                "find",
+                "grep",
                 "list_agents",
+                "ls",
+                "read",
                 "send_message",
                 "stop_agent",
             ]
         );
-        for t in ["write", "edit", "bash", "ls", "read", "grep", "find"] {
+        for t in ["write", "edit"] {
             assert!(r.get(t).is_none(), "orchestrator must not have `{t}`");
         }
-        assert_eq!(r.all_specs().len(), 4);
+        assert_eq!(r.all_specs().len(), 9);
     }
 
     #[tokio::test]
