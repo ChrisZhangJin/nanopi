@@ -112,6 +112,17 @@ impl Tool for BashTool {
             .ok_or_else(|| ToolError::InvalidArgs("command must be a string".into()))?
             .to_string();
 
+        // Per-command sudo policy (`crate::sudo`). A refusal is an
+        // in-band error for the model, never a hard failure.
+        if let Err(refusal) = crate::sudo::check(&cmd).await {
+            return Ok(ToolOutput {
+                content: format!("sudo refused: {refusal}"),
+                is_error: true,
+                metadata: None,
+                images: Vec::new(),
+            });
+        }
+
         let sh = crate::util::shell::shell();
         let mut child = Command::new(sh)
             .arg("-c")

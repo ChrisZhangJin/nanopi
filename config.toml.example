@@ -444,6 +444,30 @@ base_url = "https://api.openai.com/v1"
 # [experimental]
 # orchestrator = false
 
+# ─── sudo ───────────────────────────────────────────────────────────
+#
+# nanopi never runs a session as root. When your account has
+# PASSWORDLESS sudo (probed at startup with `sudo -n true`), the model
+# may prefix the individual commands that need root with `sudo -n`:
+#
+#   mode = "ask"   (default) the TUI shows each sudo command and runs it
+#                  only after you press `y` (n / Esc / Enter refuse).
+#                  Print mode (`-p`) cannot ask, so there it refuses.
+#   mode = "auto"  sudo commands run without asking.
+#   mode = "never" sudo commands are refused.
+#
+# Agents (child processes) never ask: they may use sudo only with
+# `agents = true`, and then without confirmation.
+#
+# A sudo that needs a password is refused with an explanation (the
+# model gives you the command to run yourself). A project's
+# .nanopi/config.toml can only make this STRICTER, never looser.
+# Spotting sudo in a shell command is heuristic: this guards against
+# accidents, it is not a sandbox — sudoers is the real boundary.
+# [sudo]
+# mode = "ask"
+# agents = false
+
 # ─── Agent caps (v0.13) ─────────────────────────────────────────────
 #
 # Limits on the `nanopi -p` children the `agent` tool spawns. The

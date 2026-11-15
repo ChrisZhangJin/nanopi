@@ -179,6 +179,12 @@ pub struct Config {
     /// section).
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+
+    /// Per-command sudo policy for the `bash` tool (`[sudo]` section).
+    /// A project file can only make it stricter — see
+    /// [`crate::sudo::SudoConfig::merge`].
+    #[serde(default)]
+    pub sudo: crate::sudo::SudoConfig,
 }
 
 /// Value of `[experimental] orchestrator` when the key is absent
@@ -552,6 +558,7 @@ impl Config {
             max_replay_entries: None,
             agent: AgentSection::default(),
             experimental: ExperimentalConfig::default(),
+            sudo: crate::sudo::SudoConfig::default(),
         }
     }
 
@@ -788,6 +795,8 @@ fn merge(a: Config, b: Config) -> Config {
         experimental: ExperimentalConfig {
             orchestrator: b.experimental.orchestrator.or(a.experimental.orchestrator),
         },
+        // NOT project-wins like the rest: a project may only tighten.
+        sudo: crate::sudo::SudoConfig::merge(a.sudo, b.sudo),
     }
 }
 
@@ -1163,6 +1172,7 @@ command = "echo hi"
             max_replay_entries: None,
             agent: AgentSection::default(),
             experimental: ExperimentalConfig::default(),
+            sudo: Default::default(),
         };
         let b = Config {
             model: None,
@@ -1181,6 +1191,7 @@ command = "echo hi"
             max_replay_entries: None,
             agent: AgentSection::default(),
             experimental: ExperimentalConfig::default(),
+            sudo: Default::default(),
         };
         let m = merge(a, b);
         assert_eq!(m.model.as_deref(), Some("a-model"));

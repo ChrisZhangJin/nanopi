@@ -314,6 +314,35 @@ gets no badge. Caps for the spawned children live under `[agent]` (see
 entirely and always keeps its full tool set, so scripted runs are never
 silently restricted.
 
+## sudo
+
+nanopi never runs a session as root. If your account has **passwordless**
+sudo (checked at startup with `sudo -n true`), the model may prefix the
+individual commands that need root with `sudo -n` — never `sudo su`, `sudo -i`
+or a root shell. By default every such command is shown in the TUI and runs
+only after you press <kbd>y</kbd>; <kbd>n</kbd>, <kbd>Esc</kbd> or
+<kbd>Enter</kbd> refuse it, and the model is told not to retry.
+
+```toml
+[sudo]
+mode = "ask"     # "ask" (default) | "auto" (no confirmation) | "never"
+agents = false   # let dispatched agents use sudo (they cannot ask)
+```
+
+- **Print mode** (`nanopi -p`) cannot ask, so `"ask"` refuses there; `"auto"`
+  allows.
+- **Agents** never ask; they may use sudo only with `agents = true`.
+- **Password sudo** is not supported yet: the command is refused and the model
+  gives you the command to run yourself.
+- **Running as root**, nothing is gated — sudo adds nothing.
+- A project's `.nanopi/config.toml` can only make this **stricter**, never
+  looser, so a cloned repository cannot turn on unattended root.
+
+Spotting sudo inside a shell command is heuristic (it catches `a && sudo b`,
+`env X=1 sudo …`, `xargs sudo`, `bash -c "sudo …"`, but not a script that runs
+sudo internally). It guards against accidents; your sudoers policy is the real
+boundary.
+
 ## MCP servers
 
 nanopi is an [MCP](https://modelcontextprotocol.io) client: tools served by

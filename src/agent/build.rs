@@ -854,6 +854,15 @@ pub fn compose_system_prompt_mode(
     if delegating {
         prompt.push_str(&crate::mcp::catalogue::format_for_prompt(mcp));
     }
+    // Only an agent that has `bash` can run sudo. `None` when no policy
+    // is installed (tests, snapshots), as root, or without sudo at all,
+    // so those prompts stay byte-identical.
+    if tool_names.iter().any(|n| n == "bash") {
+        if let Some(note) = crate::sudo::prompt_note() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&note);
+        }
+    }
     prompt
 }
 

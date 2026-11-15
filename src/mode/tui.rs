@@ -1042,6 +1042,9 @@ struct App {
     settings_menu: Option<MenuState<SettingsRow>>,
     keybindings_menu: Option<MenuState<crate::keys::ActionId>>,
     capture_key_for: Option<crate::keys::ActionId>,
+    /// A sudo command waiting for the user's y/n (`crate::sudo`). While
+    /// set, keys go to [`handle_sudo_key`] instead of the input box.
+    sudo_pending: Option<crate::sudo::SudoRequest>,
     settings_file: crate::settings_toml::SettingsFile,
     /// After picking a fork target: modal asking whether to summarize
     /// the cut-off branch. Three options match PI's UX:
@@ -1288,6 +1291,7 @@ impl App {
             settings_menu: None,
             keybindings_menu: None,
             capture_key_for: None,
+            sudo_pending: None,
             settings_file: crate::settings_toml::SettingsFile::default(),
             capture: CaptureMode::None,
             skill_load,
@@ -2683,6 +2687,81 @@ fn try_apply_orchestrator_toggle(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// sudo confirmation (`crate::sudo`, `[sudo] mode = "ask"`)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Called on every tick. Shows the next queued sudo request, or drops
+/// the shown one if the tool call that asked has gone away (its turn
+/// was cancelled). One request at a time; the rest wait in the queue.
+fn poll_sudo_request(term: &mut Term, app: &mut App) -> Result<()> {
+    if let Some(req) = &app.sudo_pending {
+        if req.is_abandoned() {
+            app.sudo_pending = None;
+            app.status_note = None;
+            insert_line(term, Line::from(Span::styled(
+                "  sudo request withdrawn (the turn was cancelled)",
+                Style::default().fg(Color::DarkGray),
+            )))?;
+        }
+        return Ok(());
+    }
+    let Some(req) = crate::sudo::take_request() else { return Ok(()) };
+    if req.is_abandoned() {
+        return Ok(());
+    }
+    insert_line(term, Line::from(Span::styled(
+        "⚠ sudo requested — this command will run as root:",
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )))?;
+    // Model-written text: strip control characters (escape sequences)
+    // line by line, so a multi-line command keeps its shape.
+    for line in req.command.lines() {
+        insert_line(term, Line::from(Span::styled(
+            format!("    {}", crate::mode::agents_strip::sanitize(line)),
+            Style::default().fg(Color::Yellow),
+        )))?;
+    }
+    insert_line(term, Line::from(Span::styled(
+        "  allow?  y = run it   n / Esc / Enter = refuse",
+        Style::default().fg(Color::Yellow),
+    )))?;
+    app.status_note = Some("sudo: allow? [y/N]".into());
+    app.sudo_pending = Some(req);
+    Ok(())
+}
+
+/// Key handling while a sudo request is shown. Returns `true` when the
+/// key was consumed. Only `y` allows; refusing is the default. Ctrl-C
+/// refuses AND falls through, so it still cancels the turn.
+fn handle_sudo_key(term: &mut Term, app: &mut App, k: KeyEvent) -> Result<bool> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let Some(allow) = sudo_key_decision(k) else { return Ok(true) };
+    if let Some(req) = app.sudo_pending.take() {
+        req.answer(allow);
+    }
+    app.status_note = None;
+    let (text, color) = if allow {
+        ("  sudo allowed", Color::Green)
+    } else {
+        ("  sudo refused", Color::Red)
+    };
+    insert_line(term, Line::from(Span::styled(text, Style::default().fg(color))))?;
+    Ok(!(ctrl && k.code == KeyCode::Char('c')))
+}
+
+/// The pure part of [`handle_sudo_key`]: `Some(true)` allow,
+/// `Some(false)` refuse, `None` ignore (swallowed, nothing decided).
+fn sudo_key_decision(k: KeyEvent) -> Option<bool> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Char('c') if ctrl => Some(false),
+        KeyCode::Char('y') | KeyCode::Char('Y') if !ctrl => Some(true),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => Some(false),
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Main event loop
 // ─────────────────────────────────────────────────────────────────────
 
@@ -2869,6 +2948,9 @@ async fn run_app(
                     // lost, never duplicated.
                     send_agent_reports_to_turn(steer_tx_slot.as_ref(), &mut agent_report_slot);
                 }
+                // A bash call asking to run sudo (`crate::sudo`, mode
+                // "ask"): show it and hold keys for the answer.
+                poll_sudo_request(term, app)?;
                 // Agents strip (D-07/UI-04): refresh the cached snapshot
                 // ONLY here, on the tick — never from agent events or key
                 // handling, so the strip can never race ahead of or
@@ -2894,10 +2976,13 @@ async fn run_app(
             key = key_events.next() => {
                 match key {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
-                        let action = interpret_key(app, k);
-                        handle_action(action, app, term, &agent_slot,
-                                      &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot,
-                                      &mut cancel, &mut turn_task).await?;
+                        let consumed = app.sudo_pending.is_some() && handle_sudo_key(term, app, k)?;
+                        if !consumed {
+                            let action = interpret_key(app, k);
+                            handle_action(action, app, term, &agent_slot,
+                                          &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot,
+                                          &mut cancel, &mut turn_task).await?;
+                        }
                     }
                     Some(Ok(Event::Paste(s))) => {
                         app.input.insert_str(&s);
@@ -10188,6 +10273,31 @@ mod tests {
         let off_text = render(&buf_off);
         assert!(!on_text.contains('⎈'), "no badge in the default mode: {on_text}");
         assert!(off_text.contains("⎈ solo"), "{off_text}");
+    }
+
+    /// Only a plain `y` allows a sudo command; refusing is the default
+    /// (Enter, Esc, n), Ctrl-C refuses, and anything else is ignored
+    /// rather than typed into the input box.
+    #[test]
+    fn sudo_prompt_only_a_plain_y_allows() {
+        let k = |code, mods| KeyEvent::new(code, mods);
+        assert_eq!(sudo_key_decision(k(KeyCode::Char('y'), KeyModifiers::NONE)), Some(true));
+        assert_eq!(sudo_key_decision(k(KeyCode::Char('Y'), KeyModifiers::SHIFT)), Some(true));
+        for refuse in [
+            k(KeyCode::Char('n'), KeyModifiers::NONE),
+            k(KeyCode::Enter, KeyModifiers::NONE),
+            k(KeyCode::Esc, KeyModifiers::NONE),
+            k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(sudo_key_decision(refuse), Some(false), "{refuse:?}");
+        }
+        for ignored in [
+            k(KeyCode::Char('x'), KeyModifiers::NONE),
+            k(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            k(KeyCode::Up, KeyModifiers::NONE),
+        ] {
+            assert_eq!(sudo_key_decision(ignored), None, "{ignored:?}");
+        }
     }
 }
 
