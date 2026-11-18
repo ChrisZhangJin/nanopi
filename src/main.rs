@@ -536,6 +536,23 @@ async fn main() -> ExitCode {
     // with a bare "No such device or address".
     let non_interactive = args.print || !std::io::stdin().is_terminal();
 
+    // Per-command sudo policy for the bash tool. Probed once, before any
+    // prompt is composed, so the system prompt and the gate agree.
+    {
+        use nanopi::sudo::{self, Role};
+        let role = if is_agent_mode(&args) {
+            Role::Agent
+        } else if non_interactive {
+            Role::Print
+        } else {
+            Role::Tui
+        };
+        let mode = cfg.sudo.mode();
+        let agents = cfg.sudo.agents();
+        let availability = sudo::detect(mode, role, agents);
+        sudo::set_policy(sudo::Policy { mode, agents, availability, role });
+    }
+
     let result = if non_interactive {
         let from_stdin: Option<String>;
         let message = match args
