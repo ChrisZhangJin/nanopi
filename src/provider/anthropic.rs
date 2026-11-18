@@ -396,6 +396,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
         use std::collections::HashMap;
         let retry = RetryConfig::default();
         let mut attempt: u32 = 0;
+        let started_at = std::time::Instant::now();
         let final_usage;
 
         'retry: loop {
@@ -488,6 +489,8 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
             let mut pending: HashMap<u32, PendingAnthropicTool> = HashMap::new();
             let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
             let mut started = false;
+            // `stop_reason` or `message_stop` arrived: the reply is whole.
+            let mut finished = false;
             let mut usage_local = Usage::default();
 
             while let Some(ev) = sse.next().await {
@@ -660,6 +663,7 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                 "message_delta" => {
                     if let Some(delta) = chunk.delta {
                         if let Some(sr) = delta.stop_reason {
+                            finished = true;
                             let finish = match sr.as_str() {
                                 "end_turn" | "stop_sequence" => FinishReason::Stop,
                                 "tool_use" => FinishReason::ToolCalls,
@@ -685,9 +689,27 @@ impl crate::agent::loop_::Provider for AnthropicProvider {
                 }
                 "message_stop" => {
                     // Already emitted Done via message_delta.
+                    finished = true;
                 }
                 _ => {}
             }
+            }
+            // Same rule as the OpenAI provider: a stream that just stops,
+            // with no stop_reason / message_stop / [DONE], was cut off.
+            if !finished && !sse.saw_done() {
+                if !started && attempt < retry.max_attempts {
+                    let delay = compute_delay(attempt, &retry, None, rand01());
+                    crate::note!(
+                        "[retrying ({}/{}) after {:.1}s: stream closed before any data]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry;
+                }
+                return Err(crate::provider::cut_off_error(started_at.elapsed()));
             }
             final_usage = usage_local;
             break 'retry;

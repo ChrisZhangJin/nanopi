@@ -98,6 +98,12 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: fmt::Display,
 {
+    /// Whether the server sent the `[DONE]` terminator, i.e. the stream
+    /// ended on purpose rather than being cut off.
+    pub fn saw_done(&self) -> bool {
+        self.done
+    }
+
     pub fn new(inner: S) -> Self {
         Self {
             inner,

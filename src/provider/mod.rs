@@ -61,6 +61,20 @@ impl ApiKind {
 /// Exposed separately from `build` so the startup banner can announce
 /// the protocol we're *really* about to speak rather than the one the
 /// config asked for.
+/// The error for a response stream that ended before the model
+/// finished: the connection was closed (by the server, a gateway or a
+/// proxy) without the protocol's end marker. Treating that as a normal
+/// end used to make a long reasoning pass just stop, with no answer and
+/// no error, so the turn looked finished when it had been cut off.
+pub(crate) fn cut_off_error(elapsed: std::time::Duration) -> String {
+    format!(
+        "the response stream was closed after {}s before the model finished \
+         (no end-of-response marker) — the reply was cut off, likely by the \
+         server, a gateway or a proxy timeout. Say \"continue\" to resume.",
+        elapsed.as_secs()
+    )
+}
+
 pub fn effective_kind(
     configured: Option<ApiKind>,
     vendor: Option<&dyn crate::vendor::Vendor>,
