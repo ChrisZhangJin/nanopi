@@ -33,6 +33,7 @@ pub mod plugin_grants;
 /// ever calls `send`, both drains are always empty, and the loop is
 /// byte-identical.
 pub mod plugin_send;
+pub mod profile;
 pub mod resources;
 pub mod session;
 pub mod settings;

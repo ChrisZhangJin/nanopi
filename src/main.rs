@@ -174,6 +174,13 @@ struct Args {
     /// Brief file for an agent child. Its presence marks agent mode.
     #[arg(long = "brief", value_name = "PATH")]
     brief: Option<PathBuf>,
+
+    /// Use the named config profile (`~/.nanopi/profiles/NAME/config.toml`) for
+    /// this run, without changing the saved active profile. `default`
+    /// is `~/.nanopi/config.toml`. Falls back to NANOPI_PROFILE, then
+    /// the profile last chosen with `/profile use`.
+    #[arg(long = "profile", value_name = "NAME")]
+    profile: Option<String>,
 }
 
 /// Agent (child) mode: launched by a parent nanopi as an agent.
@@ -288,6 +295,42 @@ async fn main() -> ExitCode {
     {
         eprintln!("error: --no-session cannot be combined with --continue/--fork/--session");
         return ExitCode::from(2);
+    }
+
+    // Pick the config profile before anything reads config (the wizard
+    // included, so `nanopi --profile work init` configures `work`).
+    if let Some(home) = nanopi::paths::nanopi_home() {
+        // Profiles used to be flat `profiles/<name>.toml` files; move
+        // them into their own folders before anything looks for them.
+        for note in nanopi::profile::migrate_flat_in(&home) {
+            eprintln!("nanopi: {note}");
+        }
+        // `nanopi --profile NAME init` configures NAME, creating its
+        // folder first when it is new (it has no config.toml yet, so the
+        // normal resolution below would reject it).
+        let init_profile = args.profile.as_deref().filter(|_| is_init_subcommand(&args));
+        let selected = match init_profile {
+            Some(name) if nanopi::profile::exists_in(&home, name) => Ok((name.to_string(), None)),
+            Some(name) => nanopi::profile::prepare_dir_in(&home, name)
+                .map(|_| (name.to_string(), None))
+                .map_err(|e| format!("--profile: {e}")),
+            None => {
+                let env = std::env::var(nanopi::profile::ENV).ok();
+                nanopi::profile::resolve_startup(&home, args.profile.as_deref(), env.as_deref())
+            }
+        };
+        match selected {
+            Ok((name, warning)) => {
+                if let Some(w) = warning {
+                    eprintln!("nanopi: {w}");
+                }
+                nanopi::profile::set_current(&name);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
     // `nanopi init` — explicit invocation of the first-run wizard.

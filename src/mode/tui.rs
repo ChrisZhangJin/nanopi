@@ -143,6 +143,10 @@ enum SlashCmd {
     /// at dispatch time by `parse_orchestrator_args`, mirroring
     /// `/agents`).
     Orchestrator,
+    /// `/profile [list | create <name> | use <name> | switch <name>]`:
+    /// manage config profiles (see `crate::profile`). Parsed at
+    /// dispatch time by `parse_profile_args`.
+    Profile,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -267,6 +271,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/orchestrator",
             "Toggle orchestrator mode (on|off to set explicitly)",
             SlashCmd::Orchestrator,
+        ),
+        MenuItem::new(
+            "/profile",
+            "Config profiles: list | create <name> (setup wizard) | use <name> (switch now, remembered)",
+            SlashCmd::Profile,
         ),
         MenuItem::new("/quit", "Exit the session", SlashCmd::Quit),
         MenuItem::new("/exit", "Exit the session", SlashCmd::Quit),
@@ -762,7 +771,10 @@ pub async fn run_tui_mode(
         prompt_overrides_for_rebuilds,
         cfg_for_build.extensions.clone(),
         tools_allow.clone(),
-        session_path.with_extension("history.txt"),
+        // Shared by every session, like a shell history: Up recalls
+        // what was typed before, also after a restart or /new. It used
+        // to be per session, so a new session always started empty.
+        crate::paths::history_path().unwrap_or_else(|| session_path.with_extension("history.txt")),
     );
     // v0.9.3: apply settings.toml (keybindings, hide_thinking, etc.).
     let settings_file = crate::settings_toml::load();
@@ -1042,6 +1054,9 @@ struct App {
     settings_menu: Option<MenuState<SettingsRow>>,
     keybindings_menu: Option<MenuState<crate::keys::ActionId>>,
     capture_key_for: Option<crate::keys::ActionId>,
+    /// `/profile create <name>` in progress: while Some, Enter feeds the
+    /// input line to the wizard and Esc / Ctrl-C cancel it.
+    profile_wizard: Option<ProfileWizard>,
     settings_file: crate::settings_toml::SettingsFile,
     /// After picking a fork target: modal asking whether to summarize
     /// the cut-off branch. Three options match PI's UX:
@@ -1288,6 +1303,7 @@ impl App {
             settings_menu: None,
             keybindings_menu: None,
             capture_key_for: None,
+            profile_wizard: None,
             settings_file: crate::settings_toml::SettingsFile::default(),
             capture: CaptureMode::None,
             skill_load,
@@ -1510,6 +1526,14 @@ enum KeyAction {
     /// `/orchestrator <bad arg>` — print the usage line, change
     /// nothing (T-06-05).
     OrchestratorUsage(String),
+    /// `/profile ...` parsed successfully.
+    Profile(ProfileCmd),
+    /// `/profile ...` with bad arguments — print usage, change nothing.
+    ProfileUsage(String),
+    /// Enter while the profile wizard runs: the answer to its question.
+    ProfileWizardInput(String),
+    /// Esc / Ctrl-C while the profile wizard runs.
+    ProfileWizardCancel,
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
     /// `/export [path]` — write the current session to a file.
@@ -1560,6 +1584,22 @@ enum KeyAction {
 /// handled, the palette's open/closed state is re-synced against the
 /// input buffer (open ⇔ first line starts with `/`).
 fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
+    if app.profile_wizard.is_some() && app.palette.is_none() {
+        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+        if (k.code == KeyCode::Esc && k.modifiers.is_empty()) || ctrl_c {
+            app.input.clear();
+            return KeyAction::ProfileWizardCancel;
+        }
+        // Enter answers the wizard directly, not through the text
+        // buffer's Submit: that ignores an empty line (which here means
+        // "accept the [default]") and records the line in the input
+        // history, where the API key would come back on Up.
+        if k.code == KeyCode::Enter && k.modifiers.is_empty() {
+            let text = app.input.as_string();
+            app.input.clear();
+            return KeyAction::ProfileWizardInput(text);
+        }
+    }
     if let Some(action) = app.capture_key_for {
         if k.code == KeyCode::Esc {
             app.capture_key_for = None;
@@ -1793,6 +1833,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                         .map(|(_, rest)| rest.trim().to_string())
                         .unwrap_or_default();
                     app.palette = None;
+                    app.input.push_history(&full);
                     app.input.clear();
                     return dispatch_slash(cmd, arg);
                 }
@@ -1837,6 +1878,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                     {
                         let text = app.input.as_string();
                         app.palette = None;
+                        app.input.push_history(&text);
                         app.input.clear();
                         return submit_or_chat(app, text);
                     }
@@ -1880,6 +1922,20 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     };
     sync_palette(app);
     out
+}
+
+/// The line shown when a turn ended because of a loop limit rather than
+/// because the model finished.
+fn turn_limit_notice(hit: Option<&str>, max_turns: u32) -> Option<String> {
+    match hit {
+        Some("max_turns") => Some(format!(
+            "[turn stopped after {max_turns} model rounds (the per-turn limit) — say \"continue\" to keep going]"
+        )),
+        Some("token_budget") => Some(
+            "[turn stopped: its token budget is used up — say \"continue\" to keep going]".to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// Hand a mid-stream message to the running turn.
@@ -2427,6 +2483,49 @@ fn cancel_turn(
 
 const ORCHESTRATOR_USAGE: &str = "Usage: /orchestrator [on|off]";
 
+const PROFILE_USAGE: &str =
+    "Usage: /profile [list | create <name> [--copy] | use <name> | switch <name>]";
+
+/// State of a `/profile create` wizard running inside the TUI.
+struct ProfileWizard {
+    name: String,
+    flow: crate::wizard::Flow,
+    target: crate::wizard::WizardTarget,
+    /// The question currently shown in the status line.
+    prompt: String,
+}
+
+/// A parsed `/profile` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProfileCmd {
+    /// Bare `/profile` or `/profile list`.
+    List,
+    /// `/profile create <name>`: run the setup wizard for a new profile.
+    /// With `--copy`, copy the active profile's config instead.
+    Create { name: String, copy: bool },
+    /// `/profile use <name>` (alias `switch`): switch now and remember it.
+    Use(String),
+}
+
+fn parse_profile_args(arg: &str) -> Result<ProfileCmd, String> {
+    let words: Vec<&str> = arg.split_whitespace().collect();
+    let named = |name: &str| -> Result<String, String> {
+        crate::profile::validate_name(name)?;
+        Ok(name.to_string())
+    };
+    match words.as_slice() {
+        [] | ["list"] | ["ls"] => Ok(ProfileCmd::List),
+        ["create", name] | ["new", name] => {
+            named(name).map(|name| ProfileCmd::Create { name, copy: false })
+        }
+        ["create", name, "--copy"] | ["new", name, "--copy"] => {
+            named(name).map(|name| ProfileCmd::Create { name, copy: true })
+        }
+        ["use", name] | ["switch", name] => named(name).map(ProfileCmd::Use),
+        _ => Err(PROFILE_USAGE.to_string()),
+    }
+}
+
 /// Parse `/orchestrator`'s argument: bare toggles (`None`), `on`/`off`
 /// set explicitly (`Some(bool)`), anything else is a usage error and
 /// changes nothing (T-06-05).
@@ -2565,6 +2664,10 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Orchestrator => match parse_orchestrator_args(&arg) {
             Ok(v) => KeyAction::SetOrchestrator(v),
             Err(msg) => KeyAction::OrchestratorUsage(msg),
+        },
+        SlashCmd::Profile => match parse_profile_args(&arg) {
+            Ok(cmd) => KeyAction::Profile(cmd),
+            Err(msg) => KeyAction::ProfileUsage(msg),
         },
     }
 }
@@ -2994,6 +3097,22 @@ async fn run_app(
                                     // `refresh_status` is the one place
                                     // that copies both.
                                     refresh_status(app, &agent_slot).await;
+                                    // A turn cut short by a loop limit ends
+                                    // like a finished one; say which it was
+                                    // (print mode reports it as
+                                    // `limit_reached`, the TUI said nothing).
+                                    let notice = {
+                                        let g = agent_slot.lock().await;
+                                        g.as_ref().and_then(|a| {
+                                            turn_limit_notice(a.last_limit_hit(), a.limits.max_turns)
+                                        })
+                                    };
+                                    if let Some(n) = notice {
+                                        insert_line(term, Line::from(vec![Span::styled(
+                                            n,
+                                            Style::default().fg(Color::Yellow),
+                                        )]))?;
+                                    }
                                 }
                                 Ok(Err(e)) => {
                                     // Refresh before showing the error so
@@ -4589,6 +4708,38 @@ async fn handle_action(
         KeyAction::Reload => {
             handle_reload(term, app, agent_slot).await?;
         }
+        KeyAction::Profile(cmd) => {
+            handle_profile(term, app, agent_slot, cmd).await?;
+        }
+        KeyAction::ProfileWizardInput(text) => {
+            profile_wizard_input(term, app, text).await?;
+        }
+        KeyAction::ProfileWizardCancel => {
+            if let Some(w) = app.profile_wizard.take() {
+                app.status_note = None;
+                // An untouched folder goes away; one holding a draft stays
+                // so the next `/profile create` resumes with those answers.
+                if let Some(dir) = w.target.cfg_path.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                insert_line(
+                    term,
+                    Line::from(vec![Span::styled(
+                        format!("profile `{}` not created (wizard cancelled)", w.name),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+                    )]),
+                )?;
+            }
+        }
+        KeyAction::ProfileUsage(msg) => {
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    msg,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )]),
+            )?;
+        }
         KeyAction::Compact => {
             app.status_note = Some("compacting…".into());
             term.draw(|f| {
@@ -5246,6 +5397,283 @@ fn reload_extensions_guarded(
     } else {
         a.reload_extensions(exts)
     }
+}
+
+/// Footer segment for the active profile: `profile:<name>`, or nothing
+/// for `default`.
+fn profile_segment(name: &str) -> Option<String> {
+    (name != crate::profile::DEFAULT).then(|| format!("profile:{name}"))
+}
+
+/// `/profile` lines for the list view. Pure so it can be tested.
+fn profile_list_lines(names: &[String], active: &str, path_of: impl Fn(&str) -> String) -> Vec<String> {
+    let mut out = vec!["profiles (* = active):".to_string()];
+    for n in names {
+        let mark = if n == active { "*" } else { " " };
+        out.push(format!("  {mark} {n:<16} {}", path_of(n)));
+    }
+    out.push("  /profile create <name> · /profile use <name>".to_string());
+    out
+}
+
+async fn handle_profile(
+    term: &mut Term,
+    app: &mut App,
+    agent: &Arc<Mutex<Option<Agent>>>,
+    cmd: ProfileCmd,
+) -> Result<()> {
+    fn say(term: &mut Term, msg: String, color: Color) -> Result<()> {
+        insert_line(
+            term,
+            Line::from(vec![Span::styled(msg, Style::default().fg(color).add_modifier(Modifier::ITALIC))]),
+        )
+    }
+    let Some(home) = crate::paths::nanopi_home() else {
+        return say(term, "profile: cannot resolve ~/.nanopi".to_string(), Color::Red);
+    };
+    match cmd {
+        ProfileCmd::List => {
+            let active = crate::profile::current();
+            let lines = profile_list_lines(&crate::profile::list(), &active, |n| {
+                crate::profile::config_path_in(&home, n).display().to_string()
+            });
+            for l in lines {
+                say(term, l, Color::Indexed(108))?;
+            }
+            Ok(())
+        }
+        ProfileCmd::Create { name, copy: true } => match crate::profile::create(&name) {
+            Ok(path) => say(
+                term,
+                format!(
+                    "created profile `{name}` at {} (a copy of `{}`). Edit it, then /profile use {name}",
+                    path.display(),
+                    crate::profile::current()
+                ),
+                Color::Indexed(108),
+            ),
+            Err(e) => say(term, format!("profile: {e}"), Color::Red),
+        },
+        ProfileCmd::Create { name, copy: false } => {
+            if app.profile_wizard.is_some() {
+                return say(
+                    term,
+                    "profile: a profile wizard is already running (Esc cancels it)".to_string(),
+                    Color::Yellow,
+                );
+            }
+            let dir = match crate::profile::prepare_dir_in(&home, &name) {
+                Ok(d) => d,
+                Err(e) => return say(term, format!("profile: {e}"), Color::Red),
+            };
+            let target = crate::wizard::WizardTarget::in_dir(&dir);
+            let (flow, reply) = crate::wizard::Flow::start(target.load_draft());
+            say(
+                term,
+                format!(
+                    "new profile `{name}` → {}  (Enter accepts the [default], Esc cancels)",
+                    dir.display()
+                ),
+                Color::Indexed(108),
+            )?;
+            app.profile_wizard = Some(ProfileWizard { name, flow, target, prompt: String::new() });
+            profile_wizard_drive(term, app, reply).await
+        }
+        ProfileCmd::Use(name) => handle_profile_use(term, app, agent, &home, &name).await,
+    }
+}
+
+/// How an answer is echoed into scrollback: the API key is masked.
+fn wizard_echo(prompt: &str, answer: &str, secret: bool) -> String {
+    let shown = if secret && !answer.is_empty() {
+        format!("•••• ({} chars)", answer.chars().count())
+    } else {
+        answer.to_string()
+    };
+    format!("{prompt}{shown}")
+}
+
+async fn profile_wizard_input(term: &mut Term, app: &mut App, text: String) -> Result<()> {
+    let Some(w) = app.profile_wizard.as_mut() else {
+        return Ok(());
+    };
+    let answer = crate::wizard::clean_input(&text);
+    let echo = wizard_echo(&w.prompt, &answer, w.flow.asking_secret());
+    let reply = w.flow.answer(&answer);
+    insert_line(
+        term,
+        Line::from(vec![Span::styled(echo, Style::default().fg(Color::DarkGray))]),
+    )?;
+    profile_wizard_drive(term, app, reply).await
+}
+
+/// Act on a wizard reply: print its lines, then show the next question,
+/// probe, or finish. Loops through probe failures (which yield a new
+/// question) until the wizard needs input again or is done.
+async fn profile_wizard_drive(
+    term: &mut Term,
+    app: &mut App,
+    mut reply: crate::wizard::Reply,
+) -> Result<()> {
+    use crate::wizard::Next;
+    fn say(term: &mut Term, msg: String, color: Color) -> Result<()> {
+        insert_line(term, Line::from(vec![Span::styled(msg, Style::default().fg(color))]))
+    }
+    loop {
+        for l in reply.lines.iter().filter(|l| !l.is_empty()) {
+            say(term, l.clone(), Color::Indexed(108))?;
+        }
+        let Some(w) = app.profile_wizard.as_mut() else {
+            return Ok(());
+        };
+        match reply.next {
+            Next::Ask(prompt) => {
+                app.status_note = Some(format!("profile {}: {}  (Esc cancels)", w.name, prompt.trim_end()));
+                w.prompt = prompt;
+                return Ok(());
+            }
+            Next::Abort => {
+                app.profile_wizard = None;
+                app.status_note = None;
+                return Ok(());
+            }
+            Next::Probe => {
+                crate::wizard::save_target_draft(&w.target, &w.flow);
+                let a = w.flow.answers();
+                say(term, format!("probing {}...", a.base_url), Color::Indexed(108))?;
+                app.status_note = Some("profile: probing the endpoint…".into());
+                term.draw(|f| {
+                    let area = f.area();
+                    draw_dock(f.buffer_mut(), area, app);
+                })?;
+                let probed =
+                    crate::wizard::probe_config(&a.base_url, &a.api_kind, &a.model, &a.api_key).await;
+                let Some(w) = app.profile_wizard.as_mut() else {
+                    return Ok(());
+                };
+                match probed {
+                    Err(e) => reply = w.flow.probe_failed(&e),
+                    Ok(()) => {
+                        let w = app.profile_wizard.take().expect("checked above");
+                        app.status_note = None;
+                        say(term, "probe OK.".into(), Color::Indexed(108))?;
+                        return match crate::wizard::finish(&w.target, &a) {
+                            Ok(lines) => {
+                                for l in lines {
+                                    say(term, l, Color::Indexed(108))?;
+                                }
+                                say(
+                                    term,
+                                    format!("profile `{0}` created. Switch to it with /profile use {0}", w.name),
+                                    Color::Green,
+                                )
+                            }
+                            Err(e) => say(term, format!("profile: {e:#}"), Color::Red),
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `/profile use <name>`: validate the target fully BEFORE changing
+/// anything (it exists, parses, and resolves to a model + key), then
+/// persist it, swap the live Agent's provider/model/endpoint/key, point
+/// future agent children at it, and run the `/reload` steps so hooks,
+/// skills and extensions come from the new profile too.
+async fn handle_profile_use(
+    term: &mut Term,
+    app: &mut App,
+    agent: &Arc<Mutex<Option<Agent>>>,
+    home: &std::path::Path,
+    name: &str,
+) -> Result<()> {
+    fn warn(term: &mut Term, msg: String) -> Result<()> {
+        insert_line(
+            term,
+            Line::from(vec![Span::styled(msg, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
+        )
+    }
+    // The Agent is moved out of the slot while a turn runs; switching
+    // the provider under it is not possible, so say so.
+    if agent.lock().await.is_none() {
+        return warn(term, "profile: a turn is in flight — try again once it finishes".to_string());
+    }
+    if !crate::profile::exists_in(home, name) {
+        return warn(
+            term,
+            format!(
+                "profile: no profile `{name}`. Profiles: {} (create one with /profile create {name})",
+                crate::profile::list().join(", ")
+            ),
+        );
+    }
+    let path = crate::profile::config_path_in(home, name);
+    let cfg = match crate::config::load_config_from(Some(&path), &app.cwd) {
+        Ok(c) => c,
+        Err(e) => return warn(term, format!("profile `{name}` not switched: {e}")),
+    };
+    let ep = match crate::profile::resolve_endpoint(&cfg, |k| std::env::var(k).ok()) {
+        Ok(ep) => ep,
+        Err(e) => return warn(term, format!("profile `{name}` not switched: {e} ({})", path.display())),
+    };
+    if let Err(e) = crate::profile::switch(name) {
+        return warn(term, format!("profile: {e}"));
+    }
+
+    app.api_kind = crate::provider::ApiKind::from_config_opt(ep.api_kind.as_deref());
+    app.cfg_provider = ep.provider.clone();
+    app.inline_think_tags = ep.inline_think_tags;
+    let pick = || crate::vendor::pick_vendor(ep.provider.as_deref(), Some(&ep.base_url), &ep.model);
+    let vendor_id = pick().id().to_string();
+    {
+        let mut g = agent.lock().await;
+        if let Some(a) = g.as_mut() {
+            if a.model != ep.model {
+                // Same record `/model` writes, so replay and /export
+                // show the switch.
+                let _ = crate::session::append_entry(
+                    &a.session_path,
+                    &crate::session::SessionEntry::ModelChange {
+                        timestamp: crate::util::time::now_iso8601(),
+                        from: a.model.clone(),
+                        to: ep.model.clone(),
+                    },
+                );
+            }
+            a.provider = crate::provider::build(
+                app.api_kind,
+                &ep.base_url,
+                &ep.api_key,
+                &ep.model,
+                Some(pick()),
+                app.inline_think_tags,
+            );
+            a.model = ep.model.clone();
+            a.base_url = ep.base_url.clone();
+            a.api_key = ep.api_key.clone();
+        }
+    }
+    app.model = ep.model.clone();
+    app.vendor_id = Some(vendor_id.clone());
+    crate::tool::agent::update_launch_spec(|s| {
+        s.model = Some(ep.model.clone());
+        s.base_url = Some(ep.base_url.clone());
+        s.api_key = Some(ep.api_key.clone());
+        s.api_kind = ep.api_kind.clone();
+        s.vendor = Some(vendor_id.clone());
+    });
+    insert_line(
+        term,
+        Line::from(vec![Span::styled(
+            format!("[profile → {name}: {} @ {}]", ep.model, ep.base_url),
+            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+        )]),
+    )?;
+    // Hooks, skills, extensions and the system prompt, from the new
+    // profile (load_config now reads it).
+    handle_reload(term, app, agent).await
 }
 
 async fn handle_reload(
@@ -6595,6 +7023,15 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             ));
         }
     }
+    // Active config profile, only when it isn't `default`, so the
+    // footer is unchanged for anyone not using profiles.
+    if let Some(seg) = profile_segment(&crate::profile::current()) {
+        l2.push(Span::raw(" · "));
+        l2.push(Span::styled(
+            seg,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+        ));
+    }
     // ORC-05: mode indicator, next to think:/vendor:. Orchestrator is
     // the default main flow, so the badge marks the DEVIATION from it —
     // `⎈ solo` means "this main agent edits and runs things itself".
@@ -7739,8 +8176,20 @@ mod tests {
             crate::agent::prompt_override::PromptOverrides::from_cli(None, Vec::new(), false),
             Vec::new(),
             Vec::new(),
-            std::path::PathBuf::from("/tmp/nanopi-test-history.txt"),
+            fresh_history_path(),
         )
+    }
+
+    /// A history file of its own for every test app. A shared fixed
+    /// path let one test's recorded commands (`/agents`) come back on
+    /// another test's Up arrow, across tests and across runs.
+    fn fresh_history_path() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir()
+            .join(format!("nanopi-test-history-{}-{n}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
     }
 
     fn seed_input(app: &mut App, text: &str) {
@@ -7885,6 +8334,19 @@ mod tests {
             interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             KeyAction::Compact
         ));
+    }
+
+    /// A command picked from the palette never reaches the buffer's
+    /// Submit, so it used to skip history: Up after `/profile` showed
+    /// the prompt before it instead.
+    #[test]
+    fn palette_commands_are_recalled_by_up_arrow() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/profile list");
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input.as_string(), "/profile list");
     }
 
     #[test]
@@ -9469,6 +9931,104 @@ mod tests {
             crate::agent_registry::AgentState::Queued,
             "no strip key may change agent state"
         );
+    }
+
+    // ─────── profiles ───────
+
+    #[test]
+    fn profile_slash_parses_subcommands() {
+        for (arg, want) in [
+            ("", ProfileCmd::List),
+            ("list", ProfileCmd::List),
+            ("create work", ProfileCmd::Create { name: "work".into(), copy: false }),
+            ("create work --copy", ProfileCmd::Create { name: "work".into(), copy: true }),
+            ("use work", ProfileCmd::Use("work".into())),
+            ("switch  local ", ProfileCmd::Use("local".into())),
+            ("use default", ProfileCmd::Use("default".into())),
+        ] {
+            match dispatch_slash(SlashCmd::Profile, arg.to_string()) {
+                KeyAction::Profile(cmd) => assert_eq!(cmd, want, "{arg:?}"),
+                other => panic!("{arg:?}: got {other:?}"),
+            }
+        }
+        for bad in ["use", "create", "use a b", "bogus x", "use ../etc"] {
+            assert!(
+                matches!(dispatch_slash(SlashCmd::Profile, bad.to_string()), KeyAction::ProfileUsage(_)),
+                "{bad:?} must be a usage error"
+            );
+        }
+    }
+
+    /// While the wizard runs, Enter answers it (never chats) and Esc /
+    /// Ctrl-C cancel it (Ctrl-C must not quit nanopi).
+    #[test]
+    fn profile_wizard_owns_enter_esc_and_ctrl_c() {
+        let mut app = mkapp();
+        let (flow, _) = crate::wizard::Flow::start(Default::default());
+        let target = crate::wizard::WizardTarget::in_dir(std::path::Path::new("/nonexistent"));
+        app.profile_wizard = Some(ProfileWizard { name: "w".into(), flow, target, prompt: String::new() });
+
+        for c in "2".chars() {
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        match interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            KeyAction::ProfileWizardInput(t) => assert_eq!(t, "2"),
+            other => panic!("Enter must answer the wizard, got {other:?}"),
+        }
+        // An empty line accepts the [default] — it must still be sent.
+        match interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            KeyAction::ProfileWizardInput(t) => assert_eq!(t, ""),
+            other => panic!("empty Enter must answer the wizard, got {other:?}"),
+        }
+        // Answers (the API key among them) never enter the input history.
+        for c in "sk-secret".chars() {
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!app.input.as_string().contains("sk-secret"), "key leaked into history");
+        assert!(matches!(
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyAction::ProfileWizardCancel
+        ));
+        assert!(matches!(
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            KeyAction::ProfileWizardCancel
+        ));
+    }
+
+    #[test]
+    fn a_limit_ended_turn_is_announced() {
+        assert_eq!(turn_limit_notice(None, 50), None);
+        assert!(turn_limit_notice(Some("max_turns"), 50).unwrap().contains("after 50 model rounds"));
+        assert!(turn_limit_notice(Some("token_budget"), 50).unwrap().contains("token budget"));
+    }
+
+    #[test]
+    fn wizard_masks_only_the_key() {
+        assert_eq!(wizard_echo("model: ", "gpt", false), "model: gpt");
+        assert_eq!(wizard_echo("api key: ", "sk-secret", true), "api key: •••• (9 chars)");
+        assert!(!wizard_echo("api key: ", "sk-secret", true).contains("secret"));
+    }
+
+    #[test]
+    fn profile_list_marks_the_active_one() {
+        let names = vec!["default".to_string(), "work".to_string()];
+        let lines = profile_list_lines(&names, "work", |n| format!("/h/{n}.toml"));
+        assert!(lines.iter().any(|l| l.contains("* work") && l.contains("/h/work.toml")));
+        assert!(lines.iter().any(|l| l.contains("  default")));
+        assert!(!lines.iter().any(|l| l.contains("* default")));
+    }
+
+    #[test]
+    fn footer_shows_the_profile_only_when_not_default() {
+        assert_eq!(profile_segment("default"), None);
+        assert_eq!(profile_segment("work").as_deref(), Some("profile:work"));
+    }
+
+    #[test]
+    fn profile_is_in_the_palette() {
+        assert!(slash_items().iter().any(|i| i.label == "/profile"));
     }
 
     // ─────── orchestrator mode (06-02) ───────

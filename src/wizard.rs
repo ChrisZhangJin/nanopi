@@ -2,7 +2,10 @@
 //!
 //! Bootstraps `~/.nanopi/config.toml` when a user runs nanopi with no
 //! config, no env vars, and no CLI creds. Also reachable explicitly via
-//! `nanopi init`.
+//! `nanopi init`, and for a named profile via `nanopi --profile NAME
+//! init` or the TUI's `/profile create NAME`, which write into
+//! `~/.nanopi/profiles/NAME/` instead. The questions themselves are the
+//! I/O-free [`Flow`], shared by both front ends.
 //!
 //! Design constraints (see `.planning/quick/260819-ayr-.../PLAN.md`):
 //! - Zero new crates. Uses only `reqwest`, `serde_json`, `anyhow`,
@@ -106,7 +109,12 @@ pub async fn probe_config(
     model: &str,
     api_key: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    // Bounded: an unreachable host must not hang the wizard (in the TUI
+    // that would freeze the whole screen).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let base = base_url.trim_end_matches('/');
     let resp = if api_kind == "anthropic" {
         let url = format!("{base}/v1/messages");
@@ -243,7 +251,13 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
         // "required" retry loops don't spin forever on empty reads.
         anyhow::bail!("wizard: stdin closed before input was provided");
     }
-    let s = buf.trim();
+    Ok(clean_input(&buf))
+}
+
+/// Trim an answer and drop one pair of surrounding quotes (people paste
+/// `"sk-..."`). Shared by the stdin and TUI front ends.
+pub fn clean_input(raw: &str) -> String {
+    let s = raw.trim();
     let s = if s.len() >= 2 {
         let b = s.as_bytes();
         let first = b[0];
@@ -256,30 +270,14 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
     } else {
         s
     };
-    Ok(s.to_string())
-}
-
-/// Prompt with an optional default. Empty input returns the default.
-/// `label` is the bare field name (e.g. "base_url"); we append the
-/// bracketed default and the ": " ourselves.
-fn read_line_default(label: &str, default: Option<&str>) -> anyhow::Result<String> {
-    let p = match default {
-        Some(d) if !d.is_empty() => format!("{label} [{d}]: "),
-        _ => format!("{label}: "),
-    };
-    let v = read_line(&p)?;
-    if v.is_empty() {
-        Ok(default.unwrap_or("").to_string())
-    } else {
-        Ok(v)
-    }
+    s.to_string()
 }
 
 /// A partial wizard attempt, persisted between runs so the user can
 /// resume after a probe failure or Ctrl-C without re-typing long URLs
 /// and API keys.
-#[derive(Debug, Default)]
-struct WizardDraft {
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WizardDraft {
     base_url: Option<String>,
     api_kind: Option<String>,
     model: Option<String>,
@@ -337,26 +335,336 @@ fn save_draft(path: &Path, d: &WizardDraft) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The interactive entry point.
+/// Where one wizard run writes: a config, its key file and the resume
+/// draft, all in one folder. For the `default` profile that folder is
+/// the nanopi home (`~/.nanopi/config.toml`, `~/.nanopi/api_key`, as
+/// always); for any other profile it is `~/.nanopi/profiles/<name>/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WizardTarget {
+    pub cfg_path: std::path::PathBuf,
+    pub key_path: std::path::PathBuf,
+    pub draft_path: std::path::PathBuf,
+}
+
+impl WizardTarget {
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            cfg_path: dir.join("config.toml"),
+            key_path: dir.join("api_key"),
+            draft_path: dir.join("wizard_draft.toml"),
+        }
+    }
+
+    /// The target for profile `name` under `home`.
+    pub fn for_profile(home: &Path, name: &str) -> Self {
+        Self::in_dir(&crate::profile::dir_in(home, name))
+    }
+
+    pub fn load_draft(&self) -> WizardDraft {
+        load_draft(&self.draft_path)
+    }
+}
+
+/// What the user answered, ready to probe and write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answers {
+    pub base_url: String,
+    pub api_kind: String,
+    pub model: String,
+    /// Empty for localhost endpoints.
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Provider,
+    BaseUrl,
+    ApiKind,
+    Model,
+    ApiKey,
+    ProbeFailed,
+}
+
+/// What the front end should do after an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Next {
+    /// Show this prompt and feed the reply to [`Flow::answer`].
+    Ask(String),
+    /// Everything is answered: probe [`Flow::answers`], then call
+    /// [`finish`] on success or [`Flow::probe_failed`] on failure.
+    Probe,
+    /// The user aborted; nothing is written.
+    Abort,
+}
+
+/// Lines to show (in order), then what to do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub lines: Vec<String>,
+    pub next: Next,
+}
+
+impl Reply {
+    fn ask(lines: Vec<String>, prompt: String) -> Self {
+        Self { lines, next: Next::Ask(prompt) }
+    }
+}
+
+/// The wizard's questions as a state machine, with no I/O, so the
+/// stdin wizard (`nanopi init`) and the TUI's `/profile create` ask
+/// exactly the same things in the same order.
+#[derive(Debug, Clone)]
+pub struct Flow {
+    step: Step,
+    preset: usize,
+    base_url: String,
+    api_kind: String,
+    model: String,
+    api_key: String,
+    draft: WizardDraft,
+}
+
+fn prompt_default(label: &str, default: Option<&str>) -> String {
+    match default {
+        Some(d) if !d.is_empty() => format!("{label} [{d}]: "),
+        _ => format!("{label}: "),
+    }
+}
+
+impl Flow {
+    /// Begin, with a saved draft's values as defaults.
+    pub fn start(draft: WizardDraft) -> (Self, Reply) {
+        let mut f = Self {
+            step: Step::Provider,
+            preset: 0,
+            base_url: String::new(),
+            api_kind: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            draft,
+        };
+        let r = f.provider_menu();
+        (f, r)
+    }
+
+    fn provider_menu(&mut self) -> Reply {
+        self.step = Step::Provider;
+        let mut lines = vec![String::new(), "Select a provider:".to_string()];
+        for (i, p) in PROVIDER_PRESETS.iter().enumerate() {
+            lines.push(format!("  {}) {}", i + 1, p.label));
+        }
+        Reply::ask(lines, "Choice [1]: ".to_string())
+    }
+
+    /// True while the question is the API key, so a front end that
+    /// echoes answers can mask this one.
+    pub fn asking_secret(&self) -> bool {
+        self.step == Step::ApiKey
+    }
+
+    pub fn answers(&self) -> Answers {
+        Answers {
+            base_url: self.base_url.clone(),
+            api_kind: self.api_kind.clone(),
+            model: self.model.clone(),
+            api_key: self.api_key.clone(),
+        }
+    }
+
+    /// The answers as a draft, saved before probing so an abort or a
+    /// failed probe can be resumed without retyping.
+    pub fn draft(&self) -> WizardDraft {
+        WizardDraft {
+            base_url: Some(self.base_url.clone()),
+            api_kind: Some(self.api_kind.clone()),
+            model: Some(self.model.clone()),
+            api_key: (!self.api_key.is_empty()).then(|| self.api_key.clone()),
+        }
+    }
+
+    fn after_model(&mut self) -> Reply {
+        if is_localhost(&self.base_url) {
+            self.api_key.clear();
+            return Reply { lines: vec![], next: Next::Probe };
+        }
+        self.step = Step::ApiKey;
+        Reply::ask(vec![], self.api_key_prompt())
+    }
+
+    /// Feed one answer (already trimmed of surrounding quotes by
+    /// [`clean_input`]).
+    pub fn answer(&mut self, input: &str) -> Reply {
+        let or_default = |v: &str, d: Option<&str>| {
+            if v.is_empty() { d.unwrap_or("").to_string() } else { v.to_string() }
+        };
+        match self.step {
+            Step::Provider => {
+                let sel = if input.is_empty() { "1" } else { input };
+                match sel.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= PROVIDER_PRESETS.len() => {
+                        self.preset = n - 1;
+                        let p = &PROVIDER_PRESETS[self.preset];
+                        if p.is_custom {
+                            self.step = Step::BaseUrl;
+                            Reply::ask(vec![], prompt_default("base_url", self.draft.base_url.as_deref()))
+                        } else {
+                            self.step = Step::Model;
+                            Reply::ask(vec![], format!("model [{}]: ", p.default_model))
+                        }
+                    }
+                    _ => Reply::ask(
+                        vec!["invalid selection, try again.".to_string()],
+                        "Choice [1]: ".to_string(),
+                    ),
+                }
+            }
+            Step::BaseUrl => {
+                let v = or_default(input, self.draft.base_url.as_deref());
+                if v.is_empty() {
+                    return Reply::ask(
+                        vec!["base_url is required.".to_string()],
+                        prompt_default("base_url", self.draft.base_url.as_deref()),
+                    );
+                }
+                self.base_url = v;
+                self.step = Step::ApiKind;
+                Reply::ask(vec![], self.api_kind_prompt())
+            }
+            Step::ApiKind => {
+                let v = or_default(input, Some(self.draft.api_kind.as_deref().unwrap_or("openai")));
+                if v != "openai" && v != "anthropic" {
+                    return Reply::ask(
+                        vec!["api_kind must be `openai` or `anthropic`.".to_string()],
+                        self.api_kind_prompt(),
+                    );
+                }
+                self.api_kind = v;
+                self.step = Step::Model;
+                Reply::ask(vec![], prompt_default("model", self.draft.model.as_deref()))
+            }
+            Step::Model => {
+                let p = &PROVIDER_PRESETS[self.preset];
+                if p.is_custom {
+                    let v = or_default(input, self.draft.model.as_deref());
+                    if v.is_empty() {
+                        return Reply::ask(
+                            vec!["model is required.".to_string()],
+                            prompt_default("model", self.draft.model.as_deref()),
+                        );
+                    }
+                    self.model = v;
+                } else {
+                    self.model = or_default(input, Some(p.default_model));
+                    self.base_url = p.base_url.to_string();
+                    self.api_kind = p.api_kind.to_string();
+                }
+                self.after_model()
+            }
+            Step::ApiKey => {
+                let v = or_default(input, self.draft.api_key.as_deref());
+                if v.is_empty() {
+                    return Reply::ask(
+                        vec!["api key is required (or pick Ollama/localhost to skip).".to_string()],
+                        self.api_key_prompt(),
+                    );
+                }
+                self.api_key = v;
+                Reply { lines: vec![], next: Next::Probe }
+            }
+            Step::ProbeFailed => match input.to_ascii_lowercase().as_str() {
+                "r" | "retry" => Reply { lines: vec![], next: Next::Probe },
+                "e" | "edit" => {
+                    // Start over with what was typed as the defaults.
+                    self.draft = self.draft();
+                    self.provider_menu()
+                }
+                "a" | "abort" | "" => Reply {
+                    lines: vec!["aborted; no config written.".to_string()],
+                    next: Next::Abort,
+                },
+                _ => Reply {
+                    lines: vec!["unrecognized choice; aborting.".to_string()],
+                    next: Next::Abort,
+                },
+            },
+        }
+    }
+
+    /// The key prompt. A saved key (from the draft) is offered as the
+    /// default but never shown: the prompt lands in the terminal's
+    /// scrollback, and in the TUI also in the status line.
+    fn api_key_prompt(&self) -> String {
+        match self.draft.api_key.as_deref() {
+            Some(k) if !k.is_empty() => "api key [•••• saved, Enter to reuse]: ".to_string(),
+            _ => "api key: ".to_string(),
+        }
+    }
+
+    fn api_kind_prompt(&self) -> String {
+        let d = self.draft.api_kind.as_deref().unwrap_or("openai");
+        prompt_default("api_kind [openai/anthropic]", Some(d))
+    }
+
+    /// The probe failed with `err`: offer retry / edit / abort.
+    pub fn probe_failed(&mut self, err: &str) -> Reply {
+        self.step = Step::ProbeFailed;
+        Reply::ask(
+            vec![format!("probe failed: {err}")],
+            "retry / edit / abort? [r/e/a]: ".to_string(),
+        )
+    }
+}
+
+/// Write the key file (empty for localhost) and the config, then drop
+/// the draft. Returns the lines to report.
 ///
-/// `force_overwrite_prompt=true`: coming from `nanopi init`; if
-/// `~/.nanopi/config.toml` already exists we prompt for confirmation
-/// before clobbering it.
+/// We always emit api_key_file so subsequent launches load cleanly —
+/// the config loader accepts an empty key file for no-auth localhost
+/// endpoints. The path we emit is the same absolute `key_path` we just
+/// wrote to, never a `~/…` literal: the two sides used to disagree
+/// about where `~` points, which broke every Windows first run.
+pub fn finish(target: &WizardTarget, a: &Answers) -> anyhow::Result<Vec<String>> {
+    write_key_file(&target.key_path, &a.api_key)?;
+    write_config_toml(
+        &target.cfg_path,
+        &a.model,
+        &a.base_url,
+        &a.api_kind,
+        Some(&target.key_path.to_string_lossy()),
+    )?;
+    let _ = std::fs::remove_file(&target.draft_path);
+    Ok(vec![
+        format!("wrote {}", target.cfg_path.display()),
+        format!("wrote {} (mode 0600)", target.key_path.display()),
+    ])
+}
+
+/// Save the draft before probing (it holds the key, so 0600).
+pub fn save_target_draft(target: &WizardTarget, flow: &Flow) {
+    let _ = save_draft(&target.draft_path, &flow.draft());
+}
+
+/// The interactive entry point, for the ACTIVE profile (so
+/// `nanopi --profile work init` configures `work`).
+///
+/// `force_overwrite_prompt=true`: coming from `nanopi init`; if the
+/// config already exists we prompt for confirmation before clobbering it.
 ///
 /// `force_overwrite_prompt=false`: coming from the no-config
 /// fallthrough in `main.rs`; there's no config to protect.
 pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
     let home = paths::nanopi_home()
         .ok_or_else(|| anyhow!("cannot resolve ~/.nanopi (HOME unset and NANOPI_HOME unset)"))?;
-    let cfg_path = home.join("config.toml");
-    let key_path = home.join("api_key");
-    let draft_path = home.join("wizard_draft.toml");
-    let draft = load_draft(&draft_path);
+    let target = WizardTarget::for_profile(&home, &crate::profile::current());
+    run_wizard_at(&target, force_overwrite_prompt).await
+}
 
-    if force_overwrite_prompt && cfg_path.exists() {
+/// The stdin front end over [`Flow`].
+pub async fn run_wizard_at(target: &WizardTarget, force_overwrite_prompt: bool) -> anyhow::Result<()> {
+    if force_overwrite_prompt && target.cfg_path.exists() {
         let ans = read_line(&format!(
             "{} already exists. Overwrite? [y/N]: ",
-            cfg_path.display()
+            target.cfg_path.display()
         ))?;
         let a = ans.to_ascii_lowercase();
         if a != "y" && a != "yes" {
@@ -365,146 +673,147 @@ pub async fn run_wizard(force_overwrite_prompt: bool) -> anyhow::Result<()> {
         }
     }
 
-    'outer: loop {
-        // Provider selection.
-        println!();
-        println!("Select a provider:");
-        for (i, p) in PROVIDER_PRESETS.iter().enumerate() {
-            println!("  {}) {}", i + 1, p.label);
+    let (mut flow, mut reply) = Flow::start(target.load_draft());
+    loop {
+        for l in &reply.lines {
+            println!("{l}");
         }
-        let preset = loop {
-            let sel = read_line("Choice [1]: ")?;
-            let sel = if sel.is_empty() { "1".to_string() } else { sel };
-            match sel.parse::<usize>() {
-                Ok(n) if n >= 1 && n <= PROVIDER_PRESETS.len() => break &PROVIDER_PRESETS[n - 1],
-                _ => println!("invalid selection, try again."),
-            }
-        };
-
-        // Fill (base_url, api_kind, model) — for Custom, prompt each.
-        let (base_url, api_kind, model) = if preset.is_custom {
-            let base_url = loop {
-                let v = read_line_default("base_url", draft.base_url.as_deref())?;
-                if !v.is_empty() {
-                    break v;
-                }
-                println!("base_url is required.");
-            };
-            let api_kind = loop {
-                let default = draft.api_kind.as_deref().unwrap_or("openai");
-                let v = read_line_default(
-                    "api_kind [openai/anthropic]",
-                    Some(default),
-                )?;
-                if v == "openai" || v == "anthropic" {
-                    break v;
-                }
-                println!("api_kind must be `openai` or `anthropic`.");
-            };
-            let model = loop {
-                let v = read_line_default("model", draft.model.as_deref())?;
-                if !v.is_empty() {
-                    break v;
-                }
-                println!("model is required.");
-            };
-            (base_url, api_kind, model)
-        } else {
-            let model_prompt = format!("model [{}]: ", preset.default_model);
-            let m = read_line(&model_prompt)?;
-            let model = if m.is_empty() {
-                preset.default_model.to_string()
-            } else {
-                m
-            };
-            (
-                preset.base_url.to_string(),
-                preset.api_kind.to_string(),
-                model,
-            )
-        };
-
-        // API key — skipped for localhost.
-        let localhost = is_localhost(&base_url);
-        // v1: single-line stdin, no echo-hide. Matches trust.rs simplicity.
-        // Users on shared terminals can set OPENAI_API_KEY out-of-band instead.
-        let api_key = if localhost {
-            String::new()
-        } else {
-            loop {
-                let v = read_line_default("api key", draft.api_key.as_deref())?;
-                if !v.is_empty() {
-                    break v;
-                }
-                println!("api key is required (or pick Ollama/localhost to skip).");
-            }
-        };
-
-        // Save draft before probing so a Ctrl-C or aborted retry loop
-        // leaves the filled fields on disk for the next run.
-        let _ = save_draft(&draft_path, &WizardDraft {
-            base_url: Some(base_url.clone()),
-            api_kind: Some(api_kind.clone()),
-            model: Some(model.clone()),
-            api_key: if api_key.is_empty() { None } else { Some(api_key.clone()) },
-        });
-
-        // Probe.
-        'probe: loop {
-            println!("probing {}...", base_url);
-            match probe_config(&base_url, &api_kind, &model, &api_key).await {
-                Ok(()) => {
-                    println!("probe OK.");
-                    break 'probe;
-                }
-                Err(e) => {
-                    println!("probe failed: {e}");
-                    let ans = read_line("retry / edit / abort? [r/e/a]: ")?;
-                    match ans.to_ascii_lowercase().as_str() {
-                        "r" | "retry" => continue 'probe,
-                        "e" | "edit" => continue 'outer,
-                        "a" | "abort" | "" => {
-                            println!("aborted; no config written.");
-                            return Ok(());
+        reply = match reply.next {
+            Next::Ask(prompt) => flow.answer(&read_line(&prompt)?),
+            Next::Probe => {
+                save_target_draft(target, &flow);
+                let a = flow.answers();
+                println!("probing {}...", a.base_url);
+                match probe_config(&a.base_url, &a.api_kind, &a.model, &a.api_key).await {
+                    Ok(()) => {
+                        println!("probe OK.");
+                        println!();
+                        for l in finish(target, &a)? {
+                            println!("{l}");
                         }
-                        _ => {
-                            println!("unrecognized choice; aborting.");
-                            return Ok(());
-                        }
+                        return Ok(());
                     }
+                    Err(e) => flow.probe_failed(&e),
                 }
             }
-        }
-
-        // Write key file (empty for localhost) then config.toml.
-        // We always emit api_key_file so subsequent launches load
-        // cleanly — the config loader accepts an empty key file for
-        // no-auth localhost endpoints.
-        //
-        // The path we emit is the same absolute `key_path` we just
-        // wrote to, never a `~/…` literal: the two sides used to
-        // disagree about where `~` points, which broke every Windows
-        // first run.
-        write_key_file(&key_path, &api_key)?;
-        write_config_toml(
-            &cfg_path,
-            &model,
-            &base_url,
-            &api_kind,
-            Some(&key_path.to_string_lossy()),
-        )?;
-        let _ = std::fs::remove_file(&draft_path);
-
-        println!();
-        println!("wrote {}", cfg_path.display());
-        println!("wrote {} (mode 0600)", key_path.display());
-        return Ok(());
+            Next::Abort => return Ok(()),
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask(r: &Reply) -> &str {
+        match &r.next {
+            Next::Ask(p) => p,
+            other => panic!("expected a question, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flow_preset_path_asks_model_then_key_then_probes() {
+        let (mut f, r) = Flow::start(WizardDraft::default());
+        assert!(r.lines.iter().any(|l| l.contains("1) OpenAI")));
+        assert_eq!(ask(&r), "Choice [1]: ");
+        assert!(f.answer("9").lines[0].contains("invalid"));
+        let r = f.answer("2");
+        assert_eq!(ask(&r), "model [deepseek-chat]: ");
+        let r = f.answer("");
+        assert_eq!(ask(&r), "api key: ");
+        assert!(f.asking_secret());
+        assert!(f.answer("").lines[0].contains("required"));
+        assert_eq!(f.answer("sk-1").next, Next::Probe);
+        assert_eq!(
+            f.answers(),
+            Answers {
+                base_url: "https://api.deepseek.com/v1".into(),
+                api_kind: "openai".into(),
+                model: "deepseek-chat".into(),
+                api_key: "sk-1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn flow_custom_localhost_skips_the_key_and_uses_draft_defaults() {
+        let draft = WizardDraft {
+            base_url: Some("http://localhost:8080/v1".into()),
+            api_kind: None,
+            model: Some("qwen".into()),
+            api_key: None,
+        };
+        let (mut f, _) = Flow::start(draft);
+        let r = f.answer("6");
+        assert_eq!(ask(&r), "base_url [http://localhost:8080/v1]: ");
+        let r = f.answer("");
+        assert_eq!(ask(&r), "api_kind [openai/anthropic] [openai]: ");
+        assert!(f.answer("grpc").lines[0].contains("must be"));
+        let r = f.answer("");
+        assert_eq!(ask(&r), "model [qwen]: ");
+        assert_eq!(f.answer("").next, Next::Probe, "localhost needs no key");
+        let a = f.answers();
+        assert_eq!((a.model.as_str(), a.api_key.as_str()), ("qwen", ""));
+    }
+
+    #[test]
+    fn flow_probe_failure_offers_retry_edit_abort() {
+        let (mut f, _) = Flow::start(WizardDraft::default());
+        f.answer("1");
+        f.answer("my-model");
+        f.answer("sk-x");
+        let r = f.probe_failed("HTTP 401");
+        assert!(r.lines[0].contains("HTTP 401"));
+        assert_eq!(f.answer("r").next, Next::Probe);
+        f.probe_failed("again");
+        let r = f.answer("e");
+        assert_eq!(ask(&r), "Choice [1]: ", "edit starts over");
+        f.answer("1");
+        let r = f.answer("");
+        assert_eq!(ask(&r), "api key [•••• saved, Enter to reuse]: ");
+        assert!(!ask(&r).contains("sk-x"), "a saved key is never displayed");
+        let r = f.answer("");
+        assert_eq!(r.next, Next::Probe, "the key typed before is now the default");
+        assert_eq!(f.answers().api_key, "sk-x");
+        f.probe_failed("x");
+        assert_eq!(f.answer("a").next, Next::Abort);
+    }
+
+    #[test]
+    fn finish_writes_config_and_key_into_the_profile_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::profile::prepare_dir_in(home.path(), "office").unwrap();
+        let t = WizardTarget::for_profile(home.path(), "office");
+        assert_eq!(t.cfg_path, dir.join("config.toml"));
+        assert_eq!(t.key_path, dir.join("api_key"));
+        let a = Answers {
+            base_url: "https://gw.example/v1".into(),
+            api_kind: "openai".into(),
+            model: "office-model".into(),
+            api_key: "sk-office".into(),
+        };
+        std::fs::write(&t.draft_path, "x").unwrap();
+        finish(&t, &a).unwrap();
+        assert!(!t.draft_path.exists(), "draft removed on success");
+        assert_eq!(std::fs::read_to_string(&t.key_path).unwrap(), "sk-office");
+        let cfg = crate::config::load_config_from(Some(&t.cfg_path), home.path()).unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("office-model"));
+        let ep = crate::profile::resolve_endpoint(&cfg, |_| None).unwrap();
+        assert_eq!(ep.api_key, "sk-office", "the profile's own key file is used");
+        assert_eq!(crate::profile::list_in(home.path()), vec!["default", "office"]);
+        // default keeps its historical locations.
+        let d = WizardTarget::for_profile(home.path(), crate::profile::DEFAULT);
+        assert_eq!(d.cfg_path, home.path().join("config.toml"));
+        assert_eq!(d.key_path, home.path().join("api_key"));
+    }
+
+    #[test]
+    fn clean_input_strips_one_pair_of_quotes() {
+        assert_eq!(clean_input("  \"sk-1\" \n"), "sk-1");
+        assert_eq!(clean_input("'a'"), "a");
+        assert_eq!(clean_input("\"a"), "\"a");
+    }
 
     #[test]
     fn presets_has_six_entries_with_custom_last() {

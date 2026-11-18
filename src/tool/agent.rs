@@ -80,11 +80,26 @@ impl Default for ChildLaunchSpec {
     }
 }
 
-static LAUNCH_SPEC: OnceLock<ChildLaunchSpec> = OnceLock::new();
+static LAUNCH_SPEC: std::sync::RwLock<Option<ChildLaunchSpec>> = std::sync::RwLock::new(None);
 
 /// Install the parent's resolved launch settings (first call wins).
 pub fn set_launch_spec(spec: ChildLaunchSpec) {
-    let _ = LAUNCH_SPEC.set(spec);
+    let mut g = LAUNCH_SPEC.write().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        *g = Some(spec);
+    }
+}
+
+/// Change the installed launch settings in place (a `/profile use`
+/// switched the model/endpoint/key). No-op when none was installed.
+pub fn update_launch_spec(f: impl FnOnce(&mut ChildLaunchSpec)) {
+    if let Some(spec) = LAUNCH_SPEC.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        f(spec);
+    }
+}
+
+fn installed_launch_spec() -> Option<ChildLaunchSpec> {
+    LAUNCH_SPEC.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The `agent` tool. Fields are overrides; unset ones resolve to the
@@ -134,7 +149,7 @@ impl AgentTool {
             spec: self
                 .spec
                 .clone()
-                .or_else(|| LAUNCH_SPEC.get().cloned())
+                .or_else(installed_launch_spec)
                 .unwrap_or_default(),
             program: self.program.clone().unwrap_or_default(),
         }
@@ -2126,6 +2141,9 @@ impl ChildProgram {
     pub fn command(&self) -> Command {
         let mut c = Command::new(&self.program);
         c.args(&self.leading_args);
+        // A child loads the same profile as its parent, including one
+        // picked with `--profile` or switched to with `/profile use`.
+        c.env(crate::profile::ENV, crate::profile::current());
         c
     }
 }

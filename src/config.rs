@@ -3,7 +3,8 @@
 //! Three layers, in priority order (highest wins):
 //!   1. CLI flags (handled by clap, not this module)
 //!   2. Project-local: `<cwd>/.nanopi/config.toml`
-//!   3. Global: `~/.nanopi/config.toml`
+//!   3. Global: `~/.nanopi/config.toml`, or the active profile's
+//!      `~/.nanopi/profiles/<name>.toml` (see `crate::profile`)
 //!
 //! Missing files → defaults. Invalid TOML → error with file path.
 //! All fields optional; serde defaults fill them in.
@@ -569,24 +570,56 @@ impl Config {
 
 /// Load and merge configs from global + project-local. Missing files are
 /// silently ignored (use defaults). Malformed TOML is a hard error.
+///
+/// The global layer is the active profile's file (see `crate::profile`),
+/// which is `~/.nanopi/config.toml` unless a profile is selected.
 pub fn load_config(cwd: &Path) -> Result<Config, ConfigError> {
-    let global_path = global_config_path();
+    load_config_from(global_config_path().as_deref(), cwd)
+}
+
+/// True when `path` is `<nanopi home>/config.toml` (the default
+/// profile), compared after resolving symlinks.
+fn is_home_config(path: &Path) -> bool {
+    let Some(home) = crate::paths::nanopi_home() else {
+        return false;
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(path) == canon(&home.join("config.toml"))
+}
+
+/// [`load_config`] with an explicit global file, so a profile can be
+/// loaded (and validated) before it is made active.
+pub fn load_config_from(global_path: Option<&Path>, cwd: &Path) -> Result<Config, ConfigError> {
     let local_path = cwd.join(".nanopi").join("config.toml");
 
     let mut merged = Config::builtin_defaults();
 
     if let Some(path) = global_path {
         if path.exists() {
-            merged = merge(merged, load_one(&path)?);
+            merged = merge(merged, load_one(path)?);
         }
     }
 
-    if local_path.exists() {
+    // Started in the home directory, the "project" file is
+    // `~/.nanopi/config.toml` — the default profile's own file. Layering
+    // it over another profile would silently undo the switch (the
+    // default's model and endpoint win), so it only counts as a project
+    // file when it is not nanopi's home config.
+    if local_path.exists() && !is_home_config(&local_path) {
         merged = merge(merged, load_one(&local_path)?);
     }
 
-    validate_tool_exec_overrides(&merged)?;
-    validate_agent(&merged)?;
+    // The validators name the active profile's file; when loading some
+    // other file (a profile about to be switched to), name that one.
+    validate_tool_exec_overrides(&merged)
+        .and_then(|()| validate_agent(&merged))
+        .map_err(|e| match (e, global_path) {
+            (ConfigError::Toml { source, .. }, Some(p)) => ConfigError::Toml {
+                path: p.to_path_buf(),
+                source,
+            },
+            (e, _) => e,
+        })?;
 
     Ok(merged)
 }
@@ -1500,5 +1533,38 @@ command = "/bin/true"
         tmp.write(".nanopi/config.toml", "[agent]\nmax_live = 8\n");
         let c = load_config(tmp.path()).expect("project value repairs it");
         assert_eq!(agent_of(&c).max_live, 8);
+    }
+
+    /// Started from the home directory, `./.nanopi/config.toml` IS the
+    /// default profile's file. It must not be layered over another
+    /// profile as if it were a project config, or switching profiles
+    /// there silently keeps the default's model and endpoint.
+    #[test]
+    fn home_config_is_not_a_project_layer_over_another_profile() {
+        let g = crate::TempNanopiHome::new();
+        let home = g.path();
+        std::fs::write(home.join("config.toml"), "model = \"default-model\"\n").unwrap();
+        let office = crate::profile::create_in(home, "office", None).unwrap();
+        std::fs::write(&office, "model = \"office-model\"\n").unwrap();
+
+        // cwd = "~": its .nanopi is the nanopi home (via a symlink here).
+        let user_home = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home, user_home.path().join(".nanopi")).unwrap();
+        #[cfg(unix)]
+        {
+            let c = load_config_from(Some(&office), user_home.path()).unwrap();
+            assert_eq!(c.model.as_deref(), Some("office-model"));
+            let c = load_config_from(Some(&home.join("config.toml")), user_home.path()).unwrap();
+            assert_eq!(c.model.as_deref(), Some("default-model"));
+        }
+
+        // A real project config still overrides the profile.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".nanopi")).unwrap();
+        std::fs::write(project.path().join(".nanopi/config.toml"), "model = \"project-model\"\n")
+            .unwrap();
+        let c = load_config_from(Some(&office), project.path()).unwrap();
+        assert_eq!(c.model.as_deref(), Some("project-model"));
     }
 }
