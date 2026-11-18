@@ -107,9 +107,10 @@ fn sep_to_native(s: &str) -> PathBuf {
     }
 }
 
-/// The global `config.toml`.
+/// The global config file: the active profile's (see
+/// `crate::profile`). With no profiles in use that is `config.toml`.
 pub fn global_config_path() -> Option<PathBuf> {
-    nanopi_home().map(|h| h.join("config.toml"))
+    crate::profile::current_config_path()
 }
 
 /// The global `settings.toml`.
@@ -139,9 +140,13 @@ pub fn global_mcp_path() -> Option<PathBuf> {
     nanopi_home().map(|h| h.join("mcp.json"))
 }
 
-/// Rustyline history file.
+/// The TUI's prompt history (Up / Down in the input box), shared by
+/// every session and project, like a shell's. One JSON string per line
+/// so multi-line prompts survive. (The rustyline mode that used
+/// `history.txt` is gone; a new name keeps a stale file of that format
+/// from being read as this one.)
 pub fn history_path() -> Option<PathBuf> {
-    nanopi_home().map(|h| h.join("history.txt"))
+    nanopi_home().map(|h| h.join("history.jsonl"))
 }
 
 /// Directory holding `<cwd-key>=trusted|denied` markers.

@@ -486,6 +486,7 @@ impl OpenAiProvider {
         // would produce duplicates.
         let retry = crate::provider::retry::RetryConfig::default();
         let mut attempt: u32 = 0;
+        let started_at = std::time::Instant::now();
 
         // These vars are set by the loop body on success, then used
         // AFTER the loop for the drain phase. Rust's borrow checker
@@ -598,6 +599,8 @@ impl OpenAiProvider {
             let mut pending: std::collections::HashMap<u32, PendingToolCall> = Default::default();
             let mut emitted_call_ids: std::collections::HashSet<String> = Default::default();
             let mut started = false;
+            // A `finish_reason` arrived: the model finished this reply.
+            let mut finished = false;
             let mut usage_local = Usage::default();
             let mut splitter = InlineThinkSplitter::new();
 
@@ -679,6 +682,7 @@ impl OpenAiProvider {
                     }
                     // Flush completed tool calls on finish_reason.
                     if let Some(fr) = &choice.finish_reason {
+                        finished = true;
                         flush_pending_tool_calls(
                             &mut pending,
                             &mut emitted_call_ids,
@@ -739,7 +743,30 @@ impl OpenAiProvider {
                 }
             }
 
-            // Stream closed without an explicit finish_reason; emit Done with what we have.
+            // Closed with neither a finish_reason nor `[DONE]`: the
+            // connection was cut mid-reply. Nothing reached the caller
+            // yet → retry like any transport failure; otherwise say so
+            // instead of passing the fragment off as a complete reply.
+            if !finished && !stream.saw_done() {
+                if !started && attempt < retry.max_attempts {
+                    let delay =
+                        crate::provider::retry::compute_delay(attempt, &retry, None, rand01());
+                    crate::note!(
+                        "[retrying ({}/{}) after {:.1}s: stream closed before any data]",
+                        attempt + 1,
+                        retry.max_attempts,
+                        delay.as_secs_f64(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry;
+                }
+                return Err(OpenAiError::Api(crate::provider::cut_off_error(
+                    started_at.elapsed(),
+                )));
+            }
+            // Ended on purpose (`[DONE]`) without a finish_reason, which
+            // some gateways do: emit what we have.
             flush_pending_tool_calls(&mut pending, &mut emitted_call_ids, &tx, 0).await;
             // Drain any splitter state still buffered (unclosed <think>,
             // partial delimiter prefix) so nothing is lost. Harmless if

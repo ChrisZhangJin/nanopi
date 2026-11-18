@@ -124,6 +124,7 @@ pub const RESERVED_COMMAND_NAMES: &[&str] = &[
     "settings",
     "keybindings",
     "orchestrator",
+    "profile",
     "quit",
     "exit",
 ];

@@ -76,9 +76,52 @@ pub struct TextBuffer {
     /// entered history mode, so Down past the newest entry restores
     /// it. PI calls this `historyDraft`.
     history_draft: String,
-    /// When set, history is persisted to this file (one entry per
-    /// line). Loaded on construction, saved after each submit.
+    /// When set, history is persisted to this file (one JSON string per
+    /// line, so multi-line prompts survive). Loaded on construction;
+    /// each submit APPENDS one line, so several nanopi windows sharing
+    /// the file add to it instead of overwriting each other.
     history_path: Option<PathBuf>,
+}
+
+/// Append one entry to the history file (created owner-only: prompts can
+/// contain things people would rather not share). Best-effort — a
+/// history that cannot be written must never cost the user a prompt.
+fn append_history(path: &std::path::Path, entry: &str) {
+    use std::io::Write;
+    let Ok(line) = serde_json::to_string(entry) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(path) {
+        // One write per entry, so concurrent appenders don't interleave.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+/// Replace the history file with exactly `entries`, via a temp file and
+/// a rename so a crash never leaves it half-written.
+fn rewrite_history(path: &std::path::Path, entries: &[String]) {
+    let tmp = path.with_extension("jsonl.tmp");
+    let body: String = entries
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .map(|l| l + "\n")
+        .collect();
+    if std::fs::write(&tmp, body).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,23 +160,33 @@ impl TextBuffer {
         }
     }
 
-    /// Create a TextBuffer with per-session history persistence.
-    /// Loads existing history from `path` on creation; saves after
-    /// each submit.
+    /// Create a TextBuffer whose history is persisted at `path`.
+    /// Loads the newest `HISTORY_CAP` entries on creation; each submit
+    /// appends one. A file that has grown well past the cap (appends
+    /// from many sessions) is rewritten down to the cap here.
     pub fn with_history(path: PathBuf) -> Self {
         let mut buf = Self::new();
         buf.history_path = Some(path.clone());
         if let Ok(contents) = std::fs::read_to_string(&path) {
+            let mut all: Vec<String> = Vec::new();
             for line in contents.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    buf.history.push(trimmed.to_string());
+                // A JSON string per line; anything else (a hand-edited
+                // or plain-text line) is taken verbatim.
+                let entry = serde_json::from_str::<String>(line)
+                    .unwrap_or_else(|_| line.to_string());
+                let entry = entry.trim();
+                if !entry.is_empty() && all.last().map(String::as_str) != Some(entry) {
+                    all.push(entry.to_string());
                 }
             }
-            if buf.history.len() > HISTORY_CAP {
-                let excess = buf.history.len() - HISTORY_CAP;
-                buf.history.drain(0..excess);
+            let lines = contents.lines().count();
+            if all.len() > HISTORY_CAP {
+                all.drain(0..all.len() - HISTORY_CAP);
             }
+            if lines > 2 * HISTORY_CAP {
+                rewrite_history(&path, &all);
+            }
+            buf.history = all;
         }
         buf
     }
@@ -197,7 +250,9 @@ impl TextBuffer {
     /// Push a submitted prompt onto the history ring. Blank text and
     /// exact-duplicate consecutive entries are skipped (bash-style).
     /// Older entries drop off the front once we exceed HISTORY_CAP.
-    fn push_history(&mut self, text: &str) {
+    /// Also called by the TUI for lines the slash palette consumed
+    /// (`/profile` chosen from the menu), which never reach `Submit`.
+    pub fn push_history(&mut self, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
@@ -210,14 +265,8 @@ impl TextBuffer {
             let excess = self.history.len() - HISTORY_CAP;
             self.history.drain(0..excess);
         }
-        self.save_history();
-    }
-
-    /// Persist the in-memory history ring to disk (if a path is set).
-    fn save_history(&self) {
         if let Some(path) = &self.history_path {
-            let content = self.history.join("\n");
-            let _ = std::fs::write(path, content);
+            append_history(path, trimmed);
         }
     }
 
@@ -1037,10 +1086,10 @@ mod tests {
         submit(&mut b, "beta");
         submit(&mut b, "gamma");
 
-        // Verify the file was written.
+        // Verify the file was written: one JSON string per line.
         let contents = std::fs::read_to_string(&path).expect("history file should exist");
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(lines, vec!["\"alpha\"", "\"beta\"", "\"gamma\""]);
 
         // Load a fresh buffer from the same path — should recall history.
         let mut b2 = TextBuffer::with_history(path.clone());
@@ -1054,6 +1103,52 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A multi-line prompt comes back as ONE entry with its newlines,
+    /// and two buffers sharing a file (two nanopi windows) both add to
+    /// it rather than the later one overwriting the earlier.
+    #[test]
+    fn shared_history_keeps_multiline_entries_and_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut a = TextBuffer::with_history(path.clone());
+        let mut b = TextBuffer::with_history(path.clone());
+        a.insert_str("line one\nline two");
+        a.handle_key(press(KeyCode::Enter));
+        submit(&mut b, "from window b");
+        submit(&mut a, "from window a");
+
+        let mut fresh = TextBuffer::with_history(path.clone());
+        fresh.handle_key(press(KeyCode::Up));
+        assert_eq!(fresh.as_string(), "from window a");
+        fresh.handle_key(press(KeyCode::Up));
+        assert_eq!(fresh.as_string(), "from window b");
+        fresh.handle_key(press(KeyCode::Up));
+        assert_eq!(fresh.as_string(), "line one\nline two");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// The file only ever grows by appends; loading trims it back to the
+    /// cap once it is well past it, keeping the newest entries.
+    #[test]
+    fn history_file_is_trimmed_to_the_cap_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut w = TextBuffer::with_history(path.clone());
+        for i in 0..(2 * HISTORY_CAP + 5) {
+            submit(&mut w, &format!("p{i}"));
+        }
+        let loaded = TextBuffer::with_history(path.clone());
+        assert_eq!(loaded.history.len(), HISTORY_CAP);
+        assert_eq!(loaded.history.last().unwrap(), &format!("p{}", 2 * HISTORY_CAP + 4));
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(lines, HISTORY_CAP, "file rewritten down to the cap");
     }
 
     /// Regression: a bracketed paste arrives with the terminal's own

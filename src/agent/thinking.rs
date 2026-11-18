@@ -90,6 +90,18 @@ impl std::str::FromStr for ThinkingLevel {
 /// text-only models that would 400 on them.
 pub fn supports_vision(model_id: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
+    // Claude 5 family. Missing for the same reason as in
+    // `supports_thinking` below — the list predates 5.x. Not cosmetic:
+    // both providers strip image blocks when this returns false, so a
+    // `read` of a PNG on a Claude 5 model reached the model only as
+    // "(N image(s) omitted — model does not support vision)".
+    if m.starts_with("claude-opus-5")
+        || m.starts_with("claude-sonnet-5")
+        || m.starts_with("claude-haiku-5")
+        || m.starts_with("claude-fable-5")
+    {
+        return true;
+    }
     if m.starts_with("claude-opus-4")
         || m.starts_with("claude-sonnet-4")
         || m.starts_with("claude-haiku-4")
@@ -214,6 +226,18 @@ mod tests {
         assert!(!supports_thinking("claude-haiku-4-5"));
         assert!(!supports_thinking("gpt-4o"));
         assert!(!supports_thinking("unknown-model"));
+    }
+
+    #[test]
+    fn supports_vision_claude_5_family() {
+        // Regression: Claude 5 ids were missing from the allowlist, so
+        // images from `read` were stripped before reaching the model.
+        assert!(supports_vision("claude-opus-5-5"));
+        assert!(supports_vision("claude-sonnet-5"));
+        assert!(supports_vision("claude-haiku-5-5"));
+        assert!(supports_vision("claude-fable-5-1"));
+        assert!(supports_vision("Claude-Opus-5-5"));
+        assert!(!supports_vision("unknown-model"));
     }
 
     #[test]

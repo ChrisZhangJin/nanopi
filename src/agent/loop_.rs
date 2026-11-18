@@ -72,7 +72,15 @@ pub struct HooksConfig {
     pub session_compact: Vec<HookConfig>,
 }
 
-/// The agent — owns context, provider, tool registry, session, permissions.
+/// What to tell the user when a reply ends at the output-token limit.
+pub(crate) fn output_limit_note(no_answer: bool) -> String {
+    format!(
+        "[the model hit its output-token limit (finish_reason = length){} — \
+         the reply is incomplete. Say \"continue\" to resume]",
+        if no_answer { " before writing any answer" } else { "" }
+    )
+}
+
 /// Per-turn loop limits. `max_turns` caps LLM iterations within one
 /// `run_turn` (default 50); `token_budget` caps cumulative
 /// input+output tokens for the turn (default unlimited).
@@ -103,6 +111,7 @@ impl Default for TurnLimits {
     }
 }
 
+/// The agent — owns context, provider, tool registry, session, permissions.
 pub struct Agent {
     pub context: Context,
     pub provider: Box<dyn Provider>,
@@ -1495,7 +1504,13 @@ impl Agent {
                 // event that got silently skipped). Emit a real Error
                 // event and surface it so the user sees something
                 // instead of the "nothing was printed" bug.
-                if final_text.is_empty() && assistant_text.is_empty() && calls.is_empty() {
+                //
+                // Judged on THIS round only. `final_text` carries text from
+                // earlier rounds of the turn, and checking it let a round
+                // that produced nothing (say, a reasoning pass that was cut
+                // off) end the turn silently whenever an earlier round had
+                // said something.
+                if assistant_text.is_empty() && calls.is_empty() {
                     let msg = "empty response — provider ended the stream with no text, tool call, or Done event (likely gateway silently dropped an error)".to_string();
                     let _ = tx.send(AgentEvent::Error { error: msg.clone() }).await;
                     return Err(AgentError::Provider(msg));
@@ -1533,7 +1548,15 @@ impl Agent {
             let had_tool_calls = !calls.is_empty();
 
             match finish_reason {
-                FinishReason::Stop | FinishReason::Length | FinishReason::Refusal => {
+                FinishReason::Stop | FinishReason::Refusal => {
+                    break;
+                }
+                FinishReason::Length => {
+                    // The reply hit the output-token limit. Ending the turn
+                    // is right (there is nothing to execute), but silently
+                    // it looks like the model chose to stop — and with a
+                    // long reasoning pass there may be no answer at all.
+                    crate::note!("{}", output_limit_note(assistant_text.is_empty() && calls.is_empty()));
                     break;
                 }
                 FinishReason::ToolCalls => {
@@ -5194,6 +5217,126 @@ mod tests {
     }
 
     // ─────── v0.6: parallel tool execution ───────
+
+    /// The 3.jsonl failure at the loop level: an earlier round of the
+    /// turn produced text, then a round streamed only reasoning and ended
+    /// with no Done (the stream was cut). The empty-round check looked at
+    /// the turn's CUMULATIVE text, so it saw "first" and ended the turn
+    /// as if finished. It must be judged on the round itself.
+    #[tokio::test]
+    async fn a_round_that_produces_nothing_errors_even_after_earlier_text() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CutProvider {
+            step: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for CutProvider {
+            fn id(&self) -> &'static str {
+                "cut"
+            }
+            async fn stream_turn(
+                &self,
+                _ctx: &Context,
+                tx: mpsc::Sender<AgentEvent>,
+            ) -> Result<Usage, String> {
+                let step = self.step.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(AgentEvent::Start { message_id: "m".into() }).await;
+                match step {
+                    0 => {
+                        let _ = tx
+                            .send(AgentEvent::TextDelta { content_index: 0, text: "first".into() })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::ToolCall {
+                                content_index: 0,
+                                call: ToolCall {
+                                    id: "c1".into(),
+                                    name: "bash".into(),
+                                    arguments: json!({"command": "echo hi"}),
+                                },
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::Done {
+                                finish_reason: FinishReason::ToolCalls,
+                                usage: Usage::default(),
+                            })
+                            .await;
+                    }
+                    1 => {
+                        // Reasoning only, then the stream just ends.
+                        let _ = tx
+                            .send(AgentEvent::ThinkingDelta {
+                                content_index: 0,
+                                text: "still thinking…".into(),
+                            })
+                            .await;
+                    }
+                    _ => unreachable!("provider called too many times"),
+                }
+                Ok(Usage::default())
+            }
+        }
+
+        let dir = tmp();
+        let session_path = dir.join("cut.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"session\",\"version\":2,\"id\":\"019fe000-0000-7000-8000-000000000001\",\"timestamp\":\"2026-08-10T00:00:00Z\",\"cwd\":\"/tmp\",\"model\":\"cut\",\"base_url\":\"\"}\n",
+        )
+        .unwrap();
+        let mut agent = Agent {
+            context: Context::default(),
+            provider: Box::new(CutProvider { step: Arc::new(AtomicUsize::new(0)) }),
+            registry: ToolRegistry::standard(),
+            session_path,
+            session_id: uuid::v7().to_string(),
+            cwd: dir.clone(),
+            permission: PermissionGate::from_cli(false, None),
+            hooks: HooksConfig::default(),
+            model: "cut".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            usage_total: Usage::default(),
+            limits: Default::default(),
+            turn_count: 0,
+            skills: Vec::new(),
+            no_context_files: false,
+            pending_follow_ups: Default::default(),
+            tool_exec_mode: crate::config::ToolExecMode::default(),
+            tool_exec_overrides: Default::default(),
+            plugin_commands: Vec::new(),
+            plugin_grants: Vec::new(),
+            event_subscribers: Default::default(),
+            prompt_overrides: crate::agent::prompt_override::PromptOverrides::default(),
+            system_base: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let drain = tokio::spawn(async move {
+            let mut errors = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                if let AgentEvent::Error { error } = ev {
+                    errors.push(error);
+                }
+            }
+            errors
+        });
+        let res = agent.run_turn("go", &tx, None, None).await;
+        drop(tx);
+        let errors = drain.await.unwrap();
+        assert!(res.is_err(), "the turn must not end as if finished: {res:?}");
+        assert!(errors.iter().any(|e| e.contains("empty response")), "{errors:?}");
+    }
+
+    #[test]
+    fn output_limit_note_says_the_reply_is_incomplete() {
+        let n = output_limit_note(true);
+        assert!(n.contains("output-token limit") && n.contains("before writing any answer"), "{n}");
+        assert!(n.contains("continue"), "{n}");
+        assert!(!output_limit_note(false).contains("before writing any answer"));
+    }
 
     /// Two bash calls that each sleep 1s — they MUST run in parallel
     /// (total wall time < 1.8s), not sequentially (<2s). v0.5 was

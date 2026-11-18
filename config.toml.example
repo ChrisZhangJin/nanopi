@@ -1,7 +1,8 @@
 # nanopi config.toml
 #
 # Loaded from two locations (both optional, project overrides global):
-#   1. ~/.nanopi/config.toml        (global — user-wide defaults)
+#   1. ~/.nanopi/config.toml        (global — user-wide defaults; or the
+#                                    active profile's config, see below)
 #   2. <cwd>/.nanopi/config.toml    (project-local — overrides global)
 #
 # Precedence for any given value:
@@ -9,6 +10,20 @@
 #
 # Every field below is optional. Copy this file to
 # ~/.nanopi/config.toml (or ./.nanopi/config.toml) and edit as needed.
+#
+# Profiles: the global file can be swapped for a named profile, one
+# complete config per folder, all with the keys documented here:
+#   ~/.nanopi/config.toml                  the "default" profile (this file)
+#   ~/.nanopi/profiles/<name>/config.toml  any other profile
+#   ~/.nanopi/profiles/<name>/api_key      its key file (written by the wizard)
+# Create one with `/profile create <name>` in the TUI or
+# `nanopi --profile <name> init` (both run the setup wizard), or
+# `/profile create <name> --copy` to copy the active profile. Pick one
+# with `--profile <name>` (this run only) or `/profile use <name>` in the
+# TUI (switches immediately and is remembered in ~/.nanopi/active_profile).
+# The project-local file above is still merged over whichever profile is
+# active. Without any profile, nothing changes: this file is the global
+# config, as before.
 
 # ─── Model / endpoint ────────────────────────────────────────────────
 

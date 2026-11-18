@@ -314,3 +314,59 @@ async fn the_reported_gateway_shape_produces_text_not_silence() {
     assert_eq!(text_of(&evs), "hi", "{evs:?}");
     assert!(evs.iter().any(|e| e["type"] == "done" && e["finish_reason"] == "stop"), "{evs:?}");
 }
+
+// ── cut-off streams ─────────────────────────────────────────────────
+
+/// Like `run_openai`/`run_anthropic`, but hands back the `Result`.
+async fn run_raw(anthropic: bool, body: Vec<u8>) -> (Vec<serde_json::Value>, Result<(), String>) {
+    let base = serve(body, None);
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let res = if anthropic {
+        let mut p = AnthropicProvider::new(base, "k", "m");
+        p.client = client();
+        tokio::time::timeout(Duration::from_secs(30), Provider::stream_turn(&p, &Context::default(), tx)).await
+    } else {
+        let mut p = OpenAiProvider::new(base, "k", "m");
+        p.client = client();
+        tokio::time::timeout(Duration::from_secs(30), Provider::stream_turn(&p, &Context::default(), tx)).await
+    }
+    .expect("stream_turn must finish");
+    (drain(&mut rx), res.map(|_| ()))
+}
+
+/// The 3.jsonl failure: the model is mid-reasoning when the connection
+/// is closed (no finish_reason, no [DONE]). That used to count as a
+/// normal end, so the turn just stopped with no answer and no error.
+/// It must be reported as a cut-off, and the reasoning that did arrive
+/// must still have been streamed.
+#[tokio::test]
+async fn openai_stream_cut_off_mid_reasoning_is_an_error() {
+    let body = b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking about it\"},\"finish_reason\":null}]}\n\n"
+        .to_vec();
+    let (evs, res) = run_raw(false, body).await;
+    let err = res.expect_err("a cut-off stream must not look like a finished reply");
+    assert!(err.contains("cut off") && err.contains("continue"), "{err}");
+    assert!(evs.iter().any(|e| e["type"] == "thinking_delta"), "{evs:?}");
+    assert!(!evs.iter().any(|e| e["type"] == "done"), "{evs:?}");
+}
+
+#[tokio::test]
+async fn anthropic_stream_cut_off_mid_reply_is_an_error() {
+    let events: Vec<Ev> = anthropic_events().into_iter().take(4).collect();
+    let (evs, res) = run_raw(true, render(&events, Wire { done: None, ..CANONICAL })).await;
+    let err = res.expect_err("a cut-off stream must not look like a finished reply");
+    assert!(err.contains("cut off"), "{err}");
+    assert_eq!(text_of(&evs), "Hello", "what arrived is still delivered: {evs:?}");
+}
+
+/// Some gateways end with `[DONE]` but never send a finish_reason. That
+/// is a deliberate end, not a cut: it must keep working.
+#[tokio::test]
+async fn done_without_finish_reason_still_counts_as_finished() {
+    let body = b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                 data: [DONE]\n\n"
+        .to_vec();
+    let (evs, res) = run_raw(false, body).await;
+    res.expect("[DONE] is an end-of-response marker");
+    assert_eq!(text_of(&evs), "ok");
+}
