@@ -137,6 +137,18 @@ pub fn policy() -> Option<Policy> {
 /// for a password. Skipped (reported `Unavailable`) when the policy
 /// could never allow sudo anyway, so no process is spawned for nothing.
 pub fn detect(mode: SudoMode, role: Role, agents: bool) -> Availability {
+    // No sudo outside unix (and `libc` is a unix-only dependency).
+    #[cfg(not(unix))]
+    {
+        let _ = (mode, role, agents);
+        Availability::Unavailable
+    }
+    #[cfg(unix)]
+    detect_unix(mode, role, agents)
+}
+
+#[cfg(unix)]
+fn detect_unix(mode: SudoMode, role: Role, agents: bool) -> Availability {
     // SAFETY: geteuid has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } == 0 {
         return Availability::Root;
