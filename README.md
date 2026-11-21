@@ -286,7 +286,7 @@ doesn't know to `custom`:
 
 ```json
 {
-  "generated_by": "0.15.0",
+  "generated_by": "0.16.1",
   "custom": [
     { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
   ],
@@ -786,7 +786,12 @@ Host-side plugin state survives a reload, deliberately: the plugin's host-store 
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.11.0** | current | ~1.6 MB | WASM extensions with gated `host-fs-read` / `host-http-get` and plugin-registered slash commands; Pi lifecycle hooks (`before_agent_start`, `turn_start`, `turn_end`, `message_end`); mid-stream steering; configurable tool exec mode |
+| **v0.16.1** | current | 2.0 MB | `/goal` (work until a verified condition), `/loop` (fixed or self-paced), background mode (`/background`, `--foreground`); config profiles; per-command sudo gate; hybrid orchestrator; cut-off replies reported; shared input history |
+| v0.15.0 | released | — | MCP servers (stdio + Streamable HTTP, `/mcp`); interactive `/agents` picker; orderly SIGTERM/SIGHUP exit |
+| v0.14.0 | released | 1.8 MB | Orchestrator as the default main agent; user-editable `models.json`; context usage bar |
+| v0.13.0 | released | — | Orchestrator mode; background agent dispatch; agents strip (Ctrl+G) |
+| v0.12.x | released | — | One hook-event vocabulary, plugin capabilities, hot-reloadable extensions (`.release-notes-v0.12.0.md`); explicit DNS, `sh`/ripgrep fallbacks (0.12.1) |
+| v0.11.0 | closed | ~1.6 MB | WASM extensions with gated `host-fs-read` / `host-http-get` and plugin-registered slash commands; Pi lifecycle hooks (`before_agent_start`, `turn_start`, `turn_end`, `message_end`); mid-stream steering; configurable tool exec mode |
 | v0.10.0 | released | 1.6 MB | Custom system prompt (`--system-prompt`, `SYSTEM.md`); explicit `api_kind` beats the vendor sniff; readable tool failures in `-p`; UPX-packed release |
 | v0.9.x | released | ~3.9 MB | First-run wizard, `/settings` + `/keybindings`, 8-vendor dispatch, retry envelope (0.9.2–0.9.3); v0.9.1 fixed the v0.9.0 tool loop |
 | v0.9.0 | released | ~4.0 MB | Skills (PI-parity), `--skill`/`--no-skills`, folded TUI card, `UserPromptSubmit` hook |
@@ -798,6 +803,7 @@ Sizes are the published musl artifact. From v0.10.0 that artifact is
 UPX-packed (`make`), so 1.6 MB is not comparable to the unpacked figures
 above it — the same build is 4.4 MB before packing. The v0.11.0 figure is
 approximate: it is measured from a development build, not a published tag.
+`—` marks sizes not recorded here.
 
 ## Roadmap
 

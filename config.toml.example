@@ -409,7 +409,7 @@ base_url = "https://api.openai.com/v1"
 # On first interactive run nanopi writes `~/.nanopi/models.json`:
 #
 #   {
-#     "generated_by": "0.15.0",
+#     "generated_by": "0.16.1",
 #     "custom":  [],
 #     "builtin": [ { "id": "...", "vendor": "...", "context_window": 0 } ]
 #   }
