@@ -147,6 +147,15 @@ enum SlashCmd {
     /// manage config profiles (see `crate::profile`). Parsed at
     /// dispatch time by `parse_profile_args`.
     Profile,
+    /// `/goal [condition | clear]`: keep working until a model judges
+    /// the condition met (`crate::goal`).
+    Goal,
+    /// `/loop [interval] [prompt] | stop | status`: re-run a prompt
+    /// while the session is idle (`crate::loops`).
+    Loop,
+    /// `/background [list]`: hand a goal / loop to a background worker
+    /// and quit (`crate::background`), or list the workers.
+    Background,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -276,6 +285,21 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/profile",
             "Config profiles: list | create <name> (setup wizard) | use <name> (switch now, remembered)",
             SlashCmd::Profile,
+        ),
+        MenuItem::new(
+            "/goal",
+            "Keep working until a condition holds: /goal <condition> | /goal (status) | /goal clear",
+            SlashCmd::Goal,
+        ),
+        MenuItem::new(
+            "/loop",
+            "Re-run a prompt: /loop [5m] [prompt] (no interval = self-paced) | /loop stop",
+            SlashCmd::Loop,
+        ),
+        MenuItem::new(
+            "/background",
+            "Keep the goal / loop working in the background and quit (nanopi --foreground brings it back) | list",
+            SlashCmd::Background,
         ),
         MenuItem::new("/quit", "Exit the session", SlashCmd::Quit),
         MenuItem::new("/exit", "Exit the session", SlashCmd::Quit),
@@ -839,6 +863,12 @@ pub async fn run_tui_mode(
         }
     }
 
+    // `nanopi --foreground`: continue the goal / loop the background
+    // worker was running.
+    if let Some(st) = crate::background::take_restore() {
+        restore_from_background(&mut terminal, &mut app, st)?;
+    }
+
     // Agents dispatched from the TUI run in the background by default so
     // the user can keep talking while they work; reports arrive later.
     if let Some(reg) = crate::agent_registry::global() {
@@ -1060,6 +1090,30 @@ struct App {
     /// `/profile create <name>` in progress: while Some, Enter feeds the
     /// input line to the wizard and Esc / Ctrl-C cancel it.
     profile_wizard: Option<ProfileWizard>,
+    /// `/goal`: the active goal, the last one that resolved, a counter
+    /// that tells a stale verdict from a current one, and the running
+    /// evaluation.
+    goal: Option<crate::goal::Goal>,
+    goal_done: Option<crate::goal::Finished>,
+    goal_gen: u64,
+    goal_eval: Option<tokio::task::JoinHandle<GoalEvalResult>>,
+    /// `/loop`: the running loop, and whether the current turn is one
+    /// of its iterations.
+    loop_state: Option<crate::loops::LoopState>,
+    loop_turn: bool,
+    /// `schedule_wakeup` is registered on the agent (self-paced loop).
+    wakeup_tool_on: bool,
+    /// Tool calls the current turn has made, `schedule_wakeup` aside —
+    /// the goal's "is it still doing work" signal.
+    turn_tool_calls: usize,
+    /// `/background` was asked for mid-turn: hand off when it ends.
+    background_pending: bool,
+    /// `/background now` stopped agents: told to the worker's next goal
+    /// turn so it can dispatch them again.
+    background_note: Option<String>,
+    /// Back from the background with a goal step owed: judge the last
+    /// worker turn, or run the turn the worker had decided on.
+    goal_restore: Option<GoalRestore>,
     settings_file: crate::settings_toml::SettingsFile,
     /// After picking a fork target: modal asking whether to summarize
     /// the cut-off branch. Three options match PI's UX:
@@ -1308,6 +1362,17 @@ impl App {
             capture_key_for: None,
             sudo_pending: None,
             profile_wizard: None,
+            goal: None,
+            goal_done: None,
+            goal_gen: 0,
+            goal_eval: None,
+            loop_state: None,
+            loop_turn: false,
+            wakeup_tool_on: false,
+            turn_tool_calls: 0,
+            background_pending: false,
+            background_note: None,
+            goal_restore: None,
             settings_file: crate::settings_toml::SettingsFile::default(),
             capture: CaptureMode::None,
             skill_load,
@@ -1538,6 +1603,17 @@ enum KeyAction {
     ProfileWizardInput(String),
     /// Esc / Ctrl-C while the profile wizard runs.
     ProfileWizardCancel,
+    /// `/goal …` parsed.
+    Goal(crate::goal::GoalCmd),
+    /// `/loop …` parsed (Esc on an empty idle prompt sends `Stop`).
+    Loop(crate::loops::LoopCmd),
+    /// `/goal` or `/loop` with bad arguments.
+    GoalLoopUsage(String),
+    /// `/background [list]`.
+    Background(String),
+    /// A `/goal` line inside a longer message: set the goal; the text
+    /// before it goes with the first goal turn.
+    GoalInline { preamble: String, condition: String },
     /// `/copy`: copy the last assistant message via OSC 52.
     CopyLastReply,
     /// `/export [path]` — write the current session to a file.
@@ -1758,6 +1834,20 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
         return KeyAction::CancelTurn;
     }
 
+    // ── Esc on an empty, idle prompt stops a running /loop (Claude
+    // Code's gesture). Consumed, so it does not also arm the fork
+    // picker's double-tap.
+    if k.code == KeyCode::Esc
+        && k.modifiers.is_empty()
+        && app.loop_state.is_some()
+        && app.input.is_empty()
+        && app.palette.is_none()
+        && app.model_picker.is_none()
+        && app.status != Status::Streaming
+    {
+        return KeyAction::Loop(crate::loops::LoopCmd::Stop);
+    }
+
     // ── Esc double-tap → open fork picker ───────────────────────────
     // Only when the editor is empty, no menu open, not streaming, and
     // the previous Esc was < 500ms ago. First-Esc-on-empty just records
@@ -1836,6 +1926,12 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
                         .split_once(' ')
                         .map(|(_, rest)| rest.trim().to_string())
                         .unwrap_or_default();
+                    // A goal may span lines; every one of them is the
+                    // condition, not just the first.
+                    let arg = match (&cmd, full.trim_start().strip_prefix("/goal")) {
+                        (SlashCmd::Goal, Some(rest)) if full.contains('\n') => rest.trim().to_string(),
+                        _ => arg,
+                    };
                     app.palette = None;
                     app.input.push_history(&full);
                     app.input.clear();
@@ -2128,6 +2224,15 @@ fn submit_or_chat(app: &App, text: String) -> KeyAction {
     if t.is_empty() {
         return KeyAction::Nothing;
     }
+    // A `/goal` line inside a longer message ("answer…\n/goal …"): set
+    // the goal, and send what came before it along with the first turn.
+    if let Some((preamble, condition)) = split_inline_goal(t) {
+        return match crate::goal::parse_args(&condition) {
+            Ok(crate::goal::GoalCmd::Set(condition)) => KeyAction::GoalInline { preamble, condition },
+            Ok(_) => KeyAction::StartTurn(t.to_string()),
+            Err(msg) => KeyAction::GoalLoopUsage(format!("{msg}\n{}", crate::goal::USAGE)),
+        };
+    }
     let known = known_command_names(app);
     let known: Vec<&str> = known.iter().map(String::as_str).collect();
     let t = match classify_submission(t, &known) {
@@ -2144,6 +2249,32 @@ fn submit_or_chat(app: &App, text: String) -> KeyAction {
         return KeyAction::SteerTurn(t.to_string());
     }
     KeyAction::StartTurn(t.to_string())
+}
+
+/// `(text before, condition)` when a multi-line message has a line that
+/// starts with `/goal ` — the condition is the rest of that line plus
+/// every line after it. One-line messages are the palette's business.
+fn split_inline_goal(text: &str) -> Option<(String, String)> {
+    if !text.contains('\n') {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| {
+        let l = l.trim_start();
+        l.strip_prefix("/goal").is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })?;
+    let first = lines[at].trim_start().strip_prefix("/goal").unwrap_or("");
+    let mut condition = first.trim().to_string();
+    for l in &lines[at + 1..] {
+        condition.push('\n');
+        condition.push_str(l);
+    }
+    let condition = condition.trim().to_string();
+    if condition.is_empty() {
+        return None;
+    }
+    let preamble = lines[..at].join("\n").trim().to_string();
+    Some((preamble, condition))
 }
 
 /// The single line every slash path parses: the first line of the
@@ -2673,6 +2804,15 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             Ok(cmd) => KeyAction::Profile(cmd),
             Err(msg) => KeyAction::ProfileUsage(msg),
         },
+        SlashCmd::Goal => match crate::goal::parse_args(&arg) {
+            Ok(cmd) => KeyAction::Goal(cmd),
+            Err(msg) => KeyAction::GoalLoopUsage(format!("{msg}\n{}", crate::goal::USAGE)),
+        },
+        SlashCmd::Background => KeyAction::Background(arg),
+        SlashCmd::Loop => match crate::loops::parse_args(&arg) {
+            Ok(cmd) => KeyAction::Loop(cmd),
+            Err(msg) => KeyAction::GoalLoopUsage(format!("{msg}\n{}", crate::loops::USAGE)),
+        },
     }
 }
 
@@ -3054,6 +3194,28 @@ async fn run_app(
                 // A bash call asking to run sudo (`crate::sudo`, mode
                 // "ask"): show it and hold keys for the answer.
                 poll_sudo_request(term, app)?;
+                // /goal verdicts and retries, /loop iterations.
+                let idle = app.status != Status::Streaming && turn_task.is_none();
+                // A hand-off that waited for agents: go once everything
+                // has settled (their reports normally arrive as a turn,
+                // and that turn's end hands off; this covers the rest).
+                if app.background_pending
+                    && idle
+                    && app.goal_eval.is_none()
+                    && follow_up_slot.is_empty()
+                    && agent_report_slot.is_empty()
+                    && crate::agent_registry::global().is_none_or(|r| !r.has_pending_reports())
+                    && live_agents(crate::agent_registry::global().as_deref()) == 0
+                {
+                    hand_off_to_background(term, app, &agent_slot, false, None).await?;
+                }
+                if let Some(text) = poll_goal_and_loop(term, app, &agent_slot, idle).await? {
+                    handle_action(
+                        KeyAction::StartTurn(text),
+                        app, term, &agent_slot,
+                        &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                    ).await?;
+                }
                 // Agents strip (D-07/UI-04): refresh the cached snapshot
                 // ONLY here, on the tick — never from agent events or key
                 // handling, so the strip can never race ahead of or
@@ -3070,6 +3232,8 @@ async fn run_app(
                 if app.turn_started_at.is_some()
                     || app.tool_started_at.is_some()
                     || app.status_note.is_some()
+                    || app.goal.is_some()
+                    || app.loop_state.is_some()
                     || !app.agents_view.is_empty()
                     || became_empty
                 {
@@ -3082,6 +3246,12 @@ async fn run_app(
                         let consumed = app.sudo_pending.is_some() && handle_sudo_key(term, app, k)?;
                         if !consumed {
                             let action = interpret_key(app, k);
+                            // The user's own prompt resumes a paused goal.
+                            if matches!(action, KeyAction::StartTurn(_)) {
+                                if let Some(g) = app.goal.as_mut() {
+                                    g.resume_on_user_prompt();
+                                }
+                            }
                             handle_action(action, app, term, &agent_slot,
                                           &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot,
                                           &mut cancel, &mut turn_task).await?;
@@ -3140,6 +3310,8 @@ async fn run_app(
                         // as aborted in the transcript, PI-style. See
                         // interactive-mode.ts:3040-3045 where PI emits
                         // "Operation aborted" for stopReason=="aborted".
+                        let was_cancelled = app.turn_was_cancelled;
+                        let mut turn_error: Option<String> = None;
                         if app.turn_was_cancelled {
                             app.turn_was_cancelled = false;
                             let mut aborted = vec![
@@ -3208,6 +3380,7 @@ async fn run_app(
                                         Span::styled(format!("[error: {e}]"),
                                             Style::default().fg(Color::Red)),
                                     ]))?;
+                                    turn_error = Some(e);
                                 }
                                 Err(join_err) => {
                                     refresh_status(app, &agent_slot).await;
@@ -3215,6 +3388,7 @@ async fn run_app(
                                         Span::styled(format!("[turn panic: {join_err}]"),
                                             Style::default().fg(Color::Red)),
                                     ]))?;
+                                    turn_error = Some(format!("turn panic: {join_err}"));
                                 }
                             }
                         }
@@ -3239,13 +3413,37 @@ async fn run_app(
                             g.as_mut().and_then(|a| a.pending_follow_ups.pop_front())
                         };
                         let follow_up = pick_follow_up(from_agent, &mut follow_up_slot, &mut agent_report_slot);
+                        // /loop: a finished iteration schedules the next.
+                        after_loop_iteration(term, app, was_cancelled, turn_error.as_deref())?;
+                        if app.background_pending && was_cancelled {
+                            app.background_pending = false;
+                            app.background_note = None;
+                            dim_line(term, "◐ background hand-off cancelled")?;
+                        }
                         if let Some(text) = follow_up {
                             handle_action(
                                 KeyAction::StartTurn(text),
                                 app, term, &agent_slot,
                                 &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
                             ).await?;
+                        } else if app.background_pending
+                            && live_agents(crate::agent_registry::global().as_deref()) == 0
+                        {
+                            // /background asked mid-turn: the worker
+                            // judges this turn (or retries it).
+                            let live = app.goal.as_ref().is_some_and(|g| g.paused.is_none());
+                            let needs_eval = live && turn_error.is_none();
+                            let retry = turn_error.as_deref().filter(|_| live).and_then(|e| {
+                                app.goal.as_ref().map(|g| crate::goal::retry_prompt(&g.condition, e))
+                            });
+                            hand_off_to_background(term, app, &agent_slot, needs_eval, retry).await?;
+                        } else {
+                            // /goal: judge the turn (or retry / pause).
+                            // Skipped when a follow-up just started:
+                            // that turn's end is judged instead.
+                            after_goal_turn(term, app, &agent_slot, was_cancelled, turn_error).await?;
                         }
+                        term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
                     }
                 }
             }
@@ -3274,6 +3472,94 @@ async fn handle_action(
         }
         KeyAction::CancelTurn => {
             cancel_turn(app, cancel.as_ref(), crate::agent_registry::global().as_deref());
+        }
+        KeyAction::GoalLoopUsage(msg) => {
+            for l in msg.lines() {
+                insert_line(term, Line::from(vec![Span::styled(l.to_string(), Style::default().fg(Color::Yellow))]))?;
+            }
+        }
+        KeyAction::Goal(cmd) => {
+            if let Some(text) = handle_goal_cmd(term, app, cmd)? {
+                if app.status != Status::Streaming && turn_task.is_none() {
+                    Box::pin(handle_action(
+                        KeyAction::StartTurn(text),
+                        app, term, agent_slot, ag_rx, steer_tx, follow_up, cancel, turn_task,
+                    ))
+                    .await?;
+                } else {
+                    dim_line(term, "  (a turn is running — the goal is checked when it ends)")?;
+                }
+            }
+        }
+        KeyAction::Loop(cmd) => handle_loop_cmd(term, app, cmd)?,
+        KeyAction::GoalInline { preamble, condition } => {
+            let busy = app.status == Status::Streaming || turn_task.is_some();
+            if let Some(kickoff) = handle_goal_cmd(term, app, crate::goal::GoalCmd::Set(condition))? {
+                if !busy {
+                    let text = if preamble.is_empty() { kickoff } else { format!("{preamble}\n\n{kickoff}") };
+                    Box::pin(handle_action(
+                        KeyAction::StartTurn(text),
+                        app, term, agent_slot, ag_rx, steer_tx, follow_up, cancel, turn_task,
+                    ))
+                    .await?;
+                } else {
+                    if !preamble.is_empty() {
+                        steer_or_queue(term, steer_tx.as_ref(), follow_up, preamble).await?;
+                    }
+                    dim_line(term, "  (a turn is running — the goal is checked when it ends)")?;
+                }
+            }
+        }
+        KeyAction::Background(arg) => {
+            let arg = arg.trim();
+            if arg == "list" || arg == "ls" {
+                let home = crate::paths::nanopi_home().unwrap_or_default();
+                let states = crate::background::list_in(&home);
+                for l in crate::background::list_lines(&states, crate::background::unix_now(), crate::background::is_running) {
+                    goal_line(term, &l, Color::Magenta)?;
+                }
+            } else if arg == "cancel" {
+                if std::mem::take(&mut app.background_pending) {
+                    app.background_note = None;
+                    goal_line(term, "◐ background hand-off cancelled", Color::Magenta)?;
+                } else {
+                    goal_line(term, "◐ no background hand-off waiting", Color::DarkGray)?;
+                }
+            } else if !arg.is_empty() && arg != "now" {
+                goal_line(term, BACKGROUND_USAGE, Color::Yellow)?;
+            } else if let Some(why) = background_refusal(app) {
+                goal_line(term, &why, Color::Yellow)?;
+            } else {
+                let reg = crate::agent_registry::global();
+                let live = live_agents(reg.as_deref());
+                if arg == "now" && live > 0 {
+                    // Agents are children of this process and would die
+                    // with it anyway: stop them, and tell the worker
+                    // which ones, so it can dispatch them again.
+                    let stopped = reg.as_ref().map(|r| stop_agents_for_handoff(r)).unwrap_or_default();
+                    goal_line(term, &format!("◐ stopped {} for the hand-off", agents_phrase(live)), Color::Magenta)?;
+                    app.background_note = Some(stopped);
+                }
+                let live = live_agents(reg.as_deref());
+                let busy = app.status == Status::Streaming || turn_task.is_some();
+                if busy || live > 0 {
+                    app.background_pending = true;
+                    let when = match (busy, live > 0) {
+                        (_, true) => format!("once {} report{} and the turn ends", agents_phrase(live), if live == 1 { "s" } else { "" }),
+                        _ => "when this turn ends".to_string(),
+                    };
+                    goal_line(term, &format!("◐ going to the background {when} — the TUI then quits by itself"), Color::Magenta)?;
+                    dim_line(term, "  /background now stops the agents and goes at once · /background cancel · Esc cancels a running turn and the hand-off")?;
+                } else {
+                // Idle. A check in flight is redone by the worker.
+                let needs_eval = app.goal_eval.is_some();
+                abort_goal_eval(app);
+                if app.status_note.as_deref() == Some("◎ checking the goal…") {
+                    app.status_note = None;
+                }
+                hand_off_to_background(term, app, agent_slot, needs_eval, None).await?;
+                }
+            }
         }
         KeyAction::ExpandLastTool => {
             // Only expand once per source. Priority: tool result first
@@ -3461,6 +3747,7 @@ async fn handle_action(
             }
         }
         KeyAction::NewSession => {
+            end_goal_and_loop(term, app, "new session")?;
             // Fresh session in the same cwd. Preserves model, api,
             // hooks, permission from the current agent.
             let (cwd, model, base_url, api_key, permission, hooks) = {
@@ -3636,6 +3923,7 @@ async fn handle_action(
             app.resume_picker = Some(MenuState::new(items));
         }
         KeyAction::ResumeSession(path) => {
+            end_goal_and_loop(term, app, "session switched")?;
             // Snapshot the caller's Agent trappings (api/hooks/etc.)
             // then swap the underlying session by loading `path`.
             let (cwd, model, base_url, api_key, permission, hooks) = {
@@ -4873,6 +5161,7 @@ async fn handle_action(
             }
             // Echo user message into scrollback, PI-style gray card.
             render_user_echo(term, &msg)?;
+            app.turn_tool_calls = 0;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
             let (steer_tx_inner, steer_rx) = mpsc::channel::<SteerMessage>(32);
             let ct = CancellationToken::new();
@@ -5202,6 +5491,7 @@ async fn execute_fork(
     term: &mut Term,
     agent_slot: &Arc<Mutex<Option<Agent>>>,
 ) -> Result<()> {
+    end_goal_and_loop(term, app, "forked")?;
     let (cwd, model, base_url, api_key, permission, hooks) = {
         let g = agent_slot.lock().await;
         let a = match g.as_ref() {
@@ -5482,6 +5772,796 @@ fn reload_extensions_guarded(
     } else {
         a.reload_extensions(exts)
     }
+}
+
+// ── /goal and /loop ───────────────────────────────────────────────────
+//
+// The logic (parsing, prompts, verdicts, scheduling) lives in
+// `crate::goal` and `crate::loops`; these functions only connect it to
+// the TUI's turn lifecycle: judge a turn when it ends, start the next
+// one from the tick when the session is idle.
+
+/// What a goal evaluation sends back: the goal generation it was made
+/// for, the tool calls of the judged turn, and the verdict.
+type GoalEvalResult = (
+    u64,
+    usize,
+    Result<(crate::goal::Evaluation, crate::event::Usage), String>,
+);
+
+fn usage_tokens(u: &crate::event::Usage) -> u64 {
+    u64::from(u.input_tokens) + u64::from(u.output_tokens)
+}
+
+fn dim_line(term: &mut Term, text: &str) -> Result<()> {
+    insert_line(term, Line::from(vec![Span::styled(text.to_string(), Style::default().fg(Color::DarkGray))]))
+}
+
+fn goal_line(term: &mut Term, text: &str, color: Color) -> Result<()> {
+    insert_line(term, Line::from(vec![Span::styled(text.to_string(), Style::default().fg(color))]))
+}
+
+/// `/goal` status, as lines. Pure so it can be tested.
+fn goal_status_lines(app: &App, now: std::time::Instant) -> Vec<String> {
+    use crate::goal::format_duration as fd;
+    let mut out = Vec::new();
+    if let Some(g) = &app.goal {
+        out.push(format!("◎ goal: {}", g.condition));
+        let mut l = format!(
+            "  running {} · {} turn(s) evaluated · {} tokens",
+            fd(now.duration_since(g.started)),
+            g.turns_evaluated,
+            g.spent(usage_tokens(&app.usage))
+        );
+        if app.goal_eval.is_some() {
+            l.push_str(" · checking now");
+        }
+        out.push(l);
+        if let Some(r) = &g.last_reason {
+            out.push(format!("  last check: {r}"));
+        }
+        if let Some(p) = &g.paused {
+            out.push(format!("  paused: {p} — send a message to resume, or /goal clear"));
+        }
+        if let Some(t) = g.retry_at {
+            out.push(format!("  retrying in {}", fd(t.saturating_duration_since(now))));
+        }
+    } else if let Some(d) = &app.goal_done {
+        out.push(format!(
+            "no active goal · last goal {}: {}",
+            if d.achieved { "achieved" } else { "failed" },
+            d.condition
+        ));
+        out.push(format!(
+            "  {} · {} turn(s) · {} tokens — {}",
+            fd(d.elapsed),
+            d.turns,
+            d.tokens,
+            d.reason
+        ));
+    } else {
+        out.push("No goal set.".into());
+        out.push(crate::goal::USAGE.into());
+    }
+    out
+}
+
+fn loop_status_lines(app: &App, now: std::time::Instant) -> Vec<String> {
+    let Some(l) = &app.loop_state else {
+        return vec!["No loop running.".into(), crate::loops::USAGE.into()];
+    };
+    let prompt = l.prompt.clone().unwrap_or_else(|| {
+        let (_, src) = crate::loops::default_prompt(&app.cwd);
+        format!("({src})")
+    });
+    let mut out = vec![format!("⟳ loop {} · {} iteration(s) · {}", l.describe_pace(), l.iterations, prompt)];
+    match l.next_fire {
+        Some(t) => out.push(format!(
+            "  next in {}",
+            crate::loops::human(std::time::Duration::from_secs(t.saturating_duration_since(now).as_secs()))
+        )),
+        None => out.push("  iteration running".into()),
+    }
+    if let Some(r) = &l.last_reason {
+        out.push(format!("  last: {r}"));
+    }
+    out.push("  /loop stop, or Esc on an empty prompt, ends it".into());
+    out
+}
+
+/// Footer segments for an active goal and loop.
+fn goal_loop_segments(app: &App, now: std::time::Instant) -> Vec<String> {
+    let mut out = Vec::new();
+    if app.background_pending {
+        out.push(if live_agents(crate::agent_registry::global().as_deref()) > 0 {
+            "◐ to background after agents report".to_string()
+        } else {
+            "◐ to background after this turn".to_string()
+        });
+    }
+    if let Some(g) = &app.goal {
+        out.push(if g.paused.is_some() {
+            "◎ goal paused".to_string()
+        } else {
+            format!("◎ goal {}", crate::goal::format_duration(now.duration_since(g.started)))
+        });
+    }
+    if let Some(l) = &app.loop_state {
+        let pace = match l.pace {
+            crate::loops::Pace::Fixed(d) => crate::loops::human(d),
+            crate::loops::Pace::SelfPaced => "auto".into(),
+        };
+        out.push(match l.next_fire {
+            Some(t) => {
+                let left = t.saturating_duration_since(now).as_secs();
+                format!("⟳ loop {pace} · next {}", crate::goal::format_duration(std::time::Duration::from_secs(left)))
+            }
+            None => format!("⟳ loop {pace} · running"),
+        });
+    }
+    out
+}
+
+/// `  · ◎ <goal>` (or `  · ⟳ <loop prompt>`) for the footer's first
+/// line, fitted into `room` terminal columns. `None` when there is
+/// nothing to show or no room for a useful part of it.
+fn footer_brief(app: &App, room: usize) -> Option<String> {
+    let (mark, text) = if let Some(g) = &app.goal {
+        ("◎", g.condition.clone())
+    } else if let Some(l) = &app.loop_state {
+        ("⟳", l.prompt.clone().unwrap_or_else(|| "loop.md / maintenance prompt".into()))
+    } else {
+        return None;
+    };
+    let prefix = format!("  · {mark} ");
+    let prefix_w = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+    // Below this, a sliver of the goal says nothing.
+    if room < prefix_w + 8 {
+        return None;
+    }
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(format!("{prefix}{}", fit_width(&text, room - prefix_w)))
+}
+
+/// `s` cut to `cols` terminal columns, with `…` when cut. Wide (CJK)
+/// characters count as two.
+fn fit_width(s: &str, cols: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= cols {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw + 1 > cols {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+fn abort_goal_eval(app: &mut App) {
+    if let Some(t) = app.goal_eval.take() {
+        t.abort();
+    }
+}
+
+/// `/goal …`. Returns the prompt of a turn to start, if any.
+fn handle_goal_cmd(term: &mut Term, app: &mut App, cmd: crate::goal::GoalCmd) -> Result<Option<String>> {
+    use crate::goal::GoalCmd;
+    match cmd {
+        GoalCmd::Status => {
+            for l in goal_status_lines(app, std::time::Instant::now()) {
+                goal_line(term, &l, Color::Magenta)?;
+            }
+            Ok(None)
+        }
+        GoalCmd::Clear => {
+            abort_goal_eval(app);
+            app.goal_gen += 1;
+            match app.goal.take() {
+                Some(g) => goal_line(term, &format!("Goal cleared: {}", g.condition), Color::Magenta)?,
+                None => goal_line(term, "No goal set", Color::DarkGray)?,
+            }
+            Ok(None)
+        }
+        GoalCmd::Set(condition) => {
+            abort_goal_eval(app);
+            app.goal_gen += 1;
+            let replaced = app.goal.is_some();
+            app.goal = Some(crate::goal::Goal::new(condition.clone(), usage_tokens(&app.usage), app.goal_gen));
+            goal_line(
+                term,
+                &format!("◎ goal {}: {condition}", if replaced { "replaced" } else { "set" }),
+                Color::Magenta,
+            )?;
+            dim_line(term, "  checked after every turn · /goal for status · /goal clear to stop")?;
+            Ok(Some(crate::goal::kickoff_prompt(&condition)))
+        }
+    }
+}
+
+fn handle_loop_cmd(term: &mut Term, app: &mut App, cmd: crate::loops::LoopCmd) -> Result<()> {
+    use crate::loops::{LoopCmd, LoopState, Pace};
+    match cmd {
+        LoopCmd::Status => {
+            for l in loop_status_lines(app, std::time::Instant::now()) {
+                goal_line(term, &l, Color::Magenta)?;
+            }
+        }
+        LoopCmd::Stop => match app.loop_state.take() {
+            Some(l) => {
+                let _ = crate::loops::take_wakeup();
+                let _ = crate::loops::take_stop_request();
+                goal_line(term, &format!("⟳ loop stopped after {} iteration(s)", l.iterations), Color::Magenta)?;
+            }
+            None => goal_line(term, "No loop running", Color::DarkGray)?,
+        },
+        LoopCmd::Start { interval, prompt } => {
+            let (pace, note) = match interval {
+                Some(d) => {
+                    let (d, note) = crate::loops::clamp_interval(d);
+                    (Pace::Fixed(d), note)
+                }
+                None => (Pace::SelfPaced, None),
+            };
+            let _ = crate::loops::take_wakeup();
+            let _ = crate::loops::take_stop_request();
+            let replaced = app.loop_state.is_some();
+            let what = match &prompt {
+                Some(p) => p.clone(),
+                None => crate::loops::default_prompt(&app.cwd).1,
+            };
+            let state = LoopState::new(prompt, pace, std::time::Instant::now());
+            goal_line(
+                term,
+                &format!(
+                    "⟳ loop {} ({}): {what}",
+                    if replaced { "replaced" } else { "started" },
+                    state.describe_pace()
+                ),
+                Color::Magenta,
+            )?;
+            if let Some(n) = note {
+                dim_line(term, &format!("  {n}"))?;
+            }
+            dim_line(term, "  runs while the session is idle · /loop for status · /loop stop or Esc on an empty prompt to stop")?;
+            app.loop_state = Some(state);
+        }
+    }
+    Ok(())
+}
+
+/// `/new`, `/resume`, fork: a goal or loop belongs to its conversation.
+fn end_goal_and_loop(term: &mut Term, app: &mut App, why: &str) -> Result<()> {
+    abort_goal_eval(app);
+    app.goal_gen += 1;
+    if let Some(g) = app.goal.take() {
+        goal_line(term, &format!("Goal cleared ({why}): {}", g.condition), Color::Magenta)?;
+    }
+    if app.loop_state.take().is_some() {
+        let _ = crate::loops::take_wakeup();
+        goal_line(term, &format!("⟳ loop stopped ({why})"), Color::Magenta)?;
+    }
+    app.loop_turn = false;
+    Ok(())
+}
+
+/// A loop iteration ended: schedule the next one, or end the loop.
+fn after_loop_iteration(term: &mut Term, app: &mut App, cancelled: bool, error: Option<&str>) -> Result<()> {
+    // `stop_loop`, from any turn — an iteration, or the user asking for
+    // it in chat.
+    if let Some(reason) = crate::loops::take_stop_request() {
+        app.loop_turn = false;
+        let _ = crate::loops::take_wakeup();
+        if let Some(l) = app.loop_state.take() {
+            let why = reason.map(|r| format!(" — {r}")).unwrap_or_default();
+            return goal_line(term, &format!("⟳ loop ended by the model after {} iteration(s){why}", l.iterations), Color::Magenta);
+        }
+        return Ok(());
+    }
+    if !std::mem::take(&mut app.loop_turn) {
+        return Ok(());
+    }
+    let now = std::time::Instant::now();
+    let Some(l) = app.loop_state.as_mut() else {
+        let _ = crate::loops::take_wakeup();
+        return Ok(());
+    };
+    if cancelled {
+        let n = l.iterations;
+        app.loop_state = None;
+        let _ = crate::loops::take_wakeup();
+        return goal_line(term, &format!("⟳ loop stopped: iteration {n} was interrupted"), Color::Magenta);
+    }
+    if let Some(e) = error {
+        dim_line(term, &format!("⟳ iteration {} failed: {e}", l.iterations))?;
+    }
+    match l.pace {
+        crate::loops::Pace::Fixed(_) => {
+            let left = l.next_fire.map(|t| t.saturating_duration_since(now)).unwrap_or_default();
+            dim_line(term, &format!("⟳ next iteration in {}", crate::goal::format_duration(left)))
+        }
+        crate::loops::Pace::SelfPaced => {
+            let req = crate::loops::take_wakeup();
+            if l.after_self_paced_iteration(req, now) {
+                let left = l.next_fire.map(|t| t.saturating_duration_since(now)).unwrap_or_default();
+                let reason = l.last_reason.clone().unwrap_or_default();
+                dim_line(
+                    term,
+                    &format!("⟳ next iteration in {} — {reason}", crate::loops::human(std::time::Duration::from_secs(left.as_secs()))),
+                )
+            } else {
+                let n = l.iterations;
+                let reason = l.last_reason.clone();
+                app.loop_state = None;
+                let why = reason.map(|r| format!(" — {r}")).unwrap_or_default();
+                goal_line(term, &format!("⟳ loop ended after {n} iteration(s){why}"), Color::Magenta)
+            }
+        }
+    }
+}
+
+/// A turn ended with a goal set: judge it, or retry / pause / clear on
+/// a failure.
+async fn after_goal_turn(
+    term: &mut Term,
+    app: &mut App,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    cancelled: bool,
+    error: Option<String>,
+) -> Result<()> {
+    use crate::goal::{classify_error, retry_delay, ErrorKind, MAX_RETRIES};
+    let Some(g) = app.goal.as_mut() else { return Ok(()) };
+    if g.paused.is_some() {
+        return Ok(());
+    }
+    if cancelled {
+        g.paused = Some("the turn was interrupted".into());
+        return goal_line(term, "◎ goal paused (turn interrupted) — send a message to resume, or /goal clear", Color::Yellow);
+    }
+    if let Some(e) = error {
+        match classify_error(&e) {
+            ErrorKind::Fatal => {
+                let c = g.condition.clone();
+                app.goal = None;
+                app.goal_gen += 1;
+                goal_line(term, &format!("Goal cleared after an unrecoverable error: {e}"), Color::Red)?;
+                return dim_line(term, &format!("  goal was: {c} — fix the cause, then run /goal again to continue"));
+            }
+            ErrorKind::Pause => {
+                g.paused = Some(format!("error: {e}"));
+                return goal_line(term, "◎ goal paused after an error that a retry would repeat — send a message to resume", Color::Yellow);
+            }
+            ErrorKind::Transient => {
+                g.retries += 1;
+                if g.retries > MAX_RETRIES {
+                    g.paused = Some(format!("{MAX_RETRIES} retries failed: {e}"));
+                    return goal_line(term, &format!("◎ goal paused after {MAX_RETRIES} failed retries — send a message to resume"), Color::Yellow);
+                }
+                let d = retry_delay(g.retries);
+                g.retry_at = Some(std::time::Instant::now() + d);
+                g.last_reason = Some(format!("the last turn failed: {e}"));
+                return goal_line(
+                    term,
+                    &format!("◎ Goal still active — retrying in {} ({}/{MAX_RETRIES})", crate::goal::format_duration(d), g.retries),
+                    Color::Yellow,
+                );
+            }
+        }
+    }
+    // Background agents still running: their reports arrive as a new
+    // turn, which is judged when it ends.
+    let live = live_agents(crate::agent_registry::global().as_deref());
+    if live > 0 {
+        return dim_line(term, &format!("◎ goal check deferred: {} still running", agents_phrase(live)));
+    }
+    spawn_goal_eval(app, agent_slot).await;
+    Ok(())
+}
+
+async fn spawn_goal_eval(app: &mut App, agent_slot: &Arc<Mutex<Option<Agent>>>) {
+    let Some(g) = app.goal.as_ref() else { return };
+    let condition = g.condition.clone();
+    let generation = g.generation;
+    let (model, base_url, api_key, transcript) = {
+        let guard = agent_slot.lock().await;
+        let Some(a) = guard.as_ref() else { return };
+        let kickoff = crate::goal::kickoff_prompt(&condition);
+        let start = a
+            .context
+            .messages
+            .iter()
+            .rposition(|m| match m {
+                crate::agent::context::ContextMessage::User { content } => content.iter().any(|b| {
+                    matches!(b, crate::agent::context::ContentBlock::Text { text } if *text == kickoff)
+                }),
+                _ => false,
+            })
+            .unwrap_or(usize::MAX);
+        (a.model.clone(), a.base_url.clone(), a.api_key.clone(), crate::goal::transcript(&a.context, start))
+    };
+    // The evaluator can run on a cheaper model of the same endpoint.
+    let model = std::env::var("NANOPI_GOAL_MODEL").ok().filter(|m| !m.trim().is_empty()).unwrap_or(model);
+    let provider = crate::provider::build(
+        app.api_kind,
+        &base_url,
+        &api_key,
+        &model,
+        Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)),
+        app.inline_think_tags,
+    );
+    let tool_calls = app.turn_tool_calls;
+    app.goal_eval = Some(tokio::spawn(async move {
+        let r = crate::goal::evaluate(provider.as_ref(), &condition, &transcript).await;
+        (generation, tool_calls, r)
+    }));
+    app.status_note = Some("◎ checking the goal…".into());
+}
+
+/// Called on every tick. Returns the prompt of a turn to start: a goal
+/// continuation or retry, or a loop iteration.
+async fn poll_goal_and_loop(
+    term: &mut Term,
+    app: &mut App,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    idle: bool,
+) -> Result<Option<String>> {
+    use crate::goal::{Verdict, NO_PROGRESS_LIMIT};
+    let now = std::time::Instant::now();
+    // 1. A finished goal evaluation.
+    if let Some(task) = app.goal_eval.take() {
+        if !task.is_finished() {
+            app.goal_eval = Some(task);
+        } else {
+            if app.status_note.as_deref() == Some("◎ checking the goal…") {
+                app.status_note = None;
+            }
+            let Ok((generation, tool_calls, result)) = task.await else { return Ok(None) };
+            let Some(g) = app.goal.as_mut() else { return Ok(None) };
+            // Replaced or cleared meanwhile, or the user already started
+            // another turn (judged when it ends).
+            if g.generation != generation || !idle {
+                return Ok(None);
+            }
+            match result {
+                Err(e) => {
+                    g.paused = Some(e.clone());
+                    goal_line(term, &format!("◎ goal paused — {e}"), Color::Yellow)?;
+                    dim_line(term, "  send a message to resume, or /goal clear")?;
+                }
+                Ok((eval, usage)) => {
+                    g.eval_tokens += usage_tokens(&usage);
+                    g.turns_evaluated += 1;
+                    g.retries = 0;
+                    g.last_reason = Some(eval.reason.clone());
+                    let reason = if eval.reason.is_empty() { "(no reason given)".to_string() } else { eval.reason.clone() };
+                    match eval.verdict {
+                        Verdict::Met | Verdict::Impossible => {
+                            let achieved = eval.verdict == Verdict::Met;
+                            let g = app.goal.take().expect("checked above");
+                            app.goal_gen += 1;
+                            let done = crate::goal::Finished {
+                                condition: g.condition.clone(),
+                                achieved,
+                                reason: reason.clone(),
+                                elapsed: now.duration_since(g.started),
+                                turns: g.turns_evaluated,
+                                tokens: g.spent(usage_tokens(&app.usage)),
+                            };
+                            if achieved {
+                                goal_line(term, &format!("◎ Goal achieved: {}", g.condition), Color::Green)?;
+                            } else {
+                                goal_line(term, &format!("◎ Goal failed — judged impossible: {}", g.condition), Color::Red)?;
+                            }
+                            dim_line(
+                                term,
+                                &format!(
+                                    "  {reason} ({} · {} turn(s) · {} tokens)",
+                                    crate::goal::format_duration(done.elapsed),
+                                    done.turns,
+                                    done.tokens
+                                ),
+                            )?;
+                            app.goal_done = Some(done);
+                        }
+                        Verdict::NotMet => {
+                            g.no_progress = if tool_calls == 0 { g.no_progress + 1 } else { 0 };
+                            if g.no_progress >= NO_PROGRESS_LIMIT {
+                                g.paused = Some(format!("{NO_PROGRESS_LIMIT} turns in a row without tool use"));
+                                goal_line(
+                                    term,
+                                    &format!("◎ goal paused: {NO_PROGRESS_LIMIT} turns in a row made no progress (no tool use)"),
+                                    Color::Yellow,
+                                )?;
+                                dim_line(term, &format!("  last check: {reason} — send a message to resume, or /goal clear"))?;
+                            } else {
+                                dim_line(term, &format!("◎ not yet: {reason}"))?;
+                                return Ok(Some(crate::goal::continue_prompt(&g.condition, &reason)));
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(None);
+        }
+    }
+    if !idle || app.goal_eval.is_some() {
+        return Ok(None);
+    }
+    let modal = app.sudo_pending.is_some()
+        || app.profile_wizard.is_some()
+        || app.summarize_task.is_some()
+        || app.command_task.is_some()
+        || app.pending_fork.is_some()
+        || app.capture != CaptureMode::None;
+    if modal {
+        return Ok(None);
+    }
+    // Back from the background: the step the worker owed.
+    if let Some(act) = app.goal_restore.take() {
+        if app.goal.as_ref().is_some_and(|g| g.paused.is_none()) {
+            match act {
+                GoalRestore::Judge(tool_calls) => {
+                    app.turn_tool_calls = tool_calls;
+                    spawn_goal_eval(app, agent_slot).await;
+                    return Ok(None);
+                }
+                GoalRestore::Prompt(p) => return Ok(Some(p)),
+            }
+        }
+    }
+    // 2. A goal retry that came due.
+    if let Some(g) = app.goal.as_mut() {
+        if g.paused.is_none() && g.retry_at.is_some_and(|t| now >= t) {
+            g.retry_at = None;
+            let why = g.last_reason.clone().unwrap_or_default();
+            return Ok(Some(crate::goal::retry_prompt(&g.condition, &why)));
+        }
+        if g.paused.is_none() && g.retry_at.is_some() {
+            return Ok(None);
+        }
+    }
+    // 3. The loop.
+    let pace = app.loop_state.as_ref().map(|l| l.pace);
+    let want_tool = pace == Some(crate::loops::Pace::SelfPaced);
+    sync_wakeup_tool(app, agent_slot, pace);
+    let Some(l) = app.loop_state.as_mut() else { return Ok(None) };
+    if l.expired(now) {
+        let n = l.iterations;
+        app.loop_state = None;
+        goal_line(term, &format!("⟳ loop expired after 7 days ({n} iterations)"), Color::Magenta)?;
+        return Ok(None);
+    }
+    if !l.due(now) {
+        return Ok(None);
+    }
+    if want_tool && !app.wakeup_tool_on {
+        // The agent was busy; register the tool first, fire next tick.
+        return Ok(None);
+    }
+    let prompt = match &l.prompt {
+        Some(p) => p.clone(),
+        None => crate::loops::default_prompt(&app.cwd).0,
+    };
+    let _ = crate::loops::take_wakeup();
+    l.fired(now);
+    let text = crate::loops::iteration_prompt(&prompt, l.pace, l.iterations);
+    app.loop_turn = true;
+    Ok(Some(text))
+}
+
+/// Keep `schedule_wakeup` on the agent exactly while a self-paced loop
+/// runs. Re-checked every idle tick because `/model`, `/reload` and
+/// profile switches rebuild the agent's tool set.
+fn sync_wakeup_tool(app: &mut App, agent_slot: &Arc<Mutex<Option<Agent>>>, pace: Option<crate::loops::Pace>) {
+    if pace.is_none() && !app.wakeup_tool_on {
+        return;
+    }
+    let Ok(mut guard) = agent_slot.try_lock() else { return };
+    let Some(a) = guard.as_mut() else { return };
+    if crate::loops::sync_tools(&mut a.registry, pace) {
+        a.context.tools = a.registry.all_specs();
+    }
+    // "Loop tools are registered": what the next fire waits for.
+    let wanted = match pace {
+        Some(crate::loops::Pace::SelfPaced) => crate::loops::TOOL_NAME,
+        Some(_) => crate::loops::STOP_TOOL_NAME,
+        None => "",
+    };
+    app.wakeup_tool_on = !wanted.is_empty() && a.registry.get(wanted).is_some();
+}
+
+// ── /background ───────────────────────────────────────────────────────
+
+/// What a session back from the background still owes its goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalRestore {
+    /// Judge the worker's last turn (it made this many tool calls).
+    Judge(usize),
+    /// Run this turn next.
+    Prompt(String),
+}
+
+const BACKGROUND_USAGE: &str = "usage: /background (hand the goal / loop to a background worker and quit; waits for running agents) · /background now (stop the agents and go at once) · /background cancel · /background list";
+
+/// `/background now`: stop this run's live agents and describe them for
+/// the worker — id and the brief that holds the task.
+fn stop_agents_for_handoff(reg: &crate::agent_registry::AgentRegistry) -> String {
+    let live: Vec<_> = reg.snapshot().into_iter().filter(|e| !e.state.is_terminal()).collect();
+    reg.stop_all();
+    let list = live
+        .iter()
+        .map(|e| format!("{} (task: {})", e.id, e.dir.join("brief.md").display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[background hand-off] These agents were stopped before finishing, because the session \
+         moved to the background: {list}. Their reports will not arrive. Check what they \
+         completed, and dispatch the unfinished work again if it is still needed."
+    )
+}
+
+/// Why `/background` cannot hand off now, if it cannot.
+fn background_refusal(app: &App) -> Option<String> {
+    let goal_live = app.goal.as_ref().is_some_and(|g| g.paused.is_none());
+    if !goal_live && app.loop_state.is_none() {
+        return Some(
+            "◐ nothing to run in the background: start a /goal or a /loop first (a paused goal resumes with your next message)"
+                .into(),
+        );
+    }
+    if app.background_pending {
+        return Some("◐ already going to the background when this turn ends".into());
+    }
+    None
+}
+
+/// Write the state, start the worker, and quit the TUI.
+async fn hand_off_to_background(
+    term: &mut Term,
+    app: &mut App,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    needs_eval: bool,
+    next_goal_prompt: Option<String>,
+) -> Result<()> {
+    app.background_pending = false;
+    let Some(home) = crate::paths::nanopi_home() else {
+        return goal_line(term, "◐ cannot locate the nanopi home directory", Color::Red);
+    };
+    let (session_id, session_path, cwd, tokens) = {
+        let g = agent_slot.lock().await;
+        let Some(a) = g.as_ref() else {
+            return goal_line(term, "◐ the session is busy; try /background again", Color::Red);
+        };
+        (a.session_id.clone(), a.session_path.clone(), a.cwd.clone(), usage_tokens(&a.usage_total))
+    };
+    let now = std::time::Instant::now();
+    let goal_live = app.goal.as_ref().is_some_and(|g| g.paused.is_none());
+    let mut next_goal_prompt = next_goal_prompt.or_else(|| {
+        let g = app.goal.as_ref().filter(|_| goal_live && !needs_eval)?;
+        g.retry_at.map(|_| crate::goal::retry_prompt(&g.condition, g.last_reason.as_deref().unwrap_or("")))
+    });
+    // `/background now` stopped agents: the next goal turn hears which,
+    // so their work is not silently lost. Without a goal there is no
+    // turn to tell; the note still lands in the log.
+    let stopped_note = app.background_note.take();
+    if let (Some(note), Some(g)) = (&stopped_note, app.goal.as_ref().filter(|_| goal_live)) {
+        let base = next_goal_prompt.take().unwrap_or_else(|| match &g.last_reason {
+            Some(r) => crate::goal::continue_prompt(&g.condition, r),
+            None => crate::goal::kickoff_prompt(&g.condition),
+        });
+        next_goal_prompt = Some(format!("{note}\n\n{base}"));
+    }
+    // The worker must not judge a turn whose agents were cut short
+    // before it has re-dispatched them.
+    let needs_eval = needs_eval && stopped_note.is_none();
+    let mut st = crate::background::BgState {
+        session_id: session_id.clone(),
+        session_path,
+        cwd,
+        profile: crate::profile::current(),
+        pid: None,
+        started_unix: crate::background::unix_now(),
+        updated_unix: crate::background::unix_now(),
+        status: crate::background::Status::Starting,
+        note: stopped_note.clone(),
+        goal: app.goal.as_ref().map(|g| crate::background::GoalSnap::of(g, now, tokens)),
+        goal_done: app.goal_done.as_ref().map(crate::background::FinishedSnap::of),
+        loop_: app.loop_state.as_ref().map(|l| crate::background::LoopSnap::of(l, now)),
+        needs_eval: needs_eval && goal_live,
+        last_tool_calls: app.turn_tool_calls,
+        next_goal_prompt,
+        worker_turns: 0,
+        log_path: crate::background::log_path_in(&home, &session_id),
+    };
+    if !st.has_work() {
+        return goal_line(term, "◐ nothing left to run in the background", Color::Yellow);
+    }
+    let started = crate::background::write_in(&home, &st).and_then(|()| crate::background::spawn_worker(&st));
+    match started {
+        Err(e) => {
+            crate::background::remove_in(&home, &st.session_id);
+            goal_line(term, &format!("◐ could not start the background worker: {e}"), Color::Red)
+        }
+        Ok(pid) => {
+            // The worker may already have written its own state; only
+            // fill in the pid if it has not.
+            if let Ok(cur) = crate::background::read_in(&home, &st.session_id) {
+                if cur.pid.is_none() {
+                    st = cur;
+                    st.pid = Some(pid);
+                    let _ = crate::background::write_in(&home, &st);
+                }
+            }
+            app.goal = None;
+            app.goal_gen += 1;
+            app.loop_state = None;
+            app.loop_turn = false;
+            goal_line(
+                term,
+                &format!("◐ working in the background — session {} · worker pid {pid}", st.short_id()),
+                Color::Magenta,
+            )?;
+            dim_line(term, "  nanopi --foreground brings it back · nanopi --background lists background sessions")?;
+            dim_line(term, &format!("  log: {}", st.log_path.display()))?;
+            app.should_exit = true;
+            Ok(())
+        }
+    }
+}
+
+/// Put a background worker's goal and loop back on the TUI.
+fn restore_from_background(term: &mut Term, app: &mut App, st: crate::background::BgState) -> Result<()> {
+    let now = std::time::Instant::now();
+    let since = st.since_write();
+    app.goal_gen += 1;
+    app.goal = st
+        .goal
+        .as_ref()
+        .map(|g| g.to_goal(now, since, usage_tokens(&app.usage), app.goal_gen));
+    app.loop_state = st.loop_.as_ref().map(|l| l.to_state(now, since));
+    if let Some(d) = &st.goal_done {
+        app.goal_done = Some(d.to_finished());
+    }
+    let goal_live = app.goal.as_ref().is_some_and(|g| g.paused.is_none());
+    app.goal_restore = if !goal_live {
+        None
+    } else if st.needs_eval {
+        Some(GoalRestore::Judge(st.last_tool_calls))
+    } else {
+        st.next_goal_prompt.clone().map(GoalRestore::Prompt).or_else(|| {
+            app.goal.as_ref().filter(|g| g.retry_at.is_none()).map(|g| {
+                GoalRestore::Prompt(match &g.last_reason {
+                    Some(r) => crate::goal::continue_prompt(&g.condition, r),
+                    None => crate::goal::kickoff_prompt(&g.condition),
+                })
+            })
+        })
+    };
+    goal_line(
+        term,
+        &format!(
+            "◐ back from the background: {} after {} turn(s){}",
+            st.status.as_str(),
+            st.worker_turns,
+            st.note.as_deref().map(|n| format!(" — {n}")).unwrap_or_default()
+        ),
+        Color::Magenta,
+    )?;
+    for l in goal_status_lines(app, now).into_iter().filter(|_| app.goal.is_some()) {
+        dim_line(term, &format!("  {l}"))?;
+    }
+    if app.loop_state.is_some() {
+        for l in loop_status_lines(app, now) {
+            dim_line(term, &format!("  {l}"))?;
+        }
+    }
+    dim_line(term, &format!("  background log: {}", st.log_path.display()))
 }
 
 /// Footer segment for the active profile: `profile:<name>`, or nothing
@@ -5985,6 +7065,9 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             }
         }
         AgentEvent::ToolCall { call, .. } => {
+            if call.name != crate::loops::TOOL_NAME {
+                app.turn_tool_calls += 1;
+            }
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
             let (leading, body) = tool_call_bar_text(&call.name, &call.arguments);
@@ -7074,6 +8157,12 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         format!("  · session {}", sid_short),
         Style::default().fg(Color::DarkGray),
     ));
+    // The goal (or loop prompt) itself, so a long-running session shows
+    // what it is working toward. Cut to the room left on the line.
+    let used: usize = l1.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
+    if let Some(brief) = footer_brief(app, (chunks[3].width as usize).saturating_sub(used)) {
+        l1.push(Span::styled(brief, Style::default().fg(Color::Magenta)));
+    }
     Paragraph::new(Line::from(l1)).render(chunks[3], buf);
 
     // Line 2: tokens + cost + model + context ratio (PI-style)
@@ -7116,6 +8205,10 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             seg,
             Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
         ));
+    }
+    for seg in goal_loop_segments(app, std::time::Instant::now()) {
+        l2.push(Span::raw(" · "));
+        l2.push(Span::styled(seg, Style::default().fg(Color::Magenta)));
     }
     // ORC-05: mode indicator, next to think:/vendor:. Orchestrator is
     // the default main flow, so the badge marks the DEVIATION from it —
@@ -10136,6 +11229,244 @@ mod tests {
             KeyAction::OrchestratorUsage(msg) => assert!(msg.contains("Usage: /orchestrator")),
             other => panic!("got {other:?}"),
         }
+    }
+
+    // ── /goal and /loop ─────────────────────────────────────────────
+
+    #[test]
+    fn goal_and_loop_commands_route_from_the_palette() {
+        use crate::goal::GoalCmd;
+        use crate::loops::LoopCmd;
+        let cases: Vec<(&str, KeyAction)> = vec![
+            ("/goal all tests pass", KeyAction::Goal(GoalCmd::Set("all tests pass".into()))),
+            ("/goal", KeyAction::Goal(GoalCmd::Status)),
+            ("/goal clear", KeyAction::Goal(GoalCmd::Clear)),
+            ("/loop stop", KeyAction::Loop(LoopCmd::Stop)),
+            (
+                "/loop 5m check CI",
+                KeyAction::Loop(LoopCmd::Start {
+                    interval: Some(std::time::Duration::from_secs(300)),
+                    prompt: Some("check CI".into()),
+                }),
+            ),
+        ];
+        for (typed, want) in cases {
+            let mut app = mkapp();
+            seed_input(&mut app, typed);
+            let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{typed}");
+        }
+        let mut app = mkapp();
+        seed_input(&mut app, "/loop 0m x");
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(got, KeyAction::GoalLoopUsage(_)), "{got:?}");
+    }
+
+    #[test]
+    fn a_goal_line_inside_a_message_sets_the_goal() {
+        assert_eq!(split_inline_goal("/goal one line"), None, "one line: the palette's job");
+        assert_eq!(
+            split_inline_goal("1. A 2 保持现状\n/goal 镜像构建得小一点，然后跑起来"),
+            Some(("1. A 2 保持现状".into(), "镜像构建得小一点，然后跑起来".into()))
+        );
+        assert_eq!(
+            split_inline_goal("ok\n  /goal first\nsecond line"),
+            Some(("ok".into(), "first\nsecond line".into()))
+        );
+        assert_eq!(split_inline_goal("/goal\nall tests pass"), Some((String::new(), "all tests pass".into())));
+        // Not a /goal line.
+        assert_eq!(split_inline_goal("see /goal docs\nthanks"), None);
+        assert_eq!(split_inline_goal("a\n/goals are nice"), None);
+        assert_eq!(split_inline_goal("a\n/goal   "), None);
+
+        // Through the submit path, typed with Shift+Enter between lines.
+        let mut app = mkapp();
+        for c in "1. A 2".chars() {
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        for c in "/goal build it small".chars() {
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match got {
+            KeyAction::GoalInline { preamble, condition } => {
+                assert_eq!((preamble.as_str(), condition.as_str()), ("1. A 2", "build it small"));
+            }
+            other => panic!("expected GoalInline, got {other:?}"),
+        }
+        // A multi-line message that starts with /goal keeps every line.
+        let mut app = mkapp();
+        for c in "/goal tests pass".chars() {
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        for c in "and lint is clean".chars() {
+            interpret_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", KeyAction::Goal(crate::goal::GoalCmd::Set("tests pass\nand lint is clean".into())))
+        );
+    }
+
+    #[test]
+    fn goal_and_loop_names_are_reserved_from_plugins() {
+        assert!(crate::command::RESERVED_COMMAND_NAMES.contains(&"goal"));
+        assert!(crate::command::RESERVED_COMMAND_NAMES.contains(&"loop"));
+    }
+
+    #[test]
+    fn esc_on_an_empty_idle_prompt_stops_a_loop() {
+        let mut app = mkapp();
+        // No loop: Esc only arms the fork picker's double tap.
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Esc)), KeyAction::Nothing));
+        let mut app = mkapp();
+        app.loop_state = Some(crate::loops::LoopState::new(
+            None,
+            crate::loops::Pace::SelfPaced,
+            std::time::Instant::now(),
+        ));
+        assert!(matches!(
+            interpret_key(&mut app, key(KeyCode::Esc)),
+            KeyAction::Loop(crate::loops::LoopCmd::Stop)
+        ));
+        // Mid-turn, Esc still cancels the turn.
+        app.status = Status::Streaming;
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Esc)), KeyAction::CancelTurn));
+    }
+
+    #[test]
+    fn goal_status_and_footer() {
+        let now = std::time::Instant::now();
+        let mut app = mkapp();
+        assert_eq!(goal_status_lines(&app, now)[0], "No goal set.");
+        assert!(goal_loop_segments(&app, now).is_empty());
+
+        let mut g = crate::goal::Goal::new("tests pass".into(), 0, 1);
+        g.turns_evaluated = 2;
+        g.last_reason = Some("1 test fails".into());
+        app.goal = Some(g);
+        let lines = goal_status_lines(&app, now);
+        assert_eq!(lines[0], "◎ goal: tests pass");
+        assert!(lines[1].contains("2 turn(s) evaluated"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("last check: 1 test fails")));
+        assert!(goal_loop_segments(&app, now)[0].starts_with("◎ goal "));
+        app.goal.as_mut().unwrap().paused = Some("x".into());
+        assert_eq!(goal_loop_segments(&app, now), ["◎ goal paused"]);
+        assert!(goal_status_lines(&app, now).iter().any(|l| l.contains("paused: x")));
+
+        app.goal = None;
+        app.goal_done = Some(crate::goal::Finished {
+            condition: "tests pass".into(),
+            achieved: true,
+            reason: "all green".into(),
+            elapsed: std::time::Duration::from_secs(90),
+            turns: 3,
+            tokens: 1234,
+        });
+        let lines = goal_status_lines(&app, now);
+        assert!(lines[0].contains("last goal achieved: tests pass"), "{lines:?}");
+        assert!(lines[1].contains("3 turn(s)") && lines[1].contains("all green"));
+    }
+
+    #[test]
+    fn loop_status_and_footer() {
+        let now = std::time::Instant::now();
+        let mut app = mkapp();
+        assert_eq!(loop_status_lines(&app, now)[0], "No loop running.");
+        let mut l = crate::loops::LoopState::new(
+            Some("check CI".into()),
+            crate::loops::Pace::Fixed(std::time::Duration::from_secs(300)),
+            now,
+        );
+        l.fired(now);
+        app.loop_state = Some(l);
+        let lines = loop_status_lines(&app, now);
+        assert!(lines[0].contains("every 5m") && lines[0].contains("check CI"), "{lines:?}");
+        assert_eq!(goal_loop_segments(&app, now), ["⟳ loop 5m · next 5m00s"]);
+        app.loop_state.as_mut().unwrap().next_fire = None;
+        assert_eq!(goal_loop_segments(&app, now), ["⟳ loop 5m · running"]);
+    }
+
+    #[test]
+    fn footer_shows_the_goal_fitted_to_the_line() {
+        use unicode_width::UnicodeWidthStr;
+        let mut app = mkapp();
+        assert_eq!(footer_brief(&app, 200), None);
+        app.goal = Some(crate::goal::Goal::new("all tests\n  pass".into(), 0, 1));
+        assert_eq!(footer_brief(&app, 200).as_deref(), Some("  · ◎ all tests pass"));
+        // Too long: cut with an ellipsis, never wider than the room.
+        app.goal = Some(crate::goal::Goal::new("清理磁盘直到根分区可用空间超过一百GB并且报告每一项释放的空间".into(), 0, 1));
+        let b = footer_brief(&app, 30).unwrap();
+        assert!(b.ends_with('…'), "{b}");
+        assert!(b.width() <= 30, "{b} is {} wide", b.width());
+        assert_eq!(footer_brief(&app, 9), None, "no room, no sliver");
+        // No goal: the loop's prompt.
+        app.goal = None;
+        app.loop_state = Some(crate::loops::LoopState::new(Some("check CI".into()), crate::loops::Pace::SelfPaced, std::time::Instant::now()));
+        assert_eq!(footer_brief(&app, 200).as_deref(), Some("  · ⟳ check CI"));
+    }
+
+    #[test]
+    fn background_needs_a_goal_or_loop() {
+        let mut app = mkapp();
+        assert!(background_refusal(&app).unwrap().contains("nothing to run"));
+        app.goal = Some(crate::goal::Goal::new("c".into(), 0, 1));
+        assert_eq!(background_refusal(&app), None);
+        // A paused goal alone has nothing to run.
+        app.goal.as_mut().unwrap().paused = Some("x".into());
+        assert!(background_refusal(&app).is_some());
+        app.loop_state = Some(crate::loops::LoopState::new(None, crate::loops::Pace::SelfPaced, std::time::Instant::now()));
+        assert_eq!(background_refusal(&app), None);
+        app.background_pending = true;
+        assert!(background_refusal(&app).unwrap().contains("already"));
+        assert!(goal_loop_segments(&app, std::time::Instant::now())[0].contains("to background"));
+    }
+
+    #[test]
+    fn background_command_routes() {
+        let mut app = mkapp();
+        seed_input(&mut app, "/background list");
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(got, KeyAction::Background(ref a) if a == "list"), "{got:?}");
+        assert!(crate::command::RESERVED_COMMAND_NAMES.contains(&"background"));
+    }
+
+    /// `schedule_wakeup` is on the agent exactly while a self-paced loop
+    /// runs, and comes back if a rebuild dropped it.
+    #[test]
+    fn wakeup_tool_follows_the_loop() {
+        let dir = tmp_dir();
+        let agent = agent_with_id(&dir, "sess-loop", HooksConfig::default());
+        let slot = Arc::new(Mutex::new(Some(agent)));
+        let mut app = mkapp();
+        let has = |slot: &Arc<Mutex<Option<Agent>>>| {
+            let g = slot.try_lock().unwrap();
+            let a = g.as_ref().unwrap();
+            (
+                a.registry.get(crate::loops::TOOL_NAME).is_some(),
+                a.context.tools.iter().any(|t| t.name == crate::loops::TOOL_NAME),
+            )
+        };
+        sync_wakeup_tool(&mut app, &slot, None);
+        assert_eq!(has(&slot), (false, false));
+        sync_wakeup_tool(&mut app, &slot, Some(crate::loops::Pace::SelfPaced));
+        assert_eq!(has(&slot), (true, true));
+        assert!(app.wakeup_tool_on);
+        // A rebuild drops it; the next idle tick puts it back.
+        {
+            let mut g = slot.try_lock().unwrap();
+            let a = g.as_mut().unwrap();
+            a.registry.remove(crate::loops::TOOL_NAME);
+            a.context.tools = a.registry.all_specs();
+        }
+        sync_wakeup_tool(&mut app, &slot, Some(crate::loops::Pace::SelfPaced));
+        assert_eq!(has(&slot), (true, true));
+        sync_wakeup_tool(&mut app, &slot, None);
+        assert_eq!(has(&slot), (false, false));
+        assert!(!app.wakeup_tool_on);
     }
 
     #[test]

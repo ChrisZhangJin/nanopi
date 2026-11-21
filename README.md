@@ -207,6 +207,8 @@ nanopi --fork <id>
 | `--system-prompt <text\|path>` | — | Replace the built-in system prompt |
 | `--append-system-prompt <text\|path>` | — | Append to the system prompt (repeatable) |
 | `--profile <name>` | active profile | Use a config profile for this run only (see [Profiles](#profiles)) |
+| `--foreground [id]` | — | Bring a session working in the background back to the TUI (see [Background mode](#background-mode-background-nanopi---foreground)) |
+| `--background` | — | List the sessions working in the background and exit |
 
 ## Profiles
 
@@ -377,6 +379,84 @@ gets no badge. Caps for the spawned children live under `[agent]` (see
 `config.toml.example`). This is TUI-only: `nanopi -p` ignores the setting
 entirely and always keeps its full tool set, so scripted runs are never
 silently restricted.
+
+## Goals and loops (`/goal`, `/loop`)
+
+Two ways to keep a session working without prompting each step, after
+Claude Code's commands of the same names.
+
+**`/goal <condition>`** starts working toward the condition right away.
+After every turn a separate model call (no tools) reads the condition and
+the conversation and returns *met*, *not met* or *impossible*, with a
+reason. Not met → nanopi starts the next turn with the reason as guidance;
+met or impossible → the goal clears and the result is printed. The
+evaluator only sees the conversation, so name a check the work itself shows:
+
+```text
+/goal all tests in tests/auth pass (cargo test exits 0) and no other test file changes
+```
+
+| Command | Effect |
+|---|---|
+| `/goal <condition>` | Set (or replace) the goal and start; up to 4,000 characters |
+| `/goal` | Status: condition, time, turns judged, tokens, last reason |
+| `/goal clear` | Clear it (also `stop`, `off`, `reset`, `none`, `cancel`) |
+
+The goal **pauses** — stays set but stops driving turns — when you interrupt
+a turn (Esc), after 3 judged turns in a row with no tool call, after an
+error a retry would repeat (rate limit), after 3 failed automatic retries,
+or when the check itself fails. Your next message resumes it. Transient
+errors (dropped connection, cut-off stream) are retried after 30 s, 60 s,
+120 s; errors you must fix (bad key, unknown model, context overflow) clear
+the goal. While background agents run, the check waits for their report.
+`/new`, `/resume` and forking clear the goal. The footer shows `◎ goal 3m05s`.
+
+`nanopi -p "/goal <condition>"` runs the whole loop in one invocation (notes
+on stderr) and exits non-zero unless the goal is met. Set `NANOPI_GOAL_MODEL`
+to judge with a cheaper model on the same endpoint.
+
+**`/loop [interval] [prompt]`** re-runs a prompt while the session is open:
+
+| Input | Behaviour |
+|---|---|
+| `/loop 5m check whether the deploy finished` | Every 5 minutes (also `… every 2 hours`; units s m h d, minimum 1m) |
+| `/loop check CI and fix what broke` | Self-paced: each iteration ends with the model choosing the next delay (1–60 min) or stopping |
+| `/loop` or `/loop 15m` | `.nanopi/loop.md`, else `~/.nanopi/loop.md`, else a built-in maintenance prompt (continue unfinished work, tend the branch, small cleanup) |
+| `/loop status` | Show the loop |
+| `/loop stop`, or Esc on an empty prompt | Stop it |
+| ask in chat ("stop the loop") | The model ends it with its `stop_loop` tool, which it also uses on its own once the loop's task is done |
+
+Iterations start only when the session is idle — never mid-turn, and a
+missed one runs once, not once per missed interval. The first runs at once.
+A self-paced loop gives the model a `schedule_wakeup` tool for as long as
+the loop runs; an iteration that neither reschedules nor stops gets one
+fallback check 20 minutes later, and the loop ends if that one does not
+reschedule either. One loop per session (a new `/loop` replaces it); loops
+expire after 7 days and do not survive a restart. The first line of a
+`/skill:<name>` prompt is kept intact so the skill still expands.
+
+### Background mode (`/background`, `nanopi --foreground`)
+
+A session with a running `/goal` or `/loop` can keep working without the TUI:
+
+| Command | Effect |
+|---|---|
+| `/background` | Hand the goal / loop to a background worker and quit. Mid-turn, it happens when the turn ends (Esc cancels both); with agents running (the orchestrator's usual state), once they have reported — the TUI then quits by itself |
+| `/background now` | Stop the running agents and hand off at once; the worker's next goal turn is told which agents were stopped (and where their briefs are) so it can dispatch them again |
+| `/background cancel` | Cancel a hand-off that is still waiting |
+| `nanopi --background` (or `/background list`) | List background sessions: status, what they run, last progress line |
+| `nanopi --foreground [id]` | Stop the worker after its current turn (Ctrl-C while waiting cancels that turn), then open the TUI on the session — history replayed, goal and loop restored, work continuing. Without an id: the newest one started in this directory |
+
+The worker is a detached `nanopi` (its own session, so closing the terminal
+does not stop it) resuming the same session file. It runs goal turns and loop
+iterations exactly as the TUI would, and exits on its own when the goal is met,
+judged impossible or paused, or the loop ends; `--foreground` then just shows
+the result. State and log live in `~/.nanopi/background/<session>.json` and
+`.log` (`tail -f` the log to watch). Nothing can ask you anything in the
+background: sudo in `ask` mode is refused, as in `nanopi -p`. Agents are
+children of the process that started them, so the TUI's agents cannot move to
+the worker — hence the wait (or `now`); the worker dispatches its own. A reboot
+ends the worker — `--foreground` still restores the goal / loop from its state file.
 
 ## sudo
 

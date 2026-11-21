@@ -105,6 +105,9 @@ pub struct CommandLoadResult {
 /// stays in sync with `slash_items()` — that guard is what makes a
 /// hand-maintained list safe.
 pub const RESERVED_COMMAND_NAMES: &[&str] = &[
+    "background",
+    "goal",
+    "loop",
     "model",
     "new",
     "resume",

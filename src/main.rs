@@ -181,6 +181,67 @@ struct Args {
     /// the profile last chosen with `/profile use`.
     #[arg(long = "profile", value_name = "NAME")]
     profile: Option<String>,
+
+    /// Bring a session sent to the background with `/background` back to
+    /// the TUI: its worker stops after the current turn (Ctrl-C while
+    /// waiting cancels that turn) and the goal / loop continues here.
+    /// Without an id: the newest one started in this directory.
+    #[arg(long = "foreground", value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
+    foreground: Option<String>,
+
+    /// List the sessions working in the background (`/background`) and exit.
+    #[arg(long = "background", conflicts_with = "foreground")]
+    background: bool,
+
+    /// Internal: the background worker for a session (`/background`).
+    #[arg(long = "worker", value_name = "SESSION_ID", hide = true)]
+    worker: Option<String>,
+}
+
+/// `--foreground`: pick the background session, stop its worker at a
+/// turn boundary, and return its final state (the state file is
+/// consumed; the log stays).
+async fn foreground_prepare(home: &std::path::Path, id: &str) -> Result<nanopi::background::BgState, String> {
+    use nanopi::background as bg;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let st = bg::pick(&bg::list_in(home), Some(id), &cwd)?;
+    if let Some(pid) = st.pid.filter(|p| bg::pid_alive(*p)) {
+        bg::signal_stop(pid);
+        eprintln!(
+            "nanopi: stopping background worker {pid} after its current turn… (Ctrl-C cancels the turn now)"
+        );
+        let started = std::time::Instant::now();
+        let mut last_note = std::time::Instant::now();
+        let mut cancelled = false;
+        while bg::pid_alive(pid) {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                _ = tokio::signal::ctrl_c(), if !cancelled => {
+                    cancelled = true;
+                    bg::signal_stop(pid);
+                    eprintln!("nanopi: cancelling the worker's current turn…");
+                }
+            }
+            if last_note.elapsed() > std::time::Duration::from_secs(30) {
+                last_note = std::time::Instant::now();
+                eprintln!(
+                    "nanopi: still waiting for the turn to finish ({}s)…",
+                    started.elapsed().as_secs()
+                );
+            }
+        }
+    }
+    let st = bg::read_in(home, &st.session_id).unwrap_or(st);
+    bg::remove_in(home, &st.session_id);
+    eprintln!(
+        "nanopi: background session {} — {} after {} turn(s){}",
+        st.short_id(),
+        st.status.as_str(),
+        st.worker_turns,
+        st.note.as_deref().map(|n| format!(": {n}")).unwrap_or_default()
+    );
+    eprintln!("nanopi: its log: {}", st.log_path.display());
+    Ok(st)
 }
 
 /// Agent (child) mode: launched by a parent nanopi as an agent.
@@ -265,7 +326,66 @@ fn install_parent_death_signal() -> bool {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Background sessions (`crate::background`): list, take one back,
+    // or be one's worker. Before the profile and cwd are settled, since
+    // `--foreground` adopts the worker's directory and profile.
+    let mut worker_state: Option<nanopi::background::BgState> = None;
+    if args.background || args.foreground.is_some() || args.worker.is_some() {
+        let Some(home) = nanopi::paths::nanopi_home() else {
+            eprintln!("error: cannot locate the nanopi home directory");
+            return ExitCode::from(2);
+        };
+        if args.background {
+            let states = nanopi::background::list_in(&home);
+            let lines = nanopi::background::list_lines(
+                &states,
+                nanopi::background::unix_now(),
+                nanopi::background::is_running,
+            );
+            for l in lines {
+                println!("{l}");
+            }
+            return ExitCode::SUCCESS;
+        }
+        if let Some(id) = args.worker.clone() {
+            match nanopi::background::read_in(&home, &id) {
+                Ok(st) => {
+                    if let Err(e) = std::env::set_current_dir(&st.cwd) {
+                        eprintln!("error: cd {}: {e}", st.cwd.display());
+                        return ExitCode::from(1);
+                    }
+                    args.print = true;
+                    args.session_id = Some(st.session_id.clone());
+                    worker_state = Some(st);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else if let Some(id) = args.foreground.clone() {
+            match foreground_prepare(&home, &id).await {
+                Ok(st) => {
+                    if let Err(e) = std::env::set_current_dir(&st.cwd) {
+                        eprintln!("error: cd {}: {e}", st.cwd.display());
+                        return ExitCode::from(1);
+                    }
+                    args.session_id = Some(st.session_id.clone());
+                    args.continue_session = false;
+                    if args.profile.is_none() && st.profile != nanopi::profile::DEFAULT {
+                        args.profile = Some(st.profile.clone());
+                    }
+                    nanopi::background::set_restore(st);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
 
     let agent_mode = is_agent_mode(&args);
     if agent_mode && !install_parent_death_signal() {
@@ -606,6 +726,8 @@ async fn main() -> ExitCode {
             Some(m) => m,
             // `--brief` alone: the brief file is the task (RT-09).
             None if args.brief.is_some() => "",
+            // A background worker's work is in its state file.
+            None if worker_state.is_some() => "",
             // No message argument: read the prompt from stdin, so
             // `echo "..." | nanopi -p` works. Only when stdin is
             // actually piped — on a TTY this would silently block
@@ -656,10 +778,17 @@ async fn main() -> ExitCode {
                 brief: args.brief.clone(),
                 agent_id: std::env::var("NANOPI_AGENT_ID").ok(),
                 agent_mode,
+                worker: worker_state.clone(),
             },
         );
+        // A background worker handles SIGTERM itself: stop after the
+        // current turn, so `--foreground` finds a consistent session.
+        if worker_state.is_some() {
+            print_fut.await
+        } else
         // SIGINT/SIGTERM in print mode: kill every agent child, then exit
         // 130/143. Dropping the print future also drops each child's guard.
+        {
         tokio::select! {
             r = print_fut => r,
             code = wait_for_term_signal() => {
@@ -668,6 +797,7 @@ async fn main() -> ExitCode {
                 }
                 Ok(code)
             }
+        }
         }
     } else {
         // Ephemeral runs are only wired through the non-interactive print

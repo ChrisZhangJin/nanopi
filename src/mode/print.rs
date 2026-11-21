@@ -65,6 +65,9 @@ pub struct ChildOptions {
     pub agent_id: Option<String>,
     /// Running as a child: `agent` is never registered (D-05).
     pub agent_mode: bool,
+    /// `--worker`: a backgrounded session's state (`crate::background`).
+    /// Instead of one turn, run its goal and loop until done or stopped.
+    pub worker: Option<crate::background::BgState>,
 }
 
 pub async fn run_print_mode(
@@ -430,6 +433,55 @@ pub async fn run_print_mode(
         None => message.to_string(),
     };
 
+    // `-p "/goal <condition>"`: run turns until an evaluator judges the
+    // condition met (`crate::goal`), all in this one invocation. Only
+    // for a user's own run — a brief-driven agent has its own
+    // self-check.
+    let mut task = task;
+    let mut goal: Option<(String, Box<dyn crate::agent::loop_::Provider>)> = None;
+    if brief_path.is_none() {
+        if let Some(rest) = goal_arg(&task) {
+            match crate::goal::parse_args(rest) {
+                Ok(crate::goal::GoalCmd::Set(condition)) => {
+                    let eval_model = std::env::var("NANOPI_GOAL_MODEL")
+                        .ok()
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or_else(|| model.to_string());
+                    let evaluator = crate::provider::build(
+                        api_kind,
+                        base_url,
+                        api_key,
+                        &eval_model,
+                        Some(crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), &eval_model)),
+                        inline_think_tags,
+                    );
+                    task = crate::goal::kickoff_prompt(&condition);
+                    goal = Some((condition, evaluator));
+                }
+                Ok(_) => anyhow::bail!("in a -p run /goal needs a condition: /goal <condition>"),
+                Err(e) => anyhow::bail!("{e}"),
+            }
+        }
+    }
+
+    // `--worker`: the goal check needs its own provider, like `/goal`.
+    let worker = child.worker.clone();
+    let worker_eval: Option<Box<dyn crate::agent::loop_::Provider>> = worker.as_ref().map(|_| {
+        let eval_model = std::env::var("NANOPI_GOAL_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| model.to_string());
+        crate::provider::build(
+            api_kind,
+            base_url,
+            api_key,
+            &eval_model,
+            Some(crate::vendor::pick_vendor(cfg_provider.as_deref(), Some(base_url), &eval_model)),
+            inline_think_tags,
+        )
+    });
+    let is_worker = worker.is_some();
+
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
     // CR-01: a plain top-level `select!` in `main.rs` racing the whole
     // `print_fut` against `ctrl_c()` always won (a bare `ctrl_c().await`
@@ -473,12 +525,23 @@ pub async fn run_print_mode(
     let agent_task = {
         let mut agent = agent; // move
         let brief_path = brief_path.clone();
+        let goal_interrupted = ctrl_c_interrupted.clone();
         tokio::spawn(async move {
             let steer = match (brief_path.as_ref(), brief_content.as_deref()) {
                 (Some(p), Some(c)) => Some(start_brief_watch(p, c)),
                 _ => None,
             };
-            let mut r = agent.run_turn(task.as_str(), &tx, None, steer).await;
+            let mut r = match (worker, worker_eval.as_ref()) {
+                (Some(st), Some(ev)) => {
+                    let home = crate::paths::nanopi_home().unwrap_or_else(|| PathBuf::from("."));
+                    let done = crate::background::run_worker(&mut agent, &tx, ev.as_ref(), &home, st).await;
+                    Ok(format!("background worker finished: {}", done.status.as_str()))
+                }
+                _ => agent.run_turn(task.as_str(), &tx, None, steer).await,
+            };
+            if let Some((condition, evaluator)) = goal.as_ref() {
+                r = run_goal(&mut agent, condition, evaluator.as_ref(), r, &tx, &goal_interrupted).await;
+            }
             let mut limit = agent.last_limit_hit();
             // The task's final answer. Self-check turns below overwrite
             // `r`, so keep it for the report summary.
@@ -595,7 +658,7 @@ pub async fn run_print_mode(
     let mut renderer = StdoutRenderer::new();
     // Spinner only in text mode. JSON mode buffers everything and dumps at
     // the end, so no user-facing terminal chatter to keep alive.
-    let mut spinner = if output == OutputFormat::Text {
+    let mut spinner = if output == OutputFormat::Text && !is_worker {
         Some(crate::render::spinner::Spinner::start("thinking"))
     } else {
         None
@@ -1008,6 +1071,121 @@ fn stops_spinner(ev: &AgentEvent) -> bool {
             | AgentEvent::ToolCall { .. }
             | AgentEvent::Error { .. }
     )
+}
+
+/// The condition part of a `/goal …` message, if it is one.
+fn goal_arg(msg: &str) -> Option<&str> {
+    let t = msg.trim_start();
+    let rest = t.strip_prefix("/goal")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(rest)
+}
+
+/// Keep running turns until the evaluator judges `condition` met. Ends
+/// with an `Err` when the goal is judged impossible or stalls, so the
+/// run exits non-zero. Progress notes go to stderr.
+async fn run_goal(
+    agent: &mut crate::agent::loop_::Agent,
+    condition: &str,
+    evaluator: &dyn crate::agent::loop_::Provider,
+    first: Result<String, crate::agent::loop_::AgentError>,
+    tx: &mpsc::Sender<AgentEvent>,
+    interrupted: &std::sync::atomic::AtomicBool,
+) -> Result<String, crate::agent::loop_::AgentError> {
+    use crate::goal::{classify_error, ErrorKind, Verdict, MAX_RETRIES, NO_PROGRESS_LIMIT};
+    let fail = |m: String| Err(crate::agent::loop_::AgentError::Provider(m));
+    let kickoff = crate::goal::kickoff_prompt(condition);
+    let mut r = first;
+    let mut turn_start = 0usize;
+    let mut no_progress = 0u32;
+    let mut retries = 0u32;
+    let mut turns = 0u32;
+    loop {
+        if interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+            return r;
+        }
+        turns += 1;
+        let next = match &r {
+            Err(e) => {
+                let e = e.to_string();
+                match classify_error(&e) {
+                    ErrorKind::Transient if retries < MAX_RETRIES => {
+                        retries += 1;
+                        let d = crate::goal::retry_delay(retries);
+                        eprintln!(
+                            "◎ goal still active — retrying in {} ({retries}/{MAX_RETRIES}): {e}",
+                            crate::goal::format_duration(d)
+                        );
+                        tokio::time::sleep(d).await;
+                        crate::goal::retry_prompt(condition, &e)
+                    }
+                    _ => {
+                        eprintln!("◎ goal stopped by an error: {e}");
+                        return r;
+                    }
+                }
+            }
+            Ok(_) => {
+                retries = 0;
+                let msgs = &agent.context.messages;
+                // Compaction can shrink the context mid-turn; then the
+                // whole context counts as this turn's.
+                let from = if turn_start <= msgs.len() { turn_start } else { 0 };
+                let tool_calls = crate::goal::tool_calls_since(&agent.context, from);
+                let start = msgs
+                    .iter()
+                    .rposition(|m| match m {
+                        crate::agent::context::ContextMessage::User { content } => content.iter().any(|b| {
+                            matches!(b, crate::agent::context::ContentBlock::Text { text } if *text == kickoff)
+                        }),
+                        _ => false,
+                    })
+                    .unwrap_or(usize::MAX);
+                let transcript = crate::goal::transcript(&agent.context, start);
+                let eval = match crate::goal::evaluate(evaluator, condition, &transcript).await {
+                    Ok((e, _)) => e,
+                    Err(e) => {
+                        eprintln!("◎ {e}");
+                        return fail(e);
+                    }
+                };
+                let reason = if eval.reason.is_empty() { "(no reason given)".to_string() } else { eval.reason };
+                match eval.verdict {
+                    Verdict::Met => {
+                        eprintln!("◎ goal achieved after {turns} turn(s): {reason}");
+                        return r;
+                    }
+                    Verdict::Impossible => {
+                        eprintln!("◎ goal judged impossible: {reason}");
+                        return fail(format!("goal judged impossible: {reason}"));
+                    }
+                    Verdict::NotMet => {
+                        no_progress = if tool_calls == 0 { no_progress + 1 } else { 0 };
+                        if no_progress >= NO_PROGRESS_LIMIT {
+                            eprintln!(
+                                "◎ goal stopped: {NO_PROGRESS_LIMIT} turns in a row without tool use. Last check: {reason}"
+                            );
+                            return fail(format!("goal not met: {reason}"));
+                        }
+                        eprintln!("◎ not yet: {reason}");
+                        crate::goal::continue_prompt(condition, &reason)
+                    }
+                }
+            }
+        };
+        turn_start = agent.context.messages.len();
+        r = agent.run_turn(next.as_str(), tx, None, None).await;
+    }
+}
+
+#[cfg(test)]
+mod goal_arg_tests {
+    #[test]
+    fn goal_arg_only_matches_the_command() {
+        assert_eq!(super::goal_arg("/goal tests pass"), Some(" tests pass"));
+        assert_eq!(super::goal_arg("  /goal"), Some(""));
+        assert_eq!(super::goal_arg("/goals are nice"), None);
+        assert_eq!(super::goal_arg("fix /goal handling"), None);
+    }
 }
 
 #[cfg(test)]
