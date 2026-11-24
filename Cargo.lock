@@ -1310,6 +1310,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

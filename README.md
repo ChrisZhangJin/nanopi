@@ -753,6 +753,8 @@ Payloads cross the boundary as JSON strings rather than WIT records — one prim
 
 A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin), including the build command. [`examples/wasm-plugin-minimal/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-minimal) is a smaller skeleton to copy — two tools, split into boilerplate and the part you replace.
 
+For personal memory across sessions, nanopi now has a built-in memory (`/memory`, `/dream`, the `memory_search` / `remember` / `forget` tools; design in `docs/memory-design.md`). It lives in `~/.nanopi/memory/`, and environment entries are sent to a model only when the profile sets `memory_disclosure = "full"` for that exact endpoint (`/memory disclosure full`). The plugin below remains an example of per-project memory.
+
 For plugins meant to be *used* rather than read: [`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) is durable project memory — facts are markdown files in `.nanopi/memory/` that you can diff and commit, and only the compact index enters the model's context, with `recall` fetching the full text of whatever looks relevant. [`examples/wasm-plugin-report/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-report) records per-tool time and failures across sessions, which answers "why was that slow" — `tool_execution_end` carries a `duration_ms` that nothing else persists.
 
 All five plugins are indexed in [`examples/README.md`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples) — a table of what each one does, the grants it needs, and which WIT world it targets.

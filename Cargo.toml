@@ -82,6 +82,10 @@ toml_edit = "0.22"
 # async fn in trait objects
 async-trait = "0.1"
 
+# SHA-256 of memory entries, so Dream can tell a user-edited entry from its
+# own and leave it alone. Already in the tree through rustls.
+ring = "0.17"
+
 # Hook matchers + the grep tool
 regex = { version = "1.10", default-features = false, features = ["std"] }
 

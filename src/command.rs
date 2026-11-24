@@ -106,7 +106,9 @@ pub struct CommandLoadResult {
 /// hand-maintained list safe.
 pub const RESERVED_COMMAND_NAMES: &[&str] = &[
     "background",
+    "dream",
     "effort",
+    "memory",
     "goal",
     "loop",
     "model",

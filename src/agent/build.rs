@@ -822,6 +822,10 @@ pub fn compose_system_prompt_mode(
         prompt.push_str(&append);
     }
 
+    if tool_names.iter().any(|n| n == "memory_search") {
+        prompt.push_str(crate::memory::PROMPT);
+    }
+
     if !no_context_files {
         let files = crate::agent::context_files::load_project_context_files(
             cwd,
@@ -904,13 +908,21 @@ mod tests {
         let cwd = PathBuf::from("/tmp/__BASELINE_CWD__");
         let prompt = compose_system_prompt(
             &cwd,
-            &ToolRegistry::standard_with_control().names(),
+            // Memory tools and their prompt lines are a deliberate
+            // addition (docs/memory-design.md); the baseline guards the rest.
+            &ToolRegistry::standard_with_control()
+                .names()
+                .into_iter()
+                .filter(|n| !matches!(n.as_str(), "memory_search" | "remember" | "forget"))
+                .collect::<Vec<_>>(),
             &[],
             true,
             &PromptOverrides::default(),
         );
         let placeholder = prompt.replace(&cwd.display().to_string(), "{CWD}");
         assert_eq!(placeholder, BASELINE_DEFAULT_PROMPT);
+        let with_memory = compose_system_prompt(&cwd, &ToolRegistry::standard_with_control().names(), &[], true, &PromptOverrides::default());
+        assert!(with_memory.contains(crate::memory::PROMPT));
     }
 
     #[test]

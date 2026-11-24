@@ -156,6 +156,10 @@ enum SlashCmd {
     /// `/background [list]`: hand a goal / loop to a background worker
     /// and quit (`crate::background`), or list the workers.
     Background,
+    /// `/memory [show|forget|restore|disclosure]` (`crate::memory`).
+    Memory,
+    /// `/dream [--since Nd [--yes] | status | log]`: distill daily notes.
+    Dream,
     /// `/effort [low|medium|high|xhigh|max|auto]`: the thinking level
     /// (the same one Shift+Tab cycles), shown or set.
     Effort,
@@ -303,6 +307,16 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/effort",
             "Thinking effort: /effort low | medium | high | xhigh | max | auto (bare: show what the model receives)",
             SlashCmd::Effort,
+        ),
+        MenuItem::new(
+            "/memory",
+            "Memory: index + recent | show <id> | forget <id> | restore <id> | disclosure [general|full]",
+            SlashCmd::Memory,
+        ),
+        MenuItem::new(
+            "/dream",
+            "Distill daily notes into memory (uses the model) | --since 7d [--yes] | status | log",
+            SlashCmd::Dream,
         ),
         MenuItem::new(
             "/background",
@@ -1279,6 +1293,8 @@ struct App {
     /// `summarize_task`.
     command_task:
         Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
+    /// In-flight `/dream`, polled on the tick like `command_task`.
+    dream_task: Option<tokio::task::JoinHandle<Result<String, String>>>,
     /// Phase 5 agents strip (UI-01): cached, display-only snapshot of
     /// background agents. Refreshed ONLY on the 120ms tick arm (D-07,
     /// UI-04) — never from agent events or key handling — so the dock
@@ -1394,6 +1410,7 @@ impl App {
             subscriptions_cache: Vec::new(),
             plugin_grants_cache: Vec::new(),
             command_task: None,
+            dream_task: None,
             agents_view: AgentsView::new(),
             agents_strip_expanded: false,
             term_rows: 24,
@@ -1621,6 +1638,10 @@ enum KeyAction {
     Background(String),
     /// `/effort …` parsed.
     Effort(EffortCmd),
+    /// `/memory …` (raw arguments).
+    Memory(String),
+    /// `/dream …` (raw arguments).
+    Dream(String),
     /// A Dream run finished.
     DreamFinished(Result<String, String>),
     /// A `/goal` line inside a longer message: set the goal; the text
@@ -2821,6 +2842,8 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             Err(msg) => KeyAction::GoalLoopUsage(format!("{msg}\n{}", crate::goal::USAGE)),
         },
         SlashCmd::Background => KeyAction::Background(arg),
+        SlashCmd::Memory => KeyAction::Memory(arg),
+        SlashCmd::Dream => KeyAction::Dream(arg),
         SlashCmd::Effort => match parse_effort_args(&arg) {
             Ok(cmd) => KeyAction::Effort(cmd),
             Err(msg) => KeyAction::GoalLoopUsage(msg),
@@ -3132,6 +3155,15 @@ async fn run_app(
                     } else {
                         app.command_task = Some(task);
                     }
+                }
+                if app.dream_task.as_ref().is_some_and(|t| t.is_finished()) {
+                    let task = app.dream_task.take().expect("checked");
+                    let outcome = task.await.unwrap_or_else(|e| Err(format!("Dream panicked: {e}")));
+                    handle_action(
+                        KeyAction::DreamFinished(outcome),
+                        app, term, &agent_slot,
+                        &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                    ).await?;
                 }
                 // `note!` lines — plugin `host-log`, provider retry
                 // notices, hook diagnostics, `/new`'s config warnings.
@@ -3534,6 +3566,51 @@ async fn handle_action(
             dim_line(term, &format!("  {model} receives: {}", crate::agent::thinking::describe(&model, level)))?;
             dim_line(term, &format!("  {EFFORT_USAGE} · Shift+Tab cycles · /settings sets the default"))?;
         }
+        KeyAction::Memory(arg) => {
+            let endpoint = agent_slot.lock().await.as_ref().map(|a| a.base_url.clone()).unwrap_or_default();
+            match crate::memory::command(&arg, &endpoint) {
+                Ok(text) => text.lines().try_for_each(|l| dim_line(term, l))?,
+                Err(e) => goal_line(term, &format!("memory: {e:#}"), Color::Yellow)?,
+            }
+        }
+        KeyAction::Dream(arg) => {
+            let Some((model, base_url, api_key)) = agent_slot
+                .lock()
+                .await
+                .as_ref()
+                .map(|a| (a.model.clone(), a.base_url.clone(), a.api_key.clone()))
+            else {
+                return goal_line(term, "dream: a turn is in flight — try again once it finishes", Color::Yellow);
+            };
+            match crate::memory::dream_plan(&arg, &base_url, &model) {
+                Err(e) => goal_line(term, &format!("dream: {e:#}"), Color::Yellow)?,
+                Ok(crate::memory::DreamPlan::Print(text)) => text.lines().try_for_each(|l| dim_line(term, l))?,
+                Ok(crate::memory::DreamPlan::Run(opts)) => {
+                    if app.dream_task.is_some() {
+                        return goal_line(term, "dream: already running", Color::Yellow);
+                    }
+                    let provider = crate::provider::build(
+                        app.api_kind,
+                        &base_url,
+                        &api_key,
+                        &model,
+                        Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)),
+                        app.inline_think_tags,
+                    );
+                    goal_line(term, &format!("dream: running with {model} at {base_url} (see /dream status)"), Color::Magenta)?;
+                    app.dream_task = Some(tokio::spawn(async move {
+                        crate::memory::dream_run(provider, base_url, model, opts)
+                            .await
+                            .map(|r| r.text)
+                            .map_err(|e| format!("{e:#}"))
+                    }));
+                }
+            }
+        }
+        KeyAction::DreamFinished(outcome) => match outcome {
+            Ok(text) => goal_line(term, &text, Color::Magenta)?,
+            Err(e) => e.lines().try_for_each(|l| goal_line(term, &format!("dream: {l}"), Color::Yellow))?,
+        },
         KeyAction::Background(arg) => {
             let arg = arg.trim();
             if arg == "list" || arg == "ls" {

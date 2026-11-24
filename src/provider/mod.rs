@@ -113,6 +113,22 @@ pub fn build(
     vendor: Option<Box<dyn crate::vendor::Vendor>>,
     inline_think_tags: Option<bool>,
 ) -> Box<dyn Provider> {
+    // Every provider is wrapped, so each request path (turns, compaction,
+    // goal checks, summaries, Dream) applies the memory disclosure check.
+    Box::new(crate::memory::DisclosureGuard {
+        inner: build_unguarded(kind, base_url, api_key, model, vendor, inline_think_tags),
+        endpoint: base_url.to_string(),
+    })
+}
+
+fn build_unguarded(
+    kind: Option<ApiKind>,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    vendor: Option<Box<dyn crate::vendor::Vendor>>,
+    inline_think_tags: Option<bool>,
+) -> Box<dyn Provider> {
     let effective = effective_kind(kind, vendor.as_deref(), base_url);
     match effective {
         ApiKind::Openai => {

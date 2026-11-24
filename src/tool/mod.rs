@@ -655,6 +655,8 @@ impl ToolRegistry {
         r.register(Arc::new(find::FindTool));
         r.register(Arc::new(ls::LsTool));
         r.register(Arc::new(agent::AgentTool::new()));
+        // Read-only, so sub-agents get it too (Q31).
+        r.register(Arc::new(crate::memory::MemorySearchTool));
         r
     }
 
@@ -667,6 +669,9 @@ impl ToolRegistry {
         r.register(Arc::new(agent_ctl::ListAgentsTool::new()));
         r.register(Arc::new(agent_ctl::StopAgentTool::new()));
         r.register(Arc::new(agent_ctl::SendMessageTool::new()));
+        // Memory writes: main session only, never a child.
+        r.register(Arc::new(crate::memory::RememberTool));
+        r.register(Arc::new(crate::memory::ForgetTool));
         r
     }
 
@@ -682,7 +687,12 @@ impl ToolRegistry {
     ///
     /// Registers exactly: the four dispatch tools (`agent`,
     /// `list_agents`, `stop_agent`, `send_message`) plus `read`, `grep`,
-    /// `find`, `ls` and `bash`.
+    /// `find`, `ls` and `bash`, plus the memory tools `memory_search`,
+    /// `remember` and `forget` (docs/memory-design.md). The orchestrator
+    /// is the main session, the one that records lessons from agent
+    /// reports (Q30); without them memory would be off in the TUI's
+    /// default mode. They write only to the memory store, never to
+    /// project files, so they do not break the no-write rule below.
     ///
     /// The orchestrator is hybrid: it scouts (reads, searches, runs a
     /// quick command) to scope a job and write a better brief, and does
@@ -701,6 +711,9 @@ impl ToolRegistry {
         r.register(Arc::new(find::FindTool));
         r.register(Arc::new(ls::LsTool));
         r.register(Arc::new(bash::BashTool::new()));
+        r.register(Arc::new(crate::memory::MemorySearchTool));
+        r.register(Arc::new(crate::memory::RememberTool));
+        r.register(Arc::new(crate::memory::ForgetTool));
         r
     }
 
@@ -996,7 +1009,7 @@ mod tests {
         let names = ToolRegistry::standard().names();
         assert_eq!(
             names,
-            vec!["agent", "bash", "edit", "find", "grep", "ls", "read", "write"]
+            vec!["agent", "bash", "edit", "find", "grep", "ls", "memory_search", "read", "write"]
         );
     }
 
@@ -1039,7 +1052,7 @@ mod tests {
             .expect("greet does not collide");
 
         let entries = r.entries();
-        assert_eq!(entries.len(), 9, "8 built-ins + 1 plugin tool");
+        assert_eq!(entries.len(), 10, "9 built-ins + 1 plugin tool");
 
         let by_name = |n: &str| -> ToolSource {
             entries
@@ -1157,7 +1170,7 @@ mod tests {
         assert_eq!(err, "bash");
 
         let entries = r.entries();
-        assert_eq!(entries.len(), 8, "the refused tool must not appear");
+        assert_eq!(entries.len(), 9, "the refused tool must not appear");
         let bash = entries.iter().find(|(s, _)| s.name == "bash").unwrap();
         assert_eq!(bash.1, ToolSource::Builtin, "bash is still the built-in");
     }
@@ -1201,7 +1214,7 @@ mod tests {
             r.register_external(Arc::new(NamedPluginTool { tool, plugin }))
                 .expect("no collision");
         }
-        assert_eq!(r.names().len(), 11, "8 built-ins + 3 plugin tools");
+        assert_eq!(r.names().len(), 12, "9 built-ins + 3 plugin tools");
 
         let removed = r.unregister_plugin("alpha");
         assert_eq!(removed, vec!["greet".to_string(), "wave".to_string()]);
@@ -1210,7 +1223,7 @@ mod tests {
         assert!(r.get("query").is_some(), "beta's tool must survive");
         assert!(r.get("greet").is_none());
         assert!(r.get("wave").is_none());
-        assert_eq!(r.names().len(), 9, "8 built-ins + beta's one tool");
+        assert_eq!(r.names().len(), 10, "9 built-ins + beta's one tool");
     }
 
     /// The safety property, and the reason the signature takes a plugin
@@ -1480,14 +1493,18 @@ mod tests {
     fn standard_with_control_specs_byte_identical_to_baseline() {
         let r = ToolRegistry::standard_with_control();
         let mut specs = r.all_specs();
+        // The memory tools are a deliberate, reviewed addition
+        // (docs/memory-design.md) asserted in `memory::tests`; the rest
+        // of the surface must stay byte-identical.
+        specs.retain(|s| !matches!(s.name.as_str(), "memory_search" | "remember" | "forget"));
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         let actual = serde_json::to_string(&specs).unwrap();
         assert_eq!(actual, BASELINE_STANDARD_WITH_CONTROL_SPECS);
     }
 
     /// ORC-02/ORC-04: the hybrid orchestrator has the four dispatch
-    /// tools plus read-only scouting tools and `bash`; `write` and
-    /// `edit` must stay absent.
+    /// tools plus read-only scouting tools, `bash` and the memory tools;
+    /// `write` and `edit` must stay absent.
     #[test]
     fn orchestrator_registry_is_dispatch_plus_scouting_tools() {
         let r = ToolRegistry::orchestrator();
@@ -1497,10 +1514,13 @@ mod tests {
                 "agent",
                 "bash",
                 "find",
+                "forget",
                 "grep",
                 "list_agents",
                 "ls",
+                "memory_search",
                 "read",
+                "remember",
                 "send_message",
                 "stop_agent",
             ]
@@ -1508,7 +1528,7 @@ mod tests {
         for t in ["write", "edit"] {
             assert!(r.get(t).is_none(), "orchestrator must not have `{t}`");
         }
-        assert_eq!(r.all_specs().len(), 9);
+        assert_eq!(r.all_specs().len(), 12);
     }
 
     #[tokio::test]
