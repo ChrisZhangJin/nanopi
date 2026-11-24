@@ -218,20 +218,17 @@ pub fn build_request<'a>(ctx: &'a Context, model: &'a str) -> serde_json::Value 
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
-    // Extended thinking: only when the user picked a level AND the
-    // model supports it. Sending `thinking` to a model that doesn't
-    // support the field would 400. See agent::thinking::supports_thinking.
+    // Claude 5 / 4.6-4.8 think adaptively even with no level set, and
+    // the thinking counts against max_tokens: 4096 cut long replies off.
+    if crate::agent::thinking::uses_effort(model) {
+        body["max_tokens"] = json!(crate::agent::thinking::ADAPTIVE_MAX_TOKENS);
+    }
+    // Thinking depth: only when the user picked a level. Effort models
+    // get `thinking: adaptive` + `output_config.effort`; older ones a
+    // `budget_tokens`; models without thinking nothing (the field would
+    // 400). See `agent::thinking::wire`.
     if let Some(level) = ctx.thinking {
-        if crate::agent::thinking::supports_thinking(model) {
-            let budget = level.budget_tokens();
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            });
-            // Anthropic requires max_tokens > budget_tokens so the
-            // model has room to write an actual answer AFTER thinking.
-            body["max_tokens"] = json!(budget + 4096);
-        }
+        crate::agent::thinking::write_anthropic(&mut body, level, model);
     }
     body
 }
@@ -861,12 +858,31 @@ mod tests {
     fn build_request_includes_thinking_when_set_and_model_supports() {
         let mut ctx = Context::default();
         ctx.thinking = Some(crate::agent::thinking::ThinkingLevel::Medium);
-        let v = build_request(&ctx, "claude-opus-4-7");
+        // An older model: a token budget.
+        let v = build_request(&ctx, "claude-opus-4-5");
         let t = v.get("thinking").expect("thinking block should be present");
         assert_eq!(t["type"], "enabled");
         assert_eq!(t["budget_tokens"], 8192); // medium
                                               // max_tokens must exceed the budget or Anthropic will reject.
         assert!(v["max_tokens"].as_u64().unwrap() > 8192);
+        // A current one: adaptive thinking + effort, never budget_tokens.
+        let v = build_request(&ctx, "claude-opus-5-5");
+        assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(v["output_config"]["effort"], "medium");
+        assert_eq!(v["max_tokens"], crate::agent::thinking::ADAPTIVE_MAX_TOKENS);
+    }
+
+    /// No level set: nothing about thinking is sent, but an adaptive
+    /// model still gets room to think and answer.
+    #[test]
+    fn effort_model_without_a_level_gets_room_but_no_thinking_fields() {
+        let ctx = Context::default();
+        let v = build_request(&ctx, "claude-opus-5-5");
+        assert!(v.get("thinking").is_none());
+        assert!(v.get("output_config").is_none());
+        assert_eq!(v["max_tokens"], crate::agent::thinking::ADAPTIVE_MAX_TOKENS);
+        let v = build_request(&ctx, "claude-opus-4-5");
+        assert_eq!(v["max_tokens"], 4096, "older models unchanged");
     }
 
     #[test]

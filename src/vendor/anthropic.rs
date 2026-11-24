@@ -3,7 +3,7 @@
 use super::Vendor;
 use crate::agent::thinking::ThinkingLevel;
 use crate::provider::ApiKind;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 #[derive(Debug)]
 pub struct AnthropicVendor;
@@ -15,9 +15,9 @@ impl Vendor for AnthropicVendor {
     fn supports_thinking(&self, model: &str) -> bool {
         crate::agent::thinking::supports_thinking(model)
     }
-    fn write_thinking(&self, body: &mut Value, level: ThinkingLevel, _model: &str) {
-        let budget = level.budget_tokens();
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-        body["max_tokens"] = json!(budget + 4096);
+    fn write_thinking(&self, body: &mut Value, level: ThinkingLevel, model: &str) {
+        // Effort for adaptive-thinking models, budget_tokens for older
+        // ones — see `agent::thinking::wire`.
+        crate::agent::thinking::write_anthropic(body, level, model);
     }
 }

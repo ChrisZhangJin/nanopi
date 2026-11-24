@@ -380,6 +380,29 @@ gets no badge. Caps for the spawned children live under `[agent]` (see
 entirely and always keeps its full tool set, so scripted runs are never
 silently restricted.
 
+## Thinking effort (`/effort`)
+
+How hard the model thinks is one setting, shown in the footer as
+`effort:<level>`:
+
+| Command | Effect |
+|---|---|
+| `/effort` | Show the level and exactly what the current model receives |
+| `/effort low \| medium \| high \| xhigh \| max` | Set it, from the next turn (`minimal` also works, = `low`) |
+| `/effort auto` | Send nothing; the model uses its own default (`medium` on Claude Opus 5.5) |
+
+Shift+Tab cycles the same levels, and `/settings` sets the default for new
+sessions. What is sent depends on the model:
+
+- **Claude 5 and Claude 4.6–4.8**: `thinking: {type: "adaptive"}` plus
+  `output_config.effort` — these models reject a fixed thinking budget.
+  `xhigh` becomes `high` on 4.6, which has no `xhigh`. They also get
+  `max_tokens = 64000` (they think by default, and thinking counts against it).
+- **Older Claude models** (3.7, 4.0–4.5): `thinking.budget_tokens`, as before.
+- **OpenAI-compatible vendors**: each vendor's own field (`reasoning_effort`,
+  …). A Claude model behind an OpenAI-compatible gateway gets the Anthropic
+  fields above in the request; whether they reach the model is up to the gateway.
+
 ## Goals and loops (`/goal`, `/loop`)
 
 Two ways to keep a session working without prompting each step, after

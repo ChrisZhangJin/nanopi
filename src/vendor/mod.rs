@@ -334,7 +334,16 @@ mod tests {
     fn anthropic_vendor_write_thinking_full_shape_high() {
         let v = AnthropicVendor;
         let mut body = json!({});
+        // Opus 4.7 rejects budget_tokens: adaptive thinking + effort.
         v.write_thinking(&mut body, ThinkingLevel::High, "claude-opus-4-7");
+        assert_eq!(body, json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "max_tokens": 64000,
+        }));
+        // Pre-4.6 models keep the token budget.
+        let mut body = json!({});
+        v.write_thinking(&mut body, ThinkingLevel::High, "claude-opus-4-5");
         assert_eq!(body, json!({
             "thinking": {"type": "enabled", "budget_tokens": 16384},
             "max_tokens": 20480,

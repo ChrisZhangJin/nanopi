@@ -156,6 +156,9 @@ enum SlashCmd {
     /// `/background [list]`: hand a goal / loop to a background worker
     /// and quit (`crate::background`), or list the workers.
     Background,
+    /// `/effort [low|medium|high|xhigh|max|auto]`: the thinking level
+    /// (the same one Shift+Tab cycles), shown or set.
+    Effort,
     // Not here: /thinking. PI exposes thinking-budget control as a
     // keybinding (Shift+Tab cycle), not a slash command — see
     // packages/coding-agent/src/core/keybindings.ts:73-76.
@@ -166,7 +169,7 @@ enum SettingsRow { Thinking, HideThinking, AutoCompact, DefaultTrust, Keybinding
 
 fn settings_row_label(sf: &crate::settings_toml::SettingsFile, row: SettingsRow) -> String {
     match row {
-        SettingsRow::Thinking => format!("Thinking level          {}", sf.thinking_level.map(|l| l.to_string()).unwrap_or_else(|| "off".into())),
+        SettingsRow::Thinking => format!("Effort (thinking)       {}", sf.thinking_level.map(|l| l.to_string()).unwrap_or_else(|| "auto".into())),
         SettingsRow::HideThinking => format!("Hide thinking output    {}", if sf.hide_thinking.unwrap_or(false) { "on" } else { "off" }),
         SettingsRow::AutoCompact => format!("Auto-compact            {}", if sf.auto_compact.unwrap_or(true) { "on" } else { "off" }),
         SettingsRow::DefaultTrust => format!("Default project trust   {}", match sf.default_project_trust.unwrap_or(crate::settings_toml::TrustLevelSer::Ask) {
@@ -295,6 +298,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "/loop",
             "Re-run a prompt: /loop [5m] [prompt] (no interval = self-paced) | /loop stop",
             SlashCmd::Loop,
+        ),
+        MenuItem::new(
+            "/effort",
+            "Thinking effort: /effort low | medium | high | xhigh | max | auto (bare: show what the model receives)",
+            SlashCmd::Effort,
         ),
         MenuItem::new(
             "/background",
@@ -1611,6 +1619,10 @@ enum KeyAction {
     GoalLoopUsage(String),
     /// `/background [list]`.
     Background(String),
+    /// `/effort …` parsed.
+    Effort(EffortCmd),
+    /// A Dream run finished.
+    DreamFinished(Result<String, String>),
     /// A `/goal` line inside a longer message: set the goal; the text
     /// before it goes with the first goal turn.
     GoalInline { preamble: String, condition: String },
@@ -2809,6 +2821,10 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             Err(msg) => KeyAction::GoalLoopUsage(format!("{msg}\n{}", crate::goal::USAGE)),
         },
         SlashCmd::Background => KeyAction::Background(arg),
+        SlashCmd::Effort => match parse_effort_args(&arg) {
+            Ok(cmd) => KeyAction::Effort(cmd),
+            Err(msg) => KeyAction::GoalLoopUsage(msg),
+        },
         SlashCmd::Loop => match crate::loops::parse_args(&arg) {
             Ok(cmd) => KeyAction::Loop(cmd),
             Err(msg) => KeyAction::GoalLoopUsage(format!("{msg}\n{}", crate::loops::USAGE)),
@@ -3510,6 +3526,14 @@ async fn handle_action(
                 }
             }
         }
+        KeyAction::Effort(EffortCmd::Set(level)) => apply_effort(term, app, agent_slot, level).await?,
+        KeyAction::Effort(EffortCmd::Show) => {
+            let level = app.thinking;
+            let model = app.model.clone();
+            goal_line(term, &format!("effort: {}", effort_label(level)), Color::Indexed(108))?;
+            dim_line(term, &format!("  {model} receives: {}", crate::agent::thinking::describe(&model, level)))?;
+            dim_line(term, &format!("  {EFFORT_USAGE} · Shift+Tab cycles · /settings sets the default"))?;
+        }
         KeyAction::Background(arg) => {
             let arg = arg.trim();
             if arg == "list" || arg == "ls" {
@@ -3644,14 +3668,14 @@ async fn handle_action(
         }
         KeyAction::CycleThinking => {
             use crate::agent::thinking::ThinkingLevel;
-            let (current, model) = {
+            let current = {
                 let g = agent_slot.lock().await;
                 match g.as_ref() {
-                    Some(a) => (a.context.thinking, a.model.clone()),
+                    Some(a) => a.context.thinking,
                     None => return Ok(()),
                 }
             };
-            // Cycle: None → Minimal → Low → Medium → High → Xhigh → Max → None
+            // Cycle: auto → Minimal → Low → Medium → High → Xhigh → Max → auto
             let next: Option<ThinkingLevel> = match current {
                 None => Some(ThinkingLevel::Minimal),
                 Some(ThinkingLevel::Minimal) => Some(ThinkingLevel::Low),
@@ -3661,46 +3685,7 @@ async fn handle_action(
                 Some(ThinkingLevel::Xhigh) => Some(ThinkingLevel::Max),
                 Some(ThinkingLevel::Max) => None,
             };
-            {
-                let mut g = agent_slot.lock().await;
-                if let Some(a) = g.as_mut() {
-                    // Persisted for the same reason as the model
-                    // switch above: how much the model was allowed to
-                    // think is part of why an answer looks the way it
-                    // does, and without this a session where the user
-                    // went to `max` halfway through replays as though
-                    // every answer was produced under the level in
-                    // force at the end.
-                    let _ = crate::session::append_entry(
-                        &a.session_path,
-                        &crate::session::SessionEntry::ThinkingChange {
-                            timestamp: crate::util::time::now_iso8601(),
-                            from: current.map(|l| l.to_string()),
-                            to: next.map(|l| l.to_string()),
-                        },
-                    );
-                    a.context.thinking = next;
-                }
-            }
-            app.thinking = next;
-            let label = match next {
-                None => "off".to_string(),
-                Some(l) => l.to_string(),
-            };
-            let note = if !crate::agent::thinking::supports_thinking(&model) && next.is_some() {
-                "  (not supported by this model)"
-            } else {
-                ""
-            };
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    format!("[thinking → {}{}]", label, note),
-                    Style::default()
-                        .fg(Color::Indexed(108))
-                        .add_modifier(Modifier::ITALIC),
-                )]),
-            )?;
+            apply_effort(term, app, agent_slot, next).await?;
         }
         KeyAction::SwapModel(new_model) => {
             let mut g = agent_slot.lock().await;
@@ -6376,6 +6361,82 @@ fn sync_wakeup_tool(app: &mut App, agent_slot: &Arc<Mutex<Option<Agent>>>, pace:
     app.wakeup_tool_on = !wanted.is_empty() && a.registry.get(wanted).is_some();
 }
 
+// ── /effort ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffortCmd {
+    Show,
+    /// `None` = auto: send nothing, the model's own default.
+    Set(Option<crate::agent::thinking::ThinkingLevel>),
+}
+
+const EFFORT_USAGE: &str = "usage: /effort [low | medium | high | xhigh | max | auto]   (no argument: show the current effort)";
+
+fn parse_effort_args(arg: &str) -> Result<EffortCmd, String> {
+    let a = arg.trim().to_ascii_lowercase();
+    match a.as_str() {
+        "" => Ok(EffortCmd::Show),
+        "auto" | "default" | "off" | "none" => Ok(EffortCmd::Set(None)),
+        other => other
+            .parse::<crate::agent::thinking::ThinkingLevel>()
+            .map(|l| EffortCmd::Set(Some(l)))
+            .map_err(|()| format!("unknown effort `{arg}`\n{EFFORT_USAGE}")),
+    }
+}
+
+/// The effort label for the footer and messages.
+fn effort_label(level: Option<crate::agent::thinking::ThinkingLevel>) -> String {
+    match level {
+        None => "auto".into(),
+        Some(crate::agent::thinking::ThinkingLevel::Minimal) => "minimal (= low)".into(),
+        Some(l) => l.to_string(),
+    }
+}
+
+/// Set the thinking level on the agent (from the next turn), record the
+/// change in the session, and say what the model will now receive.
+/// Shared by `/effort` and Shift+Tab.
+async fn apply_effort(
+    term: &mut Term,
+    app: &mut App,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    next: Option<crate::agent::thinking::ThinkingLevel>,
+) -> Result<()> {
+    let model = {
+        let mut g = agent_slot.lock().await;
+        let Some(a) = g.as_mut() else {
+            return goal_line(term, "the agent is busy; try again when the turn ends", Color::Yellow);
+        };
+        let current = a.context.thinking;
+        // Persisted: how hard the model was allowed to think is part of
+        // why an answer looks the way it does, and without this a session
+        // where the user went to `max` halfway through replays as though
+        // every answer was produced under the level in force at the end.
+        let _ = crate::session::append_entry(
+            &a.session_path,
+            &crate::session::SessionEntry::ThinkingChange {
+                timestamp: crate::util::time::now_iso8601(),
+                from: current.map(|l| l.to_string()),
+                to: next.map(|l| l.to_string()),
+            },
+        );
+        a.context.thinking = next;
+        a.model.clone()
+    };
+    app.thinking = next;
+    insert_line(
+        term,
+        Line::from(vec![Span::styled(
+            format!(
+                "[effort → {} · {model} receives: {}]",
+                effort_label(next),
+                crate::agent::thinking::describe(&model, next)
+            ),
+            Style::default().fg(Color::Indexed(108)).add_modifier(Modifier::ITALIC),
+        )]),
+    )
+}
+
 // ── /background ───────────────────────────────────────────────────────
 
 /// What a session back from the background still owes its goal.
@@ -8179,7 +8240,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     if let Some(lvl) = app.thinking {
         l2.push(Span::raw(" · "));
         l2.push(Span::styled(
-            format!("think:{}", lvl),
+            format!("effort:{}", lvl.effort()),
             Style::default()
                 .fg(Color::Indexed(108))
                 .add_modifier(Modifier::ITALIC),
@@ -8210,7 +8271,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         l2.push(Span::raw(" · "));
         l2.push(Span::styled(seg, Style::default().fg(Color::Magenta)));
     }
-    // ORC-05: mode indicator, next to think:/vendor:. Orchestrator is
+    // ORC-05: mode indicator, next to effort:/vendor:. Orchestrator is
     // the default main flow, so the badge marks the DEVIATION from it —
     // `⎈ solo` means "this main agent edits and runs things itself".
     // Showing a badge for the default would pin a permanent, no-signal
@@ -11423,6 +11484,27 @@ mod tests {
         app.background_pending = true;
         assert!(background_refusal(&app).unwrap().contains("already"));
         assert!(goal_loop_segments(&app, std::time::Instant::now())[0].contains("to background"));
+    }
+
+    #[test]
+    fn effort_command_parses_and_routes() {
+        use crate::agent::thinking::ThinkingLevel as L;
+        assert_eq!(parse_effort_args(""), Ok(EffortCmd::Show));
+        assert_eq!(parse_effort_args("HIGH"), Ok(EffortCmd::Set(Some(L::High))));
+        assert_eq!(parse_effort_args("xhigh"), Ok(EffortCmd::Set(Some(L::Xhigh))));
+        assert_eq!(parse_effort_args("max"), Ok(EffortCmd::Set(Some(L::Max))));
+        assert_eq!(parse_effort_args("minimal"), Ok(EffortCmd::Set(Some(L::Minimal))));
+        for a in ["auto", "default", "off"] {
+            assert_eq!(parse_effort_args(a), Ok(EffortCmd::Set(None)), "{a}");
+        }
+        assert!(parse_effort_args("ultra").unwrap_err().contains("usage: /effort"));
+        let mut app = mkapp();
+        seed_input(&mut app, "/effort high");
+        let got = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(got, KeyAction::Effort(EffortCmd::Set(Some(L::High)))), "{got:?}");
+        assert!(crate::command::RESERVED_COMMAND_NAMES.contains(&"effort"));
+        assert_eq!(effort_label(None), "auto");
+        assert_eq!(effort_label(Some(L::Minimal)), "minimal (= low)");
     }
 
     #[test]

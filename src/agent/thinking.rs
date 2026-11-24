@@ -1,4 +1,13 @@
-//! Extended thinking / reasoning budgets for Claude 3.7+ / 4.x models.
+//! Thinking depth: one level, sent per model as the right wire field.
+//!
+//! - Claude 5 and Claude 4.6-4.8: adaptive thinking plus
+//!   `output_config.effort` ([`uses_effort`]). These models reject (or,
+//!   on 4.6, deprecate) a fixed `budget_tokens`; effort is the control.
+//! - Older thinking-capable Claude models (3.7, 4.0-4.5): the original
+//!   `thinking: {type: "enabled", budget_tokens}`.
+//!
+//! The user sets it with `/effort`, Shift+Tab or `/settings`; `None`
+//! (`/effort auto`) sends nothing and leaves the model's own default.
 //!
 //! Mirrors PI's ThinkingLevel enum (see
 //! `packages/ai/src/types.ts:79-80`). Token budgets match PI's
@@ -52,6 +61,122 @@ impl ThinkingLevel {
             ThinkingLevel::Xhigh,
             ThinkingLevel::Max,
         ]
+    }
+}
+
+impl ThinkingLevel {
+    /// The `effort` value for this level. `Minimal` has no effort of its
+    /// own and maps to `low`.
+    pub fn effort(self) -> &'static str {
+        match self {
+            ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::Xhigh => "xhigh",
+            ThinkingLevel::Max => "max",
+        }
+    }
+}
+
+/// `max_tokens` for models that think adaptively: they think by default,
+/// and the thinking counts against `max_tokens`, so the old 4096 left
+/// little room for the answer (a long reply or a whole-file `write` was
+/// cut off). Well under their 128K output cap; only generated tokens are
+/// billed. Requests stream, so a large value is no timeout risk.
+pub const ADAPTIVE_MAX_TOKENS: u32 = 64_000;
+
+/// Claude models whose thinking is controlled by `output_config.effort`
+/// with `thinking: {type: "adaptive"}` (Claude 5 family; Opus 4.6-4.8,
+/// Sonnet 4.6).
+pub fn uses_effort(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
+    .iter()
+    .any(|p| m.starts_with(p))
+}
+
+/// What a thinking level becomes on the wire for one model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingWire {
+    /// `thinking: {type: "adaptive"}` + `output_config.effort`.
+    /// `clamped` is set when the model lacks the asked-for level.
+    Effort { effort: &'static str, clamped: bool },
+    /// `thinking: {type: "enabled", budget_tokens}`.
+    Budget(u32),
+    /// The model takes no thinking control; nothing is sent.
+    Unsupported,
+}
+
+pub fn wire(model_id: &str, level: ThinkingLevel) -> ThinkingWire {
+    if uses_effort(model_id) {
+        let m = model_id.to_ascii_lowercase();
+        // 4.6 has low/medium/high/max; `xhigh` arrived with Opus 4.7.
+        let no_xhigh = m.starts_with("claude-opus-4-6") || m.starts_with("claude-sonnet-4-6");
+        if no_xhigh && level == ThinkingLevel::Xhigh {
+            return ThinkingWire::Effort { effort: "high", clamped: true };
+        }
+        return ThinkingWire::Effort { effort: level.effort(), clamped: false };
+    }
+    if supports_thinking(model_id) {
+        return ThinkingWire::Budget(level.budget_tokens());
+    }
+    ThinkingWire::Unsupported
+}
+
+/// One line saying what the model receives — for `/effort` and the
+/// confirmation after a change.
+pub fn describe(model_id: &str, level: Option<ThinkingLevel>) -> String {
+    match level {
+        None if uses_effort(model_id) => {
+            "nothing — the model uses its own default effort".to_string()
+        }
+        None => "nothing — thinking off".to_string(),
+        Some(l) => match wire(model_id, l) {
+            ThinkingWire::Effort { effort, clamped } => format!(
+                "thinking: adaptive · output_config.effort = \"{effort}\"{}",
+                if clamped { format!(" ({l} is not available on this model)") } else { String::new() }
+            ),
+            ThinkingWire::Budget(b) => format!("thinking.budget_tokens = {b}"),
+            ThinkingWire::Unsupported => "nothing — this model takes no thinking setting".to_string(),
+        },
+    }
+}
+
+/// Write the Anthropic thinking fields for `level` into a request body.
+/// Shared by the native Anthropic provider and the Anthropic vendor (the
+/// latter also on an OpenAI-compatible gateway, where these fields pass
+/// through to the model as-is).
+pub fn write_anthropic(body: &mut serde_json::Value, level: ThinkingLevel, model_id: &str) {
+    use serde_json::json;
+    match wire(model_id, level) {
+        ThinkingWire::Effort { effort, .. } => {
+            body["thinking"] = json!({"type": "adaptive"});
+            if !body["output_config"].is_object() {
+                body["output_config"] = json!({});
+            }
+            body["output_config"]["effort"] = json!(effort);
+            let cur = body["max_tokens"].as_u64().unwrap_or(0);
+            if cur < u64::from(ADAPTIVE_MAX_TOKENS) {
+                body["max_tokens"] = json!(ADAPTIVE_MAX_TOKENS);
+            }
+        }
+        ThinkingWire::Budget(budget) => {
+            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            // Anthropic requires max_tokens > budget_tokens so the model
+            // has room to answer after thinking.
+            body["max_tokens"] = json!(budget + 4096);
+        }
+        ThinkingWire::Unsupported => {}
     }
 }
 
@@ -134,18 +259,9 @@ pub fn supports_vision(model_id: &str) -> bool {
 /// top-level params instead of ignoring them).
 pub fn supports_thinking(model_id: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
-    // Claude 5 family. Absent until now simply because this list was
-    // written while 4.x was current — not a deliberate exclusion. The
-    // omission was not cosmetic: `provider/anthropic.rs` only sends the
-    // `thinking` field when this returns true, so on a Claude 5 model
-    // the whole feature was silently inert. `/thinking` still relabelled
-    // and still wrote a `thinking_change` entry, so it looked like it
-    // worked. Verified against the live API: opus-5, sonnet-5 and
-    // fable-5 all return a `thinking` content block.
-    if m.starts_with("claude-opus-5")
-        || m.starts_with("claude-sonnet-5")
-        || m.starts_with("claude-fable-5")
-    {
+    // Claude 5 family and Claude 4.6-4.8 take thinking through effort
+    // (`uses_effort`): adaptive thinking, no `budget_tokens`.
+    if uses_effort(&m) {
         return true;
     }
     // Claude 4.x family — every current member supports thinking.
@@ -162,6 +278,56 @@ pub fn supports_thinking(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_models_get_adaptive_thinking_and_effort() {
+        use serde_json::json;
+        for m in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-opus-4-7"] {
+            assert!(uses_effort(m), "{m}");
+            let mut b = json!({"max_tokens": 4096});
+            write_anthropic(&mut b, ThinkingLevel::Xhigh, m);
+            assert_eq!(b["thinking"], json!({"type": "adaptive"}), "{m}");
+            assert_eq!(b["output_config"]["effort"], "xhigh", "{m}");
+            assert!(b["thinking"].get("budget_tokens").is_none(), "{m}: budget_tokens 400s here");
+            assert_eq!(b["max_tokens"], ADAPTIVE_MAX_TOKENS);
+        }
+        // Minimal has no effort of its own.
+        assert_eq!(wire("claude-opus-5-5", ThinkingLevel::Minimal), ThinkingWire::Effort { effort: "low", clamped: false });
+        // 4.6 has no xhigh.
+        assert_eq!(wire("claude-opus-4-6", ThinkingLevel::Xhigh), ThinkingWire::Effort { effort: "high", clamped: true });
+        assert_eq!(wire("claude-sonnet-4-6", ThinkingLevel::Max), ThinkingWire::Effort { effort: "max", clamped: false });
+        // An existing output_config (e.g. a format) is kept.
+        let mut b = json!({"output_config": {"format": {"type": "json_schema"}}});
+        write_anthropic(&mut b, ThinkingLevel::Low, "claude-opus-5-5");
+        assert_eq!(b["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(b["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn older_models_keep_budget_tokens_and_others_get_nothing() {
+        use serde_json::json;
+        for m in ["claude-opus-4-5", "claude-sonnet-4-5", "claude-opus-4-1", "claude-3-7-sonnet-latest"] {
+            assert!(!uses_effort(m), "{m}");
+            assert_eq!(wire(m, ThinkingLevel::Medium), ThinkingWire::Budget(8192), "{m}");
+        }
+        let mut b = json!({"max_tokens": 4096});
+        write_anthropic(&mut b, ThinkingLevel::Medium, "claude-opus-4-5");
+        assert_eq!(b["thinking"], json!({"type": "enabled", "budget_tokens": 8192}));
+        assert!(b.get("output_config").is_none());
+        let mut b = json!({});
+        write_anthropic(&mut b, ThinkingLevel::High, "gpt-4o");
+        assert_eq!(b, json!({}));
+        assert_eq!(wire("gpt-4o", ThinkingLevel::High), ThinkingWire::Unsupported);
+    }
+
+    #[test]
+    fn describe_says_what_is_sent() {
+        assert!(describe("claude-opus-5-5", Some(ThinkingLevel::High)).contains("output_config.effort = \"high\""));
+        assert!(describe("claude-opus-4-6", Some(ThinkingLevel::Xhigh)).contains("not available"));
+        assert!(describe("claude-opus-4-5", Some(ThinkingLevel::Medium)).contains("budget_tokens = 8192"));
+        assert!(describe("claude-opus-5-5", None).contains("own default"));
+        assert!(describe("gpt-4o", Some(ThinkingLevel::High)).contains("no thinking setting"));
+    }
 
     #[test]
     fn budget_tokens_match_pi_defaults() {
