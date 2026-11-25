@@ -40,10 +40,14 @@ jobs:
           set -eux
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --repo "${{ github.repository }}" \
-              --title "$TAG" \
-              --generate-notes
+            notes="docs/releases/${TAG}.md"
+            if [[ -f "$notes" ]]; then
+              gh release create "$TAG" --verify-tag --repo "${{ github.repository }}" \
+                --title "$TAG" --notes-file "$notes"
+            else
+              gh release create "$TAG" --verify-tag --repo "${{ github.repository }}" \
+                --title "$TAG" --generate-notes
+            fi
           fi
 
   build:

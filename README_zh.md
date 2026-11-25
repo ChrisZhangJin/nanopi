@@ -206,7 +206,7 @@ auto-compact 也只能退回到更粗糙的字符数阈值。
 
 ```json
 {
-  "generated_by": "0.16.1",
+  "generated_by": "0.17.0",
   "custom": [
     { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
   ],
