@@ -21,7 +21,7 @@ use crate::agent::context::Context;
 use crate::agent::loop_::Provider;
 use crate::event::AgentEvent;
 
-pub(crate) const DREAM_USAGE: &str = "Usage: /dream [--since <N>d [--yes]] | /dream status | /dream log";
+pub(crate) const DREAM_USAGE: &str = "Usage: /dream [--since <N>d [--yes]] | /dream status | /dream log | /dream schedule";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DreamOpts {
@@ -42,6 +42,7 @@ pub(crate) fn plan(args: &str, endpoint: &str, model: &str) -> Result<DreamPlan>
     let store = Store::active()?;
     let words: Vec<&str> = args.split_whitespace().collect();
     match words.as_slice() {
+        ["schedule", rest @ ..] => Ok(DreamPlan::Print(schedule::manage(&store, rest)?)),
         ["status"] => Ok(DreamPlan::Print(status(&store, endpoint))),
         ["log"] => Ok(DreamPlan::Print(
             read_limited(&store.root.join("dream-log.md"), 1024 * 1024)
@@ -60,7 +61,7 @@ pub(crate) fn plan(args: &str, endpoint: &str, model: &str) -> Result<DreamPlan>
                     let p = Policy::active();
                     Ok(DreamPlan::Print(format!(
                         "Backfill range: {since} .. {} ({n} unprocessed daily notes).\n\
-                         Budget: at most {} model calls, {} input characters; the rest waits for the next run.\n\
+                         Budget: at most {} model calls, {} serialized data bytes; the rest waits for the next run.\n\
                          Model {model} at {endpoint}; memory disclosure: {}.\n\
                          Confirm with /dream --since {days}d --yes",
                         today(),
@@ -89,7 +90,7 @@ fn status(store: &Store, endpoint: &str) -> String {
     match &st.last_run {
         Some(r) => {
             let _ = writeln!(s, "last Dream: {} · {} · model {} at {}", r.at, r.result, r.model, r.endpoint);
-            let _ = writeln!(s, "  range {} · {} model calls · {} notes processed · {} withheld by disclosure", r.range, r.calls, r.notes_processed, r.withheld);
+            let _ = writeln!(s, "  range {} · {} model calls · {} data bytes · {} notes processed · {} withheld by disclosure", r.range, r.calls, r.input_bytes, r.notes_processed, r.withheld);
             if let Some(f) = &r.failure {
                 let _ = writeln!(s, "  failure: {f}");
             }
@@ -97,7 +98,9 @@ fn status(store: &Store, endpoint: &str) -> String {
         None => s.push_str("last Dream: never\n"),
     }
     let _ = writeln!(s, "backlog: {pending} unprocessed daily notes");
-    let _ = writeln!(s, "next scheduled run: none (scheduling is not set up; run /dream manually)");
+    let _ = writeln!(s, "{}", schedule::status(store));
+    let p = Policy::active();
+    let _ = writeln!(s, "budget: {} model calls, {} serialized data bytes per Dream", p.memory_dream_max_calls, p.memory_dream_max_input_chars);
     let _ = write!(s, "disclosure for {endpoint}: {}", if Policy::active().full_for(endpoint) { "full" } else { "general" });
     s
 }
@@ -269,52 +272,71 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
     let mut applied = 0;
     let mut failure = None;
     let mut idx = 0;
-    while idx < batch_notes.len() {
+    let mut input_bytes = 0;
+    let mut review_only = batch_notes.is_empty();
+    while idx < batch_notes.len() || review_only {
         if calls >= policy.memory_dream_max_calls {
-            let _ = writeln!(log, "- budget: model-call limit ({}) reached; remaining notes wait for the next run", policy.memory_dream_max_calls);
+            let _ = writeln!(log, "- budget: model-call limit reached; remaining notes wait for the next run");
             break;
         }
-        // Existing entries visible to this endpoint, for dedupe.
-        let mut index = Vec::new();
-        for e in store.entries("library") {
-            if e.kind == Kind::Environment && !full {
-                continue;
-            }
-            index.push(json!({"id": e.id, "kind": e.kind.as_str(), "title": e.title(), "aliases": e.get("aliases"), "status": e.get("status"), "pinned": e.pinned()}));
-        }
-        let mut chars = serde_json::to_string(&index)?.len();
-        let mut batch = Vec::new();
-        while idx < batch_notes.len() {
-            let n = &batch_notes[idx];
-            let c = n.text.len() + 200;
-            if !batch.is_empty() && chars + c > policy.memory_dream_max_input_chars {
+        let remaining = policy.memory_dream_max_input_chars - input_bytes;
+        let payload = |index: &[serde_json::Value], notes: &[serde_json::Value]| {
+            serde_json::to_string(&json!({"today": today().to_string(), "existing_entries": index, "new_notes": notes}))
+        };
+        let start = idx;
+        let mut notes = Vec::new();
+        while let Some(n) = batch_notes.get(idx) {
+            let text = if n.kind == Kind::Environment { format!("{ENV_OPEN}{}{ENV_CLOSE}", n.text) } else { n.text.clone() };
+            let fallback = "general";
+            let project = if check_text(&n.project, true).is_ok() { &n.project } else { fallback };
+            notes.push(json!({"note_id": n.id, "date": n.date.to_string(), "project": project, "kind": n.kind.as_str(), "text": text}));
+            if payload(&[], &notes)?.len() > remaining {
+                notes.pop();
                 break;
             }
-            if batch.is_empty() && chars + c > policy.memory_dream_max_input_chars {
-                rejected.push((n.id.clone(), "larger than the input budget".into()));
-                idx += 1;
-                continue;
-            }
-            chars += c;
-            batch.push(n.clone());
             idx += 1;
         }
-        if batch.is_empty() {
-            continue;
+        if notes.is_empty() && !review_only {
+            let _ = writeln!(log, "- budget: next note does not fit the remaining input allowance; it stays pending");
+            break;
         }
-        let notes: Vec<_> = batch
-            .iter()
-            .map(|n| {
-                let text = if n.kind == Kind::Environment { format!("{ENV_OPEN}{}{ENV_CLOSE}", n.text) } else { n.text.clone() };
-                json!({"note_id": n.id, "date": n.date.to_string(), "project": n.project, "kind": n.kind.as_str(), "text": text})
-            })
-            .collect();
-        let user = serde_json::to_string_pretty(&json!({"today": today().to_string(), "existing_entries": index, "new_notes": notes}))?;
+        let mut entries = store.entries("library");
+        entries.sort_by_key(|e| !e.effective_status(&st, &policy).starts_with("needs_review"));
+        let mut index = Vec::new();
+        for e in entries {
+            let env = e.kind == Kind::Environment;
+            if (env && !full) || check_text(e.title(), env).is_err() || check_text(e.get("aliases"), env).is_err() { continue; }
+            let status = e.effective_status(&st, &policy);
+            if review_only && !status.starts_with("needs_review") { continue; }
+            let data = json!({"id": e.id, "kind": e.kind.as_str(), "title": e.title(), "aliases": e.get("aliases"), "status": status, "pinned": e.pinned()});
+            let row = if env { json!({"environment": format!("{ENV_OPEN}{data}{ENV_CLOSE}")}) } else { data };
+            index.push((e.id, row));
+        }
+        let mut visible = BTreeSet::new();
+        let mut rows = Vec::new();
+        for (id, row) in index {
+            rows.push(row);
+            if payload(&rows, &notes)?.len() > remaining { rows.pop(); break; }
+            visible.insert(id);
+        }
+        if review_only && rows.is_empty() { break; }
+        review_only = false;
+        let batch = &batch_notes[start..idx];
+        let user = payload(&rows, &notes)?;
+        input_bytes += user.len();
         calls += 1;
         let reply = match call(provider.as_ref(), SYSTEM, user).await {
             Ok((t, _)) => t,
             Err(e) => {
-                failure = Some(format!("model call failed: {e}"));
+                // A response body can echo the request. Do not retain it in
+                // the local log or print it to the unattended service journal.
+                failure = Some(if ["HTTP 401", "HTTP 403", "status 401", "status 403"].iter().any(|p| e.contains(p)) {
+                    "model call failed: provider rejected credentials (HTTP 401/403)".into()
+                } else if e.contains("attempted a tool call") {
+                    "model attempted a tool call; Dream has no tools".into()
+                } else {
+                    "model call failed (check provider connectivity and configuration)".into()
+                });
                 break;
             }
         };
@@ -330,7 +352,6 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
             }
         };
         let notes_by_id: BTreeMap<String, &ParsedNote> = batch.iter().map(|n| (n.id.clone(), n)).collect();
-        let visible: BTreeSet<String> = index.iter().filter_map(|v| v["id"].as_str().map(str::to_string)).collect();
         {
             let _g = store.lock(".lock")?;
             let mut st = store.state();
@@ -345,7 +366,7 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
                     }
                 }
             }
-            for n in &batch {
+            for n in batch {
                 st.processed.insert(n.id.clone());
             }
             processed += batch.len();
@@ -373,6 +394,7 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
             let _ = writeln!(log, "- stopped: {f}; progress so far is kept");
         }
         summary.calls = calls;
+        summary.input_bytes = input_bytes;
         summary.notes_processed = processed;
         summary.pending = pending;
         summary.withheld = withheld;
@@ -381,15 +403,11 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
         st.last_run = Some(summary.clone());
         store.save_state(&st)?;
         store.write_index(&st)?;
-        let mut o = std::fs::OpenOptions::new();
-        o.append(true).create(true);
-        super::open_opts(&mut o);
-        use std::io::Write as _;
-        o.open(store.root.join("dream-log.md"))?.write_all(log.as_bytes())?;
+        append_log(&store, &log)?;
     }
     drop(dream_lock);
     let text = format!(
-        "Dream {}: range {range}; {calls} model call(s); {processed} note(s) processed; {applied} change(s); {} pending; {withheld} withheld by disclosure. /dream log for details.",
+        "Dream {}: range {range}; {calls} model call(s); {input_bytes} data bytes; {processed} note(s) processed; {applied} change(s); {} pending; {withheld} withheld by disclosure. /dream log for details.",
         if failure.is_some() { "stopped" } else { "finished" },
         summary.pending
     );
@@ -397,6 +415,22 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
         bail!("{text}\n{f}");
     }
     Ok(Report { text })
+}
+
+/// Keep the local log readable over long-running schedules. Take the
+/// log lock independently of the library state and retain recent runs.
+ pub(super) fn append_log(store: &Store, text: &str) -> Result<()> {
+    let _lock = store.lock(".dream-log.lock")?;
+    let path = store.root.join("dream-log.md");
+    let old = match read_limited(&path, 1024 * 1024) {
+        Ok(old) => old,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let combined = old + text;
+    let mut start = combined.len().saturating_sub(512 * 1024);
+    while !combined.is_char_boundary(start) { start += 1; }
+    store.replace(&path, &combined[start..])
 }
 
 fn reason(r: &str) -> Result<String> {

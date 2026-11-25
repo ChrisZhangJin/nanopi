@@ -15,6 +15,8 @@
 //!   and forgotten IDs are never regenerated.
 
 mod dream;
+#[doc(hidden)]
+pub mod schedule;
 mod tools;
 
 pub(crate) use dream::{plan as dream_plan, run as dream_run, DreamPlan};
@@ -606,6 +608,7 @@ pub(crate) struct RunSummary {
     pub failure: Option<String>,
     pub range: String,
     pub calls: usize,
+    pub input_bytes: usize,
     pub notes_processed: usize,
     pub pending: usize,
     pub withheld: usize,
@@ -698,13 +701,23 @@ impl Store {
 
     /// Short-lived exclusive lock for every mutation.
     pub(crate) fn lock(&self, name: &str) -> Result<File> {
+        let f = self.open_lock(name)?;
+        f.lock()?;
+        Ok(f)
+    }
+
+    fn try_lock(&self, name: &str) -> Result<File> {
+        let f = self.open_lock(name)?;
+        f.try_lock()?;
+        Ok(f)
+    }
+
+    fn open_lock(&self, name: &str) -> Result<File> {
         self.init()?;
         let mut o = OpenOptions::new();
         o.read(true).write(true).create(true).truncate(false);
         open_opts(&mut o);
-        let f = o.open(self.root.join(name))?;
-        f.lock()?;
-        Ok(f)
+        Ok(o.open(self.root.join(name))?)
     }
 
     /// Write a file that must not already exist.

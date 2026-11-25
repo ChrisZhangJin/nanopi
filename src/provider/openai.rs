@@ -232,6 +232,11 @@ impl OpenAiProvider {
         }
     }
 
+    pub(crate) fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// v0.9.3: attach a vendor. `split_inline_think` is no longer set
     /// from the vendor (see the position rule in `provider::think_tags`)
     /// — it's already on by default from `new()`.

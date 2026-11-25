@@ -315,7 +315,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         ),
         MenuItem::new(
             "/dream",
-            "Distill daily notes into memory (uses the model) | --since 7d [--yes] | status | log",
+            "Distill daily notes into memory | --since 7d [--yes] | status | log | schedule",
             SlashCmd::Dream,
         ),
         MenuItem::new(
@@ -3574,6 +3574,16 @@ async fn handle_action(
             }
         }
         KeyAction::Dream(arg) => {
+            let local = matches!(arg.split_whitespace().next(), Some("status" | "log" | "schedule"));
+            if local {
+                let endpoint = agent_slot.lock().await.as_ref().map(|a| a.base_url.clone()).unwrap_or_default();
+                match crate::memory::dream_plan(&arg, &endpoint, &app.model) {
+                    Ok(crate::memory::DreamPlan::Print(text)) => text.lines().try_for_each(|l| dim_line(term, l))?,
+                    Err(e) => goal_line(term, &format!("dream: {e:#}"), Color::Yellow)?,
+                    Ok(crate::memory::DreamPlan::Run(_)) => unreachable!("local Dream command"),
+                }
+                return Ok(());
+            }
             let Some((model, base_url, api_key)) = agent_slot
                 .lock()
                 .await

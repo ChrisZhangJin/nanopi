@@ -55,6 +55,11 @@ impl AnthropicProvider {
         }
     }
 
+    pub(crate) fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// v0.9.3: attach a vendor for thinking-block emission.
     pub fn with_vendor(mut self, vendor: Box<dyn crate::vendor::Vendor>) -> Self {
         self.vendor = Some(vendor);

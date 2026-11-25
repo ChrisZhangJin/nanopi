@@ -196,6 +196,14 @@ struct Args {
     /// Internal: the background worker for a session (`/background`).
     #[arg(long = "worker", value_name = "SESSION_ID", hide = true)]
     worker: Option<String>,
+
+    /// Manage the user-level Dream timer: status, enable [HH:MM], pause, remove.
+    #[arg(long, value_names = ["ACTION", "TIME"], num_args = 1..=2)]
+    dream_schedule: Option<Vec<String>>,
+
+    /// Internal: absolute config root supplied by the Dream timer.
+    #[arg(long, hide = true, requires = "dream_schedule")]
+    dream_home: Option<PathBuf>,
 }
 
 /// `--foreground`: pick the background session, stop its worker at a
@@ -327,6 +335,26 @@ fn install_parent_death_signal() -> bool {
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args = Args::parse();
+    if let Some(action) = &args.dream_schedule {
+        if let Some(home) = &args.dream_home {
+            if !home.is_absolute() {
+                eprintln!("error: --dream-home must be absolute");
+                return ExitCode::from(2);
+            }
+            std::env::set_var("NANOPI_HOME", home);
+        }
+        if let Some(profile) = &args.profile {
+            if let Err(e) = nanopi::profile::validate_name(profile) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+            nanopi::profile::set_current(profile);
+        }
+        return match nanopi::memory::schedule::cli(action).await {
+            Ok(text) => { println!("{text}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e:#}"); ExitCode::from(1) }
+        };
+    }
 
     // Background sessions (`crate::background`): list, take one back,
     // or be one's worker. Before the profile and cwd are settled, since
@@ -714,6 +742,12 @@ async fn main() -> ExitCode {
         let agents = cfg.sudo.agents();
         let availability = sudo::detect(mode, role, agents);
         sudo::set_policy(sudo::Policy { mode, agents, availability, role });
+    }
+
+    if !non_interactive && !agent_mode && std::io::stderr().is_terminal() {
+        if let Err(e) = nanopi::memory::schedule::offer() {
+            eprintln!("Dream scheduling not configured: {e:#}. Manual /dream remains available.");
+        }
     }
 
     let result = if non_interactive {

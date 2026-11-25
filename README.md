@@ -755,6 +755,31 @@ A worked example lives in [`examples/wasm-plugin/`](https://github.com/ChrisZhan
 
 For personal memory across sessions, nanopi now has a built-in memory (`/memory`, `/dream`, the `memory_search` / `remember` / `forget` tools; design in `docs/memory-design.md`). It lives in `~/.nanopi/memory/`, and environment entries are sent to a model only when the profile sets `memory_disclosure = "full"` for that exact endpoint (`/memory disclosure full`). The plugin below remains an example of per-project memory.
 
+**Nightly Dream (Linux):** On the first eligible interactive launch, nanopi
+asks whether to enable a daily **03:00 local time** run. It prefers a systemd
+user timer when the user manager is reachable and lingering is enabled.
+Otherwise it falls back to the current user's crontab if a cron daemon is
+running and the user's table is accessible. Neither backend uses sudo.
+NanoPi manages only its own tagged cron entry; it does not change other jobs.
+Systemd catches up missed runs once; cron does not, but pending notes stay
+queued for the next run. If neither backend is available, NanoPi warns once
+and leaves manual `/dream` available; `/dream status` shows the reason.
+
+- `/dream schedule enable 03:00` installs or re-enables the schedule using the
+  selected profile's on-disk model, endpoint and credentials. Keep the binary
+  at its installed path. CLI and project configuration overrides are ignored.
+- `/dream schedule pause` or `/dream schedule remove` stops future runs.
+  Removal does not delete memories. `nanopi --dream-schedule status` and the
+  corresponding `enable`, `pause`, and `remove` actions also work outside the TUI.
+- `/dream status` shows the next run, last result, budget and backlog;
+  `/dream log` shows changes and their reasons. A changed connection or rejected
+  credentials pauses the schedule instead of trying another endpoint.
+- `memory_dream_max_calls` (default 3) and `memory_dream_max_input_chars`
+  (default 40000, measured as serialized memory-data bytes across the run)
+  can be set in the profile. Remaining notes stay pending; an individually
+  oversized note requires increasing the budget. Dream operates on daily notes
+  and the library, not historical raw transcripts.
+
 For plugins meant to be *used* rather than read: [`examples/wasm-plugin-memory/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-memory) is durable project memory — facts are markdown files in `.nanopi/memory/` that you can diff and commit, and only the compact index enters the model's context, with `recall` fetching the full text of whatever looks relevant. [`examples/wasm-plugin-report/`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples/wasm-plugin-report) records per-tool time and failures across sessions, which answers "why was that slow" — `tool_execution_end` carries a `duration_ms` that nothing else persists.
 
 All five plugins are indexed in [`examples/README.md`](https://github.com/ChrisZhangJin/nanopi/tree/main/examples) — a table of what each one does, the grants it needs, and which WIT world it targets.

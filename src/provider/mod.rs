@@ -116,9 +116,22 @@ pub fn build(
     // Every provider is wrapped, so each request path (turns, compaction,
     // goal checks, summaries, Dream) applies the memory disclosure check.
     Box::new(crate::memory::DisclosureGuard {
-        inner: build_unguarded(kind, base_url, api_key, model, vendor, inline_think_tags),
+        inner: build_unguarded(kind, base_url, api_key, model, vendor, inline_think_tags, None),
         endpoint: base_url.to_string(),
     })
+}
+
+/// A Dream worker must not follow redirects to a different endpoint.
+pub(crate) fn build_pinned(
+    kind: ApiKind,
+    ep: &crate::profile::Endpoint,
+    vendor: Box<dyn crate::vendor::Vendor>,
+) -> Result<Box<dyn Provider>, reqwest::Error> {
+    let client = crate::net::client_builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    Ok(Box::new(crate::memory::DisclosureGuard {
+        inner: build_unguarded(Some(kind), &ep.base_url, &ep.api_key, &ep.model, Some(vendor), ep.inline_think_tags, Some(client)),
+        endpoint: ep.base_url.clone(),
+    }))
 }
 
 fn build_unguarded(
@@ -128,11 +141,13 @@ fn build_unguarded(
     model: &str,
     vendor: Option<Box<dyn crate::vendor::Vendor>>,
     inline_think_tags: Option<bool>,
+    client: Option<reqwest::Client>,
 ) -> Box<dyn Provider> {
     let effective = effective_kind(kind, vendor.as_deref(), base_url);
     match effective {
         ApiKind::Openai => {
             let p = openai::OpenAiProvider::new(base_url, api_key, model);
+            let p = if let Some(c) = client { p.with_client(c) } else { p };
             let p = match vendor {
                 Some(v) => p.with_vendor(v),
                 None => p,
@@ -145,6 +160,7 @@ fn build_unguarded(
         }
         ApiKind::Anthropic => {
             let p = anthropic::AnthropicProvider::new(base_url, api_key, model);
+            let p = if let Some(c) = client { p.with_client(c) } else { p };
             Box::new(match vendor {
                 Some(v) => p.with_vendor(v),
                 None => p,

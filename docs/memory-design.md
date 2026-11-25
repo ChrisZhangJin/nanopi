@@ -1,4 +1,4 @@
-# Agent memory for nanopi — design (agreed, not yet implemented)
+# Agent memory for nanopi — design
 
 Background: <https://www.anthropic.com/research/components-of-agent-memory>.
 Decisions Q1–Q42 from the design discussion of 2026-11-23.
@@ -167,14 +167,16 @@ The store is shared; what reaches a model endpoint is not.
 - The first interactive start (and the first start of the new version
   for existing users) asks: enable / not now / never. Not asked again
   after "never".
-- Linux first: a user-level scheduled task (no sudo), default 03:00 local
-  time, changeable, verified active after setup. Runs without the TUI as
-  long as the machine is on. Missed runs: one catch-up run, oldest
-  unprocessed date first, within budget.
+- Linux: prefer a persistent systemd user timer (requires an available user
+  manager and pre-enabled lingering), otherwise use a tagged job in the
+  current user's crontab if a running daemon is detected and the table is
+  accessible. Neither uses sudo. Default 03:00 local time, changeable and
+  verified after setup. Systemd catches up missed runs once; cron waits for
+  its next firing. Both process the oldest unprocessed notes within budget.
 - The scheduled Dream uses the model and endpoint chosen at setup, shown
   to the user. If that changes or credentials fail, it records why and
   pauses — it never falls back to another endpoint.
-- Where unattended runs cannot be guaranteed: say so, keep manual
+- Where neither backend is available: warn once, show the reason in status, keep manual
   `/dream`; no silent fallback to an in-TUI loop.
 - Status shows last result, next run time and backlog; pause and remove
   are available.
