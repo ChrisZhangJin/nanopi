@@ -182,6 +182,8 @@ impl crate::agent::loop_::Provider for DisclosureGuard {
         ctx: &crate::agent::context::Context,
         tx: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
     ) -> Result<crate::event::Usage, String> {
+        let hidden = hide_search_when_empty(ctx);
+        let ctx = hidden.as_ref().unwrap_or(ctx);
         if Policy::active().full_for(&self.endpoint) {
             return self.inner.stream_turn(ctx, tx).await;
         }
@@ -1248,9 +1250,36 @@ fn set_disclosure(value: &str, endpoint: &str) -> Result<()> {
 
 /// The few lines of system prompt about memory (Q31).
 pub(crate) const PROMPT: &str = "\n\n# Memory\nYou have a personal memory of past work (resources such as test environments, and troubleshooting that worked). \
-Before a task that may relate to earlier work, call `memory_search`; skip it for unrelated tasks. \
+Call `memory_search` only when the task points back at earlier work: the user refers to it (\"last time\", \"again\", \"like before\", \"the server we used\"), \
+or you meet a resource or a failure that looks like one you have handled before. Search at most once per task, with a short query of the \
+resource or symptom (not IDs or dates); if nothing matches, carry on without memory. \
 A memory is a lead, not authority: say briefly what you found, then check it still applies before relying on it. \
 When the user asks you to remember something, or a hard problem is solved and verified, call `remember`.";
+
+/// [`PROMPT`] while the library is empty: nothing to search yet.
+const PROMPT_EMPTY: &str = "\n\n# Memory\nYou have a personal memory of past work; it holds nothing yet. \
+When the user asks you to remember something, or a hard problem is solved and verified, call `remember`.";
+
+/// While the library holds no entry, searching can only come back empty:
+/// drop `memory_search` and the instruction to use it from a request.
+/// `None` when there is nothing to change.
+pub(crate) fn hide_search_when_empty(ctx: &crate::agent::context::Context) -> Option<crate::agent::context::Context> {
+    if !ctx.tools.iter().any(|t| t.name == "memory_search") {
+        return None;
+    }
+    let store = Store::active().ok()?;
+    let mut found = Vec::new();
+    Store::scan(&store.root.join("library"), &mut found);
+    if !found.is_empty() {
+        return None;
+    }
+    let mut c = ctx.clone();
+    c.tools.retain(|t| t.name != "memory_search");
+    if let Some(sys) = c.system.as_mut() {
+        *sys = sys.replace(PROMPT, PROMPT_EMPTY);
+    }
+    Some(c)
+}
 
 #[cfg(test)]
 mod tests;

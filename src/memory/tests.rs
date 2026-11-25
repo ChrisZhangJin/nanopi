@@ -433,3 +433,55 @@ fn subagents_get_read_only_memory() {
     let main = crate::tool::ToolRegistry::standard_with_control().names();
     assert!(main.contains(&"remember".to_string()) && main.contains(&"forget".to_string()));
 }
+
+/// With nothing in the library there is nothing to search: the request
+/// carries no `memory_search` tool and no instruction to search, so the
+/// model does not run empty searches every turn. `remember` stays.
+#[test]
+fn empty_library_hides_memory_search_from_the_model() {
+    let h = Home::general();
+    let ctx = || {
+        let mut c = crate::agent::context::Context::default();
+        c.system = Some(format!("base prompt{}", PROMPT));
+        for name in ["memory_search", "remember", "bash"] {
+            c.tools.push(crate::agent::context::ToolSpec { name: name.into(), description: String::new(), parameters: json!({}) });
+        }
+        c.push_user_text("why does the build fail again");
+        c
+    };
+    let send = |c: &crate::agent::context::Context| {
+        let (p, seen) = mock("ok");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        rt().block_on(async {
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            p.stream_turn(c, tx).await.unwrap();
+            drain.await.unwrap();
+        });
+        let v: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        v
+    };
+    let v = send(&ctx());
+    let tools: Vec<&str> = v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(tools, ["remember", "bash"]);
+    let system = v["system"].as_str().unwrap();
+    assert!(!system.contains("memory_search"), "{system}");
+    assert!(system.contains("remember") && system.starts_with("base prompt"), "{system}");
+
+    remember(&h, docker_fix());
+    let v = send(&ctx());
+    let tools: Vec<&str> = v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(tools, ["memory_search", "remember", "bash"]);
+    assert!(v["system"].as_str().unwrap().contains("memory_search"));
+}
+
+/// Searching is for tasks that point back at earlier work, and an empty
+/// result is final for the task.
+#[test]
+fn search_guidance_is_narrow_and_an_empty_result_is_final() {
+    assert!(PROMPT.contains("only when"), "{PROMPT}");
+    let h = Home::general();
+    remember(&h, docker_fix());
+    let out = search_q(&h, "translate this paragraph into French");
+    assert!(out.starts_with("No memory"), "{out}");
+    assert!(out.contains("Do not search memory again for this task"), "{out}");
+}

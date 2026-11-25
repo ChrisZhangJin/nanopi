@@ -24,9 +24,9 @@ impl Tool for MemorySearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "memory_search".into(),
-            description: "Search your memory of past work (distilled library only) before a task that may relate to earlier work: \
-a resource used before, or a problem that looks familiar. Pass `query` describing the task or symptom, or `id` to open one entry. \
-Returns at most a few entries."
+            description: "Search your memory of past work (distilled library only). Use only when the task points back at earlier work: \
+the user refers to it, or a resource or failure looks familiar. At most once per task; a short `query` naming the resource or symptom \
+(not IDs or dates), or `id` to open one entry. Returns at most a few entries."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -59,8 +59,8 @@ Returns at most a few entries."
         };
         if hits.is_empty() {
             return Ok(out(
-                "No memory entry matched. Do not answer from raw notes or transcripts. \
-If this relates to recent work, tell the user that running /dream may distill it (it uses the model and costs tokens)."
+                "No memory entry matched. Carry on without memory, and do not answer from raw notes or transcripts. \
+Do not search memory again for this task unless new, specific clues appear."
                     .into(),
                 false,
             ));
