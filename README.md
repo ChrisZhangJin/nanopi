@@ -356,10 +356,31 @@ every dispatched agent — background, foreground, `parallel` or `chain` — kee
 running and reports when it finishes. Agents are stopped only by
 `/agents stop <id|name-prefix>` (or `/agents stop all`), by the orchestrator's
 own `stop_agent` when you ask it to, or by quitting nanopi. Bare `/agents`
-opens a picker over every agent of the run, finished ones included; <kbd>Enter</kbd>
-prints that agent's detail card (state, time, model, task, recent activity,
-report, paths), and `/agents show <id|name-prefix>` prints one directly.
+opens a picker over every agent of the run, finished ones included
+(<kbd>↑</kbd>/<kbd>↓</kbd> to choose). <kbd>Enter</kbd> opens a **read-only live
+panel** on the right: the screen splits, the conversation and your prompt stay
+on the left, and the panel follows that agent's work as it happens — its
+replies, every tool call, the head of each tool result, its state and time.
+You cannot type to the agent; everything you type still goes to the
+orchestrator. <kbd>PgUp</kbd>/<kbd>PgDn</kbd> scroll the panel; <kbd>Esc</kbd>
+on an empty prompt (or `/agents close`) closes it, and anything printed
+meanwhile lands in your scrollback. Terminals narrower than 90 columns get
+the detail card instead. `/agents show <id|name-prefix>` prints an agent's
+detail card (state, time, model, task, recent activity, report, paths);
 `/agents list` is the plain-text version. See [docs/agents.md](docs/agents.md).
+
+**One shared status check watches all running agents.** As soon as an agent
+starts, nanopi begins checking on every live agent together — never one loop
+per agent. Each check reads only local state (each agent's state, time, how
+long its output has been quiet, and its latest activity) and asks the model
+in one small, tool-free request when to look again (30 s – 15 min: soon when
+something is about to finish or looks wrong, later during steady work) and
+whether anything looks stuck. The result is printed between turns
+(`⊙ agents: 2 running · next check in 5m`, stuck agents in yellow), the
+footer shows when the next check is due, and the checks stop by themselves
+when the last agent finishes. The watcher never stops or messages an agent,
+and it is separate from any `/loop` you run. `NANOPI_GOAL_MODEL` puts the
+checks on a cheaper model of the same endpoint.
 
 Parallel agents that write code can each get their own git worktree
 (`isolation: "worktree"`), merged back automatically, with conflicts

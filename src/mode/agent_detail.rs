@@ -958,8 +958,100 @@ fn one_line_keep_indent(l: &str) -> String {
     format!("{indent}{}", sanitize(l.trim()))
 }
 
+/// Lines of a tool result shown in the live panel.
+const PANEL_RESULT_LINES: usize = 5;
+/// One message is capped so a runaway reply cannot fill the panel.
+const PANEL_MESSAGE_LINES: usize = 400;
+
+/// The live agent panel: the agent's transcript tail as a running log —
+/// full replies, every tool call with its main argument, and the head of
+/// each tool result. Read-only and pure; every string is sanitized.
+pub fn panel_lines(lines: &[String], window_cut: bool) -> Vec<CardLine> {
+    let mut out = Vec::new();
+    if window_cut {
+        out.push(line(LineKind::Dim, "… earlier activity not shown"));
+    }
+    for raw in lines {
+        let Ok(v) = serde_json::from_str::<Value>(raw) else { continue };
+        let str_of = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or("");
+        match str_of("type") {
+            "message" => {
+                let content = str_of("content");
+                match str_of("role") {
+                    "user" => {
+                        let text = if is_brief(content) {
+                            "(the task brief)".to_string()
+                        } else {
+                            first_line(content, ENTRY_CHARS)
+                        };
+                        out.push(line(LineKind::Section, format!("you: {text}")));
+                    }
+                    "assistant" => {
+                        for l in content.lines().take(PANEL_MESSAGE_LINES) {
+                            out.push(line(LineKind::Body, sanitize(l.trim_end())));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "tool_call" => {
+                let name = sanitize(&cap_chars(str_of("tool_name"), 60));
+                let args = sanitize(&summarize_args(v.get("arguments")));
+                out.push(line(LineKind::Header, format!("⚙ {name}({args})")));
+            }
+            "tool_result" => {
+                let content = str_of("content");
+                if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                    out.push(line(LineKind::Error, format!("✗ {}", sanitize(&first_line(content, ENTRY_CHARS)))));
+                    continue;
+                }
+                let all: Vec<&str> = content.lines().collect();
+                for l in all.iter().take(PANEL_RESULT_LINES) {
+                    out.push(line(LineKind::Dim, format!("  {}", sanitize(&cap_chars(l.trim_end(), ENTRY_CHARS)))));
+                }
+                if all.len() > PANEL_RESULT_LINES {
+                    out.push(line(LineKind::Dim, format!("  … {} more lines", all.len() - PANEL_RESULT_LINES)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn live_panel_shows_full_replies_tool_calls_and_result_heads() {
+        let msg = |role: &str, content: &str| {
+            serde_json::json!({"type":"message","id":"m","timestamp":"t","role":role,"content":content}).to_string()
+        };
+        let lines: Vec<String> = vec![
+            r#"{"type":"session","id":"x"}"#.to_string(),
+            msg("user", "---\nid: a1\n---\nrun the tests"),
+            r#"{"type":"tool_call","id":"c1","timestamp":"t","tool_name":"bash","arguments":{"command":"cargo test"}}"#.to_string(),
+            serde_json::json!({"type":"tool_result","tool_call_id":"c1","timestamp":"t","content":"line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7","is_error":false}).to_string(),
+            serde_json::json!({"type":"tool_result","tool_call_id":"c2","timestamp":"t","content":"boom","is_error":true}).to_string(),
+            msg("assistant", "First paragraph.\nSecond \u{1b}[31mline."),
+            "not json".to_string(),
+        ];
+        let got: Vec<(LineKind, String)> =
+            panel_lines(&lines, false).into_iter().map(|l| (l.kind, l.text)).collect();
+        let text: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(text.contains(&"you: (the task brief)"), "{text:?}");
+        assert!(text.contains(&"⚙ bash(cargo test)"), "{text:?}");
+        assert!(text.contains(&"  line 1") && text.contains(&"  line 5"), "{text:?}");
+        assert!(!text.contains(&"  line 6"), "result heads are bounded: {text:?}");
+        assert!(text.contains(&"  … 2 more lines"), "{text:?}");
+        assert!(got.iter().any(|(k, t)| *k == LineKind::Error && t == "✗ boom"), "{got:?}");
+        // A full reply, every line, with control characters removed.
+        assert!(text.contains(&"First paragraph.") && text.contains(&"Second [31mline."), "{text:?}");
+        assert!(!text.iter().any(|t| t.contains('\u{1b}')));
+        // A cut window says so.
+        assert_eq!(panel_lines(&lines, true)[0].text, "… earlier activity not shown");
+    }
+
     use super::*;
     use std::time::Duration;
 

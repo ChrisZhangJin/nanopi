@@ -34,6 +34,7 @@ pub mod plugin_grants;
 /// ever calls `send`, both drains are always empty, and the loop is
 /// byte-identical.
 pub mod plugin_send;
+pub mod agent_watch;
 pub mod background;
 pub mod goal;
 pub mod loops;

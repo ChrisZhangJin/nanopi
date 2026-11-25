@@ -1,6 +1,7 @@
 //! Run modes: interactive (TUI) and print (-p).
 
 pub mod agent_detail;
+pub mod agent_panel;
 pub mod agents_strip;
 pub mod brief_watch;
 pub mod exit_signal;

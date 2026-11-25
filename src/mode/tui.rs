@@ -252,7 +252,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/import", "Import a session from JSONL", SlashCmd::Import),
         MenuItem::new(
             "/agents",
-            "Agents: pick one to inspect | show <id|name> | list | stop <id|name|all> | clean [--older <days> | --keep <n>]",
+            "Agents: pick one to watch live (Enter) | show <id|name> | list | close | stop <id|name|all> | clean [--older <days> | --keep <n>]",
             SlashCmd::Agents,
         ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
@@ -910,6 +910,9 @@ pub async fn run_tui_mode(
             result = Ok(code);
         }
     }
+    // Leave the panel's alternate screen (a signal can end the loop with
+    // it open) and write what it held back to the real scrollback.
+    let _ = close_agent_panel(&mut terminal, &mut app);
     // TUI quit: stop every live agent child before anything else.
     if let Some(reg) = crate::agent_registry::global() {
         reg.kill_all();
@@ -1103,6 +1106,19 @@ struct App {
     /// (finished ones included) is open. Payload is the agent id. Esc only
     /// closes it; it never reaches the turn or the registry.
     agents_picker: Option<MenuState<String>>,
+    /// The agent shown in the read-only live panel (routing state).
+    agent_panel_id: Option<String>,
+    /// The panel's full-screen terminal and caches while it is open.
+    agent_panel: Option<AgentPanel>,
+    /// One shared status check for all live agents (`crate::agent_watch`).
+    agent_watch: crate::agent_watch::Watch,
+    /// The check in flight, with the snapshot it was asked about.
+    agent_watch_task: Option<AgentWatchTask>,
+    /// The connection the check uses; cached while the agent is in its
+    /// slot, since a running turn takes it out.
+    agent_watch_conn: Option<(String, String, String)>,
+    /// Watch lines waiting for an idle moment to be printed.
+    agent_watch_lines: Vec<(String, Color)>,
     settings_menu: Option<MenuState<SettingsRow>>,
     keybindings_menu: Option<MenuState<crate::keys::ActionId>>,
     capture_key_for: Option<crate::keys::ActionId>,
@@ -1381,6 +1397,12 @@ impl App {
             turn_was_cancelled: false,
             resume_picker: None,
             agents_picker: None,
+            agent_panel_id: None,
+            agent_panel: None,
+            agent_watch: crate::agent_watch::Watch::default(),
+            agent_watch_task: None,
+            agent_watch_conn: None,
+            agent_watch_lines: Vec::new(),
             settings_menu: None,
             keybindings_menu: None,
             capture_key_for: None,
@@ -1638,6 +1660,12 @@ enum KeyAction {
     Background(String),
     /// `/effort …` parsed.
     Effort(EffortCmd),
+    /// Picker Enter: open the read-only live panel for this agent.
+    OpenAgentPanel(String),
+    /// Esc on an empty idle prompt, or `/agents close`.
+    CloseAgentPanel,
+    /// PgUp (+1) / PgDn (-1): scroll the panel by a page.
+    ScrollAgentPanel(i32),
     /// `/memory …` (raw arguments).
     Memory(String),
     /// `/dream …` (raw arguments).
@@ -1815,7 +1843,7 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
             MenuAction::Chosen(id) => {
                 app.agents_picker = None;
                 app.input.clear();
-                return KeyAction::ShowAgent(id);
+                return KeyAction::OpenAgentPanel(id);
             }
             MenuAction::Cancel => {
                 app.agents_picker = None;
@@ -1828,6 +1856,28 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
             MenuAction::Nothing | MenuAction::Filled(_) | MenuAction::ChosenRaw(_) => {
                 return KeyAction::Nothing
             }
+        }
+    }
+    // ── Live agent panel (read-only) ───────────────────────────────
+    // The panel never takes the keyboard: only PgUp/PgDn (view scrolling)
+    // and Esc-to-close are claimed; everything else is the orchestrator's.
+    if app.agent_panel_id.is_some()
+        && app.palette.is_none()
+        && app.model_picker.is_none()
+        && app.fork_picker.is_none()
+        && app.resume_picker.is_none()
+    {
+        match k.code {
+            KeyCode::PageUp => return KeyAction::ScrollAgentPanel(1),
+            KeyCode::PageDown => return KeyAction::ScrollAgentPanel(-1),
+            KeyCode::Esc
+                if k.modifiers.is_empty()
+                    && app.status != Status::Streaming
+                    && app.input.is_empty() =>
+            {
+                return KeyAction::CloseAgentPanel
+            }
+            _ => {}
         }
     }
     // ── Fork picker (opens summary modal on Chosen) ─────────────────
@@ -2356,7 +2406,7 @@ fn sync_palette(app: &mut App) {
 /// `/agents` usage line, shown on any bad/missing argument (T-02-19:
 /// strict parse, anything unrecognized deletes and stops nothing).
 const AGENTS_USAGE: &str = "Usage: /agents | /agents show <id|name-prefix> | /agents <id> | \
-/agents list | /agents stop <id|name-prefix|all> | /agents clean [--older <days> | --keep <n>]";
+/agents list | /agents close | /agents stop <id|name-prefix|all> | /agents clean [--older <days> | --keep <n>]";
 
 /// What `/agents stop` was asked to stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2378,6 +2428,8 @@ enum AgentsCmd {
     Show(String),
     Stop(AgentStopTarget),
     Clean(crate::archive::CleanMode),
+    /// `/agents close`: close the live panel.
+    Close,
 }
 
 /// Parse the argument string after `/agents` (D-10, ARC-05). Accepted:
@@ -2400,6 +2452,10 @@ fn parse_agents_args(arg: &str) -> Result<AgentsCmd, String> {
         }
         Some(id) if looks_like_agent_id(&id.to_lowercase()) => match parts.next() {
             None => Ok(AgentsCmd::Show(id.to_string())),
+            Some(_) => Err(AGENTS_USAGE.to_string()),
+        },
+        Some("close") => match parts.next() {
+            None => Ok(AgentsCmd::Close),
             Some(_) => Err(AGENTS_USAGE.to_string()),
         },
         Some("list") => match parts.next() {
@@ -2797,6 +2853,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             Ok(AgentsCmd::List) => KeyAction::ListAgents,
             Ok(AgentsCmd::Pick) => KeyAction::OpenAgentsPicker,
             Ok(AgentsCmd::Show(q)) => KeyAction::ShowAgent(q),
+            Ok(AgentsCmd::Close) => KeyAction::CloseAgentPanel,
             Err(msg) => KeyAction::AgentsUsage(msg),
         },
         SlashCmd::Copy => KeyAction::CopyLastReply,
@@ -3077,10 +3134,7 @@ async fn run_app(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Initial dock draw.
-    term.draw(|f| {
-        let area = f.area();
-        draw_dock(f.buffer_mut(), area, app);
-    })?;
+    redraw(term, app)?;
 
     loop {
         if app.should_exit {
@@ -3274,6 +3328,14 @@ async fn run_app(
                 }
                 let became_empty = !was_empty && app.agents_view.is_empty();
                 reset_strip_expanded_on_became_empty(app, became_empty);
+                // One shared status check for every live agent.
+                poll_agent_watch(term, app, &agent_slot, app.status != Status::Streaming && turn_task.is_none())?;
+                // The live agent panel follows its agent's transcript.
+                if let Some(p) = app.agent_panel.as_mut() {
+                    let snap = crate::agent_registry::global().map(|r| r.snapshot()).unwrap_or_default();
+                    let entry = snap.iter().find(|e| e.id == p.view.id);
+                    p.view.refresh(entry);
+                }
                 // Redraw when there's a live counter to update, the strip
                 // has agents to show, or the strip just emptied out (so
                 // it disappears instead of leaving a stale last frame).
@@ -3284,8 +3346,10 @@ async fn run_app(
                     || app.loop_state.is_some()
                     || !app.agents_view.is_empty()
                     || became_empty
+                    || app.agent_panel.is_some()
+                    || app.agent_watch.active()
                 {
-                    term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+                    redraw(term, app)?;
                 }
             }
             key = key_events.next() => {
@@ -3313,13 +3377,13 @@ async fn run_app(
                     Some(Err(_)) => {}
                     None => return Ok(0),
                 }
-                term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+                redraw(term, app)?;
             }
             maybe_ev = recv_optional(&mut ag_rx) => {
                 match maybe_ev {
                     Some(ev) => {
                         on_agent_event(term, app, ev)?;
-                        term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+                        redraw(term, app)?;
                     }
                     None => {
                         // Turn done. Flush buffers + any orphan pending bar
@@ -3442,7 +3506,7 @@ async fn run_app(
                         }
                         // Blank separator between turns.
                         insert_line(term, Line::from(""))?;
-                        term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+                        redraw(term, app)?;
 
                         // v0.11.0: auto-start the next turn instead of
                         // idling back to the prompt (Pi's
@@ -3491,7 +3555,7 @@ async fn run_app(
                             // that turn's end is judged instead.
                             after_goal_turn(term, app, &agent_slot, was_cancelled, turn_error).await?;
                         }
-                        term.draw(|f| { let area = f.area(); draw_dock(f.buffer_mut(), area, app); })?;
+                        redraw(term, app)?;
                     }
                 }
             }
@@ -3516,6 +3580,7 @@ async fn handle_action(
     match action {
         KeyAction::Nothing => {}
         KeyAction::Exit => {
+            close_agent_panel(term, app)?;
             app.should_exit = true;
         }
         KeyAction::CancelTurn => {
@@ -3556,6 +3621,13 @@ async fn handle_action(
                     }
                     dim_line(term, "  (a turn is running — the goal is checked when it ends)")?;
                 }
+            }
+        }
+        KeyAction::OpenAgentPanel(id) => open_agent_panel(term, app, &id)?,
+        KeyAction::CloseAgentPanel => close_agent_panel(term, app)?,
+        KeyAction::ScrollAgentPanel(pages) => {
+            if let Some(p) = app.agent_panel.as_mut() {
+                p.view.scroll(pages);
             }
         }
         KeyAction::Effort(EffortCmd::Set(level)) => apply_effort(term, app, agent_slot, level).await?,
@@ -3819,6 +3891,7 @@ async fn handle_action(
             }
         }
         KeyAction::NewSession => {
+            close_agent_panel(term, app)?;
             end_goal_and_loop(term, app, "new session")?;
             // Fresh session in the same cwd. Preserves model, api,
             // hooks, permission from the current agent.
@@ -3995,6 +4068,7 @@ async fn handle_action(
             app.resume_picker = Some(MenuState::new(items));
         }
         KeyAction::ResumeSession(path) => {
+            close_agent_panel(term, app)?;
             end_goal_and_loop(term, app, "session switched")?;
             // Snapshot the caller's Agent trappings (api/hooks/etc.)
             // then swap the underlying session by loading `path`.
@@ -5187,10 +5261,7 @@ async fn handle_action(
         }
         KeyAction::Compact => {
             app.status_note = Some("compacting…".into());
-            term.draw(|f| {
-                let area = f.area();
-                draw_dock(f.buffer_mut(), area, app);
-            })?;
+            redraw(term, app)?;
             let mut g = agent_slot.lock().await;
             if let Some(a) = g.as_mut() {
                 let before = a.context.estimate_chars();
@@ -5944,6 +6015,15 @@ fn loop_status_lines(app: &App, now: std::time::Instant) -> Vec<String> {
 /// Footer segments for an active goal and loop.
 fn goal_loop_segments(app: &App, now: std::time::Instant) -> Vec<String> {
     let mut out = Vec::new();
+    if app.agent_watch.active() {
+        out.push(match app.agent_watch.next_check() {
+            Some(t) => format!(
+                "⊙ watching agents · next {}",
+                crate::goal::format_duration(std::time::Duration::from_secs(t.saturating_duration_since(now).as_secs()))
+            ),
+            None => "⊙ checking agents…".to_string(),
+        });
+    }
     if app.background_pending {
         out.push(if live_agents(crate::agent_registry::global().as_deref()) > 0 {
             "◐ to background after agents report".to_string()
@@ -6448,6 +6528,101 @@ fn sync_wakeup_tool(app: &mut App, agent_slot: &Arc<Mutex<Option<Agent>>>, pace:
     app.wakeup_tool_on = !wanted.is_empty() && a.registry.get(wanted).is_some();
 }
 
+// ── shared agent status check ─────────────────────────────────────────
+
+type AgentWatchResult = Result<(crate::agent_watch::Decision, crate::event::Usage), String>;
+
+struct AgentWatchTask {
+    handle: tokio::task::JoinHandle<AgentWatchResult>,
+    statuses: Vec<crate::agent_watch::AgentStatus>,
+}
+
+/// Called on every tick: start, run and stop the one watcher that checks
+/// on all live agents. Lines are queued and printed only when idle, so a
+/// check never cuts into a streaming reply.
+fn poll_agent_watch(
+    term: &mut Term,
+    app: &mut App,
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    idle: bool,
+) -> Result<()> {
+    use crate::agent_watch::{Step, RETRY_DELAY};
+    let now = std::time::Instant::now();
+    if let Ok(g) = agent_slot.try_lock() {
+        if let Some(a) = g.as_ref() {
+            app.agent_watch_conn = Some((a.model.clone(), a.base_url.clone(), a.api_key.clone()));
+        }
+    }
+    // A finished check: schedule the next one on the model's word.
+    if app.agent_watch_task.as_ref().is_some_and(|t| t.handle.is_finished()) {
+        let task = app.agent_watch_task.take().expect("checked");
+        let result = futures_util::FutureExt::now_or_never(task.handle)
+            .unwrap_or_else(|| Ok(Err("agent status check did not finish".into())))
+            .unwrap_or_else(|e| Err(format!("agent status check failed: {e}")));
+        match result {
+            Ok((d, _usage)) => {
+                let next = crate::goal::format_duration(d.delay);
+                app.agent_watch_lines.push((format!("⊙ agents: {} running · next check in {next}", task.statuses.len()), Color::DarkGray));
+                for st in &task.statuses {
+                    let colour = if d.stuck.contains(&st.id) { Color::Yellow } else { Color::DarkGray };
+                    let mark = if d.stuck.contains(&st.id) { " · looks stuck" } else { "" };
+                    app.agent_watch_lines.push((format!("{}{mark}", crate::agent_watch::status_line(st)), colour));
+                }
+                if let Some(n) = &d.note {
+                    app.agent_watch_lines.push((format!("  {n}"), Color::Indexed(108)));
+                }
+                app.agent_watch.checked(d.delay, d.note, now);
+            }
+            Err(e) => {
+                app.agent_watch_lines.push((
+                    format!("⊙ agent status check failed ({e}); next try in {}", crate::goal::format_duration(RETRY_DELAY)),
+                    Color::DarkGray,
+                ));
+                app.agent_watch.checked(RETRY_DELAY, None, now);
+            }
+        }
+    }
+    let snap = crate::agent_registry::global().map(|r| r.snapshot()).unwrap_or_default();
+    let live = snap.iter().filter(|e| !e.state.is_terminal()).count();
+    match app.agent_watch.tick(live, now) {
+        Step::Nothing => {}
+        Step::Started => app.agent_watch_lines.push((
+            format!(
+                "⊙ watching running agents — one shared status check for all of them, first in {}",
+                crate::goal::format_duration(crate::agent_watch::FIRST_DELAY)
+            ),
+            Color::DarkGray,
+        )),
+        Step::Stopped => app.agent_watch_lines.push(("⊙ all agents finished — status checks stopped".into(), Color::DarkGray)),
+        Step::Check => {
+            let statuses = crate::agent_watch::snapshot(&snap, now);
+            match (&app.agent_watch_conn, statuses.is_empty()) {
+                (Some((model, base_url, api_key)), false) => {
+                    let model = std::env::var("NANOPI_GOAL_MODEL").ok().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| model.clone());
+                    let provider = crate::provider::build(
+                        app.api_kind,
+                        base_url,
+                        api_key,
+                        &model,
+                        Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(base_url), &model)),
+                        app.inline_think_tags,
+                    );
+                    let asked = statuses.clone();
+                    let handle = tokio::spawn(async move { crate::agent_watch::check(provider.as_ref(), &asked).await });
+                    app.agent_watch_task = Some(AgentWatchTask { handle, statuses });
+                }
+                _ => app.agent_watch.checked(RETRY_DELAY, None, now),
+            }
+        }
+    }
+    if idle && !app.agent_watch_lines.is_empty() {
+        for (text, colour) in std::mem::take(&mut app.agent_watch_lines) {
+            goal_line(term, &text, colour)?;
+        }
+    }
+    Ok(())
+}
+
 // ── /effort ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6855,10 +7030,7 @@ async fn profile_wizard_drive(
                 let a = w.flow.answers();
                 say(term, format!("probing {}...", a.base_url), Color::Indexed(108))?;
                 app.status_note = Some("profile: probing the endpoint…".into());
-                term.draw(|f| {
-                    let area = f.area();
-                    draw_dock(f.buffer_mut(), area, app);
-                })?;
+                redraw(term, app)?;
                 let probed =
                     crate::wizard::probe_config(&a.base_url, &a.api_kind, &a.model, &a.api_key).await;
                 let Some(w) = app.profile_wizard.as_mut() else {
@@ -7865,15 +8037,159 @@ fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEnt
     Ok(())
 }
 
+/// The read-only live agent panel while it is open: a full-screen
+/// terminal on the alternate screen, and what it shows.
+struct AgentPanel {
+    term: Term,
+    view: crate::mode::agent_panel::PanelView,
+    screen: AgentPanelScreen,
+}
+
+/// Owns the screen switch from the first write, including setup failures.
+struct AgentPanelScreen(bool);
+
+impl AgentPanelScreen {
+    fn leave(&mut self) -> io::Result<()> {
+        crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+        self.0 = false;
+        Ok(())
+    }
+}
+
+impl Drop for AgentPanelScreen {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = self.leave();
+            crate::mode::agent_panel::release();
+            if std::thread::panicking() {
+                let _ = disable_raw_mode();
+                crate::render::raw_tty::set_raw_mode(false);
+                let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, crossterm::cursor::Show);
+            }
+        }
+    }
+}
+
+/// Draw the screen: the inline dock normally, the full-screen split while
+/// the agent panel is open. Every redraw goes through here.
+fn redraw(term: &mut Term, app: &mut App) -> Result<()> {
+    if let Some(mut p) = app.agent_panel.take() {
+        let r = {
+            let AgentPanel { term: full, view, .. } = &mut p;
+            full.draw(|f| {
+                let area = f.area();
+                draw_split(f.buffer_mut(), area, app, view);
+            })
+            .map(|_| ())
+        };
+        app.agent_panel = Some(p);
+        return r.map_err(Into::into);
+    }
+    term.draw(|f| {
+        let area = f.area();
+        draw_dock(f.buffer_mut(), area, app);
+    })?;
+    Ok(())
+}
+
+/// Left: the recent conversation above the usual dock. Right: the panel.
+fn draw_split(buf: &mut Buffer, area: Rect, app: &App, view: &crate::mode::agent_panel::PanelView) {
+    use crate::mode::agent_panel as ap;
+    let (left, right) = ap::split(area);
+    let dock_h = DOCK_HEIGHT.min(left.height);
+    let convo = Rect { height: left.height - dock_h, ..left };
+    let dock = Rect { y: left.y + convo.height, height: dock_h, ..left };
+    ap::draw_conversation(buf, convo);
+    draw_dock(buf, dock, app);
+    ap::draw_panel(buf, right, view, std::time::Instant::now());
+}
+
+/// Open the live panel for agent `id`: enter the alternate screen and
+/// start holding scrollback output for later.
+fn open_agent_panel(term: &mut Term, app: &mut App, id: &str) -> Result<()> {
+    let Some(reg) = crate::agent_registry::global() else {
+        return insert_line(term, Line::from(Span::styled("no agent registry in this session", Style::default().fg(Color::Yellow))));
+    };
+    let snapshot = reg.snapshot();
+    let Some(entry) = snapshot.iter().find(|e| e.id == id) else {
+        return insert_line(term, Line::from(Span::styled(format!("no agent {id} in this session"), Style::default().fg(Color::Yellow))));
+    };
+    let width = term.size().map(|r| r.width).unwrap_or(80);
+    if width < crate::mode::agent_panel::MIN_SPLIT_WIDTH {
+        insert_line(term, Line::from(Span::styled(
+            format!("terminal is narrower than {} columns: showing the card instead of the live panel", crate::mode::agent_panel::MIN_SPLIT_WIDTH),
+            Style::default().fg(Color::DarkGray),
+        )))?;
+        let w = width.max(1) as usize;
+        return match show_agent(Some(&reg), id, w, std::time::Instant::now()) {
+            Ok((state, lines)) => {
+                for l in lines {
+                    insert_line(term, Line::from(Span::styled(l.text, card_line_style(l.kind, state))))?;
+                }
+                Ok(())
+            }
+            Err(msg) => insert_line(term, Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)))),
+        };
+    }
+    if app.agent_panel.is_some() {
+        close_agent_panel(term, app)?;
+    }
+    let label = agent_detail::collect_rows(&snapshot, std::time::Instant::now())
+        .into_iter()
+        .find(|r| r.id == id)
+        .and_then(|r| r.label.or(r.role));
+    let view = crate::mode::agent_panel::PanelView::new(entry, label);
+    let screen = AgentPanelScreen(true);
+    crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    let mut full = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    full.clear()?;
+    crate::mode::agent_panel::hold();
+    app.agent_panel_id = Some(id.to_string());
+    app.agent_panel = Some(AgentPanel { term: full, view, screen });
+    redraw(term, app)
+}
+
+/// Close the panel: back to the inline screen, then write everything held
+/// back meanwhile into the real scrollback.
+fn close_agent_panel(term: &mut Term, app: &mut App) -> Result<()> {
+    app.agent_panel_id = None;
+    let Some(mut panel) = app.agent_panel.take() else {
+        return Ok(());
+    };
+    let leave = panel.screen.leave();
+    let held = crate::mode::agent_panel::release();
+    leave?;
+    // The inline viewport did not receive resize events on the alternate
+    // screen; synchronize it before inserting any rows into scrollback.
+    term.autoresize()?;
+    for rec in held {
+        let spans: Vec<Span> = rec.spans.into_iter().map(|(t, st)| Span::styled(t, st)).collect();
+        match rec.bg {
+            Some(bg) => insert_line_bg_raw(term, Line::from(spans), Some(bg))?,
+            None => insert_line_raw(term, Line::from(spans))?,
+        }
+    }
+    term.clear()?;
+    redraw(term, app)
+}
+
 /// Insert a line into scrollback above the viewport. Wraps to
 /// multiple rows when the content exceeds the terminal width so long
 /// assistant replies stay visible instead of getting silently
 /// truncated at the right edge (matches PI's wrapping — see
 /// SCR-20260808-sihi.png).
 fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
+    if crate::mode::agent_panel::record(&line, None) {
+        return Ok(());
+    }
+    insert_line_raw(term, line)
+}
+
+/// [`insert_line`] without recording: writes straight to scrollback.
+fn insert_line_raw(term: &mut Term, line: Line<'_>) -> Result<()> {
     // Fast path for empty lines.
     if line.spans.iter().all(|s| s.content.is_empty()) {
-        return insert_line_bg(term, line, None);
+        return insert_line_bg_raw(term, line, None);
     }
     let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
 
@@ -7967,6 +8283,13 @@ fn wrap_chars(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> 
 /// `bg_style` is Some, unset cells beyond the text get that style
 /// (PI's "user echo" gray bar effect).
 fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> Result<()> {
+    if crate::mode::agent_panel::record(&line, bg_style) {
+        return Ok(());
+    }
+    insert_line_bg_raw(term, line, bg_style)
+}
+
+fn insert_line_bg_raw(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> Result<()> {
     let spans: Vec<(String, Style)> = line
         .spans
         .iter()
@@ -10519,10 +10842,41 @@ mod tests {
         interpret_key(&mut app, key(KeyCode::Backspace));
         // Enter on the match opens that agent's card.
         match interpret_key(&mut app, key(KeyCode::Enter)) {
-            KeyAction::ShowAgent(id) => assert_eq!(id, "a1"),
-            other => panic!("expected ShowAgent, got {other:?}"),
+            KeyAction::OpenAgentPanel(id) => assert_eq!(id, "a1"),
+            other => panic!("expected OpenAgentPanel, got {other:?}"),
         }
         assert!(app.agents_picker.is_none(), "Enter closes the picker");
+    }
+
+    /// Enter in the picker opens the read-only live panel. While it is
+    /// open the keyboard still belongs to the orchestrator: text goes to
+    /// the input, PgUp/PgDn only scroll the panel, and Esc on an empty
+    /// idle prompt closes it (mid-turn Esc still cancels the turn).
+    #[test]
+    fn picker_enter_opens_the_live_panel_and_keys_stay_with_the_orchestrator() {
+        use crate::agent_registry::AgentState::*;
+        let (_d, reg, _view) = agents_fixture(&[("one", Running), ("two", Running)]);
+        let mut app = mkapp();
+        app.agents_picker = open_agents_picker(Some(&reg), std::time::Instant::now()).ok();
+        interpret_key(&mut app, key(KeyCode::Down));
+        match interpret_key(&mut app, key(KeyCode::Enter)) {
+            KeyAction::OpenAgentPanel(id) => assert_eq!(id, "a2"),
+            other => panic!("{other:?}"),
+        }
+        assert!(app.agents_picker.is_none());
+
+        app.agent_panel_id = Some("a2".into());
+        for c in "hi".chars() {
+            interpret_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Enter)), KeyAction::StartTurn(ref t) if t == "hi"));
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::PageUp)), KeyAction::ScrollAgentPanel(1)));
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::PageDown)), KeyAction::ScrollAgentPanel(-1)));
+        app.status = Status::Streaming;
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Esc)), KeyAction::CancelTurn));
+        app.status = Status::Idle;
+        assert!(matches!(interpret_key(&mut app, key(KeyCode::Esc)), KeyAction::CloseAgentPanel));
+        assert!(matches!(parse_agents_args("close"), Ok(AgentsCmd::Close)));
     }
 
     #[test]
@@ -10533,7 +10887,7 @@ mod tests {
         app.agents_picker = open_agents_picker(Some(&reg), std::time::Instant::now()).ok();
         interpret_key(&mut app, key(KeyCode::Down));
         match interpret_key(&mut app, key(KeyCode::Enter)) {
-            KeyAction::ShowAgent(id) => assert_eq!(id, "a2"),
+            KeyAction::OpenAgentPanel(id) => assert_eq!(id, "a2"),
             other => panic!("{other:?}"),
         }
     }
