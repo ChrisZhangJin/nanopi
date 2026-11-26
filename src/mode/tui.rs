@@ -11619,7 +11619,8 @@ mod tests {
         assert!(all.contains("● main"), "{all}");
         assert!(all.contains("2 agents working"), "{all}");
         assert!(all.contains(" alpha"), "{all}");
-        assert!(all.contains("◌ bravo"), "queued agents get the dim pulse: {all}");
+        assert!(all.contains("◌ a2  bravo"), "queued agents get the dim pulse, id then name: {all}");
+        assert!(all.contains("a1  alpha"), "{all}");
         // The strip sits under the footer: `● main` comes after the input
         // box and the last dock row is an agent row.
         let main_idx = rows.iter().position(|r| r.contains("● main")).unwrap();

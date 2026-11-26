@@ -674,12 +674,16 @@ fn agent_row<'a>(info: &AgentInfo, name_w: usize, width: usize, now: Instant, in
         other => (glyph_for(other), style_for_state(other)),
     };
     let elapsed = format!(" {}", format_elapsed(elapsed_secs_for(info, now)));
-    let name = truncate_to_width(&display_name(info), name_w);
+    // The id always leads (it is what `/agents show`, the panel and the
+    // reports use); the label follows when there is one.
+    let label = if info.description.trim().is_empty() { String::new() } else { info.description.clone() };
+    let name = truncate_to_width(&label, name_w);
     let pad = " ".repeat(name_w.saturating_sub(display_width(&name)));
     let mut spans = vec![
         Span::raw(" "),
         Span::styled(glyph, glyph_style),
         Span::raw(" "),
+        Span::styled(format!("{:<3} ", info.id), Style::default().fg(Color::Cyan)),
         Span::styled(format!("{name}{pad}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ];
     let total = info.total_steps();
@@ -839,7 +843,7 @@ mod tests {
         let rows = draw(t0);
         assert!(rows[0].trim().is_empty() && rows[2].trim().is_empty(), "{rows:#?}");
         assert!(rows[1].starts_with("● main"), "{rows:#?}");
-        assert!(rows[3].contains("list_calls") && rows[3].contains("▕") && rows[3].contains("1/4"), "{rows:#?}");
+        assert!(rows[3].contains("a1  list_calls") && rows[3].contains("▕") && rows[3].contains("1/4"), "{rows:#?}");
         assert_ne!(draw(t0 + std::time::Duration::from_millis(400))[3], rows[3], "the row animates");
 
         // The next step glides in rather than jumping.
@@ -1005,7 +1009,8 @@ mod tests {
         let row = |y: u16| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
         assert!(row(0).starts_with("● main"), "{:?}", row(0));
         assert!(row(0).contains("1 agent working · Ctrl+G details"), "{:?}", row(0));
-        assert!(row(1).contains(" #a"), "{:?}", row(1));
+        assert!(row(1).contains(" a "), "the id leads the row: {:?}", row(1));
+        assert!(!row(1).contains("#a"), "no duplicate id for an unlabeled agent: {:?}", row(1));
     }
 
     /// The collapsed strip draws at most 2 agents plus a `+N more`
@@ -1057,9 +1062,9 @@ mod tests {
         let all = (0..area.height).map(row).collect::<Vec<_>>().join("\n");
         assert!(!all.contains("a-really-long-hidden-name"), "{all}");
         // ...so it must not push the status column rightwards either.
-        // ` ⠋ x` is 4 columns, then the 2-space gap: the bar at col 6.
+        // ` ⠋ a0  x`, then the 2-space gap: the bar right after.
         assert!(
-            row(1).starts_with(" ⠋ x  ▕"),
+            row(1).starts_with(" ⠋ a0  x  ▕"),
             "status column padded by an unseen name: {:?}",
             row(1)
         );
