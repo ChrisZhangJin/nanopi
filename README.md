@@ -286,7 +286,7 @@ doesn't know to `custom`:
 
 ```json
 {
-  "generated_by": "0.17.0",
+  "generated_by": "0.17.1",
   "custom": [
     { "id": "some-new-model", "vendor": "openai", "context_window": 2000000 }
   ],
@@ -857,7 +857,8 @@ Host-side plugin state survives a reload, deliberately: the plugin's host-store 
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.17.0** | current | — | `/effort`; persistent experience library and nightly Dream; read-only agent panel and shared status checks |
+| **v0.17.1** | current | 2.2 MB | Live compaction progress with input queued until it finishes; collapsed agent reports (Ctrl+G shows all); per-agent progress bar; CJK-aware scrollback wrapping; Dream times in local time |
+| v0.17.0 | released | — | `/effort`; persistent experience library and nightly Dream; read-only agent panel and shared status checks |
 | v0.16.1 | released | 2.0 MB | `/goal` (work until a verified condition), `/loop` (fixed or self-paced), background mode (`/background`, `--foreground`); config profiles; per-command sudo gate; hybrid orchestrator; cut-off replies reported; shared input history |
 | v0.15.0 | released | — | MCP servers (stdio + Streamable HTTP, `/mcp`); interactive `/agents` picker; orderly SIGTERM/SIGHUP exit |
 | v0.14.0 | released | 1.8 MB | Orchestrator as the default main agent; user-editable `models.json`; context usage bar |

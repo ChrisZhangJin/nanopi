@@ -1043,7 +1043,82 @@ fn print_startup_skills(skills: &[crate::resources::Skill]) {
 // scrollback the way PI does)
 // ─────────────────────────────────────────────────────────────────────
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term = Terminal<DockBackend>;
+
+/// The crossterm backend, plus one answer ratatui would otherwise ask
+/// the terminal for. Building an inline viewport asks where the cursor
+/// is; while the TUI's `EventStream` reads input, that query cannot be
+/// answered in time and the TUI quit with "The cursor position could not
+/// be read". When the dock is rebuilt the cursor position is known
+/// exactly (it was just put there), so it is handed over instead.
+struct DockBackend {
+    inner: CrosstermBackend<Stdout>,
+    cursor: Option<ratatui::layout::Position>,
+}
+
+impl DockBackend {
+    fn new() -> Self {
+        Self { inner: CrosstermBackend::new(io::stdout()), cursor: None }
+    }
+
+    fn at(cursor: ratatui::layout::Position) -> Self {
+        Self { cursor: Some(cursor), ..Self::new() }
+    }
+}
+
+impl io::Write for DockBackend {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut self.inner)
+    }
+}
+
+impl ratatui::backend::Backend for DockBackend {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.cursor = None;
+        self.inner.draw(content)
+    }
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.cursor = None;
+        self.inner.append_lines(n)
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+        match self.cursor.take() {
+            Some(p) => Ok(p),
+            None => self.inner.get_cursor_position(),
+        }
+    }
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(&mut self, position: P) -> io::Result<()> {
+        self.cursor = None;
+        self.inner.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+    fn size(&self) -> io::Result<ratatui::layout::Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+}
 
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
@@ -1051,7 +1126,7 @@ fn setup_terminal() -> Result<Term> {
     crate::render::raw_tty::set_raw_mode(true);
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(stdout);
+    let backend = DockBackend::new();
     let terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -1311,6 +1386,20 @@ struct App {
         Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
     /// In-flight `/dream`, polled on the tick like `command_task`.
     dream_task: Option<tokio::task::JoinHandle<Result<String, String>>>,
+    /// In-flight `/compact`. It runs off the event loop (the agent is
+    /// taken out of its slot, like a turn) so the progress panel keeps
+    /// animating and the input stays editable.
+    compact_task: Option<tokio::task::JoinHandle<CompactOutcome>>,
+    /// Messages entered while compaction runs. They are handled only
+    /// once it finishes, in order.
+    compact_queue: std::collections::VecDeque<String>,
+    /// The compaction panel was on screen at the last tick (one more
+    /// redraw clears it when it goes).
+    compact_shown: bool,
+    /// Recent reports waiting for the details shortcut.
+    collapsed_reports: std::collections::VecDeque<String>,
+    /// Current height of the inline dock (see `wanted_dock_height`).
+    dock_h: u16,
     /// Phase 5 agents strip (UI-01): cached, display-only snapshot of
     /// background agents. Refreshed ONLY on the 120ms tick arm (D-07,
     /// UI-04) — never from agent events or key handling — so the dock
@@ -1433,6 +1522,11 @@ impl App {
             plugin_grants_cache: Vec::new(),
             command_task: None,
             dream_task: None,
+            compact_task: None,
+            compact_queue: Default::default(),
+            compact_shown: false,
+            collapsed_reports: Default::default(),
+            dock_h: DOCK_HEIGHT,
             agents_view: AgentsView::new(),
             agents_strip_expanded: false,
             term_rows: 24,
@@ -1672,6 +1766,8 @@ enum KeyAction {
     Dream(String),
     /// A Dream run finished.
     DreamFinished(Result<String, String>),
+    /// A background `/compact` finished.
+    CompactFinished(CompactOutcome),
     /// A `/goal` line inside a longer message: set the goal; the text
     /// before it goes with the first goal turn.
     GoalInline { preamble: String, condition: String },
@@ -3210,6 +3306,30 @@ async fn run_app(
                         app.command_task = Some(task);
                     }
                 }
+                if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
+                    let task = app.compact_task.take().expect("checked");
+                    match task.await {
+                        Ok(out) => {
+                            handle_action(
+                                KeyAction::CompactFinished(out),
+                                app, term, &agent_slot,
+                                &mut ag_rx, &mut steer_tx_slot, &mut follow_up_slot, &mut cancel, &mut turn_task,
+                            ).await?;
+                        }
+                        Err(e) => {
+                            crate::agent::compact_progress::abandon();
+                            insert_line(term, Line::from(Span::styled(
+                                format!("[compaction failed: {e}]"),
+                                Style::default().fg(Color::Red),
+                            )))?;
+                        }
+                    }
+                }
+                // Release buffered prompts as ordinary follow-ups. Do not
+                // fill the steer channel while the event loop must drain events.
+                if !compacting(app) {
+                    follow_up_slot.append(&mut app.compact_queue);
+                }
                 if app.dream_task.as_ref().is_some_and(|t| t.is_finished()) {
                     let task = app.dream_task.take().expect("checked");
                     let outcome = task.await.unwrap_or_else(|e| Err(format!("Dream panicked: {e}")));
@@ -3275,7 +3395,9 @@ async fn run_app(
                 // ever run — would sit unheard until the user typed
                 // something, which is the silent-drop shape all over
                 // again.
-                if app.status != Status::Streaming && turn_task.is_none() {
+                if compacting(app) {
+                    // Nothing new starts until the pass is over.
+                } else if app.status != Status::Streaming && turn_task.is_none() {
                     if let Some(text) = pick_follow_up(None, &mut follow_up_slot, &mut agent_report_slot) {
                         handle_action(
                             KeyAction::StartTurn(text),
@@ -3297,7 +3419,7 @@ async fn run_app(
                 // "ask"): show it and hold keys for the answer.
                 poll_sudo_request(term, app)?;
                 // /goal verdicts and retries, /loop iterations.
-                let idle = app.status != Status::Streaming && turn_task.is_none();
+                let idle = app.status != Status::Streaming && turn_task.is_none() && !compacting(app);
                 // A hand-off that waited for agents: go once everything
                 // has settled (their reports normally arrive as a turn,
                 // and that turn's end hands off; this covers the rest).
@@ -3329,13 +3451,15 @@ async fn run_app(
                 let became_empty = !was_empty && app.agents_view.is_empty();
                 reset_strip_expanded_on_became_empty(app, became_empty);
                 // One shared status check for every live agent.
-                poll_agent_watch(term, app, &agent_slot, app.status != Status::Streaming && turn_task.is_none())?;
+                poll_agent_watch(term, app, &agent_slot, idle)?;
                 // The live agent panel follows its agent's transcript.
                 if let Some(p) = app.agent_panel.as_mut() {
                     let snap = crate::agent_registry::global().map(|r| r.snapshot()).unwrap_or_default();
                     let entry = snap.iter().find(|e| e.id == p.view.id);
                     p.view.refresh(entry);
                 }
+                let compact_visible = crate::agent::compact_progress::snapshot(std::time::Instant::now()).is_some();
+                let compact_was_visible = std::mem::replace(&mut app.compact_shown, compact_visible);
                 // Redraw when there's a live counter to update, the strip
                 // has agents to show, or the strip just emptied out (so
                 // it disappears instead of leaving a stale last frame).
@@ -3348,6 +3472,8 @@ async fn run_app(
                     || became_empty
                     || app.agent_panel.is_some()
                     || app.agent_watch.active()
+                    || compact_visible
+                    || compact_was_visible
                 {
                     redraw(term, app)?;
                 }
@@ -3524,6 +3650,7 @@ async fn run_app(
                             let mut g = agent_slot.lock().await;
                             g.as_mut().and_then(|a| a.pending_follow_ups.pop_front())
                         };
+                        follow_up_slot.append(&mut app.compact_queue);
                         let follow_up = pick_follow_up(from_agent, &mut follow_up_slot, &mut agent_report_slot);
                         // /loop: a finished iteration schedules the next.
                         after_loop_iteration(term, app, was_cancelled, turn_error.as_deref())?;
@@ -3578,6 +3705,11 @@ async fn handle_action(
     turn_task: &mut Option<tokio::task::JoinHandle<Result<String, String>>>,
 ) -> Result<()> {
     match action {
+        // The agent is out of its slot while `/compact` runs.
+        KeyAction::NewSession | KeyAction::ResumeSession(_) | KeyAction::ApplyImport(_) | KeyAction::ForkChosen(..)
+            if compacting(app) || !app.compact_queue.is_empty() => {
+            dim_line(term, "  (compaction is running — try again when it finishes)")?;
+        }
         KeyAction::Nothing => {}
         KeyAction::Exit => {
             close_agent_panel(term, app)?;
@@ -3724,7 +3856,7 @@ async fn handle_action(
                     app.background_note = Some(stopped);
                 }
                 let live = live_agents(reg.as_deref());
-                let busy = app.status == Status::Streaming || turn_task.is_some();
+                let busy = app.status == Status::Streaming || turn_task.is_some() || compacting(app);
                 if busy || live > 0 {
                     app.background_pending = true;
                     let when = match (busy, live > 0) {
@@ -3770,6 +3902,11 @@ async fn handle_action(
                     render_skill_expansion(term, &s)?;
                     app.last_skill_block = None;
                 }
+            }
+        }
+        KeyAction::ToggleAgentsStrip if !app.collapsed_reports.is_empty() => {
+            while let Some(report) = app.collapsed_reports.pop_front() {
+                render_user_echo(term, &expand_agent_report(&report))?;
             }
         }
         KeyAction::ToggleAgentsStrip => {
@@ -5260,50 +5397,75 @@ async fn handle_action(
             )?;
         }
         KeyAction::Compact => {
-            app.status_note = Some("compacting…".into());
-            redraw(term, app)?;
-            let mut g = agent_slot.lock().await;
-            if let Some(a) = g.as_mut() {
+            if compacting(app) {
+                dim_line(term, "  (compaction is already running)")?;
+                return Ok(());
+            }
+            if app.status == Status::Streaming || turn_task.is_some() {
+                dim_line(term, "  (a turn is running — /compact when it ends)")?;
+                return Ok(());
+            }
+            let slot = agent_slot.clone();
+            app.compact_task = Some(tokio::spawn(async move {
+                let mut a = match slot.lock().await.take() {
+                    Some(a) => a,
+                    None => {
+                        return CompactOutcome { ran: false, before: 0, after: 0, usage: Default::default(), turn_count: 0 };
+                    }
+                };
                 let before = a.context.estimate_chars();
                 let ran = a.compact_now(None, "manual").await;
-                let after = a.context.estimate_chars();
-                // `before → after` alone can't distinguish "compacted,
-                // same size" from "never ran", and on a short session
-                // it printed the former while doing the latter:
-                // `[compacted: 2158 → 2158 chars]`. The whole context
-                // already fit inside the verbatim tail budget, so there
-                // was no head to summarize — which is the right call,
-                // just not what the line said.
-                let msg = if ran {
-                    format!("[compacted: {before} → {after} chars]")
-                } else {
-                    format!(
-                        "[nothing to compact: {before} chars all fit in the \
-                         {} k-token tail kept verbatim]",
-                        crate::agent::compact::KEEP_RECENT_TOKENS / 1000
-                    )
+                let out = CompactOutcome {
+                    ran,
+                    before,
+                    after: a.context.estimate_chars(),
+                    usage: a.usage_total.clone(),
+                    turn_count: a.turn_count,
                 };
-                insert_line(
-                    term,
-                    Line::from(vec![Span::styled(
-                        msg,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )]),
-                )?;
-                app.context_chars = after;
-                app.usage = a.usage_total.clone();
-                app.turn_count = a.turn_count;
-            }
-            app.status_note = None;
+                *slot.lock().await = Some(a);
+                out
+            }));
         }
+        KeyAction::CompactFinished(out) => {
+            // `before → after` alone can't distinguish "compacted, same
+            // size" from "never ran": on a short session the whole
+            // context fits inside the verbatim tail budget, so there is
+            // no head to summarize — the right call, but say so.
+            let msg = if out.ran {
+                let saved = if out.before > 0 { out.before.saturating_sub(out.after) * 100 / out.before } else { 0 };
+                format!(
+                    "[compacted: ~{} → {} tokens (-{saved}%)]",
+                    crate::models::fmt_tokens((out.before / 4) as u32),
+                    crate::models::fmt_tokens((out.after / 4) as u32),
+                )
+            } else {
+                format!(
+                    "[nothing to compact: {} chars all fit in the \
+                     {} k-token tail kept verbatim]",
+                    out.before,
+                    crate::agent::compact::KEEP_RECENT_TOKENS / 1000
+                )
+            };
+            insert_line(
+                term,
+                Line::from(vec![Span::styled(
+                    msg,
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )]),
+            )?;
+            if out.ran || out.before > 0 {
+                app.context_chars = out.after;
+                app.usage = out.usage;
+                app.turn_count = out.turn_count;
+            }
+        }
+        KeyAction::StartTurn(msg) if compacting(app) || !app.compact_queue.is_empty() => app.compact_queue.push_back(msg),
+        KeyAction::SteerTurn(msg) if compacting(app) || !app.compact_queue.is_empty() => app.compact_queue.push_back(msg),
         KeyAction::StartTurn(msg) => {
             if app.status == Status::Streaming {
                 return Ok(());
             }
-            // Echo user message into scrollback, PI-style gray card.
-            render_user_echo(term, &msg)?;
+            render_prompt_echo(term, app, &msg)?;
             app.turn_tool_calls = 0;
             let (tx, rx) = mpsc::channel::<AgentEvent>(64);
             let (steer_tx_inner, steer_rx) = mpsc::channel::<SteerMessage>(32);
@@ -7426,12 +7588,17 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
         } => {
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
+            let preview = if matches!(tool_name.as_str(), "agent" | "send_message") && content.contains("# Report\n") {
+                Some(collapsed_report_preview(term, app, &content))
+            } else {
+                None
+            };
             render_tool_card(
                 term,
                 app,
                 &call_id,
                 &tool_name,
-                &content,
+                preview.as_deref().unwrap_or(&content),
                 is_error,
                 elapsed_ms,
             )?;
@@ -7459,18 +7626,11 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
                 )]),
             )?;
         }
-        AgentEvent::CompactionStart { reason } => {
+        AgentEvent::CompactionStart { .. } => {
+            // The live panel above the input shows the pass; just make
+            // sure streamed text so far is in the scrollback first.
             flush_stream_buf(term, app)?;
             flush_thinking_buf(term, app)?;
-            insert_line(
-                term,
-                Line::from(vec![Span::styled(
-                    format!("[compacting context ({reason})…]"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )]),
-            )?;
         }
         AgentEvent::CompactionEnd {
             replaced_count,
@@ -7484,7 +7644,7 @@ fn on_agent_event(term: &mut Term, app: &mut App, ev: AgentEvent) -> Result<()> 
             let tokens_before = chars_before / 4;
             let tokens_after = chars_after / 4;
             let savings_pct = if chars_before > 0 {
-                ((chars_before - chars_after) * 100) / chars_before
+                chars_before.saturating_sub(chars_after).saturating_mul(100) / chars_before
             } else {
                 0
             };
@@ -7823,10 +7983,96 @@ fn render_skill_card(term: &mut Term, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Insert the PI-style gray "user echo" card into scrollback. Used
-/// both by StartTurn (live) and by replay_history when resuming a
-/// past session (`/resume`). 3-row block: pad, content, pad, with a
-/// blank line above + below.
+const REPORT_PREVIEW_LINES: usize = 3;
+
+fn report_header(line: &str) -> Option<(&str, &str)> {
+    let (header, _) = line.strip_prefix("[agent ")?.split_once(']')?;
+    let (id, state) = header.split_once(" finished: ")?;
+    (id.strip_prefix('a').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        && matches!(state, "done" | "failed" | "stopped" | "limit_reached" | "interrupted"))
+        .then_some((id, state))
+}
+
+fn is_agent_report(msg: &str) -> bool {
+    msg.lines().next().and_then(report_header).is_some() || msg.starts_with("[chain finished] ")
+}
+
+fn report_preview(msg: &str, width: usize, key: &str) -> String {
+    let headline = msg.lines().next().unwrap_or_default();
+    let headline = if let Some((id, state)) = report_header(headline) {
+        format!("[agent {id} finished: {state}]")
+    } else if msg.starts_with("[chain finished] ") {
+        "[chain finished]".into()
+    } else {
+        "[agent report]".into()
+    };
+    let summary = msg.split_once("\n## Summary\n").map(|(_, rest)| rest)
+        .unwrap_or_else(|| msg.split_once("] ").map_or(msg, |(_, rest)| rest));
+    let mut rows = vec![headline];
+    for line in summary.lines().map(str::trim).filter(|l| !l.is_empty() && !((l.starts_with("[progress ") || l.starts_with("[plan ")) && l.ends_with(']'))).take_while(|l| !l.starts_with("## ")).take(REPORT_PREVIEW_LINES) {
+        let clean = agents_strip::sanitize(line);
+        let short = agents_strip::truncate_to_width(&clean, width.min(100).saturating_sub(5));
+        if short.len() < clean.len() {
+            rows.push(format!("{short}…"));
+        } else if !short.is_empty() {
+            rows.push(short);
+        }
+    }
+    rows.push(format!("… {key} shows the full report"));
+    rows.join("\n")
+}
+
+/// Recover a capped report only from the registered agent directory, and
+/// only if the file still starts with that report's exact delivered text.
+fn expand_agent_report(report: &str) -> String {
+    let Some(registry) = crate::agent_registry::global() else { return report.to_owned() };
+    let entries = registry.snapshot();
+    let mut expanded = report.to_owned();
+    // Also handles multiple finished reports batched into one prompt.
+    for part in report.split_inclusive("\n").filter(|line| line.starts_with("…(report truncated at ")) {
+        let marker = part.trim_end();
+        let Some((_, path)) = marker.split_once(" KiB; full report: ") else { continue };
+        let Some(path) = path.strip_suffix(')') else { continue };
+        let Some(file) = entries.iter().map(|e| e.dir.join("report.md")).find(|p| p.to_string_lossy() == path) else { continue };
+        let Ok(full) = crate::memory::read_limited(&file, 8 * 1024 * 1024) else { continue };
+        let prefix_len = 8192.min(full.len());
+        let mut boundary = prefix_len;
+        while !full.is_char_boundary(boundary) { boundary -= 1; }
+        if full.len() <= boundary { continue; }
+        let capped = format!("{}\n{marker}", &full[..boundary]);
+        if let Some(index) = expanded.find(&capped) {
+            expanded.replace_range(index..index + capped.len(), &full);
+        }
+    }
+    expanded
+}
+
+fn cache_report(app: &mut App, report: &str) {
+    const RECENT_REPORT_LIMIT: usize = 16;
+    if app.collapsed_reports.len() == RECENT_REPORT_LIMIT {
+        app.collapsed_reports.pop_front();
+    }
+    app.collapsed_reports.push_back(report.to_owned());
+}
+
+fn collapsed_report_preview(term: &Term, app: &mut App, report: &str) -> String {
+    let width = term.size().map(|size| size.width).unwrap_or(80) as usize;
+    let key = app.bindings.get(crate::keys::ActionId::ToggleAgentsStrip)
+        .map_or_else(|| "Ctrl+G".to_owned(), |key| key.to_string());
+    cache_report(app, report);
+    report_preview(report, width, &key)
+}
+
+fn render_prompt_echo(term: &mut Term, app: &mut App, msg: &str) -> Result<()> {
+    if is_agent_report(msg) {
+        let preview = collapsed_report_preview(term, app, msg);
+        render_user_echo(term, &preview)
+    } else {
+        render_user_echo(term, msg)
+    }
+}
+
+/// Insert a PI-style gray card into scrollback.
 fn render_user_echo(term: &mut Term, msg: &str) -> Result<()> {
     // 256-color palette (Indexed 238) — visible on tmux-256color too;
     // truecolor fails silently there.
@@ -7882,6 +8128,7 @@ fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEnt
     app.stream_buf.clear();
     app.thinking_buf.clear();
     app.pending_tool_calls.clear();
+    app.collapsed_reports.clear();
 
     // Only repaint the tail of long transcripts. The hidden prefix is
     // still in context; we just note how much was elided so the user
@@ -7910,7 +8157,7 @@ fn replay_history(term: &mut Term, app: &mut App, entries: &[session::SessionEnt
     for entry in entries {
         match entry {
             session::SessionEntry::Message { role, content, .. } => match role.as_str() {
-                "user" => render_user_echo(term, content)?,
+                "user" => render_prompt_echo(term, app, content)?,
                 "assistant" => {
                     // Feed a single big TextDelta so on_agent_event
                     // splits on newlines + renders through markdown
@@ -8070,6 +8317,50 @@ impl Drop for AgentPanelScreen {
     }
 }
 
+/// Terminals shorter than this keep the fixed dock: extra rows would
+/// eat too much of the scrollback.
+const ROOMY_TERM_ROWS: u16 = 24;
+
+/// The dock's height: the standard [`DOCK_HEIGHT`], plus room for the
+/// agents strip to breathe (a blank row above each row) while agents
+/// are working on a tall enough terminal.
+fn wanted_dock_height(app: &App) -> u16 {
+    if app.agents_view.is_empty() || app.term_rows < ROOMY_TERM_ROWS {
+        return DOCK_HEIGHT;
+    }
+    let spaced = agents_strip::spaced_strip_height(&app.agents_view);
+    let compact = agents_strip::strip_height(&app.agents_view, app.term_rows, false);
+    DOCK_HEIGHT + spaced.saturating_sub(compact)
+}
+
+/// Rows the dock has grown by for the agents strip, as far as `area`
+/// actually has them.
+fn dock_extra(app: &App, area: Rect) -> u16 {
+    app.dock_h
+        .saturating_sub(DOCK_HEIGHT)
+        .min(area.height.saturating_sub(DOCK_HEIGHT))
+}
+
+/// Rebuild the inline viewport at a new height. ratatui 0.29 cannot
+/// resize an inline viewport in place, so the dock is cleared and a new
+/// one is anchored to the old one's position. Growing pushes the
+/// scrollback up; shrinking keeps a bottom-pinned dock at the bottom.
+fn set_dock_height(term: &mut Term, app: &mut App, height: u16) -> Result<()> {
+    let old = term.get_frame().area();
+    let screen = term.size()?;
+    let old_bottom = old.y.saturating_add(old.height);
+    let bottom = if old_bottom == screen.height { screen.height } else { old_bottom.min(screen.height) };
+    let top = if height < old.height { bottom.saturating_sub(height) } else { old.y };
+    term.clear()?;
+    term.set_cursor_position((0, top))?;
+    *term = Terminal::with_options(
+        DockBackend::at(ratatui::layout::Position { x: 0, y: top }),
+        TerminalOptions { viewport: Viewport::Inline(height) },
+    )?;
+    app.dock_h = height;
+    Ok(())
+}
+
 /// Draw the screen: the inline dock normally, the full-screen split while
 /// the agent panel is open. Every redraw goes through here.
 fn redraw(term: &mut Term, app: &mut App) -> Result<()> {
@@ -8085,6 +8376,10 @@ fn redraw(term: &mut Term, app: &mut App) -> Result<()> {
         app.agent_panel = Some(p);
         return r.map_err(Into::into);
     }
+    let want = wanted_dock_height(app);
+    if want != app.dock_h {
+        set_dock_height(term, app, want)?;
+    }
     term.draw(|f| {
         let area = f.area();
         draw_dock(f.buffer_mut(), area, app);
@@ -8096,7 +8391,7 @@ fn redraw(term: &mut Term, app: &mut App) -> Result<()> {
 fn draw_split(buf: &mut Buffer, area: Rect, app: &App, view: &crate::mode::agent_panel::PanelView) {
     use crate::mode::agent_panel as ap;
     let (left, right) = ap::split(area);
-    let dock_h = DOCK_HEIGHT.min(left.height);
+    let dock_h = app.dock_h.min(left.height);
     let convo = Rect { height: left.height - dock_h, ..left };
     let dock = Rect { y: left.y + convo.height, height: dock_h, ..left };
     ap::draw_conversation(buf, convo);
@@ -8141,7 +8436,7 @@ fn open_agent_panel(term: &mut Term, app: &mut App, id: &str) -> Result<()> {
     let view = crate::mode::agent_panel::PanelView::new(entry, label);
     let screen = AgentPanelScreen(true);
     crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
-    let mut full = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut full = Terminal::new(DockBackend::new())?;
     full.clear()?;
     crate::mode::agent_panel::hold();
     app.agent_panel_id = Some(id.to_string());
@@ -8187,94 +8482,49 @@ fn insert_line(term: &mut Term, line: Line<'_>) -> Result<()> {
 
 /// [`insert_line`] without recording: writes straight to scrollback.
 fn insert_line_raw(term: &mut Term, line: Line<'_>) -> Result<()> {
-    // Fast path for empty lines.
-    if line.spans.iter().all(|s| s.content.is_empty()) {
-        return insert_line_bg_raw(term, line, None);
-    }
-    let width = term.size().map(|r| r.width).unwrap_or(80).max(1) as usize;
-
-    // We lay the line out ourselves — ONE terminal column per `char` —
-    // instead of handing off to ratatui's `Paragraph`. Paragraph measures
-    // glyphs via the `unicode-width` crate, which classifies CJK as
-    // East-Asian *Wide* (2 columns) and reserves a blank cell after each
-    // one. On terminals/fonts that draw CJK single-width that reserved
-    // cell shows up as a gap — assistant text ends up "你 好" while the
-    // user's own echoed input (rendered by `insert_line_bg`, also 1
-    // col/char) stays tight. Matching that path keeps output visually
-    // identical to input. Leading whitespace is preserved (no trimming),
-    // so indented code / markdown stays aligned.
-    let chars: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|s| {
-            let style = s.style;
-            s.content.chars().map(move |c| (c, style))
-        })
-        .collect();
-
-    let mut rows = wrap_chars(&chars, width);
-    rows.truncate(200); // guard against runaway
-    let rows_needed = rows.len().max(1) as u16;
-
-    term.insert_before(rows_needed, move |buf: &mut Buffer| {
-        for (row_idx, row) in rows.iter().enumerate() {
-            let y = row_idx as u16;
-            if y >= buf.area.height {
-                break;
-            }
-            for (col, (ch, style)) in row.iter().enumerate() {
-                if col as u16 >= buf.area.width {
-                    break;
-                }
-                if let Some(cell) = buf.cell_mut((col as u16, y)) {
-                    cell.set_char(*ch).set_style(*style);
-                }
-            }
-        }
-    })?;
-    Ok(())
+    insert_line_bg_raw(term, line, None)
 }
 
-/// Soft-wrap a flat list of styled chars into rows of at most `width`
-/// columns, counting exactly one column per char (matching the user-echo
-/// renderer, `insert_line_bg`). Breaks at the last space when a word
-/// would overflow; hard-breaks words longer than the line.
-fn wrap_chars(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
-    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut cur: Vec<(char, Style)> = Vec::new();
-    let mut last_space: Option<usize> = None; // index in `cur` of last ' '
-
-    for &(ch, style) in chars {
-        cur.push((ch, style));
-        if ch == ' ' {
-            last_space = Some(cur.len() - 1);
+/// Wrap styled graphemes by display columns, preserving indentation and
+/// breaking at a space when possible. Long unbroken text (including CJK)
+/// wraps without dropping characters.
+fn wrap_scrollback<'a>(
+    line: &'a Line<'a>,
+    width: usize,
+    base: Style,
+) -> Vec<Vec<(ratatui::text::StyledGrapheme<'a>, usize)>> {
+    use unicode_width::UnicodeWidthStr;
+    let mut rows = Vec::new();
+    let mut row = Vec::<(ratatui::text::StyledGrapheme<'a>, usize)>::new();
+    let mut used = 0;
+    for glyph in line.styled_graphemes(base) {
+        let columns = glyph.symbol.width();
+        if columns == 0 || glyph.symbol.chars().any(char::is_control) {
+            continue;
         }
-        if cur.len() > width {
-            match last_space {
-                // Break at the last space: keep the head, drop the space,
-                // carry the tail to the next row.
-                Some(sp) if sp > 0 => {
-                    let tail: Vec<(char, Style)> = cur.split_off(sp + 1);
-                    cur.pop(); // drop the trailing space
-                    rows.push(std::mem::take(&mut cur));
-                    cur = tail;
-                    last_space = cur.iter().rposition(|(c, _)| *c == ' ');
-                }
-                // No usable space — hard-break the over-long word.
-                _ => {
-                    let carried = cur.pop().unwrap();
-                    rows.push(std::mem::take(&mut cur));
-                    cur.push(carried);
-                    last_space = None;
-                }
+        if !row.is_empty() && used + columns > width {
+            if glyph.symbol == " " && row.iter().any(|(g, _)| g.symbol != " ") {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+                continue;
+            }
+            let split = row.iter().rposition(|(g, _)| g.symbol == " ");
+            if let Some(i) = split.filter(|&i| row[..i].iter().any(|(g, _)| g.symbol != " ")) {
+                let tail = row.split_off(i + 1);
+                row.pop();
+                rows.push(std::mem::replace(&mut row, tail));
+                used = row.iter().map(|(_, w)| w).sum();
+            }
+            if !row.is_empty() && used + columns > width {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
             }
         }
+        row.push((glyph, columns));
+        used += columns;
     }
-    if !cur.is_empty() {
-        rows.push(cur);
-    }
-    if rows.is_empty() {
-        rows.push(Vec::new());
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
     }
     rows
 }
@@ -8290,39 +8540,42 @@ fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> R
 }
 
 fn insert_line_bg_raw(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> Result<()> {
-    let spans: Vec<(String, Style)> = line
-        .spans
-        .iter()
-        .map(|s| (s.content.to_string(), s.style))
-        .collect();
-    term.insert_before(1, |buf: &mut Buffer| {
-        let mut col: u16 = 0;
-        let row: u16 = 0;
-        for (text, style) in &spans {
-            if col >= buf.area.width {
-                break;
-            }
-            let remaining = buf.area.width.saturating_sub(col);
-            let take = text.chars().take(remaining as usize).collect::<String>();
-            for (i, ch) in take.chars().enumerate() {
-                let x = col + i as u16;
-                if x < buf.area.width {
-                    if let Some(cell) = buf.cell_mut((x, row)) {
-                        cell.set_char(ch).set_style(*style);
+    term.autoresize()?;
+    let width = term.size()?.width.max(1);
+    let rows = wrap_scrollback(&line, usize::from(width), bg_style.unwrap_or_default());
+    // Bound each temporary buffer, not the amount of output displayed.
+    for chunk in rows.chunks(64) {
+        term.insert_before(chunk.len() as u16, |buf: &mut Buffer| {
+            for (y, row) in chunk.iter().enumerate() {
+                let y = y as u16;
+                let mut x = 0;
+                for (glyph, columns) in row {
+                    let end = x + columns;
+                    if end > usize::from(buf.area.width) {
+                        // A two-column glyph cannot fit in a one-column terminal.
+                        if let Some(cell) = buf.cell_mut((x as u16, y)) {
+                            cell.set_symbol("�").set_style(glyph.style);
+                            x += 1;
+                        }
+                        break;
+                    }
+                    buf[(x as u16, y)].set_symbol(glyph.symbol).set_style(glyph.style);
+                    // Inline insert_before draws every cell (not a buffer diff).
+                    // Printing a space here would overwrite the wide glyph's
+                    // second column. The glyph has already advanced the cursor.
+                    for continuation in x + 1..end {
+                        buf[(continuation as u16, y)].set_symbol("").set_style(glyph.style);
+                    }
+                    x = end;
+                }
+                if let Some(bg) = bg_style {
+                    for x in x as u16..buf.area.width {
+                        buf[(x, y)].set_style(bg);
                     }
                 }
             }
-            col += take.chars().count() as u16;
-        }
-        // Fill the rest of the row with bg_style (space char + style).
-        if let Some(bg) = bg_style {
-            for x in col..buf.area.width {
-                if let Some(cell) = buf.cell_mut((x, row)) {
-                    cell.set_char(' ').set_style(bg);
-                }
-            }
-        }
-    })?;
+        })?;
+    }
     Ok(())
 }
 
@@ -8437,6 +8690,22 @@ fn reset_strip_expanded_on_became_empty(app: &mut App, became_empty: bool) {
     }
 }
 
+/// What a background `/compact` reports back.
+#[derive(Debug)]
+struct CompactOutcome {
+    ran: bool,
+    before: usize,
+    after: usize,
+    usage: crate::event::Usage,
+    turn_count: u32,
+}
+
+/// Compaction is running (a manual `/compact`, or an automatic pass
+/// inside a turn): new input waits in `compact_queue` until it ends.
+fn compacting(app: &App) -> bool {
+    app.compact_task.is_some() || crate::agent::compact_progress::running()
+}
+
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // Is a dropdown overlay open? When one is, it claims the top 4 rows
     // and the input box collapses to a single content line. When none is
@@ -8454,6 +8723,8 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
     // When an overlay is open the overlay wins the top slack: the strip
     // collapses to its header line only, or hides entirely if there would
     // be under 5 slack rows left (keeps menus from ever shrinking).
+    let now = std::time::Instant::now();
+    let compact = if overlay_open { None } else { crate::agent::compact_progress::snapshot(now) };
     let strip_h: u16 = if app.agents_view.is_empty() {
         0
     } else if overlay_open {
@@ -8465,12 +8736,23 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         let base_slack = area.height.saturating_sub(1 + 3 + 2); // status + input + footer(2)
         if base_slack < OVERLAY_MIN_ROWS { 0 } else { 1 }
     } else {
-        agents_strip::strip_height(&app.agents_view, app.term_rows, app.agents_strip_expanded)
+        // Rows the dock grew by for the strip (see `wanted_dock_height`).
+        let extra = dock_extra(app, area);
+        let height = agents_strip::strip_height(&app.agents_view, app.term_rows, app.agents_strip_expanded) + extra;
+        if compact.is_some() {
+            height.min(area.height.saturating_sub(6 + super::compact_bar::HEIGHT))
+        } else {
+            height
+        }
     };
+    // The live compaction panel takes the top slack unless a menu does.
+    let compact_h = if compact.is_some() { super::compact_bar::HEIGHT as usize } else { 0 };
     let max_input_lines = if overlay_open {
         1
     } else {
-        MAX_INPUT_LINES.saturating_sub(strip_h as usize).max(1)
+        MAX_INPUT_LINES
+            .saturating_sub((strip_h.saturating_sub(dock_extra(app, area))) as usize + compact_h)
+            .max(1)
     };
     // Content width available for the input text: full dock width minus
     // the 2-column `> ` marker (the box has no left/right border). Wrap
@@ -8518,6 +8800,8 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         draw_menu(buf, chunks[0], m, "model");
     } else if let Some(m) = &app.palette {
         draw_palette(buf, chunks[0], m);
+    } else if let Some(p) = &compact {
+        super::compact_bar::draw(buf, chunks[0], p, now, &app.compact_queue);
     }
 
     // ── Status strip ─────────────────────────────────────────────
@@ -9348,15 +9632,6 @@ mod tests {
         assert!(text.contains("[agent a1 finished"), "{text}");
     }
 
-    /// Tabs must be expanded to spaces before we hand a line to
-    /// ratatui. Otherwise the terminal's own tab expansion paints
-    /// with default bg, tearing black holes in tool / skill cards
-    /// (see SCR-20260810-bfry.png).
-    fn as_strings(rows: &[Vec<(char, Style)>]) -> Vec<String> {
-        rows.iter()
-            .map(|r| r.iter().map(|(c, _)| *c).collect::<String>())
-            .collect()
-    }
 
     /// One flattened string per rendered `Line`, for assertions that
     /// don't care about per-span styling.
@@ -9519,42 +9794,35 @@ mod tests {
     }
 
     #[test]
-    fn wrap_chars_one_column_per_char() {
-        // CJK counts as ONE column here (unlike unicode-width), so a run
-        // of 5 chars fits in width 5 on a single row — no double-width gap.
-        let chars: Vec<(char, Style)> =
-            "你好世界吗".chars().map(|c| (c, Style::default())).collect();
-        let rows = wrap_chars(&chars, 5);
-        assert_eq!(as_strings(&rows), vec!["你好世界吗"]);
+    fn agent_reports_are_collapsed_and_other_messages_are_not() {
+        let mut report = String::from("[agent a6 finished: done] ---\nid: a6\nstate: done\nturns: 2\ntokens: 0\n---\n\n# Report\n\n## Summary\n\n");
+        for i in 0..30 {
+            report.push_str(&format!("- point {i}\n"));
+        }
+        let p = report_preview(&report, 80, "Ctrl+G");
+        assert_eq!(p.lines().next(), Some("[agent a6 finished: done]"));
+        assert!(p.lines().count() <= 5, "{p}");
+        assert!(p.contains("point 0") && !p.contains("point 29"), "{p}");
+        assert!(p.contains("Ctrl+G shows the full report"), "{p}");
+        assert!(!is_agent_report("[agent a1 is still working]"));
+        let marked = "[agent a2 finished: done] [plan 4]\n[progress 1/4]\nreal summary line\n";
+        let p = report_preview(marked, 80, "Ctrl+G");
+        assert!(!p.contains("[plan") && !p.contains("[progress") && p.contains("real summary line"), "{p}");
     }
 
     #[test]
-    fn wrap_chars_breaks_at_space() {
-        let chars: Vec<(char, Style)> = "hello world foo"
-            .chars()
-            .map(|c| (c, Style::default()))
-            .collect();
-        // width 11 → "hello world" fits (11), then "foo" wraps.
-        let rows = wrap_chars(&chars, 11);
-        assert_eq!(as_strings(&rows), vec!["hello world", "foo"]);
-    }
-
-    #[test]
-    fn wrap_chars_hard_breaks_long_word() {
-        let chars: Vec<(char, Style)> = "abcdefghij"
-            .chars()
-            .map(|c| (c, Style::default()))
-            .collect();
-        let rows = wrap_chars(&chars, 4);
-        assert_eq!(as_strings(&rows), vec!["abcd", "efgh", "ij"]);
-    }
-
-    #[test]
-    fn wrap_chars_preserves_leading_indent() {
-        let chars: Vec<(char, Style)> =
-            "    indented".chars().map(|c| (c, Style::default())).collect();
-        let rows = wrap_chars(&chars, 80);
-        assert_eq!(as_strings(&rows), vec!["    indented"]);
+    fn scrollback_wraps_by_display_width() {
+        let wrap = |text: &str, width| {
+            let line = Line::raw(text);
+            wrap_scrollback(&line, width, Style::default()).iter()
+                .map(|row| row.iter().map(|(g, _)| g.symbol).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(wrap("你好世界吗", 5), ["你好", "世界", "吗"]);
+        assert_eq!(wrap("e\u{301}好!", 3), ["e\u{301}好", "!"]);
+        assert_eq!(wrap("hello world foo", 11), ["hello world", "foo"]);
+        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("    indented", 80), ["    indented"]);
     }
 
     #[test]
@@ -11350,14 +11618,14 @@ mod tests {
         let all = rows.join("\n");
         assert!(all.contains("● main"), "{all}");
         assert!(all.contains("2 agents working"), "{all}");
-        assert!(all.contains("○ alpha"), "{all}");
-        assert!(all.contains("○ bravo"), "{all}");
+        assert!(all.contains(" alpha"), "{all}");
+        assert!(all.contains("◌ bravo"), "queued agents get the dim pulse: {all}");
         // The strip sits under the footer: `● main` comes after the input
         // box and the last dock row is an agent row.
         let main_idx = rows.iter().position(|r| r.contains("● main")).unwrap();
         let input_idx = rows.iter().position(|r| r.starts_with("> ")).unwrap();
         assert!(main_idx > input_idx + 2, "strip must be below the footer: {rows:#?}");
-        assert!(rows.last().unwrap().starts_with("○ "), "{rows:#?}");
+        assert!(rows.last().unwrap().contains("bravo"), "{rows:#?}");
     }
 
     #[test]

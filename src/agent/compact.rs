@@ -302,7 +302,10 @@ pub async fn summarize_via_provider(
         let mut usage = Usage::default();
         while let Some(ev) = rx.recv().await {
             match ev {
-                AgentEvent::TextDelta { text: t, .. } => text.push_str(&t),
+                AgentEvent::TextDelta { text: t, .. } => {
+                    crate::agent::compact_progress::push(&t);
+                    text.push_str(&t);
+                }
                 // The summarization call's own billed usage — this is
                 // what actually costs money to run compaction, as
                 // opposed to `chars_before`/`chars_after` which
@@ -385,6 +388,7 @@ pub async fn compact(ctx: &mut Context, provider: &dyn Provider) -> Option<Compa
             ),
         };
 
+    crate::agent::compact_progress::rebuilding();
     let kept: Vec<ContextMessage> = ctx.messages.drain(cut..).collect();
     ctx.messages.clear();
     ctx.messages.push(ContextMessage::User {

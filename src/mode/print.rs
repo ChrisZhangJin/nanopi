@@ -390,6 +390,7 @@ pub async fn run_print_mode(
     // WR-05: the brief is read once; the same content seeds both the
     // task text and the first watcher's amendment baseline.
     let mut brief_content: Option<String> = None;
+    let mut progress = None;
     let task = match &brief_path {
         Some(p) => match std::fs::read_to_string(p) {
             Ok(b) => {
@@ -398,8 +399,19 @@ pub async fn run_print_mode(
                 } else {
                     format!("{b}\n\n{message}")
                 };
+                let steps = crate::agent::steps::task_steps(&b);
                 brief_content = Some(b);
-                t
+                match p.parent() {
+                    Some(dir) => {
+                        progress = Some(crate::agent::steps::Reporter::new(dir, steps.len()));
+                        if steps.is_empty() {
+                            t + &crate::agent::steps::plan_instruction()
+                        } else {
+                            t + &crate::agent::steps::progress_instruction(steps.len())
+                        }
+                    }
+                    None => t,
+                }
             }
             // WR-01: an unreadable brief is fatal — never run an empty task.
             Err(e) => {
@@ -664,6 +676,13 @@ pub async fn run_print_mode(
         None
     };
     while let Some(ev) = rx.recv().await {
+        if let Some(progress) = &mut progress {
+            match &ev {
+                AgentEvent::TextDelta { text, .. } => progress.push(text),
+                AgentEvent::Done { .. } => progress.end_line(),
+                _ => {}
+            }
+        }
         if output == OutputFormat::Text {
             if let Some(mut s) = spinner.take() {
                 if stops_spinner(&ev) {

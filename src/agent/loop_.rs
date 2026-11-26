@@ -631,14 +631,15 @@ impl Agent {
         // way for a hook author to tell that pair apart from a crash
         // mid-compaction. The duplicated boundary scan is a walk over
         // the message list; the honesty is worth it.
-        if crate::agent::compact::find_compact_boundary(
+        let Some(cut) = crate::agent::compact::find_compact_boundary(
             &self.context.messages,
             crate::agent::compact::KEEP_RECENT_TOKENS,
-        )
-        .is_none()
-        {
+        ) else {
             return false;
-        }
+        };
+        // Live progress for the UI (`compact_progress`): from here until
+        // the pass finishes, the TUI shows the bar and holds new input.
+        let _pass = crate::agent::compact_progress::begin(reason, cut, self.context.estimate_chars());
 
         // ── SessionBeforeCompact hook (v0.11.0) ──────────────────
         // Advisory only — fires before compaction runs. `subject`
@@ -684,6 +685,7 @@ impl Agent {
         // The boundary was there a moment ago and nothing has touched
         // the context since, so this is not expected to be None.
         let Some(result) = compact(&mut self.context, self.provider.as_ref()).await else {
+            crate::agent::compact_progress::abandon();
             return false;
         };
 
@@ -739,6 +741,7 @@ impl Agent {
                 replaced_count: result.replaced_count,
             },
         );
+        crate::agent::compact_progress::finish(result.chars_after, result.used_llm);
         true
     }
 

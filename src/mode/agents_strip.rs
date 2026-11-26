@@ -23,6 +23,10 @@ use crate::agent_registry::{AgentEntry, AgentState};
 const TRANSCRIPT_THROTTLE_SECS: u64 = 1;
 /// Read at most the last 64 KiB of `transcript.jsonl` (T-05-02).
 const TRANSCRIPT_TAIL_BYTES: u64 = 64 * 1024;
+/// How long the progress bar takes to glide to a newly reported step.
+const EASE_MS: f64 = 700.0;
+/// Progress bar width in the live strip.
+const BAR_W: usize = 12;
 /// Keep the last N tool_call entries as the activity log.
 const ACTIVITY_LINES: usize = 3;
 
@@ -106,6 +110,16 @@ pub struct AgentInfo {
     pub report_path: PathBuf,
     pub report_exists: bool,
     pub dir: PathBuf,
+    steps: Vec<String>,
+    steps_done: usize,
+    /// Step count the agent declared itself (`[plan N]`) when the brief
+    /// has no step list.
+    planned: usize,
+    /// Fraction shown when `steps_done` last changed, and when: the bar
+    /// eases from there to the new value instead of jumping.
+    ease_from: f64,
+    ease_at: Option<Instant>,
+    pid: Option<u32>,
     last_activity_read: Option<Instant>,
     last_state_for_reread: AgentState,
 }
@@ -127,6 +141,12 @@ impl AgentInfo {
             report_path: entry.dir.join("report.md"),
             report_exists: false,
             dir: entry.dir.clone(),
+            steps: Vec::new(),
+            steps_done: 0,
+            planned: 0,
+            ease_from: 0.0,
+            ease_at: None,
+            pid: entry.pid,
             last_activity_read: None,
             last_state_for_reread: entry.state,
         };
@@ -136,6 +156,7 @@ impl AgentInfo {
 
     fn reread_brief_and_report(&mut self) {
         let brief = std::fs::read_to_string(self.dir.join("brief.md")).unwrap_or_default();
+        self.steps = crate::agent::steps::task_steps(&brief);
         self.role = front_matter_get(&brief, "role").map(|s| sanitize(&s));
         let label = front_matter_get(&brief, "label")
             .filter(|s| !s.trim().is_empty() && s != "(none)");
@@ -163,8 +184,47 @@ impl AgentInfo {
         }
     }
 
+    /// Steps to measure progress against: the brief's list, else the
+    /// agent's own declared plan; 0 when neither is known.
+    pub fn total_steps(&self) -> usize {
+        if self.steps.is_empty() { self.planned } else { self.steps.len() }
+    }
+
+    /// The bar's fill at `now`: the reported fraction, eased (cubic out,
+    /// [`EASE_MS`]) from where it stood when the last step was reported.
+    /// `None` while there is no step count to measure against.
+    pub fn shown_fraction(&self, now: Instant) -> Option<f64> {
+        let total = self.total_steps();
+        if total == 0 {
+            return None;
+        }
+        let target = self.steps_done.min(total) as f64 / total as f64;
+        let Some(at) = self.ease_at else {
+            return Some(target);
+        };
+        let t = (now.saturating_duration_since(at).as_millis() as f64 / EASE_MS).min(1.0);
+        let e = 1.0 - (1.0 - t).powi(3);
+        Some(self.ease_from + (target - self.ease_from) * e)
+    }
+
     fn reread_activity(&mut self, now: Instant) {
         self.activity = tail_activity(&self.dir.join("transcript.jsonl"));
+        if let Some(pid) = self.pid {
+            let path = crate::agent::steps::progress_path(&self.dir, pid);
+            let mut state = String::new();
+            if std::fs::File::open(path).and_then(|f| f.take(32).read_to_string(&mut state)).is_ok() {
+                if let Some((done, total)) = crate::agent::steps::parse_state(&state) {
+                    if self.steps.is_empty() {
+                        self.planned = total;
+                    }
+                    if total == self.total_steps() && done > self.steps_done {
+                        self.ease_from = self.shown_fraction(now).unwrap_or(0.0);
+                        self.ease_at = Some(now);
+                        self.steps_done = done;
+                    }
+                }
+            }
+        }
         self.last_activity_read = Some(now);
     }
 }
@@ -316,6 +376,14 @@ impl AgentsView {
             if let Some(info) = self.agents.iter_mut().find(|a| a.id == entry.id) {
                 let state_changed = info.last_state_for_reread != entry.state;
                 info.state = entry.state;
+                if info.pid != entry.pid {
+                    info.pid = entry.pid;
+                    info.steps_done = 0;
+                    info.planned = 0;
+                    info.ease_from = 0.0;
+                    info.ease_at = None;
+                    info.last_activity_read = None;
+                }
                 if state_changed {
                     if entry.state.is_terminal() && info.finished_seen.is_none() {
                         info.finished_seen = Some(now);
@@ -409,6 +477,16 @@ pub fn strip_height(view: &AgentsView, term_rows: u16, _expanded: bool) -> u16 {
     1 + (view.len().min(3) as u16)
 }
 
+/// Rows the strip wants when it has room to breathe: a blank row above
+/// the `main` row and above every agent row. The TUI grows its dock by
+/// the difference to [`strip_height`] when the terminal is tall enough.
+pub fn spaced_strip_height(view: &AgentsView) -> u16 {
+    if view.is_empty() {
+        return 0;
+    }
+    2 + 2 * collapsed_rows(view).len() as u16
+}
+
 /// Rendering options independent of the cached data itself.
 #[derive(Debug, Clone)]
 pub struct StripOpts {
@@ -492,7 +570,22 @@ fn agent_line(info: &AgentInfo, name_w: usize, width: usize, now: Instant) -> St
     } else {
         format!("{WORKER_GLYPH} {name}{name_pad}  {}", status_text(info))
     };
-    pad_line(&left, &format!(" {elapsed}"), width)
+    let total = info.total_steps();
+    let meter = if total == 0 || width < 24 {
+        String::new()
+    } else if width < 45 {
+        format!(" {}/{total}", info.steps_done)
+    } else {
+        // Eighths for a smooth leading edge.
+        let units = 64 * info.steps_done / total;
+        let mut bar = "█".repeat(units / 8);
+        if units % 8 > 0 {
+            bar.push_str(["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][units % 8]);
+        }
+        let cells = bar.chars().count();
+        format!(" {bar}{} {}/{total}", "░".repeat(8 - cells), info.steps_done)
+    };
+    pad_line(&left, &format!("{meter} {elapsed}"), width)
 }
 
 /// The orchestrator's own row: `● main` plus a dim summary of how many
@@ -524,6 +617,16 @@ pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> V
     let mut out = Vec::new();
     for info in ordered_agents(view) {
         out.push(agent_line(info, name_w, width, now));
+        for (index, step) in info.steps.iter().enumerate() {
+            let mark = if index < info.steps_done { "✓" } else { "○" };
+            out.push(truncate_to_width(&format!("  {mark} {}. {}", index + 1, sanitize(step)), width));
+        }
+        if info.steps.is_empty() && info.planned > 0 {
+            out.push(truncate_to_width(
+                &format!("  progress {}/{} steps (the agent's own plan)", info.steps_done, info.planned),
+                width,
+            ));
+        }
         for act in &info.activity {
             out.push(truncate_to_width(&format!("  {act}"), width));
         }
@@ -546,27 +649,104 @@ pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> V
     out
 }
 
+fn spinner_color(phase: usize) -> Color {
+    const RAMP: [u8; 8] = [51, 45, 39, 33, 63, 99, 135, 171];
+    Color::Indexed(RAMP[phase % RAMP.len()])
+}
+
+/// One live agent row, styled and animated from `now`:
+/// ` ⠹ name      ▕██████▊░░░░░▏ 3/5   bash cargo test      1m05s`
+/// The bar is dropped below 70 columns (the count stays), the count
+/// below 45, the activity below 40.
+fn agent_row<'a>(info: &AgentInfo, name_w: usize, width: usize, now: Instant, index: usize) -> ratatui::text::Line<'a> {
+    use ratatui::style::Modifier;
+    use ratatui::text::Span;
+    let ms = now.saturating_duration_since(info.started).as_millis();
+    let dim = Style::default().fg(Color::DarkGray);
+    let (glyph, glyph_style) = match info.state {
+        AgentState::Running => {
+            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let f = (ms / 80) as usize + index * 3;
+            (FRAMES[f % FRAMES.len()], Style::default().fg(spinner_color((ms / 160) as usize + index)).add_modifier(Modifier::BOLD))
+        }
+        AgentState::Queued => ("◌", Style::default().fg(if (ms / 600) % 2 == 0 { Color::Gray } else { Color::DarkGray })),
+        AgentState::Failed => ("✗", Style::default().fg(Color::Red)),
+        other => (glyph_for(other), style_for_state(other)),
+    };
+    let elapsed = format!(" {}", format_elapsed(elapsed_secs_for(info, now)));
+    let name = truncate_to_width(&display_name(info), name_w);
+    let pad = " ".repeat(name_w.saturating_sub(display_width(&name)));
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+        Span::styled(format!("{name}{pad}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+    ];
+    let total = info.total_steps();
+    let frac = info.shown_fraction(now);
+    if width >= 70 {
+        spans.push(Span::raw("  "));
+        let edge = Style::default().fg(Color::Indexed(238));
+        spans.push(Span::styled("▕", edge));
+        let cells = match info.state {
+            AgentState::Running => crate::mode::compact_bar::bar_cells(BAR_W, frac, false, ms),
+            _ => crate::mode::compact_bar::bar_cells(BAR_W, Some(frac.unwrap_or(0.0)), false, 0),
+        };
+        for (sym, st) in cells {
+            spans.push(Span::styled(sym, st));
+        }
+        spans.push(Span::styled("▏", edge));
+    }
+    if width >= 45 {
+        let label = match (info.state, total) {
+            (AgentState::Queued, _) => " queued".to_string(),
+            (_, 0) => " plan…".to_string(),
+            _ => format!(" {}/{total}", info.steps_done.min(total)),
+        };
+        let st = if total > 0 { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { dim };
+        spans.push(Span::styled(format!("{label:<6}"), st));
+    }
+    if width >= 40 && info.state != AgentState::Queued {
+        let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+        let room = width.saturating_sub(used + 2 + display_width(&elapsed) + 1);
+        if room >= 6 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(truncate_to_width(&status_text(info), room), Style::default().fg(Color::Gray)));
+        }
+    }
+    let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+    if used + display_width(&elapsed) <= width {
+        spans.push(Span::raw(" ".repeat(width - used - display_width(&elapsed))));
+        spans.push(Span::styled(elapsed, dim));
+    }
+    ratatui::text::Line::from(spans)
+}
+
 /// Pure draw function: writes the `● main` row and one row per agent
 /// into `buf` at `area`. Reads only in-memory cached data from `view`;
 /// never touches the filesystem (UI-04). Calling twice with the same
-/// `view`/`opts` yields an identical buffer.
+/// `view`/`opts` yields an identical buffer. When `area` is as tall as
+/// [`spaced_strip_height`], every row gets a blank row above it.
 pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: &StripOpts) {
     if view.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
     let width = area.width as usize;
+    let spaced = opts.term_rows >= 15 && area.height >= spaced_strip_height(view);
+    let step: u16 = if spaced { 2 } else { 1 };
+    let top = area.y + u16::from(spaced);
 
     let (main, hint) = main_line(view, opts);
     let main = truncate_to_width(&main, width);
     buf.set_string(
         area.x,
-        area.y,
+        top,
         &main,
         Style::default().fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD),
     );
     let hint_x = display_width(&main);
     let hint = truncate_to_width(&hint, width.saturating_sub(hint_x));
-    buf.set_string(area.x + hint_x as u16, area.y, &hint, Style::default().fg(Color::DarkGray));
+    buf.set_string(area.x + hint_x as u16, top, &hint, Style::default().fg(Color::DarkGray));
 
     if opts.term_rows < 15 || area.height < 2 {
         return;
@@ -580,17 +760,16 @@ pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: 
         StripRow::More { .. } => None,
     }));
     for (i, row) in rows.iter().enumerate() {
-        let y = area.y + 1 + i as u16;
+        let y = top + step * (i as u16 + 1);
         if y >= area.y + area.height {
             break;
         }
         match row {
             StripRow::Agent(info) => {
-                let line = agent_line(info, name_w, width, opts.now);
-                buf.set_string(area.x, y, &line, style_for_state(info.state));
+                buf.set_line(area.x, y, &agent_row(info, name_w, width, opts.now, i), area.width);
             }
             StripRow::More { count, running } => {
-                let text = truncate_to_width(&format!("{WORKER_GLYPH} +{count} more ({running} running)"), width);
+                let text = truncate_to_width(&format!(" {WORKER_GLYPH} +{count} more ({running} running)"), width);
                 buf.set_string(area.x, y, &text, Style::default().fg(Color::DarkGray));
             }
         }
@@ -609,6 +788,76 @@ mod tests {
 
     fn tmp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A running agent's progress shows on its row: from the brief's
+    /// step list, or from the plan the agent declared itself.
+    #[test]
+    fn running_agent_row_shows_reported_progress() {
+        let now = Instant::now();
+        let d = tmp_dir();
+        std::fs::write(d.path().join("brief.md"), "---\nid: a1\nlabel: list_calls\n---\n\n# Brief\n\n## Task\n\nfix it in prose\n\n## Role\n\n(default)\n").unwrap();
+        let mut e = entry("a1", AgentState::Running, now, d.path().to_path_buf());
+        e.pid = Some(4242);
+        let mut view = AgentsView::new();
+        view.refresh(&[e.clone()], now);
+        let line = agent_line(&view.agents()[0], 10, 100, now);
+        assert!(!line.contains('░'), "no plan yet, no bar: {line}");
+        std::fs::write(crate::agent::steps::progress_path(d.path(), 4242), "1/4").unwrap();
+        view.refresh(&[e.clone()], now + std::time::Duration::from_secs(2));
+        let line = agent_line(&view.agents()[0], 10, 100, now);
+        assert!(line.contains("██░░░░░░ 1/4"), "{line}");
+        let detail = expanded_detail_lines(&view, 100, now).join("\n");
+        assert!(detail.contains("progress 1/4 steps"), "{detail}");
+    }
+
+    fn strip_text(buf: &Buffer) -> Vec<String> {
+        let a = buf.area;
+        (a.y..a.y + a.height).map(|y| (a.x..a.x + a.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
+    }
+
+    /// With room, every row gets a blank row above it; the running row
+    /// animates (spinner, bar) and the bar glides to a new step.
+    #[test]
+    fn spaced_strip_breathes_and_animates() {
+        let t0 = Instant::now();
+        let d = tmp_dir();
+        std::fs::write(d.path().join("brief.md"), "---\nid: a1\nlabel: list_calls\n---\n\n# Brief\n\n## Task\n\n1. read\n2. fix\n3. test\n4. report\n\n## Role\n\n(default)\n").unwrap();
+        let mut e = entry("a1", AgentState::Running, t0, d.path().to_path_buf());
+        e.pid = Some(777);
+        std::fs::write(crate::agent::steps::progress_path(d.path(), 777), "1/4").unwrap();
+        let mut view = AgentsView::new();
+        view.refresh(&[e.clone()], t0);
+        assert_eq!(spaced_strip_height(&view), 4);
+        let draw = |now: Instant| {
+            let area = Rect::new(0, 0, 100, 4);
+            let mut buf = Buffer::empty(area);
+            let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now };
+            draw_agents_strip(&mut buf, area, &view, &opts);
+            strip_text(&buf)
+        };
+        let rows = draw(t0);
+        assert!(rows[0].trim().is_empty() && rows[2].trim().is_empty(), "{rows:#?}");
+        assert!(rows[1].starts_with("● main"), "{rows:#?}");
+        assert!(rows[3].contains("list_calls") && rows[3].contains("▕") && rows[3].contains("1/4"), "{rows:#?}");
+        assert_ne!(draw(t0 + std::time::Duration::from_millis(400))[3], rows[3], "the row animates");
+
+        // The next step glides in rather than jumping.
+        std::fs::write(crate::agent::steps::progress_path(d.path(), 777), "3/4").unwrap();
+        let t1 = t0 + std::time::Duration::from_secs(2);
+        view.refresh(&[e.clone()], t1);
+        let info = &view.agents()[0];
+        assert_eq!(info.shown_fraction(t1), Some(0.25));
+        let mid = info.shown_fraction(t1 + std::time::Duration::from_millis(200)).unwrap();
+        assert!(0.25 < mid && mid < 0.75, "{mid}");
+        assert_eq!(info.shown_fraction(t1 + std::time::Duration::from_secs(1)), Some(0.75));
+        // A short area keeps the compact layout.
+        let area = Rect::new(0, 0, 100, 2);
+        let mut buf = Buffer::empty(area);
+        let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now: t1 };
+        draw_agents_strip(&mut buf, area, &view, &opts);
+        let rows = strip_text(&buf);
+        assert!(rows[0].starts_with("● main") && rows[1].contains("list_calls"), "{rows:#?}");
     }
 
     #[test]
@@ -756,7 +1005,7 @@ mod tests {
         let row = |y: u16| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
         assert!(row(0).starts_with("● main"), "{:?}", row(0));
         assert!(row(0).contains("1 agent working · Ctrl+G details"), "{:?}", row(0));
-        assert!(row(1).starts_with("○ #a"), "{:?}", row(1));
+        assert!(row(1).contains(" #a"), "{:?}", row(1));
     }
 
     /// The collapsed strip draws at most 2 agents plus a `+N more`
@@ -808,9 +1057,9 @@ mod tests {
         let all = (0..area.height).map(row).collect::<Vec<_>>().join("\n");
         assert!(!all.contains("a-really-long-hidden-name"), "{all}");
         // ...so it must not push the status column rightwards either.
-        // `○ x` is 3 columns, then the 2-space gap: status at col 5.
+        // ` ⠋ x` is 4 columns, then the 2-space gap: the bar at col 6.
         assert!(
-            row(1).starts_with("○ x  starting…"),
+            row(1).starts_with(" ⠋ x  ▕"),
             "status column padded by an unseen name: {:?}",
             row(1)
         );

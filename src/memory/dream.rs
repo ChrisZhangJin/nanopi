@@ -46,7 +46,7 @@ pub(crate) fn plan(args: &str, endpoint: &str, model: &str) -> Result<DreamPlan>
         ["status"] => Ok(DreamPlan::Print(status(&store, endpoint))),
         ["log"] => Ok(DreamPlan::Print(
             read_limited(&store.root.join("dream-log.md"), 1024 * 1024)
-                .map(|s| tail(&s, 80))
+                .map(|s| localize_log_headings(&tail(&s, 80), &chrono::Local))
                 .unwrap_or_else(|_| "no Dream runs yet".into()),
         )),
         [] => Ok(DreamPlan::Run(DreamOpts { since: None })),
@@ -82,6 +82,27 @@ fn tail(s: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+/// Render a stored timestamp without changing its on-disk UTC format.
+fn display_time(timestamp: &str, tz: &impl chrono::TimeZone) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|t| t.with_timezone(tz).fixed_offset().format("%Y-%m-%d %H:%M:%S %:z").to_string())
+        .unwrap_or_else(|_| timestamp.to_owned())
+}
+
+/// Convert only the timestamp in a Dream run heading, not text saved in
+/// summaries, reasons or other log entries.
+fn localize_log_headings(log: &str, tz: &impl chrono::TimeZone) -> String {
+    log.lines().map(|line| {
+        for prefix in ["## Dream ", "## Scheduled Dream "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let (timestamp, suffix) = rest.split_at(rest.find(' ').unwrap_or(rest.len()));
+                return format!("{prefix}{}{suffix}", display_time(timestamp, tz));
+            }
+        }
+        line.to_owned()
+    }).collect::<Vec<_>>().join("\n")
+}
+
 fn status(store: &Store, endpoint: &str) -> String {
     let st = store.state();
     let notes = store.daily_notes();
@@ -89,7 +110,7 @@ fn status(store: &Store, endpoint: &str) -> String {
     let mut s = String::new();
     match &st.last_run {
         Some(r) => {
-            let _ = writeln!(s, "last Dream: {} · {} · model {} at {}", r.at, r.result, r.model, r.endpoint);
+            let _ = writeln!(s, "last Dream: {} · {} · model {} at {}", display_time(&r.at, &chrono::Local), r.result, r.model, r.endpoint);
             let _ = writeln!(s, "  range {} · {} model calls · {} data bytes · {} notes processed · {} withheld by disclosure", r.range, r.calls, r.input_bytes, r.notes_processed, r.withheld);
             if let Some(f) = &r.failure {
                 let _ = writeln!(s, "  failure: {f}");
@@ -566,4 +587,21 @@ fn set_meta(raw: &str, key: &str, value: &str) -> Result<String> {
         None => lines.push(line),
     }
     Ok(format!("---\n{}{}", lines.join("\n"), &rest[end..]))
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn displays_local_offset_without_changing_log_body() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let utc = "2026-11-23T15:19:16Z";
+        let local = "2026-11-23 23:19:16 +08:00";
+        assert_eq!(display_time(utc, &tz), local);
+        assert_eq!(display_time("unknown", &tz), "unknown");
+        let log = format!("## Dream {utc} · unprocessed notes\n- summary mentions {utc}\n## Scheduled Dream {utc}\n- paused");
+        assert_eq!(localize_log_headings(&log, &tz),
+            format!("## Dream {local} · unprocessed notes\n- summary mentions {utc}\n## Scheduled Dream {local}\n- paused"));
+    }
 }

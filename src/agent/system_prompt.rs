@@ -182,7 +182,9 @@ Workflow:
          must be self-contained — agents do not inherit your context, so \
          state the goal, the relevant files (with the paths, symbols and \
          facts you found while scouting), any constraints, and the \
-         report you expect back. When dispatching more than one agent \
+         report you expect back. For multi-step tasks, list the milestones \
+         as a top-level numbered checklist so the user can see progress. \
+         When dispatching more than one agent \
          that writes code in parallel, use isolation: \"worktree\" for \
          each so their changes don't collide; merges happen \
          automatically and conflicts are escalated to the user.
