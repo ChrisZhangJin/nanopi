@@ -89,6 +89,7 @@ fn describe_entry(dir: &Path, id: &str, state: &str, elapsed_secs: u64) -> Value
     let mut entry = json!({
         "id": id,
         "description": description,
+        "name": front_matter_get(&brief, "name"),
         "state": state,
         "elapsed_secs": elapsed_secs,
         "turns": turns,
@@ -365,6 +366,7 @@ mod tests {
                 label: label.map(str::to_string),
                 worktree: None,
                 branch: None,
+                name: None,
             },
         );
         std::fs::write(dir.join("brief.md"), brief).unwrap();

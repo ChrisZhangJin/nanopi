@@ -102,6 +102,8 @@ pub struct AgentInfo {
     pub finished_seen: Option<Instant>,
     pub role: Option<String>,
     pub description: String,
+    /// The brief's `name:` (`agent::names`): who the user knows it as.
+    pub codename: Option<String>,
     pub activity: Vec<String>,
     pub turns: Option<String>,
     pub tokens: Option<String>,
@@ -133,6 +135,7 @@ impl AgentInfo {
             finished_seen: if entry.state.is_terminal() { Some(now) } else { None },
             role: None,
             description: String::new(),
+            codename: None,
             activity: Vec::new(),
             turns: None,
             tokens: None,
@@ -166,6 +169,9 @@ impl AgentInfo {
                 .unwrap_or_else(|| self.role.clone().unwrap_or_default())
         });
         self.description = sanitize(&description);
+        self.codename = front_matter_get(&brief, "name")
+            .map(|s| sanitize(&s))
+            .filter(|s| !s.trim().is_empty() && s != "(none)");
 
         self.report_path = self.dir.join("report.md");
         let report = std::fs::read_to_string(&self.report_path).ok();
@@ -494,6 +500,9 @@ pub struct StripOpts {
     pub term_rows: u16,
     pub toggle_key_label: String,
     pub now: Instant,
+    /// The shared agent status check, e.g. `⊙ next check 30s`; shown in
+    /// the header row.
+    pub watch: Option<String>,
 }
 
 fn style_for_state(state: AgentState) -> Style {
@@ -565,10 +574,11 @@ fn agent_line(info: &AgentInfo, name_w: usize, width: usize, now: Instant) -> St
     let elapsed = format_elapsed(elapsed_secs_for(info, now));
     let name = truncate_to_width(&display_name(info), name_w);
     let name_pad = " ".repeat(name_w.saturating_sub(display_width(&name)));
+    let who = info.codename.as_deref().map(|c| format!("{c} ({}) ", info.id)).unwrap_or_default();
     let left = if width < 40 {
-        format!("{WORKER_GLYPH} {name}")
+        format!("{WORKER_GLYPH} {who}{name}")
     } else {
-        format!("{WORKER_GLYPH} {name}{name_pad}  {}", status_text(info))
+        format!("{WORKER_GLYPH} {who}{name}{name_pad}  {}", status_text(info))
     };
     let total = info.total_steps();
     let meter = if total == 0 || width < 24 {
@@ -588,13 +598,15 @@ fn agent_line(info: &AgentInfo, name_w: usize, width: usize, now: Instant) -> St
     pad_line(&left, &format!("{meter} {elapsed}"), width)
 }
 
-/// The orchestrator's own row: `● main` plus a dim summary of how many
+/// The orchestrator's own row: `● agents` plus a dim summary of how many
 /// agents it is waiting on and the details key.
+/// The header row: what the rows below are, how many are working, the
+/// shared status check, and the details key.
 fn main_line(view: &AgentsView, opts: &StripOpts) -> (String, String) {
     let n = view.len();
-    let noun = if n == 1 { "agent" } else { "agents" };
-    let hint = format!("  {n} {noun} working · {} details", opts.toggle_key_label);
-    (format!("{MAIN_GLYPH} main"), hint)
+    let watch = opts.watch.as_deref().map(|w| format!(" · {w}")).unwrap_or_default();
+    let hint = format!("  {n} working{watch} · {} details", opts.toggle_key_label);
+    (format!("{MAIN_GLYPH} agents"), hint)
 }
 
 fn pad_line(left: &str, right: &str, width: usize) -> String {
@@ -649,6 +661,22 @@ pub fn expanded_detail_lines(view: &AgentsView, width: usize, now: Instant) -> V
     out
 }
 
+/// Each agent row's name colour, by position, so names are told apart
+/// at a glance.
+fn name_color(index: usize) -> Color {
+    const NAMES: [u8; 6] = [117, 183, 150, 216, 152, 225];
+    Color::Indexed(NAMES[index % NAMES.len()])
+}
+
+/// Width of the name column: the widest agent name (or id) drawn.
+fn who_column_width<'a>(agents: impl Iterator<Item = &'a AgentInfo>) -> usize {
+    agents
+        .map(|a| display_width(a.codename.as_deref().unwrap_or(&a.id)))
+        .max()
+        .unwrap_or(0)
+        .min(14)
+}
+
 fn spinner_color(phase: usize) -> Color {
     const RAMP: [u8; 8] = [51, 45, 39, 33, 63, 99, 135, 171];
     Color::Indexed(RAMP[phase % RAMP.len()])
@@ -658,7 +686,7 @@ fn spinner_color(phase: usize) -> Color {
 /// ` ⠹ name      ▕██████▊░░░░░▏ 3/5   bash cargo test      1m05s`
 /// The bar is dropped below 70 columns (the count stays), the count
 /// below 45, the activity below 40.
-fn agent_row<'a>(info: &AgentInfo, name_w: usize, width: usize, now: Instant, index: usize) -> ratatui::text::Line<'a> {
+fn agent_row<'a>(info: &AgentInfo, who_w: usize, name_w: usize, width: usize, now: Instant, index: usize) -> ratatui::text::Line<'a> {
     use ratatui::style::Modifier;
     use ratatui::text::Span;
     let ms = now.saturating_duration_since(info.started).as_millis();
@@ -674,8 +702,13 @@ fn agent_row<'a>(info: &AgentInfo, name_w: usize, width: usize, now: Instant, in
         other => (glyph_for(other), style_for_state(other)),
     };
     let elapsed = format!(" {}", format_elapsed(elapsed_secs_for(info, now)));
-    // The id always leads (it is what `/agents show`, the panel and the
-    // reports use); the label follows when there is one.
+    // Who: the agent's name in its own colour, its id dim beside it
+    // (the id is what tools, reports and `/agents show` use). Then the
+    // task label.
+    let who = info.codename.clone().unwrap_or_else(|| info.id.clone());
+    let who = truncate_to_width(&who, who_w);
+    let who_pad = " ".repeat(who_w.saturating_sub(display_width(&who)));
+    let id_tag = if info.codename.is_some() { format!(" {:<3}", info.id) } else { String::new() };
     let label = if info.description.trim().is_empty() { String::new() } else { info.description.clone() };
     let name = truncate_to_width(&label, name_w);
     let pad = " ".repeat(name_w.saturating_sub(display_width(&name)));
@@ -683,8 +716,9 @@ fn agent_row<'a>(info: &AgentInfo, name_w: usize, width: usize, now: Instant, in
         Span::raw(" "),
         Span::styled(glyph, glyph_style),
         Span::raw(" "),
-        Span::styled(format!("{:<3} ", info.id), Style::default().fg(Color::Cyan)),
-        Span::styled(format!("{name}{pad}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{who}{who_pad}"), Style::default().fg(name_color(index)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{id_tag} "), dim),
+        Span::styled(format!("{name}{pad}"), Style::default().fg(Color::White)),
     ];
     let total = info.total_steps();
     let frac = info.shown_fraction(now);
@@ -726,7 +760,7 @@ fn agent_row<'a>(info: &AgentInfo, name_w: usize, width: usize, now: Instant, in
     ratatui::text::Line::from(spans)
 }
 
-/// Pure draw function: writes the `● main` row and one row per agent
+/// Pure draw function: writes the `● agents` row and one row per agent
 /// into `buf` at `area`. Reads only in-memory cached data from `view`;
 /// never touches the filesystem (UI-04). Calling twice with the same
 /// `view`/`opts` yields an identical buffer. When `area` is as tall as
@@ -759,10 +793,12 @@ pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: 
     // Measure only the agents that actually get a row — see
     // `name_column_width`.
     let rows = collapsed_rows(view);
-    let name_w = name_column_width(rows.iter().filter_map(|r| match r {
+    let drawn = || rows.iter().filter_map(|r| match r {
         StripRow::Agent(info) => Some(*info),
         StripRow::More { .. } => None,
-    }));
+    });
+    let name_w = name_column_width(drawn());
+    let who_w = who_column_width(drawn());
     for (i, row) in rows.iter().enumerate() {
         let y = top + step * (i as u16 + 1);
         if y >= area.y + area.height {
@@ -770,7 +806,7 @@ pub fn draw_agents_strip(buf: &mut Buffer, area: Rect, view: &AgentsView, opts: 
         }
         match row {
             StripRow::Agent(info) => {
-                buf.set_line(area.x, y, &agent_row(info, name_w, width, opts.now, i), area.width);
+                buf.set_line(area.x, y, &agent_row(info, who_w, name_w, width, opts.now, i), area.width);
             }
             StripRow::More { count, running } => {
                 let text = truncate_to_width(&format!(" {WORKER_GLYPH} +{count} more ({running} running)"), width);
@@ -826,7 +862,7 @@ mod tests {
     fn spaced_strip_breathes_and_animates() {
         let t0 = Instant::now();
         let d = tmp_dir();
-        std::fs::write(d.path().join("brief.md"), "---\nid: a1\nlabel: list_calls\n---\n\n# Brief\n\n## Task\n\n1. read\n2. fix\n3. test\n4. report\n\n## Role\n\n(default)\n").unwrap();
+        std::fs::write(d.path().join("brief.md"), "---\nid: a1\nlabel: list_calls\nname: Curie\n---\n\n# Brief\n\n## Task\n\n1. read\n2. fix\n3. test\n4. report\n\n## Role\n\n(default)\n").unwrap();
         let mut e = entry("a1", AgentState::Running, t0, d.path().to_path_buf());
         e.pid = Some(777);
         std::fs::write(crate::agent::steps::progress_path(d.path(), 777), "1/4").unwrap();
@@ -836,14 +872,14 @@ mod tests {
         let draw = |now: Instant| {
             let area = Rect::new(0, 0, 100, 4);
             let mut buf = Buffer::empty(area);
-            let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now };
+            let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now, watch: None };
             draw_agents_strip(&mut buf, area, &view, &opts);
             strip_text(&buf)
         };
         let rows = draw(t0);
         assert!(rows[0].trim().is_empty() && rows[2].trim().is_empty(), "{rows:#?}");
-        assert!(rows[1].starts_with("● main"), "{rows:#?}");
-        assert!(rows[3].contains("a1  list_calls") && rows[3].contains("▕") && rows[3].contains("1/4"), "{rows:#?}");
+        assert!(rows[1].starts_with("● agents"), "{rows:#?}");
+        assert!(rows[3].contains("Curie a1  list_calls") && rows[3].contains("▕") && rows[3].contains("1/4"), "the name, the id, then the task: {rows:#?}");
         assert_ne!(draw(t0 + std::time::Duration::from_millis(400))[3], rows[3], "the row animates");
 
         // The next step glides in rather than jumping.
@@ -858,10 +894,10 @@ mod tests {
         // A short area keeps the compact layout.
         let area = Rect::new(0, 0, 100, 2);
         let mut buf = Buffer::empty(area);
-        let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now: t1 };
+        let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now: t1, watch: None };
         draw_agents_strip(&mut buf, area, &view, &opts);
         let rows = strip_text(&buf);
-        assert!(rows[0].starts_with("● main") && rows[1].contains("list_calls"), "{rows:#?}");
+        assert!(rows[0].starts_with("● agents") && rows[1].contains("list_calls"), "{rows:#?}");
     }
 
     #[test]
@@ -1002,13 +1038,14 @@ mod tests {
             term_rows: 40,
             toggle_key_label: "Ctrl+G".to_string(),
             now,
+            watch: None,
         };
         let area = Rect::new(0, 0, 60, 2);
         let mut buf = Buffer::empty(area);
         draw_agents_strip(&mut buf, area, &view, &opts);
         let row = |y: u16| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
-        assert!(row(0).starts_with("● main"), "{:?}", row(0));
-        assert!(row(0).contains("1 agent working · Ctrl+G details"), "{:?}", row(0));
+        assert!(row(0).starts_with("● agents"), "{:?}", row(0));
+        assert!(row(0).contains("1 working · Ctrl+G details"), "{:?}", row(0));
         assert!(row(1).contains(" a "), "the id leads the row: {:?}", row(1));
         assert!(!row(1).contains("#a"), "no duplicate id for an unlabeled agent: {:?}", row(1));
     }
@@ -1054,6 +1091,7 @@ mod tests {
                 term_rows: 40,
                 toggle_key_label: "Ctrl+G".to_string(),
                 now,
+                watch: None,
             },
         );
         let row = |y: u16| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
@@ -1062,9 +1100,10 @@ mod tests {
         let all = (0..area.height).map(row).collect::<Vec<_>>().join("\n");
         assert!(!all.contains("a-really-long-hidden-name"), "{all}");
         // ...so it must not push the status column rightwards either.
-        // ` ⠋ a0  x`, then the 2-space gap: the bar right after.
+        // ` ⠋ a0 x` (an unnamed agent shows its id), then the 2-space
+        // gap: the bar right after.
         assert!(
-            row(1).starts_with(" ⠋ a0  x  ▕"),
+            row(1).starts_with(" ⠋ a0 x  ▕"),
             "status column padded by an unseen name: {:?}",
             row(1)
         );
@@ -1272,6 +1311,7 @@ mod tests {
             term_rows: 40,
             toggle_key_label: "Ctrl+G".to_string(),
             now,
+            watch: None,
         };
         let area = Rect::new(0, 0, 40, 4);
         let mut buf1 = Buffer::empty(area);
@@ -1339,6 +1379,7 @@ mod tests {
             term_rows: 40,
             toggle_key_label: "Ctrl+G".to_string(),
             now,
+            watch: None,
         };
         let area = Rect::new(0, 0, 40, 4);
         let mut buf = Buffer::empty(area);

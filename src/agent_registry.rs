@@ -786,6 +786,7 @@ mod tests {
                 label: None,
                 worktree: None,
                 branch: None,
+                name: None,
             },
         );
         std::fs::write(dir.join("brief.md"), brief).unwrap();
@@ -917,6 +918,7 @@ mod tests {
                 label: None,
                 worktree: None,
                 branch: None,
+                name: None,
             },
         );
         std::fs::write(dir.join("brief.md"), brief).unwrap();

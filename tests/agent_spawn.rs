@@ -178,7 +178,7 @@ async fn spawn_real_child() {
         file_path: PathBuf::from("/nonexistent/scout.md"),
     };
 
-    let out = run_single(&tool.launcher(), &agent, "SPAWN-TASK", &cwd, None, None).await;
+    let out = run_single(&tool.launcher(), &agent, "SPAWN-TASK", &cwd, None, None, None).await;
     assert!(!out.is_error, "child failed: {}", out.content);
 
     let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
@@ -315,7 +315,7 @@ async fn continue_finished_agent_same_id() {
         file_path: PathBuf::from("/nonexistent/scout.md"),
     };
 
-    let out = run_single(&tool.launcher(), &agent, "FIRST-TASK", &cwd, None, None).await;
+    let out = run_single(&tool.launcher(), &agent, "FIRST-TASK", &cwd, None, None, None).await;
     assert!(!out.is_error, "first run failed: {}", out.content);
     let dir = cwd.join(".nanopi/agents").join(reg.run_id()).join("a1");
     let first_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
@@ -420,7 +420,7 @@ async fn continue_finished_agent_from_earlier_process() {
         source: AgentSource::User,
         file_path: PathBuf::from("/nonexistent/scout.md"),
     };
-    let out = run_single(&tool_a.launcher(), &agent, "FIRST-TASK", &cwd, None, None).await;
+    let out = run_single(&tool_a.launcher(), &agent, "FIRST-TASK", &cwd, None, None, None).await;
     assert!(!out.is_error, "first run failed: {}", out.content);
     let dir = cwd.join(".nanopi/agents").join(&run_id).join("a1");
     let first_report = std::fs::read_to_string(dir.join("report.md")).unwrap();
@@ -521,6 +521,7 @@ fn write_fixture_brief(dir: &std::path::Path, id: &str, state: &str) {
             label: None,
             worktree: None,
             branch: None,
+            name: None,
         },
     );
     std::fs::write(dir.join("brief.md"), brief).unwrap();
@@ -654,7 +655,7 @@ async fn worktree_isolation_creates_branch_and_path_and_removes_when_unchanged()
     let repo = tmp_repo("create");
     let script = format!("pwd > \"$(dirname \"$4\")/where\"; echo '{OK_ENV}'");
     let l = iso_launcher(&script);
-    let out = run_single(&l, &agent_fixture(), "t", &repo, None, Some("worktree")).await;
+    let out = run_single(&l, &agent_fixture(), "t", &repo, None, None, Some("worktree")).await;
     assert!(!out.is_error, "{}", out.content);
 
     let dir = repo
@@ -710,7 +711,7 @@ async fn worktree_isolation_warns_outside_git_repo() {
     std::fs::create_dir_all(&non_repo).unwrap();
     let script = format!("pwd > \"$(dirname \"$4\")/where\"; echo '{OK_ENV}'");
     let l = iso_launcher(&script);
-    let out = run_single(&l, &agent_fixture(), "t", &non_repo, None, Some("worktree")).await;
+    let out = run_single(&l, &agent_fixture(), "t", &non_repo, None, None, Some("worktree")).await;
     assert!(!out.is_error, "{}", out.content);
     assert!(out.content.contains("Warning:"), "{}", out.content);
     assert!(out.content.contains("not a git repository"), "{}", out.content);

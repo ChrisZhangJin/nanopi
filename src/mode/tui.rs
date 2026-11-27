@@ -31,7 +31,7 @@
 //!
 //! MVP: single-line input; multi-line + Emacs keys come in v0.7 S2.
 
-use std::io::{self, Stdout, Write as _};
+use std::io::{self, IsTerminal as _, Stdout, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,7 +44,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -58,6 +58,7 @@ use crate::event::{AgentEvent, SteerMessage};
 use crate::mode::agent_detail;
 use crate::mode::agents_strip::{self, AgentsView, StripOpts};
 use crate::mode::exit_signal::ExitSignals;
+use crate::mode::inline_image::{self, Support};
 use crate::render::menu::{MenuAction, MenuItem, MenuState};
 use crate::render::text_buffer::{Action as TbAction, TextBuffer};
 use crate::session::{self, SessionChoice};
@@ -88,6 +89,8 @@ enum SlashCmd {
     Fork,
     /// Dump a keybinding cheat-sheet into scrollback.
     Hotkeys,
+    /// Display a fixed inline test image in scrollback.
+    ImageTest,
     /// Print session stats (tokens, cost, model, turns) to scrollback.
     SessionInfo,
     /// Enter capture mode; next Enter sets the session's `name`.
@@ -256,6 +259,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             SlashCmd::Agents,
         ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
+        MenuItem::new("/image-test", "Show an inline test image", SlashCmd::ImageTest),
         MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
         MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
         MenuItem::new(
@@ -1054,11 +1058,12 @@ type Term = Terminal<DockBackend>;
 struct DockBackend {
     inner: CrosstermBackend<Stdout>,
     cursor: Option<ratatui::layout::Position>,
+    inline_size: Option<Size>,
 }
 
 impl DockBackend {
     fn new() -> Self {
-        Self { inner: CrosstermBackend::new(io::stdout()), cursor: None }
+        Self { inner: CrosstermBackend::new(io::stdout()), cursor: None, inline_size: None }
     }
 
     fn at(cursor: ratatui::layout::Position) -> Self {
@@ -1127,12 +1132,13 @@ fn setup_terminal() -> Result<Term> {
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, EnableBracketedPaste)?;
     let backend = DockBackend::new();
-    let terminal = Terminal::with_options(
+    let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
             viewport: Viewport::Inline(DOCK_HEIGHT),
         },
     )?;
+    terminal.backend_mut().inline_size = Some(terminal.size()?);
     Ok(terminal)
 }
 
@@ -1696,6 +1702,7 @@ enum KeyAction {
     ResumeSession(PathBuf),
     /// `/hotkeys`: dump keybinding help into scrollback.
     ShowHotkeys,
+    ShowTestImage,
     /// v0.9.3: `/settings` — dump interaction settings + toml path.
     ShowSettings,
     /// v0.9.3: `/keybindings` — dump keybindings + toml override key.
@@ -2929,6 +2936,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Resume => KeyAction::OpenResumePicker,
         SlashCmd::Fork => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
+        SlashCmd::ImageTest => KeyAction::ShowTestImage,
         SlashCmd::ListSkills => KeyAction::ShowSkills,
         SlashCmd::ListTools => KeyAction::ShowTools,
         SlashCmd::Mcp => KeyAction::ShowMcp,
@@ -5042,6 +5050,7 @@ async fn handle_action(
                 insert_line(term, Line::from(""))?;
             }
         }
+        KeyAction::ShowTestImage => show_test_image(term, app)?,
         KeyAction::ShowMcp => {
             // From the manager only: no agent lock (a turn may hold it)
             // and no request to any server.
@@ -6174,17 +6183,29 @@ fn loop_status_lines(app: &App, now: std::time::Instant) -> Vec<String> {
     out
 }
 
+/// The shared agent status check, for the agents strip's header.
+fn agent_watch_text(app: &App, now: std::time::Instant) -> Option<String> {
+    if !app.agent_watch.active() {
+        return None;
+    }
+    Some(match app.agent_watch.next_check() {
+        Some(t) => format!(
+            "⊙ next check {}",
+            crate::goal::format_duration(std::time::Duration::from_secs(t.saturating_duration_since(now).as_secs()))
+        ),
+        None => "⊙ checking…".to_string(),
+    })
+}
+
 /// Footer segments for an active goal and loop.
 fn goal_loop_segments(app: &App, now: std::time::Instant) -> Vec<String> {
     let mut out = Vec::new();
-    if app.agent_watch.active() {
-        out.push(match app.agent_watch.next_check() {
-            Some(t) => format!(
-                "⊙ watching agents · next {}",
-                crate::goal::format_duration(std::time::Duration::from_secs(t.saturating_duration_since(now).as_secs()))
-            ),
-            None => "⊙ checking agents…".to_string(),
-        });
+    // The agents strip's header shows the shared status check; the
+    // footer only does when there is no strip to show it.
+    if app.agents_view.is_empty() {
+        if let Some(w) = agent_watch_text(app, now) {
+            out.push(w);
+        }
     }
     if app.background_pending {
         out.push(if live_agents(crate::agent_registry::global().as_deref()) > 0 {
@@ -7993,6 +8014,16 @@ fn report_header(line: &str) -> Option<(&str, &str)> {
         .then_some((id, state))
 }
 
+/// The name of agent `id` in this run, from its brief.
+fn agent_codename(id: &str) -> Option<String> {
+    let reg = crate::agent_registry::global()?;
+    let entry = reg.snapshot().into_iter().find(|e| e.id == id)?;
+    let brief = crate::memory::read_limited(&entry.dir.join("brief.md"), 64 * 1024).ok()?;
+    crate::agent::brief::front_matter_get(&brief, "name")
+        .map(|n| agents_strip::sanitize(&n))
+        .filter(|n| !n.trim().is_empty() && n != "(none)")
+}
+
 fn is_agent_report(msg: &str) -> bool {
     msg.lines().next().and_then(report_header).is_some() || msg.starts_with("[chain finished] ")
 }
@@ -8000,7 +8031,10 @@ fn is_agent_report(msg: &str) -> bool {
 fn report_preview(msg: &str, width: usize, key: &str) -> String {
     let headline = msg.lines().next().unwrap_or_default();
     let headline = if let Some((id, state)) = report_header(headline) {
-        format!("[agent {id} finished: {state}]")
+        match agent_codename(id) {
+            Some(name) => format!("[{name} ({id}) finished: {state}]"),
+            None => format!("[agent {id} finished: {state}]"),
+        }
     } else if msg.starts_with("[chain finished] ") {
         "[chain finished]".into()
     } else {
@@ -8341,6 +8375,22 @@ fn dock_extra(app: &App, area: Rect) -> u16 {
         .min(area.height.saturating_sub(DOCK_HEIGHT))
 }
 
+/// On resize, anchor the inline viewport from its previous top, clamped
+/// so the dock still fits. Ratatui 0.29 otherwise queries the cursor in
+/// `resize`, which races with the active EventStream.
+fn sync_inline_size(term: &mut Term) -> Result<Size> {
+    let screen = term.size()?;
+    if term.backend_mut().inline_size != Some(screen) {
+        let old = term.get_frame().area();
+        let top = old.y.min(screen.height.saturating_sub(old.height));
+        term.set_cursor_position((0, top))?;
+        term.backend_mut().cursor = Some((0, top).into());
+        term.resize(Rect::from((ratatui::layout::Position::ORIGIN, screen)))?;
+        term.backend_mut().inline_size = Some(screen);
+    }
+    Ok(screen)
+}
+
 /// Rebuild the inline viewport at a new height. ratatui 0.29 cannot
 /// resize an inline viewport in place, so the dock is cleared and a new
 /// one is anchored to the old one's position. Growing pushes the
@@ -8357,6 +8407,7 @@ fn set_dock_height(term: &mut Term, app: &mut App, height: u16) -> Result<()> {
         DockBackend::at(ratatui::layout::Position { x: 0, y: top }),
         TerminalOptions { viewport: Viewport::Inline(height) },
     )?;
+    term.backend_mut().inline_size = Some(screen);
     app.dock_h = height;
     Ok(())
 }
@@ -8376,6 +8427,7 @@ fn redraw(term: &mut Term, app: &mut App) -> Result<()> {
         app.agent_panel = Some(p);
         return r.map_err(Into::into);
     }
+    sync_inline_size(term)?;
     let want = wanted_dock_height(app);
     if want != app.dock_h {
         set_dock_height(term, app, want)?;
@@ -8456,7 +8508,7 @@ fn close_agent_panel(term: &mut Term, app: &mut App) -> Result<()> {
     leave?;
     // The inline viewport did not receive resize events on the alternate
     // screen; synchronize it before inserting any rows into scrollback.
-    term.autoresize()?;
+    sync_inline_size(term)?;
     for rec in held {
         let spans: Vec<Span> = rec.spans.into_iter().map(|(t, st)| Span::styled(t, st)).collect();
         match rec.bg {
@@ -8539,8 +8591,37 @@ fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> R
     insert_line_bg_raw(term, line, bg_style)
 }
 
+fn show_test_image(term: &mut Term, app: &mut App) -> Result<()> {
+    let note = |term: &mut Term, message: String| {
+        insert_line(term, Line::from(Span::styled(message, Style::default().add_modifier(Modifier::DIM))))
+    };
+    if app.agent_panel.is_some() {
+        return note(term, "[image: image-test.png 96x48 — not shown while the agent panel is open]".into());
+    }
+    if let Support::Off(reason) = inline_image::detect(|key| std::env::var_os(key), io::stdout().is_terminal()) {
+        return note(term, format!("inline images are off here ({reason}); NANOPI_INLINE_IMAGES=iterm2 forces them"));
+    }
+    let screen = sync_inline_size(term)?;
+    let dock = term.get_frame().area();
+    let Some((width, rows)) = inline_image::test_box(screen.width, screen.height, dock.height) else {
+        return note(term, "[image: image-test.png 96x48 — terminal too small]".into());
+    };
+    let sequence = inline_image::encode(inline_image::TEST_PNG, width, rows)?;
+    term.insert_before(rows, |_| {})?;
+    // insert_before can scroll and can move the dock. The reserved rows
+    // now end just above its *new* top. The image may move the cursor,
+    // so explicitly put it back inside the dock before redrawing.
+    let top = term.get_frame().area().y;
+    crossterm::queue!(term.backend_mut(), crossterm::cursor::MoveTo(2, top - rows))?;
+    term.backend_mut().write_all(sequence.as_bytes())?;
+    term.set_cursor_position((0, top))?;
+    term.clear()?;
+    term.backend_mut().flush()?;
+    redraw(term, app)
+}
+
 fn insert_line_bg_raw(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> Result<()> {
-    term.autoresize()?;
+    sync_inline_size(term)?;
     let width = term.size()?.width.max(1);
     let rows = wrap_scrollback(&line, usize::from(width), bg_style.unwrap_or_default());
     // Bound each temporary buffer, not the amount of output displayed.
@@ -8815,11 +8896,13 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
             .get(crate::keys::ActionId::ToggleAgentsStrip)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Ctrl+G".to_string());
+        let now = std::time::Instant::now();
         let opts = StripOpts {
             expanded: app.agents_strip_expanded,
             term_rows: app.term_rows,
             toggle_key_label,
-            now: std::time::Instant::now(),
+            now,
+            watch: agent_watch_text(app, now),
         };
         agents_strip::draw_agents_strip(buf, chunks[5], &app.agents_view, &opts);
     }
@@ -11586,11 +11669,11 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         draw_dock(&mut buf, area, &app);
-        // No "● main" strip row anywhere in the buffer.
+        // No "● agents" strip row anywhere in the buffer.
         let mut found = false;
         for y in 0..area.height {
             let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
-            if row.contains("● main") {
+            if row.contains("● agents") {
                 found = true;
             }
         }
@@ -11616,14 +11699,14 @@ mod tests {
             })
             .collect();
         let all = rows.join("\n");
-        assert!(all.contains("● main"), "{all}");
-        assert!(all.contains("2 agents working"), "{all}");
+        assert!(all.contains("● agents"), "{all}");
+        assert!(all.contains("● agents  2 working"), "{all}");
         assert!(all.contains(" alpha"), "{all}");
-        assert!(all.contains("◌ a2  bravo"), "queued agents get the dim pulse, id then name: {all}");
-        assert!(all.contains("a1  alpha"), "{all}");
-        // The strip sits under the footer: `● main` comes after the input
+        assert!(all.contains("◌ a2 bravo"), "queued agents get the dim pulse; unnamed ones show their id: {all}");
+        assert!(all.contains("a1 alpha"), "{all}");
+        // The strip sits under the footer: `● agents` comes after the input
         // box and the last dock row is an agent row.
-        let main_idx = rows.iter().position(|r| r.contains("● main")).unwrap();
+        let main_idx = rows.iter().position(|r| r.contains("● agents")).unwrap();
         let input_idx = rows.iter().position(|r| r.starts_with("> ")).unwrap();
         assert!(main_idx > input_idx + 2, "strip must be below the footer: {rows:#?}");
         assert!(rows.last().unwrap().contains("bravo"), "{rows:#?}");
@@ -11677,8 +11760,8 @@ mod tests {
         // Palette renders (its own content, e.g. a slash command label).
         assert!(all.contains('/'), "palette should still render: {all}");
         // The strip must not show its full agent rows while the overlay
-        // is open — at most the "● main" line may appear.
-        let header_count = rows.iter().filter(|r| r.contains("● main")).count();
+        // is open — at most the "● agents" line may appear.
+        let header_count = rows.iter().filter(|r| r.contains("● agents")).count();
         assert!(header_count <= 1, "{all}");
     }
 
@@ -11719,11 +11802,11 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        let header_rows: Vec<&String> = rows.iter().filter(|r| r.contains("● main")).collect();
+        let header_rows: Vec<&String> = rows.iter().filter(|r| r.contains("● agents")).collect();
         assert_eq!(header_rows.len(), 1, "exactly one strip row: {rows:#?}");
-        // On a short terminal the `● main` row is the whole strip: it is
+        // On a short terminal the `● agents` row is the whole strip: it is
         // the last dock row and no agent row is drawn.
-        assert!(rows.last().unwrap().starts_with("● main"), "{rows:#?}");
+        assert!(rows.last().unwrap().starts_with("● agents"), "{rows:#?}");
         assert!(!rows.iter().any(|r| r.starts_with("○ ")), "no agent rows: {rows:#?}");
     }
 
@@ -12589,12 +12672,12 @@ mod tests {
 
             if n_agents == 0 {
                 assert!(
-                    !rows.iter().any(|r| r.contains("● main")),
+                    !rows.iter().any(|r| r.contains("● agents")),
                     "no agents must mean no strip: {rows:#?}"
                 );
             } else {
                 // Strip is bottom-anchored, below the footer.
-                let main_idx = rows.iter().position(|r| r.contains("● main")).unwrap();
+                let main_idx = rows.iter().position(|r| r.contains("● agents")).unwrap();
                 let input_idx = rows.iter().position(|r| r.starts_with("> ")).unwrap();
                 assert!(
                     main_idx > input_idx,
@@ -12626,7 +12709,7 @@ mod tests {
             .collect();
 
         assert!(
-            !rows.iter().any(|r| r.contains("● main")),
+            !rows.iter().any(|r| r.contains("● agents")),
             "at DOCK_HEIGHT the overlay needs every slack row, so the \
              strip must hide rather than shrink it: {rows:#?}"
         );

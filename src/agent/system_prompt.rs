@@ -173,7 +173,9 @@ Workflow:
          choice between approaches, or if the work is risky, ask the \
          user first and dispatch only after you have an answer.
 4. Dispatch. Give each agent a short `description` (3-6 words) — it \
-         is the agent's name in the user's agent list. Judge whether \
+         is the agent's task in the user's agent list — and a `name`: a \
+         famous historical figure whose work suits the task (Curie to \
+         investigate, Turing to write code); the user knows the agent by it. Judge whether \
          parallelism is actually worth it: sequential or interdependent \
          work goes to ONE agent working through the steps (chain mode), \
          not several short, separate dispatches. Use parallel agents \

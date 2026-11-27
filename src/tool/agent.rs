@@ -192,6 +192,8 @@ struct AgentItem {
     tools: Option<Vec<String>>,
     model: Option<String>,
     description: Option<String>,
+    /// The agent's name for people (`agent::names`).
+    name: Option<String>,
     /// ISO-01: opt-in `"worktree"` isolation. Validated in [`parse_item`]
     /// so an invalid value is an in-band error before anything spawns.
     isolation: Option<String>,
@@ -252,6 +254,7 @@ fn parse_item(it: &Value, prefix: &str) -> Result<AgentItem, String> {
     let role = opt_str_field(it, prefix, "role")?;
     let model = opt_str_field(it, prefix, "model")?;
     let description = opt_str_field(it, prefix, "description")?;
+    let name = opt_str_field(it, prefix, "name")?;
     let isolation = opt_str_field(it, prefix, "isolation")?;
     if let Some(v) = &isolation {
         if v != "worktree" {
@@ -299,6 +302,7 @@ fn parse_item(it: &Value, prefix: &str) -> Result<AgentItem, String> {
         tools,
         model,
         description,
+        name,
         isolation,
     })
 }
@@ -527,6 +531,10 @@ impl Tool for AgentTool {
                         "type": "string",
                         "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."
                     },
+                    "name": {
+                        "type": "string",
+                        "description": "optional: the agent's name, shown to the user in place of its id. Use the name of a famous historical figure whose work suits the task (e.g. \"Curie\" to investigate, \"Turing\" to write code); give parallel agents different names."
+                    },
                     "isolation": {
                         "type": "string",
                         "enum": ["worktree"],
@@ -544,7 +552,8 @@ impl Tool for AgentTool {
                                 "role": {"type": "string", "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."},
                                 "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
                                 "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
-                                "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."}
+                                "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."},
+                                "name": {"type": "string", "description": "optional: the agent's name, shown to the user in place of its id. Use the name of a famous historical figure whose work suits the task (e.g. \"Curie\" to investigate, \"Turing\" to write code); give parallel agents different names."}
                             },
                             "required": ["task"]
                         }
@@ -561,7 +570,8 @@ impl Tool for AgentTool {
                                 "role": {"type": "string", "description": "optional: role prompt for this agent (added to the general-purpose prompt, or replacing a named agent's prompt)."},
                                 "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
                                 "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
-                                "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."}
+                                "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."},
+                                "name": {"type": "string", "description": "optional: the agent's name, shown to the user in place of its id. Use the name of a famous historical figure whose work suits the task (e.g. \"Curie\" to investigate, \"Turing\" to write code); give parallel agents different names."}
                             },
                             "required": ["task"]
                         }
@@ -888,6 +898,7 @@ async fn run_item(
             task,
             run_cwd,
             item.description.as_deref(),
+            item.name.as_deref(),
             item.isolation.as_deref(),
         ) {
             Ok(prepared) => spawn_detached(&l.registry, prepared).result().await,
@@ -900,6 +911,7 @@ async fn run_item(
         task,
         run_cwd,
         item.description.as_deref(),
+        item.name.as_deref(),
         item.isolation.as_deref(),
     )
     .await
@@ -925,6 +937,7 @@ fn run_item_background(
         task,
         run_cwd,
         item.description.as_deref(),
+        item.name.as_deref(),
         item.isolation.as_deref(),
     ) {
         Ok(prepared) => spawn_background(&l.registry, prepared),
@@ -1547,12 +1560,26 @@ impl PreparedRun {
 /// regenerate the run index, build the child command. `Err` carries an
 /// already-terminal `ToolOutput` (reserve failed, or brief-write failed
 /// and the entry was marked `Failed`) — no spawn occurs either way.
+/// Names other agents of this run already carry (from their briefs),
+/// so a fallback name is never shared.
+fn names_in_use(reg: &AgentRegistry, except: &str) -> Vec<String> {
+    reg.snapshot()
+        .into_iter()
+        .filter(|e| e.id != except)
+        .filter_map(|e| {
+            let brief = std::fs::read_to_string(e.dir.join("brief.md")).ok()?;
+            crate::agent::brief::front_matter_get(&brief, "name")
+        })
+        .collect()
+}
+
 fn prepare_run(
     l: &Launcher,
     agent: &AgentConfig,
     task: &str,
     cwd: &Path,
     label: Option<&str>,
+    name: Option<&str>,
     isolation: Option<&str>,
 ) -> Result<PreparedRun, ToolOutput> {
     let reg = &*l.registry;
@@ -1615,6 +1642,7 @@ fn prepare_run(
             started,
             parent: reg.run_id().to_string(),
             label: label.map(str::to_string),
+            name: Some(crate::agent::names::choose(name, &id, &names_in_use(reg, &id))),
             worktree: worktree.as_ref().map(|w| w.path.to_string_lossy().into_owned()),
             branch: worktree.as_ref().map(|w| w.branch.clone()),
         },
@@ -1784,9 +1812,10 @@ pub async fn run_single(
     task: &str,
     cwd: &Path,
     label: Option<&str>,
+    name: Option<&str>,
     isolation: Option<&str>,
 ) -> ToolOutput {
-    match prepare_run(l, agent, task, cwd, label, isolation) {
+    match prepare_run(l, agent, task, cwd, label, name, isolation) {
         Ok(prepared) => run_body(&l.registry, prepared).await,
         Err(soft) => soft,
     }
@@ -2475,7 +2504,7 @@ mod tests {
             source: crate::agent::agents::AgentSource::User,
             file_path: PathBuf::from("/nonexistent/scout.md"),
         };
-        let prepared = prepare_run(&l, &agent, "task", tmp.path(), None, None).unwrap();
+        let prepared = prepare_run(&l, &agent, "task", tmp.path(), None, None, None).unwrap();
         let envs: Vec<_> = prepared.command.as_std().get_envs().collect();
         assert!(
             envs.iter().any(|(k, v)| *k == "NANOPI_RUN_ID" && v.is_none()),
@@ -2931,6 +2960,7 @@ mod tests {
                 model: None,
                 description: None,
                 isolation: None,
+                name: None,
             }],
             AgentScope::Project,
             &dir,
@@ -2956,6 +2986,7 @@ mod tests {
                 model: None,
                 description: None,
                 isolation: None,
+                name: None,
             }],
             AgentScope::Project,
             &dir,
@@ -3341,7 +3372,7 @@ mod tests {
             "[ -f \"$4\" ] || exit 7; [ \"$NANOPI_AGENT_ID\" = a1 ] || exit 8; echo '{OK_ENV}'"
         );
         let l = launcher(&script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "find the thing", &cwd, None, None).await;
+        let out = run_single(&l, &agent_fixture(), "find the thing", &cwd, None, None, None).await;
         assert!(!out.is_error, "{}", out.content);
         let dir = cwd
             .join(".nanopi/agents")
@@ -3453,7 +3484,7 @@ mod tests {
         let cwd = tmp("live");
         let l = launcher(&format!("echo '{OK_ENV}'"), 1, 4);
         l.registry.reserve(&cwd.join(".nanopi/agents")).unwrap(); // one live entry
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None, None).await;
         assert!(out.is_error);
         assert!(
             out.content.contains("agent limit reached"),
@@ -3470,7 +3501,7 @@ mod tests {
         let l = launcher(&format!("sleep 0.4; echo '{OK_ENV}'"), 8, 1);
         let a = agent_fixture();
         let t0 = std::time::Instant::now();
-        let (x, y) = tokio::join!(run_single(&l, &a, "1", &cwd, None, None), run_single(&l, &a, "2", &cwd, None, None));
+        let (x, y) = tokio::join!(run_single(&l, &a, "1", &cwd, None, None, None), run_single(&l, &a, "2", &cwd, None, None, None));
         assert!(!x.is_error && !y.is_error);
         assert!(
             t0.elapsed() >= Duration::from_millis(800),
@@ -3490,9 +3521,9 @@ mod tests {
         );
         let l = launcher(&script, 8, 4);
         let a = agent_fixture();
-        let f = run_single(&l, &a, "t", &cwd, None, None).await;
+        let f = run_single(&l, &a, "t", &cwd, None, None, None).await;
         assert!(f.is_error);
-        let ok = run_single(&l, &a, "t", &cwd, None, None).await;
+        let ok = run_single(&l, &a, "t", &cwd, None, None, None).await;
         assert!(!ok.is_error);
         assert!(ok.content.contains("REPORT-BODY"), "{}", ok.content);
         let rp = ok.metadata.as_ref().unwrap()["report_path"]
@@ -3500,7 +3531,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rp.ends_with("/a2/report.md"), "{rp}");
-        let lr = run_single(&l, &a, "t", &cwd, None, None).await;
+        let lr = run_single(&l, &a, "t", &cwd, None, None, None).await;
         assert!(!lr.is_error);
         let st: Vec<AgentState> = l.registry.snapshot().iter().map(|e| e.state).collect();
         assert_eq!(
@@ -3520,7 +3551,7 @@ mod tests {
         let cwd = tmp("fallback");
         let script = "exit 3";
         let l = launcher(script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None, None).await;
         assert!(out.is_error);
         let dir = cwd
             .join(".nanopi/agents")
@@ -3543,7 +3574,7 @@ mod tests {
             "echo MINE > \"$(dirname \"$4\")/report.md\"; echo '{OK_ENV}'"
         );
         let l = launcher(&script, 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None, None).await;
         assert!(!out.is_error);
         let dir = cwd
             .join(".nanopi/agents")
@@ -3559,7 +3590,7 @@ mod tests {
     async fn brief_front_matter_and_index_after_dispatch() {
         let cwd = tmp("frontmatter");
         let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None, None).await;
         assert!(!out.is_error, "{}", out.content);
         let run_dir = cwd.join(".nanopi/agents").join(l.registry.run_id());
         let brief = std::fs::read_to_string(run_dir.join("a1").join("brief.md")).unwrap();
@@ -3582,7 +3613,7 @@ mod tests {
         let cwd = tmp("gitignore");
         std::fs::create_dir_all(cwd.join(".git")).unwrap();
         let l = launcher(&format!("echo '{OK_ENV}'"), 8, 4);
-        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+        let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None, None).await;
         assert!(!out.is_error, "{}", out.content);
         let gi = std::fs::read_to_string(cwd.join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".nanopi/agents"), "{gi}");
@@ -3633,6 +3664,7 @@ mod tests {
             model: None,
             description: None,
             isolation: None,
+            name: None,
         };
         let out = run_item(&l, &item, &item.task, AgentScope::Project, &cwd).await;
         assert!(out.is_error);
@@ -3649,6 +3681,7 @@ mod tests {
             model: Some("no-such-model-xyz".into()),
             description: None,
             isolation: None,
+            name: None,
         };
         let out = run_item(&l, &item, &item.task, AgentScope::Project, &cwd).await;
         assert!(out.is_error);
@@ -3693,7 +3726,7 @@ mod tests {
         let script = "echo 'worktree change' > README.md; echo '{OK_ENV}'".replace("{OK_ENV}", OK_ENV);
         let l = launcher(&script, 8, 4);
 
-        let prepared = prepare_run(&l, &agent_fixture(), "t", &repo, None, Some("worktree"))
+        let prepared = prepare_run(&l, &agent_fixture(), "t", &repo, None, None, Some("worktree"))
             .expect("prepare_run should create the worktree");
         let wt = prepared.worktree.clone().expect("worktree created");
 
@@ -3747,7 +3780,7 @@ mod tests {
         let repo = tmp_repo("wtstop");
         let script = "echo feature > feature.txt; sleep 300";
         let l = launcher(script, 8, 4);
-        let prepared = prepare_run(&l, &agent_fixture(), "t", &repo, None, Some("worktree"))
+        let prepared = prepare_run(&l, &agent_fixture(), "t", &repo, None, None, Some("worktree"))
             .expect("prepare_run should create the worktree");
         let wt = prepared.worktree.clone().expect("worktree created");
         let reg = l.registry.clone();
@@ -3878,7 +3911,7 @@ mod tests {
             assert_eq!(loaded.skipped.len(), 1, "a skipped server still counts");
 
             let l = launcher(DUMP, 8, 4);
-            let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None).await;
+            let out = run_single(&l, &agent_fixture(), "t", &cwd, None, None, None).await;
             assert!(!out.is_error, "{}", out.content);
 
             l.registry.reactivate("a1").unwrap();
@@ -3975,7 +4008,7 @@ mod tests {
             let cwd = tmp("cont-restricted");
             let l = launcher(&logging_script(), 8, 4);
             let agent = with_tools(Some(vec!["read", "grep"]));
-            let out = run_single(&l, &agent, "t", &cwd, None, None).await;
+            let out = run_single(&l, &agent, "t", &cwd, None, None, None).await;
             assert!(!out.is_error, "{}", out.content);
 
             let again = continue_it(&l, &cwd, "a1");
@@ -3999,7 +4032,7 @@ mod tests {
             let cwd = tmp("cont-adopted");
             let first = launcher(&logging_script(), 8, 4);
             let agent = with_tools(Some(vec!["read", "grep"]));
-            run_single(&first, &agent, "t", &cwd, None, None).await;
+            run_single(&first, &agent, "t", &cwd, None, None, None).await;
 
             let second = later_process(&first);
             assert_eq!(second.registry.recorded_agent_tools("a1"), None);
@@ -4015,7 +4048,7 @@ mod tests {
         async fn an_unrestricted_agent_continues_unrestricted() {
             let cwd = tmp("cont-open");
             let first = launcher(&logging_script(), 8, 4);
-            run_single(&first, &with_tools(None), "t", &cwd, None, None).await;
+            run_single(&first, &with_tools(None), "t", &cwd, None, None, None).await;
 
             let same = continue_it(&first, &cwd, "a1");
             assert_eq!(tools_flag(&argv_of(&same)), None);
@@ -4031,7 +4064,7 @@ mod tests {
         async fn an_old_record_without_tools_json_falls_back_to_the_brief() {
             let cwd = tmp("cont-old");
             let first = launcher(&logging_script(), 8, 4);
-            run_single(&first, &with_tools(Some(vec!["read", "grep"])), "t", &cwd, None, None).await;
+            run_single(&first, &with_tools(Some(vec!["read", "grep"])), "t", &cwd, None, None, None).await;
             let d = dir(&first, &cwd, "a1");
             std::fs::remove_file(d.join(TOOLS_RECORD)).unwrap();
 
@@ -4069,7 +4102,7 @@ mod tests {
         async fn with_no_record_anywhere_the_default_is_used_and_flagged() {
             let cwd = tmp("cont-none");
             let first = launcher(&logging_script(), 8, 4);
-            run_single(&first, &with_tools(Some(vec!["read"])), "t", &cwd, None, None).await;
+            run_single(&first, &with_tools(Some(vec!["read"])), "t", &cwd, None, None, None).await;
             let d = dir(&first, &cwd, "a1");
             std::fs::remove_file(d.join(TOOLS_RECORD)).unwrap();
             std::fs::write(d.join("brief.md"), "---\nid: a1\nstate: done\n---\n\nt\n").unwrap();
@@ -4089,7 +4122,7 @@ mod tests {
             let cwd = tmp("cont-mcp");
             let first = launcher(&logging_script(), 8, 4);
             let agent = with_tools(Some(vec!["read", "mcp__fake__echo"]));
-            run_single(&first, &agent, "t", &cwd, None, None).await;
+            run_single(&first, &agent, "t", &cwd, None, None, None).await;
 
             let again = continue_it(&later_process(&first), &cwd, "a1");
             assert_eq!(tools_flag(&argv_of(&again)).as_deref(), Some("read,mcp__fake__echo"));
@@ -4103,7 +4136,7 @@ mod tests {
         async fn what_an_agent_writes_into_its_records_does_not_widen_its_own_process_continuation() {
             let cwd = tmp("cont-forged");
             let l = launcher(&logging_script(), 8, 4);
-            run_single(&l, &with_tools(Some(vec!["read"])), "t", &cwd, None, None).await;
+            run_single(&l, &with_tools(Some(vec!["read"])), "t", &cwd, None, None, None).await;
             let d = dir(&l, &cwd, "a1");
             std::fs::write(d.join(TOOLS_RECORD), r#"{"tools":["bash"]}"#).unwrap();
             let brief = std::fs::read_to_string(d.join("brief.md")).unwrap();
@@ -4236,7 +4269,7 @@ mod tests {
         #[tokio::test]
         async fn a_dispatched_agent_is_granted_before_spawn_and_revoked_when_it_ends() {
             let w = World::new("grant-basic").await;
-            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None).unwrap();
+            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None, None).unwrap();
             one_run(&w, "a1", prepared).await;
 
             let argv = std::fs::read_to_string(w.dir("a1").join("argv.log")).unwrap();
@@ -4250,7 +4283,7 @@ mod tests {
         #[tokio::test]
         async fn a_continued_agent_gets_a_fresh_grant_and_its_tools() {
             let w = World::new("grant-continue").await;
-            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None).unwrap();
+            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None, None).unwrap();
             one_run(&w, "a1", prepared).await;
             assert_eq!(granted(&w, "a1"), None);
 
@@ -4277,7 +4310,7 @@ mod tests {
         async fn continuing_an_agent_without_mcp_tools_grants_nothing() {
             let w = World::new("grant-none").await;
             let plain = agent_fixture();
-            let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None).unwrap();
+            let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None, None).unwrap();
             assert!(prepared.mcp.tools.is_empty());
             drop(prepared);
             w.l.registry.reactivate("a1").ok();
@@ -4300,7 +4333,7 @@ mod tests {
         async fn a_continuation_ignores_the_tools_an_agent_wrote_into_its_brief() {
             let w = World::new("grant-forged").await;
             let plain = agent_fixture();
-            let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None).unwrap();
+            let prepared = prepare_run(&w.l, &plain, "t", &w.cwd, None, None, None).unwrap();
             drop(prepared);
             let brief = w.dir("a1").join("brief.md");
             let text = std::fs::read_to_string(&brief).unwrap();
@@ -4316,7 +4349,7 @@ mod tests {
         #[tokio::test]
         async fn a_stopped_agent_is_revoked() {
             let w = World::new("grant-stop").await;
-            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None).unwrap();
+            let prepared = prepare_run(&w.l, &w.agent(), "t", &w.cwd, None, None, None).unwrap();
             let run = w.run(prepared);
             until("the child to start", || w.dir("a1").join("started").exists()).await;
             assert!(granted(&w, "a1").is_some());

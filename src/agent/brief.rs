@@ -47,6 +47,9 @@ pub struct BriefMeta {
     /// present and non-blank; briefs without one are byte-identical to
     /// before this field existed.
     pub label: Option<String>,
+    /// The agent's name for people (see `agent::names`), rendered as a
+    /// `name:` line when present.
+    pub name: Option<String>,
     /// ISO-01: absolute path of the worktree the child runs in, when
     /// isolation is active. `None` for a normal (unisolated) dispatch.
     pub worktree: Option<String>,
@@ -90,6 +93,11 @@ pub fn render_brief_with_meta(spec: &BriefSpec, meta: &BriefMeta) -> String {
     if let Some(label) = meta.label.as_deref() {
         if !label.trim().is_empty() {
             fm.push_str(&format!("label: {}\n", fm_value(label)));
+        }
+    }
+    if let Some(name) = meta.name.as_deref() {
+        if !name.trim().is_empty() {
+            fm.push_str(&format!("name: {}\n", fm_value(name)));
         }
     }
     if let Some(w) = meta.worktree.as_deref() {
@@ -602,6 +610,7 @@ mod tests {
             label: None,
             worktree: None,
             branch: None,
+            name: None,
         }
     }
 

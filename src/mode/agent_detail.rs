@@ -220,6 +220,8 @@ pub struct AgentRow {
     pub role: Option<String>,
     /// The brief's `label:` (the dispatcher's short description).
     pub label: Option<String>,
+    /// The brief's `name:` (`agent::names`): who the user knows it as.
+    pub codename: Option<String>,
     /// First line of the task.
     pub task_line: Option<String>,
 }
@@ -295,6 +297,7 @@ pub fn build_row(
         finished_ago_secs,
         role: text(front_matter_get(brief, "role")),
         label: text(front_matter_get(brief, "label")),
+        codename: text(front_matter_get(brief, "name")),
         task_line: task_text(brief)
             .map(|t| one_line(&first_line(&t, 120)))
             .filter(|s| !s.is_empty()),
@@ -340,7 +343,7 @@ pub fn order_rows(rows: &mut [AgentRow]) {
 
 /// Does `query` (already lowercased) start the agent's label, role, or task?
 fn row_name_matches(row: &AgentRow, q: &str) -> bool {
-    [&row.label, &row.role, &row.task_line]
+    [&row.codename, &row.label, &row.role, &row.task_line]
         .into_iter()
         .flatten()
         .any(|n| n.trim().to_lowercase().starts_with(q))
@@ -389,8 +392,9 @@ pub fn picker_items(rows: &[AgentRow]) -> Vec<(String, String, String)> {
     rows.iter()
         .map(|r| {
             let name = clip(&r.name(), PICKER_NAME_COLS);
+            let who = r.codename.as_deref().map(|c| format!("{c} · ")).unwrap_or_default();
             (
-                format!("{} {:<3} {name}", glyph_for(r.state), r.id),
+                format!("{} {:<3} {who}{name}", glyph_for(r.state), r.id),
                 state_clock(r),
                 r.id.clone(),
             )
@@ -405,7 +409,14 @@ pub fn finished_list_lines(rows: &[AgentRow], width: usize) -> Vec<String> {
         .filter(|r| !r.is_live())
         .map(|r| {
             clip(
-                &format!("{} {}  {}  {}", glyph_for(r.state), r.id, r.name(), state_clock(r)),
+                &format!(
+                    "{} {}  {}{}  {}",
+                    glyph_for(r.state),
+                    r.id,
+                    r.codename.as_deref().map(|c| format!("{c} · ")).unwrap_or_default(),
+                    r.name(),
+                    state_clock(r)
+                ),
                 width,
             )
         })
@@ -453,6 +464,8 @@ pub struct ReportHead {
 pub struct CardInput {
     pub id: String,
     pub state: AgentState,
+    /// The agent's name (`agent::names`), shown ahead of its id.
+    pub codename: Option<String>,
     pub label: Option<String>,
     pub role: Option<String>,
     pub elapsed_secs: u64,
@@ -659,6 +672,7 @@ pub fn load_card(entry: &AgentEntry, now: Instant) -> CardInput {
     CardInput {
         id: entry.id.clone(),
         state: entry.state,
+        codename: known(brief_fm("name")),
         label: known(brief_fm("label")),
         role: known(brief_fm("role")),
         elapsed_secs: entry
@@ -759,9 +773,13 @@ pub fn render_card(c: &CardInput, width: usize) -> Vec<CardLine> {
         .or(c.role.as_deref())
         .map(one_line)
         .filter(|n| !n.is_empty());
+    let who = match c.codename.as_deref().map(one_line).filter(|n| !n.is_empty()) {
+        Some(codename) => format!("{codename} ({})", one_line(&c.id)),
+        None => one_line(&c.id),
+    };
     let head = match name {
-        Some(n) => format!("{} {}  {n}", glyph_for(c.state), one_line(&c.id)),
-        None => format!("{} {}", glyph_for(c.state), one_line(&c.id)),
+        Some(n) => format!("{} {who}  {n}", glyph_for(c.state)),
+        None => format!("{} {who}", glyph_for(c.state)),
     };
     body.push(line(Header, clip(&head, width)));
 
@@ -1063,6 +1081,7 @@ mod tests {
             finished_ago_secs: ago,
             role: None,
             label: label.map(String::from),
+            codename: None,
             task_line: None,
         }
     }
@@ -1071,6 +1090,7 @@ mod tests {
         CardInput {
             id: "a1".into(),
             state,
+            codename: None,
             label: Some("review auth".into()),
             role: None,
             elapsed_secs: 65,
@@ -1144,6 +1164,16 @@ mod tests {
         let brief = "---\nlabel: hi\u{1b}[31mred\u{7}\n---\n";
         let r = build_row("a1", AgentState::Running, 0, None, brief);
         assert_eq!(r.label.as_deref(), Some("hi[31mred"));
+    }
+
+    /// The agent's name shows next to its id, and `/agents show` finds it.
+    #[test]
+    fn agents_are_known_by_their_name_too() {
+        let brief = "---\nid: a2\nlabel: install the skill\nname: Curie\n---\n\n# Brief\n\n## Task\n\ndo it\n";
+        let r = build_row("a2", AgentState::Running, 5, None, brief);
+        assert_eq!(r.codename.as_deref(), Some("Curie"));
+        assert_eq!(picker_items(&[r.clone()])[0].0, "● a2  Curie · install the skill");
+        assert_eq!(resolve_agent("curie", &[r]), Ok("a2".to_string()));
     }
 
     #[test]

@@ -547,6 +547,7 @@ mod tests {
             label: None,
             worktree: None,
             branch: None,
+            name: None,
         };
         std::fs::write(dir.join("brief.md"), render_brief_with_meta(&spec, &meta)).unwrap();
     }

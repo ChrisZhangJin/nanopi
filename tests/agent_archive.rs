@@ -29,6 +29,7 @@ fn write_brief(agent_dir: &std::path::Path, id: &str, state: &str, run_id: &str)
         label: None,
         worktree: None,
         branch: None,
+        name: None,
     };
     std::fs::write(agent_dir.join("brief.md"), render_brief_with_meta(&spec, &meta)).unwrap();
 }

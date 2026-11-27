@@ -11,6 +11,7 @@ pub mod context;
 pub mod context_files;
 pub mod hook;
 pub mod loop_;
+pub mod names;
 pub mod permission;
 pub mod prompt_override;
 pub mod steps;
