@@ -31,7 +31,7 @@
 //!
 //! MVP: single-line input; multi-line + Emacs keys come in v0.7 S2.
 
-use std::io::{self, IsTerminal as _, Stdout, Write as _};
+use std::io::{self, Stdout, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -266,7 +266,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             "Show a local image (PNG, JPEG, GIF) here: /image <path> — not sent to the model",
             SlashCmd::Image,
         ),
-        MenuItem::new("/image-test", "Show an inline test image", SlashCmd::ImageTest),
+        MenuItem::new("/image-test", "Show the nanopi logo (checks inline images work here)", SlashCmd::ImageTest),
         MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
         MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
         MenuItem::new(
@@ -794,6 +794,11 @@ pub async fn run_tui_mode(
         let g = agent_slot.lock().await;
         g.as_ref().map(|a| a.skills.clone()).unwrap_or_default()
     };
+    // Decide inline-image support now, before the TUI reads the keyboard
+    // (the terminal may be asked its name), and greet with the logo.
+    if *inline_image::init_support() == Support::Iterm2 {
+        print_startup_logo();
+    }
     print_startup_banner(model, &header.id, &loaded_skills);
 
     // Installed only now: before this point there is nothing to shut
@@ -996,6 +1001,29 @@ pub async fn run_tui_mode(
     );
 
     result
+}
+
+/// The logo above the startup banner, in plain terminal mode (the TUI
+/// has not started). Rows are reserved first and the cursor is saved
+/// below them, so wherever the terminal leaves the cursor after the
+/// image, the banner starts on the line under it.
+fn print_startup_logo() {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let Some((width, height)) =
+        inline_image::image_box(cols.min(40), rows, 0, inline_image::dimensions(inline_image::LOGO_PNG))
+    else {
+        return;
+    };
+    let Ok(sequence) = inline_image::encode(inline_image::LOGO_PNG, width, height) else {
+        return;
+    };
+    let mut out = io::stdout();
+    let _ = write!(
+        out,
+        "{}\x1b7\x1b[{height}A\x1b[3G{sequence}\x1b8",
+        "\n".repeat(usize::from(height))
+    );
+    let _ = out.flush();
 }
 
 fn print_startup_banner(model: &str, session_id: &str, skills: &[crate::resources::Skill]) {
@@ -8616,7 +8644,7 @@ fn inline_image_blocked(app: &App, label: &str) -> Option<String> {
     if app.agent_panel.is_some() {
         return Some(format!("[image: {label} — not shown while the agent panel is open]"));
     }
-    match inline_image::detect(|key| std::env::var_os(key), io::stdout().is_terminal()) {
+    match inline_image::support() {
         Support::Off(reason) => Some(format!(
             "inline images are off here ({reason}); NANOPI_INLINE_IMAGES=iterm2 forces them"
         )),
@@ -8641,16 +8669,19 @@ fn draw_inline_image(term: &mut Term, app: &mut App, data: &[u8], width: u16, ro
     redraw(term, app)
 }
 
+/// `/image-test`: draw the nanopi logo, to check the terminal shows
+/// inline images.
 fn show_test_image(term: &mut Term, app: &mut App) -> Result<()> {
-    if let Some(why) = inline_image_blocked(app, "image-test.png 96x48") {
+    if let Some(why) = inline_image_blocked(app, "nanopi-logo.png") {
         return image_note(term, why);
     }
     let screen = sync_inline_size(term)?;
     let dock = term.get_frame().area();
-    let Some((width, rows)) = inline_image::test_box(screen.width, screen.height, dock.height) else {
-        return image_note(term, "[image: image-test.png 96x48 — terminal too small]".into());
+    let pixels = inline_image::dimensions(inline_image::LOGO_PNG);
+    let Some((width, rows)) = inline_image::image_box(screen.width.min(44), screen.height, dock.height, pixels) else {
+        return image_note(term, "[image: nanopi-logo.png — terminal too small]".into());
     };
-    draw_inline_image(term, app, inline_image::TEST_PNG, width, rows)
+    draw_inline_image(term, app, inline_image::LOGO_PNG, width, rows)
 }
 
 const IMAGE_USAGE: &str = "usage: /image <path>   (PNG, JPEG or GIF; shown here only, not sent to the model)";
@@ -10039,8 +10070,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("ok.png");
-        std::fs::write(&png, inline_image::TEST_PNG).unwrap();
-        assert_eq!(load_display_image(&png).unwrap(), (inline_image::TEST_PNG.to_vec(), "image/png"));
+        std::fs::write(&png, inline_image::LOGO_PNG).unwrap();
+        assert_eq!(load_display_image(&png).unwrap(), (inline_image::LOGO_PNG.to_vec(), "image/png"));
         let webp = dir.path().join("x.webp");
         std::fs::write(&webp, b"RIFF\0\0\0\0WEBPVP8 ").unwrap();
         assert!(load_display_image(&webp).unwrap_err().contains("only PNG, JPEG and GIF"));
