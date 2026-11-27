@@ -123,6 +123,7 @@ pub const RESERVED_COMMAND_NAMES: &[&str] = &[
     "agents",
     "compact",
     "hotkeys",
+    "image",
     "image-test",
     "skills",
     "tools",

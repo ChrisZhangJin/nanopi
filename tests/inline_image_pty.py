@@ -91,6 +91,10 @@ def check(binary, home, force):
     (home / "config.toml").write_text(
         'model = "mock"\nbase_url = "http://127.0.0.1:1/v1"\napi_key = "test"\n'
     )
+    (home / "memory").mkdir()
+    (home / "memory" / "schedule-choice").write_text("never\n")
+    gif = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+    (home / "my image.gif").write_bytes(gif)
     tui = Tui(binary, home, force)
     input_line = re.compile(rb"\x1b\[(\d+);1H(?:\x1b\[[0-9;]*m)*>")
     dock = lambda data: input_line.search(data) and b"(auto)" in text(data)
@@ -112,6 +116,17 @@ def check(binary, home, force):
             assert int(input_line.search(tui.raw, image.end())[1]) >= int(image[1]) + 12
             print("PASS one exact PNG sequence above the redrawn input and footer")
 
+            after = len(tui.raw)
+            tui.send('/image "my image.gif"\r')
+            local = re.compile(rb"\x1b\]1337;File=inline=1;size=(\d+);width=4;height=2;"
+                               rb"preserveAspectRatio=1:([A-Za-z0-9+/=]+)\x07")
+            tui.until(local.search, after)
+            image = local.search(tui.raw, after)
+            assert int(image[1]) == len(gif)
+            assert base64.b64decode(image[2], validate=True) == gif
+            tui.until(dock, image.end())
+            print("PASS /image sends the specified file with spaces in its name")
+
             # Drive ordinary scrollback after the image without contacting a provider.
             after = len(tui.raw)
             tui.send("/hotkeys\r")
@@ -129,7 +144,7 @@ def check(binary, home, force):
             tui.until(lambda data: b"inline images are off here (tmux" in text(data)
                       and b"NANOPI_INLINE_IMAGES=iterm2 forces them" in text(data), before)
             print("PASS no override under tmux reports why and how to force")
-        assert tui.raw.count(OSC) == int(force)
+        assert tui.raw.count(OSC) == 2 * int(force)
         assert tui.queries == startup_queries, "cursor queried while EventStream was active"
     finally:
         tui.close()

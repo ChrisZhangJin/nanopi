@@ -105,6 +105,36 @@ fn append_history(path: &std::path::Path, entry: &str) {
     }
 }
 
+/// The entries in a history file's text, oldest first: one JSON string
+/// per line (anything else taken verbatim), blank and consecutive
+/// duplicates dropped.
+fn parse_history(contents: &str) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let entry = serde_json::from_str::<String>(line).unwrap_or_else(|_| line.to_string());
+        let entry = entry.trim();
+        if !entry.is_empty() && all.last().map(String::as_str) != Some(entry) {
+            all.push(entry.to_string());
+        }
+    }
+    all
+}
+
+/// Keep the history file at most [`HISTORY_CAP`] lines: once it passes
+/// that, the oldest entries roll off. Re-read rather than taken from
+/// memory, so entries other windows appended are kept.
+fn trim_history_file(path: &std::path::Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else { return };
+    if contents.lines().count() <= HISTORY_CAP {
+        return;
+    }
+    let mut all = parse_history(&contents);
+    if all.len() > HISTORY_CAP {
+        all.drain(0..all.len() - HISTORY_CAP);
+    }
+    rewrite_history(path, &all);
+}
+
 /// Replace the history file with exactly `entries`, via a temp file and
 /// a rename so a crash never leaves it half-written.
 fn rewrite_history(path: &std::path::Path, entries: &[String]) {
@@ -168,22 +198,11 @@ impl TextBuffer {
         let mut buf = Self::new();
         buf.history_path = Some(path.clone());
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            let mut all: Vec<String> = Vec::new();
-            for line in contents.lines() {
-                // A JSON string per line; anything else (a hand-edited
-                // or plain-text line) is taken verbatim.
-                let entry = serde_json::from_str::<String>(line)
-                    .unwrap_or_else(|_| line.to_string());
-                let entry = entry.trim();
-                if !entry.is_empty() && all.last().map(String::as_str) != Some(entry) {
-                    all.push(entry.to_string());
-                }
-            }
-            let lines = contents.lines().count();
+            let mut all = parse_history(&contents);
             if all.len() > HISTORY_CAP {
                 all.drain(0..all.len() - HISTORY_CAP);
             }
-            if lines > 2 * HISTORY_CAP {
+            if contents.lines().count() > HISTORY_CAP {
                 rewrite_history(&path, &all);
             }
             buf.history = all;
@@ -267,6 +286,7 @@ impl TextBuffer {
         }
         if let Some(path) = &self.history_path {
             append_history(path, trimmed);
+            trim_history_file(path);
         }
     }
 
@@ -285,18 +305,6 @@ impl TextBuffer {
         self.last_op = LastOp::Other;
     }
 
-    /// True when the editor is fully empty (one row, no chars).
-    fn buffer_blank(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
-    }
-
-    /// Should this key trigger history navigation rather than cursor
-    /// movement? PI's rule (editor.ts:824): empty buffer, already in
-    /// history mode, or cursor sitting at the very start (row 0, col 0).
-    fn history_eligible(&self) -> bool {
-        self.history_index.is_some() || self.buffer_blank() || self.cursor == (0, 0)
-    }
-
     /// Called at the start of every content mutation. If the buffer
     /// was showing a recalled history entry, the user is now editing
     /// that text — exit history mode so a subsequent Down doesn't
@@ -304,6 +312,24 @@ impl TextBuffer {
     fn exit_history_mode(&mut self) {
         self.history_index = None;
         self.history_draft.clear();
+    }
+
+    /// Move the cursor `delta` lines, keeping its column (in characters,
+    /// clamped to the target line's length).
+    fn move_row(&mut self, delta: isize) {
+        self.last_op = LastOp::Other;
+        let (row, col) = self.cursor;
+        let target = row.saturating_add_signed(delta).min(self.lines.len() - 1);
+        let chars = self.lines[row][..col].chars().count();
+        let line = &self.lines[target];
+        let byte = line.char_indices().nth(chars).map_or(line.len(), |(i, _)| i);
+        self.cursor = (target, byte);
+    }
+
+    /// While browsing history: `(position, total)`, 1-based and counted
+    /// from the oldest entry, for the `History 98/100` label.
+    pub fn history_position(&self) -> Option<(usize, usize)> {
+        self.history_index.map(|i| (i + 1, self.history.len()))
     }
 
     /// Up-arrow: step back one entry in history (or enter it from a
@@ -728,16 +754,27 @@ impl TextBuffer {
                 return Action::Nothing;
             }
             KeyCode::Up => {
-                // History nav only when eligible; else no-op (multi-
-                // line row-up navigation is a future extension).
-                if self.history_eligible() {
+                // Inside multi-line text, Up moves between lines. On the
+                // first line it opens history; what was typed is kept as
+                // the draft, and Down past the newest entry restores it.
+                if self.cursor.0 > 0 {
+                    self.move_row(-1);
+                } else {
                     self.history_prev();
                 }
                 return Action::Nothing;
             }
             KeyCode::Down => {
-                if self.history_index.is_some() {
+                // Down moves between lines; on the last line it steps
+                // forward through history while browsing it.
+                if self.cursor.0 + 1 < self.lines.len() {
+                    self.move_row(1);
+                } else if self.history_index.is_some() {
                     self.history_next();
+                } else {
+                    let last = self.lines.len() - 1;
+                    self.cursor = (last, self.lines[last].len());
+                    self.last_op = LastOp::Other;
                 }
                 return Action::Nothing;
             }
@@ -1010,11 +1047,7 @@ mod tests {
         submit(&mut b, "two");
         // Start typing something, then recall + go back forward.
         type_str(&mut b, "draft");
-        b.handle_key(press(KeyCode::Up)); // enter history mode from non-empty at (0,0)? no, cursor not at 0,0.
-                                          // With text, cursor at (0,5), NOT eligible → no history nav.
-        assert_eq!(b.as_string(), "draft");
-        // Move to (0, 0) so Up becomes eligible.
-        b.handle_key(press_c(KeyCode::Char('a')));
+        // On the first (only) line, Up opens history wherever the cursor is.
         b.handle_key(press(KeyCode::Up));
         assert_eq!(b.as_string(), "two");
         b.handle_key(press(KeyCode::Down));
@@ -1136,6 +1169,75 @@ mod tests {
 
     /// The file only ever grows by appends; loading trims it back to the
     /// cap once it is well past it, keeping the newest entries.
+    /// Up/Down move between the lines of multi-line input; history only
+    /// takes over at the first / last line.
+    #[test]
+    fn arrows_move_between_lines_before_reaching_history() {
+        let mut b = TextBuffer::new();
+        submit(&mut b, "older");
+        b.insert_str("first line\nsecond\nthird line");
+        assert_eq!(b.cursor(), (2, 10));
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.cursor(), (1, 6), "column clamped to the shorter line");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.cursor(), (0, 6), "column kept where the line allows");
+        b.handle_key(press(KeyCode::Down));
+        b.handle_key(press(KeyCode::Down));
+        assert_eq!(b.cursor(), (2, 6));
+        b.handle_key(press(KeyCode::Down));
+        assert_eq!(b.cursor(), (2, 10), "last line: to its end");
+        assert_eq!(b.history_position(), None, "Down never opens history");
+        // On the first line, Up opens history at once, from any column.
+        b.handle_key(press(KeyCode::Up));
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.cursor().0, 0);
+        assert_eq!(b.as_string(), "first line\nsecond\nthird line", "still the draft");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.as_string(), "older");
+        assert_eq!(b.history_position(), Some((1, 1)));
+        b.handle_key(press(KeyCode::Down));
+        assert_eq!(b.as_string(), "first line\nsecond\nthird line", "draft restored");
+        assert_eq!(b.history_position(), None);
+    }
+
+    /// A recalled multi-line entry can be walked line by line, and the
+    /// position reads oldest-first.
+    #[test]
+    fn recalled_multiline_entries_are_navigable() {
+        let mut b = TextBuffer::new();
+        submit(&mut b, "one");
+        b.insert_str("a\nb\nc");
+        b.handle_key(press(KeyCode::Enter));
+        submit(&mut b, "three");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.history_position(), Some((3, 3)));
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!((b.as_string().as_str(), b.history_position()), ("a\nb\nc", Some((2, 3))));
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.cursor().0, 1, "inside the recalled entry");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!(b.cursor().0, 0, "its first line");
+        b.handle_key(press(KeyCode::Up));
+        assert_eq!((b.as_string().as_str(), b.history_position()), ("one", Some((1, 3))));
+    }
+
+    /// The file never grows past the cap: every submit past it rolls the
+    /// oldest entry off.
+    #[test]
+    fn history_file_never_exceeds_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut w = TextBuffer::with_history(path.clone());
+        for i in 0..(HISTORY_CAP + 7) {
+            submit(&mut w, &format!("p{i}"));
+            let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+            assert!(lines <= HISTORY_CAP, "{lines} lines after {i}");
+        }
+        let fresh = TextBuffer::with_history(path.clone());
+        assert_eq!(fresh.history.first().unwrap(), "p7");
+        assert_eq!(fresh.history.last().unwrap(), &format!("p{}", HISTORY_CAP + 6));
+    }
+
     #[test]
     fn history_file_is_trimmed_to_the_cap_on_load() {
         let dir = tempfile::tempdir().unwrap();

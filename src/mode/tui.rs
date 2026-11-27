@@ -91,6 +91,8 @@ enum SlashCmd {
     Hotkeys,
     /// Display a fixed inline test image in scrollback.
     ImageTest,
+    /// `/image <path>`: display a local image file in scrollback.
+    Image,
     /// Print session stats (tokens, cost, model, turns) to scrollback.
     SessionInfo,
     /// Enter capture mode; next Enter sets the session's `name`.
@@ -259,6 +261,11 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
             SlashCmd::Agents,
         ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
+        MenuItem::new(
+            "/image",
+            "Show a local image (PNG, JPEG, GIF) here: /image <path> — not sent to the model",
+            SlashCmd::Image,
+        ),
         MenuItem::new("/image-test", "Show an inline test image", SlashCmd::ImageTest),
         MenuItem::new("/hotkeys", "Show all keyboard shortcuts", SlashCmd::Hotkeys),
         MenuItem::new("/skills", "List all loaded skills", SlashCmd::ListSkills),
@@ -1703,6 +1710,8 @@ enum KeyAction {
     /// `/hotkeys`: dump keybinding help into scrollback.
     ShowHotkeys,
     ShowTestImage,
+    /// `/image <path>` (the raw argument; empty shows usage).
+    ShowImage(String),
     /// v0.9.3: `/settings` — dump interaction settings + toml path.
     ShowSettings,
     /// v0.9.3: `/keybindings` — dump keybindings + toml override key.
@@ -2937,6 +2946,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
         SlashCmd::Fork => KeyAction::OpenForkPicker,
         SlashCmd::Hotkeys => KeyAction::ShowHotkeys,
         SlashCmd::ImageTest => KeyAction::ShowTestImage,
+        SlashCmd::Image => KeyAction::ShowImage(arg),
         SlashCmd::ListSkills => KeyAction::ShowSkills,
         SlashCmd::ListTools => KeyAction::ShowTools,
         SlashCmd::Mcp => KeyAction::ShowMcp,
@@ -3459,7 +3469,7 @@ async fn run_app(
                 let became_empty = !was_empty && app.agents_view.is_empty();
                 reset_strip_expanded_on_became_empty(app, became_empty);
                 // One shared status check for every live agent.
-                poll_agent_watch(term, app, &agent_slot, idle)?;
+                let watch_wrote_scrollback = poll_agent_watch(term, app, &agent_slot, idle)?;
                 // The live agent panel follows its agent's transcript.
                 if let Some(p) = app.agent_panel.as_mut() {
                     let snap = crate::agent_registry::global().map(|r| r.snapshot()).unwrap_or_default();
@@ -3480,6 +3490,7 @@ async fn run_app(
                     || became_empty
                     || app.agent_panel.is_some()
                     || app.agent_watch.active()
+                    || watch_wrote_scrollback
                     || compact_visible
                     || compact_was_visible
                 {
@@ -5051,6 +5062,7 @@ async fn handle_action(
             }
         }
         KeyAction::ShowTestImage => show_test_image(term, app)?,
+        KeyAction::ShowImage(arg) => show_image_file(term, app, &arg)?,
         KeyAction::ShowMcp => {
             // From the manager only: no agent lock (a turn may hold it)
             // and no request to any server.
@@ -6728,7 +6740,7 @@ fn poll_agent_watch(
     app: &mut App,
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     idle: bool,
-) -> Result<()> {
+) -> Result<bool> {
     use crate::agent_watch::{Step, RETRY_DELAY};
     let now = std::time::Instant::now();
     if let Ok(g) = agent_slot.try_lock() {
@@ -6798,12 +6810,15 @@ fn poll_agent_watch(
             }
         }
     }
-    if idle && !app.agent_watch_lines.is_empty() {
+    // Inserting scrollback clears the inline dock, even if the watcher
+    // has already stopped and there will be no further animated frames.
+    let wrote_scrollback = idle && !app.agent_watch_lines.is_empty();
+    if wrote_scrollback {
         for (text, colour) in std::mem::take(&mut app.agent_watch_lines) {
             goal_line(term, &text, colour)?;
         }
     }
-    Ok(())
+    Ok(wrote_scrollback)
 }
 
 // ── /effort ───────────────────────────────────────────────────────────
@@ -8591,22 +8606,28 @@ fn insert_line_bg(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> R
     insert_line_bg_raw(term, line, bg_style)
 }
 
-fn show_test_image(term: &mut Term, app: &mut App) -> Result<()> {
-    let note = |term: &mut Term, message: String| {
-        insert_line(term, Line::from(Span::styled(message, Style::default().add_modifier(Modifier::DIM))))
-    };
+fn image_note(term: &mut Term, message: String) -> Result<()> {
+    insert_line(term, Line::from(Span::styled(message, Style::default().add_modifier(Modifier::DIM))))
+}
+
+/// Why an image cannot be drawn here, if it cannot (panel open, or the
+/// terminal does not do inline images). `label` names it in the note.
+fn inline_image_blocked(app: &App, label: &str) -> Option<String> {
     if app.agent_panel.is_some() {
-        return note(term, "[image: image-test.png 96x48 — not shown while the agent panel is open]".into());
+        return Some(format!("[image: {label} — not shown while the agent panel is open]"));
     }
-    if let Support::Off(reason) = inline_image::detect(|key| std::env::var_os(key), io::stdout().is_terminal()) {
-        return note(term, format!("inline images are off here ({reason}); NANOPI_INLINE_IMAGES=iterm2 forces them"));
+    match inline_image::detect(|key| std::env::var_os(key), io::stdout().is_terminal()) {
+        Support::Off(reason) => Some(format!(
+            "inline images are off here ({reason}); NANOPI_INLINE_IMAGES=iterm2 forces them"
+        )),
+        Support::Iterm2 => None,
     }
-    let screen = sync_inline_size(term)?;
-    let dock = term.get_frame().area();
-    let Some((width, rows)) = inline_image::test_box(screen.width, screen.height, dock.height) else {
-        return note(term, "[image: image-test.png 96x48 — terminal too small]".into());
-    };
-    let sequence = inline_image::encode(inline_image::TEST_PNG, width, rows)?;
+}
+
+/// Draw `data` in a `width` x `rows` box just above the dock. The box is
+/// reserved first, so the image can never push the dock or tear it.
+fn draw_inline_image(term: &mut Term, app: &mut App, data: &[u8], width: u16, rows: u16) -> Result<()> {
+    let sequence = inline_image::encode(data, width, rows)?;
     term.insert_before(rows, |_| {})?;
     // insert_before can scroll and can move the dock. The reserved rows
     // now end just above its *new* top. The image may move the cursor,
@@ -8618,6 +8639,103 @@ fn show_test_image(term: &mut Term, app: &mut App) -> Result<()> {
     term.clear()?;
     term.backend_mut().flush()?;
     redraw(term, app)
+}
+
+fn show_test_image(term: &mut Term, app: &mut App) -> Result<()> {
+    if let Some(why) = inline_image_blocked(app, "image-test.png 96x48") {
+        return image_note(term, why);
+    }
+    let screen = sync_inline_size(term)?;
+    let dock = term.get_frame().area();
+    let Some((width, rows)) = inline_image::test_box(screen.width, screen.height, dock.height) else {
+        return image_note(term, "[image: image-test.png 96x48 — terminal too small]".into());
+    };
+    draw_inline_image(term, app, inline_image::TEST_PNG, width, rows)
+}
+
+const IMAGE_USAGE: &str = "usage: /image <path>   (PNG, JPEG or GIF; shown here only, not sent to the model)";
+
+/// Resolve `/image`'s argument: surrounding quotes dropped, `~` expanded,
+/// relative paths taken from the session's working directory.
+fn image_path(arg: &str, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let t = arg.trim();
+    let t = ['"', '\'']
+        .iter()
+        .find_map(|q| t.strip_prefix(*q).and_then(|r| r.strip_suffix(*q)))
+        .unwrap_or(t);
+    if t.is_empty() {
+        return None;
+    }
+    let p = crate::paths::expand_home(t);
+    Some(if p.is_absolute() { p } else { cwd.join(p) })
+}
+
+/// Read an image file for display, or say in one line why not.
+fn load_display_image(path: &std::path::Path) -> std::result::Result<(Vec<u8>, &'static str), String> {
+    let shown = path.display();
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot open {shown}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown} is not a file"));
+    }
+    if meta.len() > inline_image::MAX_FILE_BYTES {
+        return Err(format!(
+            "{shown} is {} bytes; images up to {} bytes can be shown",
+            meta.len(),
+            inline_image::MAX_FILE_BYTES
+        ));
+    }
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // If the path becomes a pipe between metadata and open, never wait
+    // for a writer. Verify the actual opened handle before reading it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|e| format!("cannot open {shown}: {e}"))?;
+    if !file.metadata().map_err(|e| format!("cannot inspect {shown}: {e}"))?.is_file() {
+        return Err(format!("{shown} is not a file"));
+    }
+    let mut data = Vec::new();
+    file.take(inline_image::MAX_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("cannot read {shown}: {e}"))?;
+    if data.len() as u64 > inline_image::MAX_FILE_BYTES {
+        return Err(format!("{shown}: images up to {} bytes can be shown", inline_image::MAX_FILE_BYTES));
+    }
+    match crate::util::image_detect::detect_media_type(&data) {
+        Some(t) if inline_image::displayable(t) => Ok((data, t)),
+        Some(t) => Err(format!("{shown} is {t}; only PNG, JPEG and GIF can be shown inline")),
+        None => Err(format!("{shown} is not a PNG, JPEG or GIF image")),
+    }
+}
+
+/// `/image <path>`: show a local image above the dock. Display only —
+/// nothing is added to the conversation or sent to the model.
+fn show_image_file(term: &mut Term, app: &mut App, arg: &str) -> Result<()> {
+    let Some(path) = image_path(arg, &app.cwd) else {
+        return image_note(term, IMAGE_USAGE.into());
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = agents_strip::sanitize(&name);
+    if let Some(why) = inline_image_blocked(app, &name) {
+        return image_note(term, why);
+    }
+    let (data, _) = match load_display_image(&path) {
+        Ok(v) => v,
+        Err(why) => return image_note(term, agents_strip::sanitize(&why)),
+    };
+    let pixels = inline_image::dimensions(&data);
+    let screen = sync_inline_size(term)?;
+    let dock = term.get_frame().area();
+    let Some((width, rows)) = inline_image::image_box(screen.width, screen.height, dock.height, pixels) else {
+        return image_note(term, format!("[image: {name} — terminal too small]"));
+    };
+    let size = pixels.map(|(w, h)| format!(" {w}x{h}")).unwrap_or_default();
+    image_note(term, format!("[image: {name}{size}]"))?;
+    draw_inline_image(term, app, &data, width, rows)
 }
 
 fn insert_line_bg_raw(term: &mut Term, line: Line<'_>, bg_style: Option<Style>) -> Result<()> {
@@ -8785,6 +8903,21 @@ struct CompactOutcome {
 /// inside a turn): new input waits in `compact_queue` until it ends.
 fn compacting(app: &App) -> bool {
     app.compact_task.is_some() || crate::agent::compact_progress::running()
+}
+
+/// The input box's frame. While browsing history, the top border names
+/// the position: `── History 98/100 ──`.
+fn input_block(position: Option<(usize, usize)>) -> Block<'static> {
+    let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
+    match position {
+        // A short run of border first, so the label reads as part of
+        // the line rather than starting flush at the left edge.
+        Some((at, total)) => block.title(Line::from(vec![
+            Span::raw("──"),
+            Span::styled(format!(" History {at}/{total} "), Style::default().fg(Color::DarkGray)),
+        ])),
+        None => block,
+    }
 }
 
 fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
@@ -8978,7 +9111,7 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         input_lines.push(Line::from(spans));
     }
     let input_para = Paragraph::new(input_lines)
-        .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
+        .block(input_block(app.input.history_position()));
     input_para.render(chunks[2], buf);
 
     // Line 1 of footer: cwd + branch + session
@@ -9891,6 +10024,61 @@ mod tests {
         let marked = "[agent a2 finished: done] [plan 4]\n[progress 1/4]\nreal summary line\n";
         let p = report_preview(marked, 80, "Ctrl+G");
         assert!(!p.contains("[plan") && !p.contains("[progress") && p.contains("real summary line"), "{p}");
+    }
+
+    #[test]
+    fn image_command_resolves_paths_and_refuses_what_it_cannot_show() {
+        assert!(matches!(dispatch_slash(SlashCmd::Image, "a.png".into()), KeyAction::ShowImage(ref a) if a == "a.png"));
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path();
+        assert_eq!(image_path("shot.png", cwd).unwrap(), cwd.join("shot.png"));
+        let absolute = cwd.join("my shot.png");
+        assert_eq!(image_path(&format!("  '{}'  ", absolute.display()), cwd).unwrap(), absolute);
+        assert_eq!(image_path("\"a b.gif\"", cwd).unwrap(), cwd.join("a b.gif"));
+        assert!(image_path("   ", cwd).is_none(), "empty argument shows usage");
+
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("ok.png");
+        std::fs::write(&png, inline_image::TEST_PNG).unwrap();
+        assert_eq!(load_display_image(&png).unwrap(), (inline_image::TEST_PNG.to_vec(), "image/png"));
+        let webp = dir.path().join("x.webp");
+        std::fs::write(&webp, b"RIFF\0\0\0\0WEBPVP8 ").unwrap();
+        assert!(load_display_image(&webp).unwrap_err().contains("only PNG, JPEG and GIF"));
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "hello").unwrap();
+        assert!(load_display_image(&txt).unwrap_err().contains("not a PNG, JPEG or GIF"));
+        assert!(load_display_image(&dir.path().join("missing.png")).unwrap_err().starts_with("cannot open"));
+        assert!(load_display_image(dir.path()).unwrap_err().contains("is not a file"));
+        let big = dir.path().join("big.png");
+        std::fs::File::create(&big).unwrap().set_len(inline_image::MAX_FILE_BYTES + 1).unwrap();
+        assert!(load_display_image(&big).unwrap_err().contains("images up to"));
+    }
+
+    /// Browsing history labels the input box with the position.
+    #[test]
+    fn input_box_shows_the_history_position_while_browsing() {
+        let mut app = mkapp();
+        let row0 = |app: &App| {
+            let area = Rect::new(0, 0, 60, DOCK_HEIGHT);
+            let mut buf = Buffer::empty(area);
+            draw_dock(&mut buf, area, app);
+            (0..area.height)
+                .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .take_while(|r| !r.starts_with("> "))
+                .last()
+                .unwrap()
+        };
+        assert!(!row0(&app).contains("History"), "{}", row0(&app));
+        for t in ["one", "two", "three"] {
+            app.input.insert_str(t);
+            app.input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        app.input.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.input.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let top = row0(&app);
+        assert!(top.starts_with("── History 2/3 ─"), "{top}");
     }
 
     #[test]
