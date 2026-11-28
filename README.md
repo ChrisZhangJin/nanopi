@@ -857,7 +857,7 @@ Host-side plugin state survives a reload, deliberately: the plugin's host-store 
 
 | Version | Status | Size | Notes |
 |---|---|---|---|
-| **v0.17.2** | current | 2.2 MB | Agents named after historical figures (shown with their id; `/agents show <name>`); agents strip header with the status-check countdown; iTerm2 inline images (`/image-test`) |
+| **v0.17.2** | current | 2.3 MB | Named agents (random historical figures, never repeated); agents say why they stopped and `/agents continue` picks them up; higher sub-agent limits; Dream with a live panel and a structured summary; `/image <path>` and auto-detected inline images with the logo at startup; input history position and line-wise arrows; build tag in `--version` |
 | v0.17.1 | released | 2.2 MB | Live compaction progress with input queued until it finishes; collapsed agent reports (Ctrl+G shows all); per-agent progress bar; CJK-aware scrollback wrapping; Dream times in local time |
 | v0.17.0 | released | — | `/effort`; persistent experience library and nightly Dream; read-only agent panel and shared status checks |
 | v0.16.1 | released | 2.0 MB | `/goal` (work until a verified condition), `/loop` (fixed or self-paced), background mode (`/background`, `--foreground`); config profiles; per-command sudo gate; hybrid orchestrator; cut-off replies reported; shared input history |

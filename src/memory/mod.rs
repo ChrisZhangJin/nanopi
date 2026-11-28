@@ -15,11 +15,12 @@
 //!   and forgotten IDs are never regenerated.
 
 mod dream;
+pub mod dream_progress;
 #[doc(hidden)]
 pub mod schedule;
 mod tools;
 
-pub(crate) use dream::{plan as dream_plan, run as dream_run, DreamPlan};
+pub(crate) use dream::{plan as dream_plan, run as dream_run, DreamPlan, Report as DreamReport, STATUS_LABEL as DREAM_STATUS_LABEL};
 pub(crate) use tools::{ForgetTool, MemorySearchTool, RememberTool};
 
 use std::collections::{BTreeMap, BTreeSet};

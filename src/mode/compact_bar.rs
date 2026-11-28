@@ -268,6 +268,70 @@ pub fn draw(buf: &mut Buffer, area: Rect, p: &Progress, now: Instant, queued: &s
     buf.set_line(area.x, area.y + 2, &Line::from(row3), area.width);
 }
 
+/// Rows the Dream panel wants.
+pub const DREAM_HEIGHT: u16 = 2;
+
+/// Dream's live panel above the input, while it runs in the background:
+///
+/// ```text
+///  ⠹ Dream · claude-opus-5-5 · 3 notes · unprocessed notes        12.4s
+///    ▕██████▊░░░░░░░░░░░░░░░░░▏ asking the model · call 1 of 3 · 2 changes
+/// ```
+pub fn draw_dream(buf: &mut Buffer, area: Rect, p: &crate::memory::dream_progress::Progress, now: Instant) {
+    use crate::memory::dream_progress::Phase;
+    if area.width < 20 || area.height == 0 {
+        return;
+    }
+    let h = area.height.min(DREAM_HEIGHT);
+    let area = Rect { y: area.y + area.height - h, height: h, ..area };
+    let width = area.width as usize;
+    let ms = now.saturating_duration_since(p.started).as_millis();
+    let dim = Style::default().fg(DIM);
+    // The note count once known (row two says "reading notes" before).
+    let notes = match p.notes_total {
+        0 => String::new(),
+        1 => " · 1 note".to_string(),
+        n => format!(" · {n} notes"),
+    };
+    let left = vec![
+        Span::styled(format!(" {} ", spinner(ms)), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled("Dream", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" · {}{notes} · {}", p.model, p.range), dim),
+    ];
+    let clock = format!("{} ", fmt_elapsed(now.saturating_duration_since(p.started)));
+    let mut row1 = left;
+    let used = spans_width(&row1);
+    if used + clock.len() < width {
+        row1.push(Span::raw(" ".repeat(width - used - clock.len())));
+        row1.push(Span::styled(clock, dim));
+    }
+    buf.set_line(area.x, area.y, &Line::from(row1), area.width);
+    if h < 2 {
+        return;
+    }
+    let what = match p.phase {
+        Phase::Preparing => "reading notes…".to_string(),
+        Phase::Asking => format!("asking the model · call {} of at most {}", p.calls, p.max_calls),
+        Phase::Applying => "writing changes into the library".to_string(),
+    };
+    let changes = match p.changes {
+        0 => String::new(),
+        1 => " · 1 change".to_string(),
+        n => format!(" · {n} changes"),
+    };
+    // Determinate by notes once some are done; a comet while it waits.
+    let frac = p.fraction().filter(|f| *f > 0.0);
+    let bar_w = (width / 4).clamp(8, 28);
+    let mut row2 = vec![Span::raw("   "), Span::styled("▕", Style::default().fg(TRACK))];
+    for (sym, st) in bar_cells(bar_w, frac, false, ms) {
+        row2.push(Span::styled(sym, st));
+    }
+    row2.push(Span::styled("▏ ", Style::default().fg(TRACK)));
+    row2.push(Span::styled(what, Style::default().fg(Color::Gray)));
+    row2.push(Span::styled(changes, Style::default().fg(GREEN)));
+    buf.set_line(area.x, area.y + 1, &Line::from(row2), area.width);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +417,38 @@ mod tests {
                 assert_eq!(bar_cells(w, None, false, ms).len(), w);
             }
         }
+    }
+
+    #[test]
+    fn dream_panel_shows_phase_counts_and_motion() {
+        use crate::memory::dream_progress::{Phase, Progress};
+        let t0 = Instant::now();
+        let mut p = Progress {
+            model: "claude-opus-5-5".into(),
+            range: "unprocessed notes".into(),
+            started: t0,
+            phase: Phase::Asking,
+            notes_total: 3,
+            notes_done: 0,
+            calls: 1,
+            max_calls: 3,
+            changes: 0,
+        };
+        let render = |p: &Progress, ms| {
+            let area = Rect::new(0, 0, 100, 2);
+            let mut buf = Buffer::empty(area);
+            draw_dream(&mut buf, area, p, t0 + Duration::from_millis(ms));
+            text(&buf)
+        };
+        let s = render(&p, 400);
+        assert!(s.contains("Dream · claude-opus-5-5 · 3 notes · unprocessed notes"), "{s}");
+        assert!(s.contains("asking the model · call 1 of at most 3"), "{s}");
+        assert_ne!(s, render(&p, 900), "the comet moves while it waits");
+        p.phase = Phase::Applying;
+        p.notes_done = 3;
+        p.changes = 2;
+        let s = render(&p, 1000);
+        assert!(s.contains("writing changes into the library · 2 changes"), "{s}");
     }
 
     #[test]

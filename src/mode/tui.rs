@@ -1427,7 +1427,7 @@ struct App {
     command_task:
         Option<tokio::task::JoinHandle<(String, Result<crate::command::CommandAction, String>)>>,
     /// In-flight `/dream`, polled on the tick like `command_task`.
-    dream_task: Option<tokio::task::JoinHandle<Result<String, String>>>,
+    dream_task: Option<tokio::task::JoinHandle<Result<crate::memory::DreamReport, String>>>,
     /// In-flight `/compact`. It runs off the event loop (the agent is
     /// taken out of its slot, like a turn) so the progress panel keeps
     /// animating and the input stays editable.
@@ -1812,7 +1812,7 @@ enum KeyAction {
     /// `/dream …` (raw arguments).
     Dream(String),
     /// A Dream run finished.
-    DreamFinished(Result<String, String>),
+    DreamFinished(Result<crate::memory::DreamReport, String>),
     /// A background `/compact` finished.
     CompactFinished(CompactOutcome),
     /// A `/goal` line inside a longer message: set the goal; the text
@@ -2777,6 +2777,185 @@ fn open_agents_picker(
     build_agents_picker(&rows).ok_or_else(|| "no agents in this session".to_string())
 }
 
+// ── Dream ──────────────────────────────────────────────────────────
+
+/// One change Dream made, as its log records it, taken apart for
+/// display: `(icon, verb, colour, entry id, detail)`. `None` for lines
+/// that are not a change (summaries, skips, budget notes).
+fn dream_change(line: &str) -> Option<(&'static str, &'static str, Color, String, String)> {
+    let id_of = |rest: &str| -> Option<(String, String)> {
+        let rest = rest.strip_prefix('`')?;
+        let (id, after) = rest.split_once('`')?;
+        Some((id.to_string(), after.to_string()))
+    };
+    let (icon, verb, colour, rest) = if let Some(r) = line.strip_prefix("created ") {
+        ("+", "created", Color::Green, r)
+    } else if let Some(r) = line.strip_prefix("merged new evidence into ") {
+        ("~", "merged", Color::Cyan, r)
+    } else if let Some(r) = line.strip_prefix("marked ") {
+        ("!", "review", Color::Yellow, r)
+    } else if let Some(r) = line.strip_prefix("archived ") {
+        ("▫", "archived", Color::Gray, r)
+    } else if let Some(r) = line.strip_prefix("forgot ") {
+        ("−", "forgot", Color::Red, r)
+    } else if let Some(r) = line.strip_prefix("unpinned ") {
+        ("↓", "unpinned", Color::Gray, r)
+    } else if let Some(r) = line.strip_prefix("pinned ") {
+        ("↑", "pinned", Color::Magenta, r)
+    } else {
+        return None;
+    };
+    let (id, after) = id_of(rest)?;
+    // `(troubleshooting): reason`, ` needs review: reason`, `: reason`.
+    let after = after.trim_start();
+    let detail = if let Some(r) = after.strip_prefix('(') {
+        match r.split_once("):") {
+            Some((kind, why)) => format!("{kind} · {}", why.trim()),
+            None => after.to_string(),
+        }
+    } else {
+        after
+            .split_once(':')
+            .map(|(_, why)| why.trim().to_string())
+            .unwrap_or_else(|| after.to_string())
+    };
+    Some((icon, verb, colour, id, detail))
+}
+
+/// A change as one aligned row: `  + created   <id>   <kind · reason>`.
+fn dream_change_line(line: &str, id_width: usize, width: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let Some((icon, verb, colour, id, detail)) = dream_change(line) else {
+        return Line::from(Span::styled(format!("  {}", agents_strip::sanitize(line)), dim));
+    };
+    let id = agents_strip::truncate_to_width(&agents_strip::sanitize(&id), id_width);
+    let pad = " ".repeat(id_width.saturating_sub(agents_strip::display_width(&id)));
+    let used = 2 + 2 + 9 + id_width + 3;
+    let detail = agents_strip::truncate_to_width(&agents_strip::sanitize(&detail), width.saturating_sub(used + 1).max(10));
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{icon} "), Style::default().fg(colour).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{verb:<9}"), Style::default().fg(colour)),
+        Span::styled(format!("{id}{pad}"), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("   {detail}"), Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn dream_id_width<'a>(lines: impl Iterator<Item = &'a str>) -> usize {
+    lines
+        .filter_map(dream_change)
+        .map(|(_, _, _, id, _)| agents_strip::display_width(&id))
+        .max()
+        .unwrap_or(0)
+        .min(44)
+}
+
+/// The block printed when a Dream run finishes: a headline with the
+/// time and counts, a row per change, the model's summary, and where
+/// to look for more.
+fn dream_report_lines(r: &crate::memory::DreamReport, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut out = vec![Line::from(vec![
+        Span::styled("◆ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled("Dream finished", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(
+                " · {} · {} → {} · {}",
+                crate::mode::compact_bar::fmt_elapsed(r.elapsed),
+                if r.notes_processed == 1 { "1 note".to_string() } else { format!("{} notes", r.notes_processed) },
+                if r.changes.len() == 1 { "1 change".to_string() } else { format!("{} changes", r.changes.len()) },
+                if r.range == "unprocessed notes" { r.model.clone() } else { format!("{} · {}", r.range, r.model) }
+            ),
+            dim,
+        ),
+    ])];
+    let id_width = dream_id_width(r.changes.iter().map(String::as_str));
+    for change in &r.changes {
+        out.push(dream_change_line(change, id_width, width));
+    }
+    if r.changes.is_empty() {
+        out.push(Line::from(Span::styled("  no changes: nothing new worth keeping", dim)));
+    }
+    for summary in &r.summaries {
+        out.push(Line::from(Span::styled(
+            format!("  “{}”", agents_strip::truncate_to_width(&agents_strip::sanitize(summary), width.saturating_sub(6))),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    let mut tail = format!("  ↳ {} pending", r.pending);
+    if r.withheld > 0 {
+        tail.push_str(&format!(" · {} withheld by disclosure", r.withheld));
+    }
+    tail.push_str(" · /dream log for details");
+    out.push(Line::from(Span::styled(tail, dim)));
+    out
+}
+
+/// A failed or stopped run: its reason first, then the summary line.
+fn dream_failure_lines(e: &str) -> Vec<Line<'static>> {
+    let mut lines = e.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>();
+    let reason = if lines.len() > 1 { lines.pop() } else { None };
+    let mut out = vec![Line::from(vec![
+        Span::styled("◆ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled("Dream stopped", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" · {}", agents_strip::sanitize(reason.unwrap_or(lines.first().copied().unwrap_or("unknown error")))),
+            Style::default().fg(Color::Red),
+        ),
+    ])];
+    if reason.is_some() {
+        for l in lines {
+            out.push(Line::from(Span::styled(format!("  {}", agents_strip::sanitize(l)), Style::default().fg(Color::DarkGray))));
+        }
+    }
+    out.push(Line::from(Span::styled("  ↳ progress so far is kept · /dream log for details", Style::default().fg(Color::DarkGray))));
+    out
+}
+
+/// `/dream status` and `/dream log` with structure: status labels in
+/// colour and details dim beneath them; log run headings as `◆` lines
+/// and each change as an aligned, coloured row.
+fn dream_text_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let label_w = crate::memory::DREAM_STATUS_LABEL;
+    let id_width = dream_id_width(text.lines().filter_map(|l| l.trim_start().strip_prefix("- ")));
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = agents_strip::sanitize(raw);
+        if let Some(head) = line.strip_prefix("## ") {
+            if !out.is_empty() {
+                out.push(Line::from(""));
+            }
+            let (title, rest) = head.split_once(" · ").unwrap_or((head, ""));
+            out.push(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(if rest.is_empty() { String::new() } else { format!(" · {rest}") }, dim),
+            ]));
+        } else if let Some(change) = line.trim_start().strip_prefix("- ") {
+            if let Some(summary) = change.strip_prefix("summary: ") {
+                out.push(Line::from(Span::styled(
+                    format!("  “{summary}”"),
+                    Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+                )));
+            } else {
+                out.push(dream_change_line(change, id_width, width));
+            }
+        } else if line.chars().next().is_some_and(|c| !c.is_whitespace()) && line.len() > label_w {
+            let (label, value) = line.split_at(line.char_indices().nth(label_w).map_or(line.len(), |(i, _)| i));
+            out.push(Line::from(vec![
+                Span::styled(label.to_string(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw(value.to_string()),
+            ]));
+        } else if line.trim().is_empty() {
+            out.push(Line::from(""));
+        } else {
+            out.push(Line::from(Span::styled(line, dim)));
+        }
+    }
+    out
+}
+
 /// `/agents continue`: resolve the agent among this run's, then deliver
 /// the message the way the `send_message` tool does: a running agent
 /// gets it in its brief, an ended one is continued with its context. The
@@ -3572,7 +3751,8 @@ async fn run_app(
                     let entry = snap.iter().find(|e| e.id == p.view.id);
                     p.view.refresh(entry);
                 }
-                let compact_visible = crate::agent::compact_progress::snapshot(std::time::Instant::now()).is_some();
+                let compact_visible = crate::agent::compact_progress::snapshot(std::time::Instant::now()).is_some()
+                    || crate::memory::dream_progress::snapshot().is_some();
                 let compact_was_visible = std::mem::replace(&mut app.compact_shown, compact_visible);
                 // Redraw when there's a live counter to update, the strip
                 // has agents to show, or the strip just emptied out (so
@@ -3897,23 +4077,37 @@ async fn handle_action(
             if local {
                 let endpoint = agent_slot.lock().await.as_ref().map(|a| a.base_url.clone()).unwrap_or_default();
                 match crate::memory::dream_plan(&arg, &endpoint, &app.model) {
-                    Ok(crate::memory::DreamPlan::Print(text)) => text.lines().try_for_each(|l| dim_line(term, l))?,
+                    Ok(crate::memory::DreamPlan::Print(text)) => {
+                        let width = term.size().map(|r| r.width).unwrap_or(80) as usize;
+                        for line in dream_text_lines(&text, width) {
+                            insert_line(term, line)?;
+                        }
+                    }
                     Err(e) => goal_line(term, &format!("dream: {e:#}"), Color::Yellow)?,
                     Ok(crate::memory::DreamPlan::Run(_)) => unreachable!("local Dream command"),
                 }
                 return Ok(());
             }
-            let Some((model, base_url, api_key)) = agent_slot
+            // During a turn the agent is out of its slot; the connection
+            // the status checks cached serves just as well, so Dream can
+            // start mid-turn.
+            let conn = agent_slot
                 .lock()
                 .await
                 .as_ref()
                 .map(|a| (a.model.clone(), a.base_url.clone(), a.api_key.clone()))
-            else {
+                .or_else(|| app.agent_watch_conn.clone());
+            let Some((model, base_url, api_key)) = conn else {
                 return goal_line(term, "dream: a turn is in flight — try again once it finishes", Color::Yellow);
             };
             match crate::memory::dream_plan(&arg, &base_url, &model) {
                 Err(e) => goal_line(term, &format!("dream: {e:#}"), Color::Yellow)?,
-                Ok(crate::memory::DreamPlan::Print(text)) => text.lines().try_for_each(|l| dim_line(term, l))?,
+                Ok(crate::memory::DreamPlan::Print(text)) => {
+                    let width = term.size().map(|r| r.width).unwrap_or(80) as usize;
+                    for line in dream_text_lines(&text, width) {
+                        insert_line(term, line)?;
+                    }
+                }
                 Ok(crate::memory::DreamPlan::Run(opts)) => {
                     if app.dream_task.is_some() {
                         return goal_line(term, "dream: already running", Color::Yellow);
@@ -3926,20 +4120,30 @@ async fn handle_action(
                         Some(crate::vendor::pick_vendor(app.cfg_provider.as_deref(), Some(&base_url), &model)),
                         app.inline_think_tags,
                     );
-                    goal_line(term, &format!("dream: running with {model} at {base_url} (see /dream status)"), Color::Magenta)?;
+                    insert_line(term, Line::from(vec![
+                        Span::styled("◆ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                        Span::styled("Dream started", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" · {model} · progress shows above the input; you can keep working"), Style::default().fg(Color::DarkGray)),
+                    ]))?;
                     app.dream_task = Some(tokio::spawn(async move {
                         crate::memory::dream_run(provider, base_url, model, opts)
                             .await
-                            .map(|r| r.text)
                             .map_err(|e| format!("{e:#}"))
                     }));
                 }
             }
         }
-        KeyAction::DreamFinished(outcome) => match outcome {
-            Ok(text) => goal_line(term, &text, Color::Magenta)?,
-            Err(e) => e.lines().try_for_each(|l| goal_line(term, &format!("dream: {l}"), Color::Yellow))?,
-        },
+        KeyAction::DreamFinished(outcome) => {
+            let width = term.size().map(|r| r.width).unwrap_or(80) as usize;
+            let lines = match &outcome {
+                Ok(report) => dream_report_lines(report, width),
+                Err(e) => dream_failure_lines(e),
+            };
+            insert_line(term, Line::from(""))?;
+            for line in lines {
+                insert_line(term, line)?;
+            }
+        }
         KeyAction::Background(arg) => {
             let arg = arg.trim();
             if arg == "list" || arg == "ls" {
@@ -9075,7 +9279,15 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         }
     };
     // The live compaction panel takes the top slack unless a menu does.
-    let compact_h = if compact.is_some() { super::compact_bar::HEIGHT as usize } else { 0 };
+    // Dream's live panel, when no compaction (which wins) or menu shows.
+    let dream = if overlay_open || compact.is_some() { None } else { crate::memory::dream_progress::snapshot() };
+    let compact_h = if compact.is_some() {
+        super::compact_bar::HEIGHT as usize
+    } else if dream.is_some() {
+        super::compact_bar::DREAM_HEIGHT as usize
+    } else {
+        0
+    };
     let max_input_lines = if overlay_open {
         1
     } else {
@@ -9131,6 +9343,8 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
         draw_palette(buf, chunks[0], m);
     } else if let Some(p) = &compact {
         super::compact_bar::draw(buf, chunks[0], p, now, &app.compact_queue);
+    } else if let Some(p) = &dream {
+        super::compact_bar::draw_dream(buf, chunks[0], p, now);
     }
 
     // ── Status strip ─────────────────────────────────────────────
@@ -10174,6 +10388,62 @@ mod tests {
         let big = dir.path().join("big.png");
         std::fs::File::create(&big).unwrap().set_len(inline_image::MAX_FILE_BYTES + 1).unwrap();
         assert!(load_display_image(&big).unwrap_err().contains("images up to"));
+    }
+
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Every kind of change Dream logs becomes an aligned row with its
+    /// icon; the finish block leads with time and counts and ends with
+    /// where to look; status labels stay a column.
+    #[test]
+    fn dream_output_has_structure() {
+        let cases = [
+            ("created `fs-core-build` (troubleshooting): a verified fix", "+", "created", "fs-core-build", "troubleshooting · a verified fix"),
+            ("merged new evidence into `fs-core-build`: same symptom again", "~", "merged", "fs-core-build", "same symptom again"),
+            ("marked `old-entry` needs review: contradicted", "!", "review", "old-entry", "contradicted"),
+            ("archived `old-entry`: superseded", "▫", "archived", "old-entry", "superseded"),
+            ("forgot `stale` (recoverable 30 days): no value", "−", "forgot", "stale", "recoverable 30 days · no value"),
+            ("pinned `recovery`: rare but vital", "↑", "pinned", "recovery", "rare but vital"),
+            ("unpinned `recovery`: no longer needed", "↓", "unpinned", "recovery", "no longer needed"),
+        ];
+        for (line, icon, verb, id, detail) in cases {
+            let (i, v, _, got_id, got_detail) = dream_change(line).unwrap_or_else(|| panic!("{line}"));
+            assert_eq!((i, v, got_id.as_str(), got_detail.as_str()), (icon, verb, id, detail), "{line}");
+        }
+        assert!(dream_change("budget: model-call limit reached").is_none());
+
+        let report = crate::memory::DreamReport {
+            text: String::new(),
+            model: "claude-opus-5-5".into(),
+            range: "unprocessed notes".into(),
+            elapsed: std::time::Duration::from_millis(14_200),
+            notes_processed: 3,
+            pending: 1,
+            withheld: 0,
+            changes: vec![
+                "created `freeswitch-core-build` (troubleshooting): verified fix".into(),
+                "created `rpi-cron` (troubleshooting): fix unverified".into(),
+            ],
+            summaries: vec!["Created two troubleshooting entries.".into()],
+        };
+        let lines: Vec<String> = dream_report_lines(&report, 120).iter().map(line_text).collect();
+        assert_eq!(lines[0], "◆ Dream finished · 14.2s · 3 notes → 2 changes · claude-opus-5-5");
+        assert!(lines[1].starts_with("  + created  freeswitch-core-build   troubleshooting · verified fix"), "{lines:#?}");
+        assert!(lines[2].starts_with("  + created  rpi-cron                troubleshooting"), "ids align: {lines:#?}");
+        assert_eq!(lines[3], "  “Created two troubleshooting entries.”");
+        assert_eq!(lines[4], "  ↳ 1 pending · /dream log for details");
+
+        let status = "Last run    2026-11-26 02:03:11 +08:00 · ok, 3 changes\n            unprocessed notes · 1 model call\nBacklog     1 unprocessed daily note";
+        let lines = dream_text_lines(status, 120);
+        assert_eq!(lines[0].spans[0].content, "Last run    ", "label column styled apart");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::DarkGray), "details under the label are dim");
+        let log = "\n## Dream 2026-11-26 02:03:11 +08:00 · unprocessed notes · model m\n- created `a` (method): why\n- summary: did things";
+        let lines: Vec<String> = dream_text_lines(log, 120).iter().map(line_text).collect();
+        assert!(lines.iter().any(|l| l.starts_with("◆ Dream 2026-11-26")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("  + created  a")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l == "  “did things”"), "{lines:#?}");
     }
 
     #[test]

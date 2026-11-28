@@ -103,27 +103,74 @@ fn localize_log_headings(log: &str, tz: &impl chrono::TimeZone) -> String {
     }).collect::<Vec<_>>().join("\n")
 }
 
+/// Bytes for people: `812 B`, `3.8 KB`, `1.2 MB`.
+fn human_bytes(n: usize) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.1} KB", n as f64 / 1024.0),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Width of the label column in `/dream status`.
+pub(crate) const STATUS_LABEL: usize = 12;
+
+/// `/dream status` as aligned rows: a label in the first
+/// [`STATUS_LABEL`] columns, details indented under it.
 fn status(store: &Store, endpoint: &str) -> String {
     let st = store.state();
     let notes = store.daily_notes();
     let pending = notes.iter().filter(|n| !st.processed.contains(&n.id)).count();
-    let mut s = String::new();
+    let mut rows: Vec<(&str, String)> = Vec::new();
     match &st.last_run {
         Some(r) => {
-            let _ = writeln!(s, "last Dream: {} · {} · model {} at {}", display_time(&r.at, &chrono::Local), r.result, r.model, r.endpoint);
-            let _ = writeln!(s, "  range {} · {} model calls · {} data bytes · {} notes processed · {} withheld by disclosure", r.range, r.calls, r.input_bytes, r.notes_processed, r.withheld);
+            rows.push(("Last run", format!("{} · {} · {} at {}", display_time(&r.at, &chrono::Local), r.result, r.model, r.endpoint)));
+            rows.push((
+                "",
+                format!(
+                    "{} · {} · {} · {} · {} withheld",
+                    r.range,
+                    plural(r.calls, "model call", "model calls"),
+                    human_bytes(r.input_bytes),
+                    plural(r.notes_processed, "note", "notes"),
+                    r.withheld
+                ),
+            ));
             if let Some(f) = &r.failure {
-                let _ = writeln!(s, "  failure: {f}");
+                rows.push(("", format!("failure: {f}")));
             }
         }
-        None => s.push_str("last Dream: never\n"),
+        None => rows.push(("Last run", "never".to_string())),
     }
-    let _ = writeln!(s, "backlog: {pending} unprocessed daily notes");
-    let _ = writeln!(s, "{}", schedule::status(store));
+    rows.push(("Backlog", plural(pending, "unprocessed daily note", "unprocessed daily notes")));
+    // The schedule's own text, its first line under the label and the
+    // rest (a long startup-check reason) on lines of their own.
+    let schedule = schedule::status(store);
+    for (i, line) in schedule.lines().enumerate() {
+        let line = line.strip_prefix("Dream schedule: ").unwrap_or(line);
+        rows.push((if i == 0 { "Schedule" } else { "" }, line.to_string()));
+    }
     let p = Policy::active();
-    let _ = writeln!(s, "budget: {} model calls, {} serialized data bytes per Dream", p.memory_dream_max_calls, p.memory_dream_max_input_chars);
-    let _ = write!(s, "disclosure for {endpoint}: {}", if Policy::active().full_for(endpoint) { "full" } else { "general" });
-    s
+    rows.push((
+        "Budget",
+        format!(
+            "{} · {} per run",
+            plural(p.memory_dream_max_calls, "model call", "model calls"),
+            human_bytes(p.memory_dream_max_input_chars)
+        ),
+    ));
+    rows.push((
+        "Disclosure",
+        format!("{} for {endpoint}", if p.full_for(endpoint) { "full" } else { "general" }),
+    ));
+    rows.into_iter()
+        .map(|(label, value)| format!("{label:<w$}{value}", w = STATUS_LABEL))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── model output ─────────────────────────────────────────────────────
@@ -222,8 +269,20 @@ async fn call(provider: &dyn Provider, system: &str, user: String) -> Result<(St
     Ok((text, usage))
 }
 
+#[derive(Debug)]
 pub(crate) struct Report {
+    /// One-line summary (also what the scheduled run prints).
     pub text: String,
+    pub model: String,
+    pub range: String,
+    pub elapsed: std::time::Duration,
+    pub notes_processed: usize,
+    pub pending: usize,
+    pub withheld: usize,
+    /// Each change made, as the log records it (`created \`id\` (kind): …`).
+    pub changes: Vec<String>,
+    /// The model's one-line summaries of what it did.
+    pub summaries: Vec<String>,
 }
 
 /// Run Dream. Holds the single-run lock for its whole duration.
@@ -245,6 +304,10 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
         Some(d) => format!("{d} .. {}", today()),
         None => "unprocessed notes".into(),
     };
+    let started = std::time::Instant::now();
+    let _progress = super::dream_progress::begin(&model, &range, policy.memory_dream_max_calls);
+    let mut changes: Vec<String> = Vec::new();
+    let mut summaries: Vec<String> = Vec::new();
     let mut log = format!("\n## Dream {} · {range} · model {model}\n", crate::util::time::now_iso8601());
     let mut summary = RunSummary { at: crate::util::time::now_iso8601(), endpoint: endpoint.clone(), model: model.clone(), range: range.clone(), ..Default::default() };
 
@@ -288,6 +351,7 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
         batch_notes.push(n);
     }
 
+    super::dream_progress::notes(batch_notes.len());
     let mut calls = 0;
     let mut processed = 0;
     let mut applied = 0;
@@ -346,6 +410,7 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
         let user = payload(&rows, &notes)?;
         input_bytes += user.len();
         calls += 1;
+        super::dream_progress::asking(calls);
         let reply = match call(provider.as_ref(), SYSTEM, user).await {
             Ok((t, _)) => t,
             Err(e) => {
@@ -373,6 +438,7 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
             }
         };
         let notes_by_id: BTreeMap<String, &ParsedNote> = batch.iter().map(|n| (n.id.clone(), n)).collect();
+        super::dream_progress::applying();
         {
             let _g = store.lock(".lock")?;
             let mut st = store.state();
@@ -381,6 +447,7 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
                     Ok(line) => {
                         applied += 1;
                         let _ = writeln!(log, "- {line}");
+                        changes.push(line);
                     }
                     Err(e) => {
                         let _ = writeln!(log, "- rejected operation: {e}");
@@ -394,9 +461,11 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
             store.save_state(&st)?;
             store.write_index(&st)?;
         }
+        super::dream_progress::applied(processed, applied);
         if check_text(&parsed.summary, true).is_ok() && !parsed.summary.trim().is_empty() {
             let s: String = parsed.summary.chars().filter(|c| !c.is_control()).take(400).collect();
             let _ = writeln!(log, "- summary: {s}");
+            summaries.push(s);
         }
     }
 
@@ -435,7 +504,17 @@ pub(crate) async fn run(provider: Box<dyn Provider>, endpoint: String, model: St
     if let Some(f) = failure {
         bail!("{text}\n{f}");
     }
-    Ok(Report { text })
+    Ok(Report {
+        text,
+        model,
+        range,
+        elapsed: started.elapsed(),
+        notes_processed: processed,
+        pending: summary.pending,
+        withheld,
+        changes,
+        summaries,
+    })
 }
 
 /// Keep the local log readable over long-running schedules. Take the
