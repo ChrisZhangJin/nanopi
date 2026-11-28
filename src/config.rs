@@ -296,11 +296,14 @@ pub struct AgentConfig {
     pub max_live: usize,
     /// Max children running at once; the rest queue. Default 4.
     pub max_concurrency: usize,
-    /// Per-child turn limit. Default 50.
+    /// Per-child turn limit. Default 200 (long tasks run to hundreds of
+    /// tool calls).
     pub max_turns: u32,
-    /// Per-child token budget. Default 300_000.
+    /// Per-child token budget, cumulative over every model call (each
+    /// call counts its uncached input again). Default 10_000_000: about
+    /// 200 turns at 50k a turn.
     pub token_budget: u64,
-    /// Per-child wall-clock timeout in seconds. Default 1800.
+    /// Per-child wall-clock timeout in seconds. Default 10_800 (3 h).
     pub timeout_secs: u64,
     /// Auto-prune runs older than this many days at startup. Default 2;
     /// 0 disables.
@@ -312,9 +315,9 @@ impl Default for AgentConfig {
         Self {
             max_live: 8,
             max_concurrency: 4,
-            max_turns: 50,
-            token_budget: 300_000,
-            timeout_secs: 1800,
+            max_turns: 200,
+            token_budget: 10_000_000,
+            timeout_secs: 10_800,
             archive_keep_days: 2,
         }
     }
@@ -1352,9 +1355,9 @@ command = "/bin/true"
             AgentConfig {
                 max_live: 8,
                 max_concurrency: 4,
-                max_turns: 50,
-                token_budget: 300_000,
-                timeout_secs: 1800,
+                max_turns: 200,
+                token_budget: 10_000_000,
+                timeout_secs: 10_800,
                 archive_keep_days: 2,
             }
         );
@@ -1375,7 +1378,7 @@ command = "/bin/true"
         let a = c.agent_config();
         assert_eq!(a.max_live, 2);
         assert_eq!(a.max_concurrency, 4);
-        assert_eq!(a.timeout_secs, 1800);
+        assert_eq!(a.timeout_secs, 10_800);
     }
 
     #[test]
@@ -1451,9 +1454,9 @@ command = "/bin/true"
     const AGENT_FIELDS: [(&str, u64, u64); 6] = [
         ("max_live", 8, 3),
         ("max_concurrency", 4, 2),
-        ("max_turns", 50, 7),
-        ("token_budget", 300_000, 1_000),
-        ("timeout_secs", 1800, 60),
+        ("max_turns", 200, 7),
+        ("token_budget", 10_000_000, 1_000),
+        ("timeout_secs", 10_800, 60),
         ("archive_keep_days", 2, 9),
     ];
 
@@ -1521,15 +1524,15 @@ command = "/bin/true"
         assert_eq!(a.max_concurrency, 2, "global field the project did not set survives");
         assert_eq!(a.timeout_secs, 60, "so does every other global field");
         assert_eq!(a.max_live, 8);
-        assert_eq!(a.token_budget, 300_000);
+        assert_eq!(a.token_budget, 10_000_000);
 
         // And the sneaky variant: project sets one field to the default.
         let c = load_layers(
             Some("[agent]\nmax_concurrency = 2\nmax_turns = 7\n"),
-            Some("[agent]\nmax_turns = 50\n"),
+            Some("[agent]\nmax_turns = 200\n"),
         );
         let a = agent_of(&c);
-        assert_eq!(a.max_turns, 50);
+        assert_eq!(a.max_turns, 200);
         assert_eq!(a.max_concurrency, 2);
     }
 

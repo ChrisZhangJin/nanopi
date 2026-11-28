@@ -343,3 +343,10 @@ mod test_lock_tests {
         );
     }
 }
+
+/// The build this binary is: the commit it was built from (with
+/// `-dirty` when the source had uncommitted changes) and the build date,
+/// stamped by `build.rs`. `49ab2ec, built 2026-11-28`.
+pub fn build_id() -> &'static str {
+    concat!(env!("NANOPI_COMMIT"), ", built ", env!("NANOPI_BUILD_DATE"))
+}

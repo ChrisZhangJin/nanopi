@@ -353,6 +353,9 @@ pub struct ReportMeta {
     pub ended: String,
     pub turns: Option<u32>,
     pub tokens: Option<u64>,
+    /// Which limit stopped the agent (`max_turns` | `token_budget`) when
+    /// `state` is `limit_reached`; rendered as a `limit:` line.
+    pub limit: Option<String>,
     pub worktree: Option<String>,
     pub branch: Option<String>,
 }
@@ -391,6 +394,9 @@ pub fn render_report(
         fm_value(&turns),
         fm_value(&tokens),
     );
+    if let Some(l) = &meta.limit {
+        fm.push_str(&format!("limit: {}\n", fm_value(l)));
+    }
     if let Some(w) = &meta.worktree {
         fm.push_str(&format!("worktree: {}\n", fm_value(w)));
     }
@@ -505,6 +511,7 @@ mod tests {
             ended: "2026-10-04T10:00:00+08:00".into(),
             turns: Some(3),
             tokens: Some(1200),
+            limit: None,
             worktree: None,
             branch: None,
         }

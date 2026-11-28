@@ -26,8 +26,11 @@ fn kind_str(k: provider::ApiKind) -> &'static str {
 /// Version string baked in at compile time from the repo-root `VERSION`
 /// file. Single source of truth so `nanopi -V` can't drift from what
 /// CI ships.
+/// `0.17.2 (49ab2ec, built 2026-11-28)`: the version, and which build of
+/// it this is (`nanopi::build_id`).
 fn nanopi_version() -> &'static str {
-    include_str!("../VERSION").trim()
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| format!("{} ({})", include_str!("../VERSION").trim(), nanopi::build_id()))
 }
 
 /// Minimal CLI — covers the v0.5 acceptance criteria.

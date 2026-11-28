@@ -138,6 +138,13 @@ pub fn build_orchestrator(cwd: &Path, tool_names: &[String]) -> String {
             tool_names.join(", ")
         )
     };
+    // The agent tool gets this run's random agent names to choose from
+    // (`agent::names`): models alone keep picking the same famous name.
+    let tools_line = if tool_names.iter().any(|n| n == "agent") {
+        format!("{tools_line}\n\n{}", crate::agent::names::prompt_line())
+    } else {
+        tools_line
+    };
 
     format!(
         "You are nanopi running in orchestrator mode: the main \
@@ -173,9 +180,9 @@ Workflow:
          choice between approaches, or if the work is risky, ask the \
          user first and dispatch only after you have an answer.
 4. Dispatch. Give each agent a short `description` (3-6 words) — it \
-         is the agent's task in the user's agent list — and a `name`: a \
-         famous historical figure whose work suits the task (Curie to \
-         investigate, Turing to write code); the user knows the agent by it. Judge whether \
+         is the agent's task in the user's agent list — and a `name` \
+         from the session's agent names below that suits the task; the \
+         user knows the agent by it. Judge whether \
          parallelism is actually worth it: sequential or interdependent \
          work goes to ONE agent working through the steps (chain mode), \
          not several short, separate dispatches. Use parallel agents \
@@ -364,6 +371,20 @@ mod tests {
 
     /// The hybrid orchestrator must be told to scout and to triage
     /// (do-it-yourself vs delegate), with a bound on going it alone.
+    /// The orchestrator prompt offers this run's agent names when it has
+    /// the agent tool.
+    #[test]
+    fn prompts_offer_the_runs_agent_names_with_the_agent_tool() {
+        let first = crate::agent::names::shortlist()[0];
+        let with = vec!["read".to_string(), "agent".to_string()];
+        let without = vec!["read".to_string()];
+        assert!(build_orchestrator(&PathBuf::from("/tmp"), &with).contains(first));
+        assert!(!build_orchestrator(&PathBuf::from("/tmp"), &without).contains("Agent names for this session"));
+        // The solo prompt stays byte-identical to its baseline; there an
+        // unoffered name is simply replaced by a random free one.
+        assert!(!build(&PathBuf::from("/tmp"), &with).contains("Agent names for this session"));
+    }
+
     #[test]
     fn orchestrator_prompt_covers_scouting_and_triage() {
         let p = build_orchestrator(&PathBuf::from("/tmp"), &orchestrator_tools());

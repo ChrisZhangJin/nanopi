@@ -765,6 +765,7 @@ pub async fn run_print_mode(
             ended: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
             turns: Some(turns),
             tokens: Some(tokens),
+            limit: limit_hit.filter(|_| status == "limit_reached").map(str::to_string),
             worktree: None,
             branch: None,
         };
@@ -1283,6 +1284,7 @@ mod report_summary_tests {
             ended: "2026-10-04T10:00:00+08:00".into(),
             turns: None,
             tokens: None,
+            limit: None,
             worktree: None,
             branch: None,
         };

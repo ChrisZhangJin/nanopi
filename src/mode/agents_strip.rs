@@ -23,6 +23,47 @@ use crate::agent_registry::{AgentEntry, AgentState};
 const TRANSCRIPT_THROTTLE_SECS: u64 = 1;
 /// Read at most the last 64 KiB of `transcript.jsonl` (T-05-02).
 const TRANSCRIPT_TAIL_BYTES: u64 = 64 * 1024;
+/// How long an agent that just ended stays on the strip, showing how it
+/// ended, before it leaves.
+pub const LINGER_SECS: u64 = 30;
+
+/// How an agent ended, for people: `done`, `stopped: hit the turn limit
+/// · /agents continue a1 · or raise [agent] max_turns`, `failed: timed
+/// out after 10800s · /agents continue a1 · or raise [agent]
+/// timeout_secs`. Built from its state and `report.md`
+/// (which records the `limit:` that stopped it). Pure.
+pub fn outcome_from_report(state: AgentState, report: Option<&str>) -> String {
+    let fm = |key: &str| report.and_then(|r| front_matter_get(r, key)).map(|v| sanitize(&v));
+    // How to pick it up again, when the report names the agent.
+    let resume = fm("id").map(|id| format!(" · /agents continue {id}")).unwrap_or_default();
+    match state {
+        AgentState::Completed => "done".to_string(),
+        AgentState::LimitReached => match fm("limit").as_deref() {
+            // The report's `turns` counts differently from `max_turns`,
+            // so no number here: it read as the limit itself.
+            Some("max_turns") => format!("stopped: hit the turn limit{resume} · or raise [agent] max_turns"),
+            Some("token_budget") => format!(
+                "stopped: token budget ({} tokens){resume} · or raise [agent] token_budget",
+                fm("tokens").unwrap_or_else(|| "?".into())
+            ),
+            _ => format!("stopped: hit a limit{resume} · see [agent] in config.toml"),
+        },
+        AgentState::Failed => {
+            // The first line of the report's summary says why.
+            let why = report
+                .and_then(|r| r.split_once("\n## Summary\n"))
+                .and_then(|(_, rest)| rest.lines().map(str::trim).find(|l| !l.is_empty()))
+                .map(|l| truncate_to_width(&sanitize(l), 80))
+                .unwrap_or_else(|| "see its report".to_string());
+            let hint = if why.contains("timed out") { " · or raise [agent] timeout_secs" } else { "" };
+            format!("failed: {why}{resume}{hint}")
+        }
+        AgentState::Stopped => "stopped".to_string(),
+        AgentState::Interrupted => "interrupted".to_string(),
+        AgentState::Running | AgentState::Queued => state.as_str().to_string(),
+    }
+}
+
 /// How long the progress bar takes to glide to a newly reported step.
 const EASE_MS: f64 = 700.0;
 /// Progress bar width in the live strip.
@@ -104,6 +145,8 @@ pub struct AgentInfo {
     pub description: String,
     /// The brief's `name:` (`agent::names`): who the user knows it as.
     pub codename: Option<String>,
+    /// How it ended ([`outcome_from_report`]); `None` while live.
+    pub outcome: Option<String>,
     pub activity: Vec<String>,
     pub turns: Option<String>,
     pub tokens: Option<String>,
@@ -136,6 +179,7 @@ impl AgentInfo {
             role: None,
             description: String::new(),
             codename: None,
+            outcome: None,
             activity: Vec::new(),
             turns: None,
             tokens: None,
@@ -176,6 +220,10 @@ impl AgentInfo {
         self.report_path = self.dir.join("report.md");
         let report = std::fs::read_to_string(&self.report_path).ok();
         self.report_exists = report.is_some();
+        self.outcome = self
+            .state
+            .is_terminal()
+            .then(|| outcome_from_report(self.state, report.as_deref()));
         match &report {
             Some(r) => {
                 self.turns = front_matter_get(r, "turns");
@@ -362,6 +410,12 @@ impl AgentsView {
         &self.agents
     }
 
+    /// Agents still queued or running (the rest are lingering after
+    /// they ended).
+    pub fn live_count(&self) -> usize {
+        self.agents.iter().filter(|a| !a.state.is_terminal()).count()
+    }
+
     /// Update the cache from a fresh registry snapshot (UI-03: read-only
     /// w.r.t. the registry — only ever called with a `&[AgentEntry]` that
     /// was already snapshotted elsewhere).
@@ -371,10 +425,20 @@ impl AgentsView {
     /// agents at most once per second (T-05-02).
     pub fn refresh(&mut self, snapshot: &[AgentEntry], now: Instant) {
         use std::collections::HashSet;
-        // Only live agents are shown: one that has finished (done, failed,
-        // stopped, ...) leaves the strip on the next tick. Its report still
-        // reaches the conversation through the normal injection path.
-        let live: Vec<&AgentEntry> = snapshot.iter().filter(|e| !e.state.is_terminal()).collect();
+        // Live agents are shown. One that ends stays for LINGER_SECS with
+        // how it ended (a limit, a failure), so it does not simply vanish;
+        // one already finished when first seen is not shown at all.
+        let linger = std::time::Duration::from_secs(LINGER_SECS);
+        let live: Vec<&AgentEntry> = snapshot
+            .iter()
+            .filter(|e| {
+                !e.state.is_terminal()
+                    || self.agents.iter().any(|a| {
+                        a.id == e.id
+                            && a.finished_seen.is_none_or(|t| now.saturating_duration_since(t) < linger)
+                    })
+            })
+            .collect();
         let seen: HashSet<&str> = live.iter().map(|e| e.id.as_str()).collect();
         self.agents.retain(|a| seen.contains(a.id.as_str()));
 
@@ -546,7 +610,7 @@ fn status_text(info: &AgentInfo) -> String {
             .cloned()
             .unwrap_or_else(|| "starting…".to_string()),
         AgentState::Queued => "queued".to_string(),
-        other => other.as_str().to_string(),
+        other => info.outcome.clone().unwrap_or_else(|| other.as_str().to_string()),
     }
 }
 
@@ -603,9 +667,12 @@ fn agent_line(info: &AgentInfo, name_w: usize, width: usize, now: Instant) -> St
 /// The header row: what the rows below are, how many are working, the
 /// shared status check, and the details key.
 fn main_line(view: &AgentsView, opts: &StripOpts) -> (String, String) {
-    let n = view.len();
+    let live = view.live_count();
+    let ended = view.len() - live;
     let watch = opts.watch.as_deref().map(|w| format!(" · {w}")).unwrap_or_default();
-    let hint = format!("  {n} working{watch} · {} details", opts.toggle_key_label);
+    let working = if live > 0 { format!("{live} working") } else { "none working".to_string() };
+    let just = if ended > 0 { format!(" · {ended} just ended") } else { String::new() };
+    let hint = format!("  {working}{just}{watch} · {} details", opts.toggle_key_label);
     (format!("{MAIN_GLYPH} agents"), hint)
 }
 
@@ -698,7 +765,9 @@ fn agent_row<'a>(info: &AgentInfo, who_w: usize, name_w: usize, width: usize, no
             (FRAMES[f % FRAMES.len()], Style::default().fg(spinner_color((ms / 160) as usize + index)).add_modifier(Modifier::BOLD))
         }
         AgentState::Queued => ("◌", Style::default().fg(if (ms / 600) % 2 == 0 { Color::Gray } else { Color::DarkGray })),
-        AgentState::Failed => ("✗", Style::default().fg(Color::Red)),
+        AgentState::Failed => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        AgentState::LimitReached => ("⏱", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        AgentState::Completed => ("✓", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         other => (glyph_for(other), style_for_state(other)),
     };
     let elapsed = format!(" {}", format_elapsed(elapsed_secs_for(info, now)));
@@ -720,6 +789,27 @@ fn agent_row<'a>(info: &AgentInfo, who_w: usize, name_w: usize, width: usize, no
         Span::styled(format!("{id_tag} "), dim),
         Span::styled(format!("{name}{pad}"), Style::default().fg(Color::White)),
     ];
+    // An agent that just ended: how it ended, in its colour, in place of
+    // the bar and activity (a limit and its config key, or the failure).
+    if info.state.is_terminal() {
+        let outcome = info.outcome.clone().unwrap_or_else(|| info.state.as_str().to_string());
+        let colour = match info.state {
+            AgentState::Completed => Color::Green,
+            AgentState::LimitReached => Color::Yellow,
+            AgentState::Failed => Color::Red,
+            _ => Color::Gray,
+        };
+        let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+        let room = width.saturating_sub(used + 2 + display_width(&elapsed) + 1);
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(truncate_to_width(&outcome, room), Style::default().fg(colour)));
+        let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+        if used + display_width(&elapsed) <= width {
+            spans.push(Span::raw(" ".repeat(width - used - display_width(&elapsed))));
+            spans.push(Span::styled(elapsed, dim));
+        }
+        return ratatui::text::Line::from(spans);
+    }
     let total = info.total_steps();
     let frac = info.shown_fraction(now);
     if width >= 70 {
@@ -900,6 +990,55 @@ mod tests {
         assert!(rows[0].starts_with("● agents") && rows[1].contains("list_calls"), "{rows:#?}");
     }
 
+    /// The bug seen in use: an agent hit its turn limit and simply
+    /// vanished from the strip. It now says how it ended, and how to
+    /// change the limit.
+    #[test]
+    fn outcomes_say_why_an_agent_ended() {
+        let report = |extra: &str| format!("---\nid: a1\nstate: limit_reached\nturns: 50\ntokens: 300412\n{extra}---\n\n# Report\n\n## Summary\n\nwhy line\n");
+        assert_eq!(
+            outcome_from_report(AgentState::LimitReached, Some(&report("limit: max_turns\n"))),
+            "stopped: hit the turn limit · /agents continue a1 · or raise [agent] max_turns"
+        );
+        assert_eq!(
+            outcome_from_report(AgentState::LimitReached, Some(&report("limit: token_budget\n"))),
+            "stopped: token budget (300412 tokens) · /agents continue a1 · or raise [agent] token_budget"
+        );
+        assert!(outcome_from_report(AgentState::LimitReached, Some(&report(""))).contains("[agent]"), "older reports without limit:");
+        let failed = "---\nid: a1\nstate: failed\n---\n\n# Report\n\n## Summary\n\ntimed out after 1800s\n";
+        assert_eq!(
+            outcome_from_report(AgentState::Failed, Some(failed)),
+            "failed: timed out after 1800s · /agents continue a1 · or raise [agent] timeout_secs"
+        );
+        assert_eq!(outcome_from_report(AgentState::Completed, None), "done");
+    }
+
+    /// While it lingers the row shows the outcome in place of the bar, and
+    /// the header counts only agents still working.
+    #[test]
+    fn an_ended_agent_lingers_with_its_outcome() {
+        let t0 = Instant::now();
+        let d = tmp_dir();
+        std::fs::write(d.path().join("brief.md"), "---\nid: a1\nlabel: full scan\nname: Fourier\n---\nbody\n").unwrap();
+        let mut view = AgentsView::new();
+        view.refresh(&[entry("a1", AgentState::Running, t0, d.path().to_path_buf())], t0);
+        std::fs::write(
+            d.path().join("report.md"),
+            "---\nid: a1\nstate: limit_reached\nturns: 50\nlimit: max_turns\n---\n\n# Report\n",
+        )
+        .unwrap();
+        let t1 = t0 + Duration::from_secs(5);
+        view.refresh(&[entry("a1", AgentState::LimitReached, t0, d.path().to_path_buf())], t1);
+        let area = Rect::new(0, 0, 120, 4);
+        let mut buf = Buffer::empty(area);
+        let opts = StripOpts { expanded: false, term_rows: 40, toggle_key_label: "Ctrl+G".into(), now: t1, watch: None };
+        draw_agents_strip(&mut buf, area, &view, &opts);
+        let rows = strip_text(&buf);
+        assert!(rows[1].contains("none working · 1 just ended"), "{rows:#?}");
+        assert!(rows[3].contains("⏱ Fourier a1") && rows[3].contains("stopped: hit the turn limit · /agents continue a1"), "{rows:#?}");
+        assert!(!rows[3].contains('▕'), "no progress bar once ended: {rows:#?}");
+    }
+
     #[test]
     fn glyph_table_covers_all_states() {
         assert_eq!(glyph_for(AgentState::Running), "●");
@@ -960,8 +1099,12 @@ mod tests {
         let t1 = t0 + Duration::from_millis(10);
         let snap2 = vec![entry("a", AgentState::Completed, t0, d1.path().to_path_buf())];
         view.refresh(&snap2, t1);
-
-        assert!(view.is_empty(), "completed agent should be dropped from the view");
+        // It stays a while, showing how it ended, then leaves.
+        assert_eq!(view.len(), 1, "a just-ended agent lingers");
+        assert_eq!(view.live_count(), 0);
+        let gone = t1 + Duration::from_secs(LINGER_SECS + 1);
+        view.refresh(&snap2, gone);
+        assert!(view.is_empty(), "completed agent leaves after the linger");
         assert_eq!(strip_height(&view, 40, false), 0);
 
         // Same for Failed.
@@ -971,7 +1114,8 @@ mod tests {
         view2.refresh(&snap3, t0);
         let snap4 = vec![entry("b", AgentState::Failed, t0, d2.path().to_path_buf())];
         view2.refresh(&snap4, t1);
-        assert!(view2.is_empty(), "failed agent should be dropped from the view");
+        view2.refresh(&snap4, gone);
+        assert!(view2.is_empty(), "failed agent leaves after the linger");
         assert_eq!(strip_height(&view2, 40, false), 0);
     }
 

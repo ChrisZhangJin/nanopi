@@ -276,6 +276,17 @@ impl Tool for SendMessageTool {
             .to_string();
 
         let reg = registry_for(&self.registry, &self.fallback);
+        Ok(deliver_message(&reg, &id, &message, &ctx.cwd))
+    }
+}
+
+/// Deliver `message` to agent `id`: appended to its brief while it runs,
+/// or, once it has ended (done, failed, stopped at a limit), it is
+/// continued under the same id with its transcript and the message as
+/// its next task. Shared by the `send_message` tool and `/agents
+/// continue`. Every outcome is in-band.
+pub fn deliver_message(reg: &Arc<AgentRegistry>, id: &str, message: &str, cwd: &std::path::Path) -> ToolOutput {
+    let id = id.to_string();
         let entry = match reg.snapshot().into_iter().find(|e| e.id == id) {
             Some(e) => e,
             None => {
@@ -285,9 +296,9 @@ impl Tool for SendMessageTool {
                 // from disk before giving up; any rejection (missing,
                 // malformed, non-terminal, interrupted, other-run) is
                 // surfaced in-band unchanged.
-                match reg.adopt_from_disk(&crate::paths::project_agents_dir(&ctx.cwd), &id) {
+                match reg.adopt_from_disk(&crate::paths::project_agents_dir(cwd), &id) {
                     Ok(e) => e,
-                    Err(e) => return Ok(in_band_error(e)),
+                    Err(e) => return in_band_error(e),
                 }
             }
         };
@@ -298,9 +309,9 @@ impl Tool for SendMessageTool {
 
         if !entry.state.is_terminal() {
             if let Err(e) = brief::append_amendment(&brief_path, next_n, &message) {
-                return Ok(in_band_error(format!("cannot amend brief: {e}")));
+                return in_band_error(format!("cannot amend brief: {e}"));
             }
-            return Ok(ok_json(json!({ "id": id, "delivered": "amended" })));
+            return ok_json(json!({ "id": id, "delivered": "amended" }));
         }
 
         // Terminal: continue under the same id (CTL-06/D-05). Same-run
@@ -308,20 +319,20 @@ impl Tool for SendMessageTool {
         if entry.dir.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
             != Some(reg.run_id())
         {
-            return Ok(in_band_error(
+            return in_band_error(
                 "cannot continue agents from other runs".to_string(),
-            ));
+            );
         }
 
         if let Err(e) = brief::append_amendment(&brief_path, next_n, &message) {
-            return Ok(in_band_error(format!("cannot amend brief: {e}")));
+            return in_band_error(format!("cannot amend brief: {e}"));
         }
         if let Err(e) = reg.reactivate(&id) {
-            return Ok(in_band_error(e));
+            return in_band_error(e);
         }
 
         let l = AgentTool::new().launcher();
-        let prepared = agent::prepare_continue(&l, &id, &entry.dir, &ctx.cwd);
+        let prepared = agent::prepare_continue(&l, &id, &entry.dir, cwd);
         let tools_unrecovered = prepared.tools_unrecovered();
         agent::spawn_continue_background(&reg, prepared);
 
@@ -337,9 +348,9 @@ impl Tool for SendMessageTool {
         } else if tools_unrecovered {
             result["note"] = json!(TOOLS_NOT_RECOVERED);
         }
-        Ok(ok_json(result))
-    }
+    ok_json(result)
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -378,6 +389,7 @@ mod tests {
                     ended: "now".into(),
                     turns: Some(3),
                     tokens: Some(1200),
+                    limit: None,
                     worktree: None,
                     branch: None,
                 },

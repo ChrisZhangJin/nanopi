@@ -533,7 +533,7 @@ impl Tool for AgentTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "optional: the agent's name, shown to the user in place of its id. Use the name of a famous historical figure whose work suits the task (e.g. \"Curie\" to investigate, \"Turing\" to write code); give parallel agents different names."
+                        "description": "optional: the agent's name, shown to the user in place of its id: pick the one that suits the task from this session's agent names in your instructions; never reuse one."
                     },
                     "isolation": {
                         "type": "string",
@@ -553,7 +553,7 @@ impl Tool for AgentTool {
                                 "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
                                 "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
                                 "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."},
-                                "name": {"type": "string", "description": "optional: the agent's name, shown to the user in place of its id. Use the name of a famous historical figure whose work suits the task (e.g. \"Curie\" to investigate, \"Turing\" to write code); give parallel agents different names."}
+                                "name": {"type": "string", "description": "optional: the agent's name, shown to the user in place of its id: pick the one that suits the task from this session's agent names in your instructions; never reuse one."}
                             },
                             "required": ["task"]
                         }
@@ -571,7 +571,7 @@ impl Tool for AgentTool {
                                 "tools": {"type": "array", "items": {"type": "string"}, "description": "optional: exactly these tools (by name); `agent` is never allowed."},
                                 "model": {"type": "string", "description": "optional: model id; must be served by the active provider; defaults to yours."},
                                 "description": {"type": "string", "description": "optional: short label (aim for 3-6 words; may be truncated if longer), shown in listings."},
-                                "name": {"type": "string", "description": "optional: the agent's name, shown to the user in place of its id. Use the name of a famous historical figure whose work suits the task (e.g. \"Curie\" to investigate, \"Turing\" to write code); give parallel agents different names."}
+                                "name": {"type": "string", "description": "optional: the agent's name, shown to the user in place of its id: pick the one that suits the task from this session's agent names in your instructions; never reuse one."}
                             },
                             "required": ["task"]
                         }
@@ -1400,6 +1400,7 @@ fn ensure_report(dir: &Path, id: &str, state: AgentState, error_text: &str) {
             ended,
             turns: None,
             tokens: None,
+            limit: None,
             worktree: None,
             branch: None,
         },
@@ -1642,7 +1643,7 @@ fn prepare_run(
             started,
             parent: reg.run_id().to_string(),
             label: label.map(str::to_string),
-            name: Some(crate::agent::names::choose(name, &id, &names_in_use(reg, &id))),
+            name: Some(crate::agent::names::choose(name, &names_in_use(reg, &id))),
             worktree: worktree.as_ref().map(|w| w.path.to_string_lossy().into_owned()),
             branch: worktree.as_ref().map(|w| w.branch.clone()),
         },
@@ -3262,7 +3263,7 @@ mod tests {
         let dir = Path::new("/tmp/agents/run/a1");
         let a = build_child_args(&spec_fixture(), dir, &["a".into(), "b".into()], None);
         let j = a.join(" ");
-        assert!(j.starts_with("-p --output json --brief /tmp/agents/run/a1/brief.md --session-file /tmp/agents/run/a1/transcript.jsonl --max-turns 50 --token-budget 300000"), "{j}");
+        assert!(j.starts_with("-p --output json --brief /tmp/agents/run/a1/brief.md --session-file /tmp/agents/run/a1/transcript.jsonl --max-turns 200 --token-budget 10000000"), "{j}");
         for want in [
             "--model M",
             "--base-url U",

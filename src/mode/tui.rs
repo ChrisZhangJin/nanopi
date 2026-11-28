@@ -257,7 +257,7 @@ fn slash_items() -> Vec<MenuItem<SlashCmd>> {
         MenuItem::new("/import", "Import a session from JSONL", SlashCmd::Import),
         MenuItem::new(
             "/agents",
-            "Agents: pick one to watch live (Enter) | show <id|name> | list | close | stop <id|name|all> | clean [--older <days> | --keep <n>]",
+            "Agents: pick one to watch live (Enter) | show <id|name> | list | close | continue <id|name> [message] | stop <id|name|all> | clean [--older <days> | --keep <n>]",
             SlashCmd::Agents,
         ),
         MenuItem::new("/compact", "Force context compaction", SlashCmd::Compact),
@@ -1030,8 +1030,9 @@ fn print_startup_banner(model: &str, session_id: &str, skills: &[crate::resource
     let sid_short = &session_id[..8.min(session_id.len())];
     // Title line: bold nanopi + dim details.
     println!(
-        "\x1b[1mnanopi\x1b[0m \x1b[2mv{}  {}  session {}\x1b[0m",
+        "\x1b[1mnanopi\x1b[0m \x1b[2mv{} ({})  {}  session {}\x1b[0m",
         env!("CARGO_PKG_VERSION"),
+        crate::build_id(),
         model,
         sid_short
     );
@@ -1766,6 +1767,8 @@ enum KeyAction {
     /// `/agents show <id|name-prefix>` (or the picker's Enter, with an id)
     /// — print one agent's detail card into scrollback.
     ShowAgent(String),
+    /// `/agents continue <agent> [message]`.
+    ContinueAgent { query: String, message: Option<String> },
     /// `/agents stop <id|name-prefix|all>` — stop agents. Works while a
     /// turn is streaming; never touches the turn.
     StopAgents(AgentStopTarget),
@@ -2130,11 +2133,17 @@ fn interpret_key(app: &mut App, k: KeyEvent) -> KeyAction {
     }
     // ── Palette owns navigation keys when open. ─────────────────────
     if app.palette.is_some() {
-        let claims_nav = matches!(
-            k.code,
-            KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Tab
-        ) || (k.code == KeyCode::Enter
-            && !k.modifiers.contains(KeyModifiers::SHIFT));
+        // While a recalled history entry is shown, Up/Down keep walking
+        // history. A recalled `/command` opens the palette, which used to
+        // take Up/Down from then on, so history stopped at that entry.
+        let browsing_history = app.input.history_position().is_some()
+            && matches!(k.code, KeyCode::Up | KeyCode::Down);
+        let claims_nav = !browsing_history
+            && (matches!(
+                k.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Tab
+            ) || (k.code == KeyCode::Enter
+                && !k.modifiers.contains(KeyModifiers::SHIFT)));
         if claims_nav {
             let m = app.palette.as_mut().unwrap();
             match m.handle_key(k) {
@@ -2546,7 +2555,11 @@ fn sync_palette(app: &mut App) {
 /// `/agents` usage line, shown on any bad/missing argument (T-02-19:
 /// strict parse, anything unrecognized deletes and stops nothing).
 const AGENTS_USAGE: &str = "Usage: /agents | /agents show <id|name-prefix> | /agents <id> | \
-/agents list | /agents close | /agents stop <id|name-prefix|all> | /agents clean [--older <days> | --keep <n>]";
+/agents list | /agents close | /agents stop <id|name-prefix|all> | /agents continue <id|name> [message] | \
+/agents clean [--older <days> | --keep <n>]";
+
+/// What `/agents continue <agent>` says when no message is given.
+const CONTINUE_DEFAULT: &str = "Continue from where you stopped: finish the remaining work of your task, then write your report.";
 
 /// What `/agents stop` was asked to stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2570,6 +2583,10 @@ enum AgentsCmd {
     Clean(crate::archive::CleanMode),
     /// `/agents close`: close the live panel.
     Close,
+    /// `/agents continue <agent> [message]`: continue an agent that ended
+    /// (a limit, a failure, done) with its context, or add the message
+    /// to the brief of one still running.
+    Continue { query: String, message: Option<String> },
 }
 
 /// Parse the argument string after `/agents` (D-10, ARC-05). Accepted:
@@ -2597,6 +2614,16 @@ fn parse_agents_args(arg: &str) -> Result<AgentsCmd, String> {
         Some("close") => match parts.next() {
             None => Ok(AgentsCmd::Close),
             Some(_) => Err(AGENTS_USAGE.to_string()),
+        },
+        Some("continue") | Some("resume") => match parts.next() {
+            None => Err(AGENTS_USAGE.to_string()),
+            Some(query) => {
+                let message = parts.collect::<Vec<_>>().join(" ");
+                Ok(AgentsCmd::Continue {
+                    query: query.to_string(),
+                    message: (!message.trim().is_empty()).then_some(message),
+                })
+            }
         },
         Some("list") => match parts.next() {
             None => Ok(AgentsCmd::List),
@@ -2748,6 +2775,46 @@ fn open_agents_picker(
     };
     let rows = agent_detail::collect_rows(&reg.snapshot(), now);
     build_agents_picker(&rows).ok_or_else(|| "no agents in this session".to_string())
+}
+
+/// `/agents continue`: resolve the agent among this run's, then deliver
+/// the message the way the `send_message` tool does: a running agent
+/// gets it in its brief, an ended one is continued with its context. The
+/// lines to print say which happened (or why nothing did).
+fn continue_agent(query: &str, message: Option<&str>, cwd: &std::path::Path) -> Vec<(String, Color)> {
+    let Some(reg) = crate::agent_registry::global() else {
+        return vec![("no agent registry in this session".into(), Color::Yellow)];
+    };
+    let rows = agent_detail::collect_rows(&reg.snapshot(), std::time::Instant::now());
+    let id = match agent_detail::resolve_agent(query, &rows) {
+        Ok(id) => id,
+        Err(e) => return vec![(e, Color::Yellow)],
+    };
+    let row = rows.iter().find(|r| r.id == id);
+    let who = match row.and_then(|r| r.codename.clone()) {
+        Some(name) => format!("{name} ({id})"),
+        None => id.clone(),
+    };
+    let message = message.unwrap_or(CONTINUE_DEFAULT);
+    let out = crate::tool::agent_ctl::deliver_message(&reg, &id, message, cwd);
+    if out.is_error {
+        return vec![(format!("cannot continue {who}: {}", out.content), Color::Yellow)];
+    }
+    let delivered = serde_json::from_str::<serde_json::Value>(&out.content)
+        .ok()
+        .and_then(|v| v["delivered"].as_str().map(str::to_string));
+    let mut lines = vec![match delivered.as_deref() {
+        Some("amended") => (format!("✎ {who} is still running: your message was added to its brief"), Color::Cyan),
+        _ => (format!("↻ {who} continues where it stopped, with its earlier context"), Color::Cyan),
+    }];
+    lines.push((format!("  {}", agents_strip::truncate_to_width(&agents_strip::sanitize(message), 200)), Color::DarkGray));
+    if let Some(note) = serde_json::from_str::<serde_json::Value>(&out.content)
+        .ok()
+        .and_then(|v| v["note"].as_str().map(str::to_string))
+    {
+        lines.push((format!("  {note}"), Color::Yellow));
+    }
+    lines
 }
 
 /// `/agents show <query>` (and the picker's Enter): resolve the query over
@@ -2995,6 +3062,7 @@ fn dispatch_slash(cmd: SlashCmd, arg: String) -> KeyAction {
             Ok(AgentsCmd::List) => KeyAction::ListAgents,
             Ok(AgentsCmd::Pick) => KeyAction::OpenAgentsPicker,
             Ok(AgentsCmd::Show(q)) => KeyAction::ShowAgent(q),
+            Ok(AgentsCmd::Continue { query, message }) => KeyAction::ContinueAgent { query, message },
             Ok(AgentsCmd::Close) => KeyAction::CloseAgentPanel,
             Err(msg) => KeyAction::AgentsUsage(msg),
         },
@@ -4584,6 +4652,11 @@ async fn handle_action(
                         Style::default().fg(Color::DarkGray),
                     )]))?;
                 }
+            }
+        }
+        KeyAction::ContinueAgent { query, message } => {
+            for (text, colour) in continue_agent(&query, message.as_deref(), &app.cwd) {
+                insert_line(term, Line::from(Span::styled(text, Style::default().fg(colour))))?;
             }
         }
         KeyAction::ShowAgent(query) => {
@@ -8074,9 +8147,20 @@ fn is_agent_report(msg: &str) -> bool {
 fn report_preview(msg: &str, width: usize, key: &str) -> String {
     let headline = msg.lines().next().unwrap_or_default();
     let headline = if let Some((id, state)) = report_header(headline) {
+        // How it ended, from the report (a limit and its config key, a
+        // failure's reason), not just the state word.
+        let outcome = crate::agent_registry::AgentState::from_disk_str(state)
+            .map(|s| agents_strip::outcome_from_report(s, msg.split_once("] ").map(|(_, r)| r)))
+            .unwrap_or_else(|| state.to_string());
+        let glyph = match state {
+            "done" => "✓",
+            "limit_reached" => "⏱",
+            "failed" => "✗",
+            _ => "■",
+        };
         match agent_codename(id) {
-            Some(name) => format!("[{name} ({id}) finished: {state}]"),
-            None => format!("[agent {id} finished: {state}]"),
+            Some(name) => format!("{glyph} [{name} ({id}) {outcome}]"),
+            None => format!("{glyph} [agent {id} {outcome}]"),
         }
     } else if msg.starts_with("[chain finished] ") {
         "[chain finished]".into()
@@ -9187,12 +9271,12 @@ fn draw_dock(buf: &mut Buffer, area: Rect, app: &App) {
                 .add_modifier(Modifier::ITALIC),
         ));
     }
-    // v0.9.3: vendor:<id> segment when a non-fallback vendor was chosen.
+    // The vendor's id (`anthropic`) when a non-fallback vendor was chosen.
     if let Some(vid) = app.vendor_id.as_deref() {
         if vid != "fallback" {
             l2.push(Span::raw(" · "));
             l2.push(Span::styled(
-                format!("vendor:{}", vid),
+                vid.to_string(),
                 Style::default()
                     .fg(Color::Indexed(108))
                     .add_modifier(Modifier::ITALIC),
@@ -10047,11 +10131,18 @@ mod tests {
             report.push_str(&format!("- point {i}\n"));
         }
         let p = report_preview(&report, 80, "Ctrl+G");
-        assert_eq!(p.lines().next(), Some("[agent a6 finished: done]"));
+        assert_eq!(p.lines().next(), Some("✓ [agent a6 done]"));
         assert!(p.lines().count() <= 5, "{p}");
         assert!(p.contains("point 0") && !p.contains("point 29"), "{p}");
         assert!(p.contains("Ctrl+G shows the full report"), "{p}");
         assert!(!is_agent_report("[agent a1 is still working]"));
+        let limited = "[agent a1 finished: limit_reached] ---\nid: a1\nstate: limit_reached\nturns: 50\nlimit: max_turns\n---\n\n# Report\n\n## Summary\n\nscanned 3 of 9 days\n";
+        let p = report_preview(limited, 120, "Ctrl+G");
+        assert_eq!(
+            p.lines().next(),
+            Some("⏱ [agent a1 stopped: hit the turn limit · /agents continue a1 · or raise [agent] max_turns]"),
+            "{p}"
+        );
         let marked = "[agent a2 finished: done] [plan 4]\n[progress 1/4]\nreal summary line\n";
         let p = report_preview(marked, 80, "Ctrl+G");
         assert!(!p.contains("[plan") && !p.contains("[progress") && p.contains("real summary line"), "{p}");
@@ -10083,6 +10174,50 @@ mod tests {
         let big = dir.path().join("big.png");
         std::fs::File::create(&big).unwrap().set_len(inline_image::MAX_FILE_BYTES + 1).unwrap();
         assert!(load_display_image(&big).unwrap_err().contains("images up to"));
+    }
+
+    #[test]
+    fn agents_continue_parses_target_and_optional_message() {
+        match parse_agents_args("continue a1") {
+            Ok(AgentsCmd::Continue { query, message }) => assert_eq!((query.as_str(), message), ("a1", None)),
+            other => panic!("{other:?}"),
+        }
+        match parse_agents_args("continue fourier scan the remaining six days") {
+            Ok(AgentsCmd::Continue { query, message }) => {
+                assert_eq!(query, "fourier");
+                assert_eq!(message.as_deref(), Some("scan the remaining six days"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_agents_args("continue").is_err(), "needs an agent");
+        assert!(matches!(
+            dispatch_slash(SlashCmd::Agents, "continue a2".into()),
+            KeyAction::ContinueAgent { ref query, message: None } if query == "a2"
+        ));
+    }
+
+    /// Regression: a recalled `/command` opened the palette, which then
+    /// took Up/Down, so history stopped there. Up keeps walking history,
+    /// and Enter on a recalled command still runs it.
+    #[test]
+    fn history_walks_past_recalled_slash_commands() {
+        let mut app = mkapp();
+        for t in ["plain older prompt", "/agents", "plain newest prompt"] {
+            app.input.insert_str(t);
+            app.input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        interpret_key(&mut app, up);
+        interpret_key(&mut app, up);
+        assert_eq!(app.input.as_string(), "/agents");
+        assert!(app.palette.is_some(), "the recalled command shows its palette");
+        interpret_key(&mut app, up);
+        assert_eq!(app.input.as_string(), "plain older prompt", "Up went on through history");
+        assert!(app.palette.is_none());
+        interpret_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input.as_string(), "/agents");
+        let action = interpret_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, KeyAction::OpenAgentsPicker), "{action:?}");
     }
 
     /// Browsing history labels the input box with the position.

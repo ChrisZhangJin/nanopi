@@ -492,9 +492,9 @@ base_url = "https://api.openai.com/v1"
 #                           # children before dispatch is refused
 # max_concurrency = 4       # max running at once; the rest queue. This
 #                           # is a ceiling, not a target
-# max_turns = 50            # per-child turn limit
-# token_budget = 300000     # per-child token budget
-# timeout_secs = 1800       # per-child wall-clock timeout
+# max_turns = 200           # per-child turn limit
+# token_budget = 10000000  # per-child token budget (cumulative over all model calls)
+# timeout_secs = 10800      # per-child wall-clock timeout (3 h)
 # archive_keep_days = 2     # prune agent runs older than this at
 #                           # startup; 0 disables pruning
 

@@ -42,9 +42,9 @@ nanopi -p --output json \
 [agent]
 max_live = 8          # tracked non-terminal children; beyond -> "agent limit reached"
 max_concurrency = 4   # running at once; the rest queue
-max_turns = 50        # per child
-token_budget = 300000 # per child
-timeout_secs = 1800   # per child wall clock
+max_turns = 200            # per child
+token_budget = 10000000    # per child, cumulative over all model calls
+timeout_secs = 10800       # per child wall clock (3 h)
 ```
 
 ## Agent dir layout
@@ -277,7 +277,7 @@ eight tool calls before it should hand the rest to an agent.
   (v0.12) behavior — pinned by a snapshot test.
 - **Status line:** the badge marks the deviation, not the default. In
   orchestrator mode (the default) there is no badge; turning it off shows
-  `⎈ solo` next to `think:`/`vendor:`.
+  `⎈ solo` next to `think:` and the vendor name.
 
 ## Known gaps
 
